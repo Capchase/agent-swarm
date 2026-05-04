@@ -551,6 +551,10 @@ export async function ensureTaskFinished(
     body.failureReason = failureReason || `Claude process exited with code ${exitCode}`;
   } else if (providerOutput) {
     // Provider already supplied structured output (e.g. Devin) — use directly.
+    // NOTE: providerOutput is NOT validated against task.outputSchema here.
+    // Known gap for default-mode Devin; see runbooks/harness-providers.md
+    // ("Per-task outputSchema support"). Schema enforcement only happens on
+    // the MCP path via store-progress.
     body.output = providerOutput;
   } else {
     // Try structured output fallback if the task has an outputSchema

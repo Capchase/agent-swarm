@@ -119,6 +119,21 @@ export function createProviderAdapter(provider: string): ProviderAdapter {
 
 The runner reads `HARNESS_PROVIDER` in [`src/commands/runner.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/commands/runner.ts) and calls the factory once per agent: `createProviderAdapter(process.env.HARNESS_PROVIDER || "claude")`.
 
+### Per-task `outputSchema` support
+
+Tasks may carry an optional JSON Schema on `outputSchema` that the agent's final output must conform to. Enforcement depends on the harness:
+
+| Provider | Supported | Notes |
+|----------|-----------|-------|
+| `claude` | Yes | Via MCP `store-progress`; CLI extraction fallback if missed |
+| `claude-managed` | Yes | Via MCP `store-progress` |
+| `codex` | Yes | Via MCP `store-progress` |
+| `opencode` | Yes | Via MCP `store-progress` |
+| `pi` (`pi-mono`) | Yes | Via MCP `store-progress` |
+| `devin` | Conditional | Only when `HAS_MCP=true`. In default mode the schema is **not** enforced — Devin's free-form output is stored as-is. |
+
+When supported, validation happens in the MCP `store-progress` tool: a non-conforming output fails the tool call and the agent is asked to retry. Callers consuming a schema'd task's output should still be defensive about JSON parsing — when a task runs on default-mode Devin, `task.output` may not match the schema.
+
 ---
 
 ## 3. How a harness run fits into a task lifecycle

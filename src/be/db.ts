@@ -2033,6 +2033,15 @@ export interface CreateTaskOptions {
   workflowRunId?: string;
   workflowRunStepId?: string;
   sourceTaskId?: string;
+  /**
+   * Optional JSON Schema the agent's final output must conform to.
+   *
+   * Enforced via the MCP `store-progress` tool (validated in
+   * `src/tools/store-progress.ts`). NOT enforced when the task runs on
+   * default-mode Devin (no MCP) — see runbooks/harness-providers.md
+   * ("Per-task outputSchema support"). Callers reading `task.output` for
+   * a schema'd task should be defensive about JSON parsing.
+   */
   outputSchema?: Record<string, unknown>;
   requestedByUserId?: string;
   contextKey?: string;
