@@ -1,3 +1,4 @@
+import { ImplicitCitationRater } from "./implicit-citation";
 import { NoopRater } from "./noop";
 import type { MemoryRater } from "./types";
 
@@ -24,7 +25,18 @@ type RaterFactory = () => MemoryRater;
 
 const FACTORIES: Record<string, RaterFactory> = {
   noop: () => new NoopRater(),
+  "implicit-citation": () => new ImplicitCitationRater(),
 };
+
+/**
+ * Raters whose `rate(ctx)` runs server-side (in `store-progress.ts` after task
+ * completion). Worker-driven raters (e.g. step-4's `LlmRater`, step-5's
+ * `ExplicitSelfRater`) emit events from outside this set and POST them to
+ * `/api/memory/rate`. The store-progress hook only fires raters listed here.
+ *
+ * Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-2.md §6
+ */
+export const SERVER_RATERS = new Set<string>(["implicit-citation"]);
 
 export function getRegisteredRaters(): MemoryRater[] {
   const raw = process.env.MEMORY_RATERS;

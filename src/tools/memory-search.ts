@@ -3,6 +3,7 @@ import * as z from "zod";
 import { getAgentById } from "@/be/db";
 import { getEmbeddingProvider, getMemoryStore } from "@/be/memory";
 import { CANDIDATE_SET_MULTIPLIER } from "@/be/memory/constants";
+import { recordRetrievals } from "@/be/memory/raters/retrieval";
 import { rerank } from "@/be/memory/reranker";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentMemoryScopeSchema, AgentMemorySourceSchema } from "@/types";
@@ -75,6 +76,23 @@ export const registerMemorySearchTool = (server: McpServer) => {
           isLead,
         });
         const ranked = rerank(candidates, { limit });
+
+        // Retrieval bridge — when called inside a task scope, log one
+        // `memory_retrieval` row per returned memory so server-side raters
+        // (ImplicitCitationRater) can score them at task completion.
+        // Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-2.md §3
+        if (requestInfo.sourceTaskId) {
+          try {
+            recordRetrievals(
+              requestInfo.sourceTaskId,
+              requestInfo.agentId,
+              ranked.map((r) => ({ memoryId: r.id, similarity: r.similarity })),
+              requestInfo.sessionId,
+            );
+          } catch (err) {
+            console.error("[memory-search] recordRetrievals failed:", (err as Error).message);
+          }
+        }
 
         const mapped = ranked.map((r) => ({
           id: r.id,

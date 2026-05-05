@@ -9,11 +9,14 @@ import {
   getAgentById,
   getDb,
   getLeadAgent,
+  getSessionLogsByTaskId,
   getTaskById,
   updateAgentStatusFromCapacity,
   updateTaskProgress,
 } from "@/be/db";
 import { getEmbeddingProvider, getMemoryStore } from "@/be/memory";
+import { getRetrievalsForTask } from "@/be/memory/raters/retrieval";
+import { runServerRaters } from "@/be/memory/raters/run-server-raters";
 import { resolveTemplate } from "@/prompts/resolver";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentTaskSchema } from "@/types";
@@ -354,6 +357,40 @@ export const registerStoreProgressTool = (server: McpServer) => {
             }
           } catch {
             // Non-blocking — task completion memory failure should not affect task status
+          }
+        })();
+
+        // Memory rater v1.5 — fire server-side raters on task completion.
+        // Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-2.md §5
+        //
+        // Read `memory_retrieval` rows for this task + concatenated session_logs
+        // and hand both to `runServerRaters`, which iterates the allow-listed
+        // server raters (currently just `implicit-citation`), stamps source,
+        // applies the configured weight multiplier, and persists via
+        // `applyRating`. The orchestration is extracted so it can be unit-tested
+        // with stub raters (see `src/tests/run-server-raters.test.ts`).
+        //
+        // Fire-and-forget: rater failure must NEVER affect task status.
+        (async () => {
+          try {
+            const retrievals = getRetrievalsForTask(taskId);
+            if (retrievals.length === 0) return;
+
+            const retrievedMemoryIds = retrievals.map((r) => r.memoryId);
+            const logs = getSessionLogsByTaskId(taskId);
+            const evidence = logs.map((l) => l.content).join("\n");
+
+            await runServerRaters({
+              taskId,
+              agentId: requestInfo.agentId ?? "",
+              retrievedMemoryIds,
+              evidence,
+            });
+          } catch (err) {
+            console.error(
+              "[store-progress] server-rater fire failed:",
+              err instanceof Error ? err.message : String(err),
+            );
           }
         })();
       }

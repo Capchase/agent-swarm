@@ -3,6 +3,7 @@ import { z } from "zod";
 import { chunkContent } from "../be/chunking";
 import { getEmbeddingProvider, getMemoryStore } from "../be/memory";
 import { CANDIDATE_SET_MULTIPLIER } from "../be/memory/constants";
+import { recordRetrievals } from "../be/memory/raters/retrieval";
 import { rerank } from "../be/memory/reranker";
 import { AgentMemoryScopeSchema, AgentMemorySourceSchema } from "../types";
 import { route } from "./route-def";
@@ -210,6 +211,27 @@ export async function handleMemory(
         isLead: false,
       });
       const ranked = rerank(candidates, { limit: Math.min(limit, 20) });
+
+      // Retrieval bridge — when caller passed `X-Source-Task-ID`, record one
+      // `memory_retrieval` row per returned memory so server-side raters
+      // (ImplicitCitationRater, fired from store-progress on task completion)
+      // know which memories were surfaced. Best-effort: a logging failure must
+      // never poison search.
+      const sourceTaskIdHeader = req.headers["x-source-task-id"];
+      const sourceTaskId = Array.isArray(sourceTaskIdHeader)
+        ? sourceTaskIdHeader[0]
+        : sourceTaskIdHeader;
+      if (sourceTaskId) {
+        try {
+          recordRetrievals(
+            sourceTaskId,
+            myAgentId,
+            ranked.map((r) => ({ memoryId: r.id, similarity: r.similarity })),
+          );
+        } catch (err) {
+          console.error("[memory-search] recordRetrievals failed:", (err as Error).message);
+        }
+      }
 
       json(res, {
         results: ranked.map((r) => ({

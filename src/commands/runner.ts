@@ -1543,6 +1543,7 @@ async function fetchRelevantMemories(
   apiKey: string,
   agentId: string,
   taskDescription: string,
+  taskId?: string,
 ): Promise<string | null> {
   try {
     const headers: Record<string, string> = {
@@ -1550,6 +1551,11 @@ async function fetchRelevantMemories(
       "X-Agent-ID": agentId,
     };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    // Memory rater v1.5: server uses this header to log `memory_retrieval`
+    // rows so server-side raters (ImplicitCitationRater) can score the
+    // memories they surface against this task's session_logs at completion.
+    // Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-2.md §2
+    if (taskId) headers["X-Source-Task-ID"] = taskId;
 
     const response = await fetch(`${apiUrl}/api/memory/search`, {
       method: "POST",
@@ -2865,6 +2871,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             apiKey,
             agentId,
             task.task,
+            task.id,
           );
           if (resumeMemoryContext) {
             resumePrompt += resumeMemoryContext;
@@ -3150,7 +3157,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
                 ? (trigger.task as { task: string; id?: string })
                 : null;
             if (task?.task) {
-              const memoryContext = await fetchRelevantMemories(apiUrl, apiKey, agentId, task.task);
+              const memoryContext = await fetchRelevantMemories(
+                apiUrl,
+                apiKey,
+                agentId,
+                task.task,
+                task.id,
+              );
               if (memoryContext) {
                 triggerPrompt += memoryContext;
                 console.log(`[${role}] Injected relevant memories into task prompt`);
