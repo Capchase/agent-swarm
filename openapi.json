@@ -8753,6 +8753,14 @@
                       "continue"
                     ],
                     "description": "Update the definition-level onNodeFailure behavior"
+                  },
+                  "triggerSchema": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "additionalProperties": {},
+                    "description": "Optional JSON-Schema describing the expected trigger payload shape. Pass an object to set/replace; pass null to clear; omit to leave unchanged. Validator subset: type, required, properties, enum, const, items. Other JSON-Schema keywords are silently ignored."
                   }
                 }
               }
@@ -9012,6 +9020,40 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Workflow not found"
+          }
+        }
+      }
+    },
+    "/api/workflows/{id}/trigger/validate": {
+      "post": {
+        "summary": "Validate a payload against the workflow's triggerSchema (no run)",
+        "tags": [
+          "Workflows"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payload matches the workflow's triggerSchema (or workflow has none)"
+          },
+          "400": {
+            "description": "Payload failed validation; body matches the TriggerSchemaError contract"
           },
           "404": {
             "description": "Workflow not found"

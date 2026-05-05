@@ -811,8 +811,8 @@ export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
 export const WorkflowNodePatchSchema = WorkflowNodeSchema.partial().omit({ id: true });
 export type WorkflowNodePatch = z.infer<typeof WorkflowNodePatchSchema>;
 
-/** Bulk workflow definition patch */
-export const WorkflowDefinitionPatchSchema = z.object({
+/** Bulk workflow patch — DAG operations plus optional metadata fields like triggerSchema */
+export const WorkflowPatchSchema = z.object({
   update: z
     .array(
       z.object({
@@ -828,8 +828,18 @@ export const WorkflowDefinitionPatchSchema = z.object({
     .enum(["fail", "continue"])
     .optional()
     .describe("Update the definition-level onNodeFailure behavior"),
+  triggerSchema: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .nullable()
+    .describe(
+      "Optional JSON-Schema describing the expected trigger payload shape. " +
+        "Pass an object to set/replace; pass null to clear; omit to leave unchanged. " +
+        "Validator subset: type, required, properties, enum, const, items. " +
+        "Other JSON-Schema keywords are silently ignored.",
+    ),
 });
-export type WorkflowDefinitionPatch = z.infer<typeof WorkflowDefinitionPatchSchema>;
+export type WorkflowPatch = z.infer<typeof WorkflowPatchSchema>;
 
 /** Result of applying a patch — collects all errors instead of throwing on the first */
 export interface PatchResult {
