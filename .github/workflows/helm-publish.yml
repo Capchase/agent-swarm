@@ -47,10 +47,12 @@ jobs:
           fi
           echo "appVersion in sync: $PKG_VERSION"
 
-      - name: Render — defaults
-        run: helm template release ${{ env.CHART_PATH }} > /tmp/render-defaults.yaml
+      - name: Render + validate — defaults
+        run: |
+          helm template release ${{ env.CHART_PATH }} \
+            | kubectl apply --dry-run=client -f -
 
-      - name: Render — agent-fs + litestream + ingress + RBAC + NetworkPolicy
+      - name: Render + validate — agent-fs + litestream + ingress + RBAC + NetworkPolicy
         run: |
           helm template release ${{ env.CHART_PATH }} \
             --set agentFs.enabled=true \
@@ -68,18 +70,7 @@ jobs:
             --set ingress.host=swarm.example.com \
             --set networkPolicy.enabled=true \
             --set rbac.create=true \
-            > /tmp/render-full.yaml
-
-      - name: Install kubeconform
-        run: |
-          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
-          sudo mv kubeconform /usr/local/bin/
-
-      - name: kubeconform — defaults
-        run: kubeconform -summary -strict -ignore-missing-schemas /tmp/render-defaults.yaml
-
-      - name: kubeconform — full
-        run: kubeconform -summary -strict -ignore-missing-schemas /tmp/render-full.yaml
+            | kubectl apply --dry-run=client -f -
 
   publish:
     name: Publish to GHCR
