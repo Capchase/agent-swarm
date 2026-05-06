@@ -1,6 +1,16 @@
 #!/usr/bin/env bun
 
 import pkg from "../../package.json";
+import {
+  buildRatingsFromLlm,
+  buildSummaryWithRatingsPrompt,
+  extractSummaryFromClaudeStdout,
+  fetchRetrievalsForTask,
+  isLlmRaterEnabled,
+  parseSummaryWithRatings,
+  postRatings,
+  type RetrievalRow,
+} from "../be/memory/raters/llm";
 import type { Agent } from "../types";
 import { checkToolLoop, clearToolHistory } from "./tool-loop-detection";
 
@@ -1071,8 +1081,26 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
               }
             }
 
+            const apiUrl =
+              process.env.MCP_BASE_URL || `http://localhost:${process.env.PORT || "3013"}`;
+            const apiKey = process.env.API_KEY || "";
+
+            // Memory-rater v1.5 step-4: piggyback per-memory ratings on the
+            // existing summary call when MEMORY_RATERS includes `llm`.
+            // Plan: thoughts/taras/plans/2026-05-05-memory-rater-v1.5/step-4.md §3
+            const llmRaterEnabled = isLlmRaterEnabled();
+            let retrievals: RetrievalRow[] = [];
+            if (llmRaterEnabled && taskId) {
+              retrievals = await fetchRetrievalsForTask({
+                apiUrl,
+                apiKey,
+                agentId: agentInfo.id,
+                taskId,
+              });
+            }
+
             // Summarize with Claude Haiku — extract only high-value learnings
-            const summarizePrompt = `You are summarizing an AI agent's work session. Extract ONLY high-value learnings.
+            const baseSummarizePrompt = `You are summarizing an AI agent's work session. Extract ONLY high-value learnings.
 
 DO NOT include:
 - Generic descriptions of what was done ("worked on task X")
@@ -1091,6 +1119,11 @@ ${taskContext ? `\nTask context: ${taskContext}` : ""}
 Transcript:
 ${transcript}`;
 
+            const wantsRatings = llmRaterEnabled && retrievals.length > 0;
+            const summarizePrompt = wantsRatings
+              ? buildSummaryWithRatingsPrompt(baseSummarizePrompt, retrievals)
+              : baseSummarizePrompt;
+
             const tmpFile = `/tmp/session-summary-${Date.now()}.txt`;
             await Bun.write(tmpFile, summarizePrompt);
             const proc = Bun.spawn(
@@ -1107,11 +1140,18 @@ ${transcript}`;
             await Bun.$`rm -f ${tmpFile}`.quiet();
 
             let summary: string;
-            try {
-              const summaryOutput = JSON.parse(result.stdout);
-              summary = summaryOutput.result ?? result.stdout;
-            } catch {
-              summary = result.stdout;
+            let parsedRatings: ReturnType<typeof parseSummaryWithRatings> = null;
+            if (wantsRatings) {
+              parsedRatings = parseSummaryWithRatings(result.stdout);
+            }
+            if (parsedRatings) {
+              summary = parsedRatings.summary;
+            } else {
+              // Fallback: never index raw JSON. extractSummaryFromClaudeStdout
+              // pulls the `summary` field out of a structured-output payload
+              // whose ratings failed schema validation; otherwise behaves
+              // like the previous unstructured envelope.result extraction.
+              summary = extractSummaryFromClaudeStdout(result.stdout);
             }
 
             // Skip indexing if the session had no significant learnings
@@ -1120,10 +1160,6 @@ ${transcript}`;
               summary.length > 20 &&
               !summary.trim().toLowerCase().includes("no significant learnings")
             ) {
-              const apiUrl =
-                process.env.MCP_BASE_URL || `http://localhost:${process.env.PORT || "3013"}`;
-              const apiKey = process.env.API_KEY || "";
-
               await fetch(`${apiUrl}/api/memory/index`, {
                 method: "POST",
                 headers: {
@@ -1142,6 +1178,27 @@ ${transcript}`;
                   ...(taskId ? { sourceTaskId: taskId } : {}),
                 }),
               });
+            }
+
+            // Best-effort: post LLM ratings. Never blocks summary indexing.
+            if (parsedRatings && parsedRatings.ratings.length > 0) {
+              try {
+                const events = buildRatingsFromLlm(parsedRatings.ratings, retrievals);
+                if (events.length > 0) {
+                  await postRatings({
+                    apiUrl,
+                    apiKey,
+                    agentId: agentInfo.id,
+                    taskId,
+                    events,
+                  });
+                }
+              } catch (err) {
+                console.error(
+                  "[memory-rater:llm] piggyback rating emission failed:",
+                  (err as Error).message,
+                );
+              }
             }
           }
         } catch {
