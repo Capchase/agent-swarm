@@ -4,7 +4,8 @@ description: Multi-agent orchestration for Claude Code, Codex, Gemini CLI, and o
 type: application
 # Chart version — bumped when the chart itself changes. Independent of appVersion.
 version: 0.1.0
-# Application version — kept in sync with package.json by CI; do not edit by hand.
+# Application version — must match package.json.version. Bump it by hand
+# whenever you bump package.json; CI rejects PRs where the two values drift.
 appVersion: "1.74.4"
 home: https://github.com/desplega-ai/agent-swarm
 sources:
