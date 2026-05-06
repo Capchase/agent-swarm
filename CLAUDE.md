@@ -147,13 +147,13 @@ Quick reference:
 
 </important>
 
-<important if="you are writing or running tests, drafting a plan with verification / E2E / QA steps, or preparing a frontend PR (new-ui/, landing/, templates-ui/)">
+<important if="you are writing or running tests, drafting a plan with verification / E2E / QA steps, or preparing a frontend PR (new-ui/, templates-ui/)">
 
 Hub: [runbooks/testing.md](./runbooks/testing.md) — routes to LOCAL_TESTING.md, qa-use, swarm-local-e2e skill, memory tests, Slack E2E.
 
 Hard rules:
 - Plan-mode verification steps MUST copy real commands from LOCAL_TESTING.md; don't paraphrase.
-- Frontend PRs (`new-ui/`, `landing/`, `templates-ui/`) MUST include a `qa-use` session with screenshots — enforced by merge gate.
+- Frontend PRs (`new-ui/`, `templates-ui/`) MUST include a `qa-use` session with screenshots — enforced by merge gate.
 
 </important>
 
@@ -184,7 +184,7 @@ Drift checks — run only if you touched the trigger files, MUST commit any rege
 - Touched `new-ui/`? → `cd new-ui && pnpm install --frozen-lockfile && pnpm lint && pnpm exec tsc -b` (CI uses `tsc -b`, not `--noEmit`)
 - Touched `Dockerfile` / `Dockerfile.worker` / files they COPY? → `docker build -f <Dockerfile> .`
 
-Frontend (`new-ui/`, `landing/`, `templates-ui/`) PRs additionally require a `qa-use` session with screenshots.
+Frontend (`new-ui/`, `templates-ui/`) PRs additionally require a `qa-use` session with screenshots.
 
 </important>
 
