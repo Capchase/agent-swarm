@@ -84,29 +84,12 @@ jobs:
 
       - name: Detect chart version change
         id: detect
-        env:
-          BEFORE: ${{ github.event.before }}
-          ZERO_SHA: "0000000000000000000000000000000000000000"
         run: |
-          NEW_VERSION=$(grep -E '^version:' ${{ env.CHART_PATH }}/Chart.yaml | awk '{print $2}' | tr -d '"')
-          # On the first push to a branch (or after a force-push) `before`
-          # is the zero SHA — git show resolves to nothing and we'd
-          # misclassify the change as new. Fall back to HEAD~1.
-          if [ "$BEFORE" = "$ZERO_SHA" ]; then
-            BEFORE_REF="HEAD~1"
-          else
-            BEFORE_REF="$BEFORE"
-          fi
-          OLD_VERSION=$(git show "$BEFORE_REF":${{ env.CHART_PATH }}/Chart.yaml 2>/dev/null \
-            | grep -E '^version:' | awk '{print $2}' | tr -d '"' || echo "")
-          echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
-          if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ] && [ -n "$OLD_VERSION" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "::notice::Chart version changed: $OLD_VERSION -> $NEW_VERSION"
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "Chart version unchanged or unable to determine previous version: $NEW_VERSION"
-          fi
+          NEW=$(yq '.version' ${{ env.CHART_PATH }}/Chart.yaml)
+          OLD=$(git show HEAD~1:${{ env.CHART_PATH }}/Chart.yaml 2>/dev/null | yq '.version' 2>/dev/null || echo "")
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+          [ "$NEW" != "$OLD" ] && [ -n "$NEW" ] && echo "changed=true" >> $GITHUB_OUTPUT || echo "changed=false" >> $GITHUB_OUTPUT
+          echo "::notice::Chart version: old=$OLD new=$NEW"
 
       - name: Log in to GHCR
         if: steps.detect.outputs.changed == 'true'
