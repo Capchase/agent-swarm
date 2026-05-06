@@ -132,14 +132,22 @@ api:
 service:
   type: ClusterIP
 
-# Defaults shared by every pool. A pool may override `resources`,
+# Defaults shared by every pool. A pool may override `resources`, `storage`,
 # `harnessProvider`, `modelOverride`, etc.
 poolDefaults:
   storage:
+    # -- Default size for each pool pod's personal PVC. Override per pool
+    # via `pools.<name>.storage.personalSize` if you need different sizing.
     personalSize: 20Gi
-    # -- StorageClass used for each pool pod's personal PVC. Empty =
-    # cluster default.
+    # -- StorageClass for the personal PVC. Empty = cluster default.
+    # Override per pool via `pools.<name>.storage.storageClassName`.
     storageClassName: ""
+  # -- emptyDir size limits for the in-pod /workspace/shared and /logs
+  # mounts. Override per pool via `pools.<name>.emptyDir.*` if a specific
+  # pool needs more (e.g. coder pools that clone large repos).
+  emptyDir:
+    sharedSizeLimit: 1Gi
+    logsSizeLimit: 1Gi
   # -- Default harness provider for new pools. Override per-pool via
   # `pools.<name>.harnessProvider`. One of: claude, codex, opencode, pi,
   # claude-managed, devin.

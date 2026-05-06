@@ -124,22 +124,27 @@ Common env vars for every pool pod.
 {{- end }}
 
 {{/*
-Volumes shared by every pool pod. Handles the sharedVolume.existingClaim
-case for an RWX cross-pod /workspace/shared.
+Volumes shared by every pool pod. Pass a dict {root, pool} so per-pool
+emptyDir overrides resolve. Handles sharedVolume.existingClaim for an
+RWX cross-pod /workspace/shared.
 */}}
 {{- define "agent-swarm.poolVolumes" -}}
-{{- if .Values.sharedVolume.existingClaim }}
+{{- $root := .root -}}
+{{- $pool := .pool -}}
+{{- $shared := default $root.Values.poolDefaults.emptyDir.sharedSizeLimit (($pool.emptyDir).sharedSizeLimit) -}}
+{{- $logs := default $root.Values.poolDefaults.emptyDir.logsSizeLimit (($pool.emptyDir).logsSizeLimit) -}}
+{{- if $root.Values.sharedVolume.existingClaim }}
 - name: shared
   persistentVolumeClaim:
-    claimName: {{ .Values.sharedVolume.existingClaim }}
+    claimName: {{ $root.Values.sharedVolume.existingClaim }}
 {{- else }}
 - name: shared
   emptyDir:
-    sizeLimit: 1Gi
+    sizeLimit: {{ $shared }}
 {{- end }}
 - name: logs
   emptyDir:
-    sizeLimit: 1Gi
+    sizeLimit: {{ $logs }}
 {{- end }}
 
 {{/*

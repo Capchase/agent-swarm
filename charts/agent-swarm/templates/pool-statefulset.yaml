@@ -152,7 +152,7 @@ spec:
               exec:
                 command: ["/bin/sh", "-c", "sleep 30"]
       volumes:
-        {{- include "agent-swarm.poolVolumes" $ | nindent 8 }}
+        {{- include "agent-swarm.poolVolumes" (dict "root" $ "pool" $pool) | nindent 8 }}
         {{- if $pool.systemPromptConfigMap }}
         - name: system-prompt
           configMap:
@@ -163,10 +163,11 @@ spec:
         name: personal
       spec:
         accessModes: ["ReadWriteOnce"]
-        {{- if $.Values.poolDefaults.storage.storageClassName }}
-        storageClassName: {{ $.Values.poolDefaults.storage.storageClassName }}
+        {{- $sc := default $.Values.poolDefaults.storage.storageClassName ($pool.storage).storageClassName }}
+        {{- if $sc }}
+        storageClassName: {{ $sc }}
         {{- end }}
         resources:
           requests:
-            storage: {{ $.Values.poolDefaults.storage.personalSize }}
+            storage: {{ default $.Values.poolDefaults.storage.personalSize ($pool.storage).personalSize }}
 {{- end }}
