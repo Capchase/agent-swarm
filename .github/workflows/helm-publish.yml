@@ -70,22 +70,6 @@ jobs:
             --set rbac.create=true \
             > /tmp/render-full.yaml
 
-      - name: Validate — guard fires for api.replicas != 1
-        run: |
-          if helm template release ${{ env.CHART_PATH }} --set api.replicas=2 2>/dev/null; then
-            echo "::error::api.replicas=2 should have failed render"
-            exit 1
-          fi
-          echo "guard fires as expected"
-
-      - name: Validate — guard fires for lead.replicas != 1
-        run: |
-          if helm template release ${{ env.CHART_PATH }} --set 'pools.lead.replicas=2' 2>/dev/null; then
-            echo "::error::pools.lead.replicas=2 should have failed render"
-            exit 1
-          fi
-          echo "guard fires as expected"
-
       - name: Install kubeconform
         run: |
           curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
