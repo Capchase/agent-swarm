@@ -1,0 +1,32 @@
+apiVersion: v2
+name: agent-swarm
+description: Multi-agent orchestration for Claude Code, Codex, Gemini CLI, and other AI coding assistants
+type: application
+# Chart version — bumped when the chart itself changes. Independent of appVersion.
+version: 0.1.0
+# Application version — kept in sync with package.json by CI; do not edit by hand.
+appVersion: "1.74.4"
+home: https://github.com/desplega-ai/agent-swarm
+sources:
+  - https://github.com/desplega-ai/agent-swarm
+keywords:
+  - agents
+  - ai
+  - claude
+  - codex
+  - llm
+  - orchestration
+  - mcp
+maintainers:
+  - name: desplega.sh
+    email: contact@desplega.sh
+    url: https://github.com/desplega-ai
+icon: https://raw.githubusercontent.com/desplega-ai/agent-swarm/main/assets/logo.png
+annotations:
+  artifacthub.io/license: MIT
+  artifacthub.io/links: |
+    - name: Source
+      url: https://github.com/desplega-ai/agent-swarm
+    - name: Documentation
+      url: https://github.com/desplega-ai/agent-swarm/blob/main/DEPLOYMENT.md
+  artifacthub.io/category: ai-machine-learning

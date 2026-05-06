@@ -1,0 +1,143 @@
+name: Helm Chart
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-publish.yml"
+  pull_request:
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-publish.yml"
+      - "package.json"
+  workflow_dispatch:
+
+concurrency:
+  group: helm-publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  CHART_PATH: charts/agent-swarm
+
+jobs:
+  lint-and-render:
+    name: Lint + render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Helm lint
+        run: helm lint ${{ env.CHART_PATH }}
+
+      - name: Verify Chart.yaml.appVersion matches package.json.version
+        run: |
+          PKG_VERSION=$(jq -r '.version' package.json)
+          CHART_APP_VERSION=$(grep -E '^appVersion:' ${{ env.CHART_PATH }}/Chart.yaml | awk '{print $2}' | tr -d '"')
+          if [ "$PKG_VERSION" != "$CHART_APP_VERSION" ]; then
+            echo "::error::Chart.yaml appVersion ($CHART_APP_VERSION) is out of sync with package.json version ($PKG_VERSION). Update Chart.yaml.appVersion to match."
+            exit 1
+          fi
+          echo "appVersion in sync: $PKG_VERSION"
+
+      - name: Render — defaults
+        run: helm template release ${{ env.CHART_PATH }} > /tmp/render-defaults.yaml
+
+      - name: Render — agent-fs + litestream + ingress + RBAC + NetworkPolicy
+        run: |
+          helm template release ${{ env.CHART_PATH }} \
+            --set agentFs.enabled=true \
+            --set agentFs.bucket=ci-bucket \
+            --set agentFs.s3.accessKeyId=ci \
+            --set agentFs.s3.secretAccessKey=ci \
+            --set litestream.enabled=true \
+            --set litestream.bucket=ci-backup \
+            --set litestream.endpoint=https://s3.amazonaws.com \
+            --set litestream.region=us-east-1 \
+            --set litestream.s3.accessKeyId=ci \
+            --set litestream.s3.secretAccessKey=ci \
+            --set ingress.enabled=true \
+            --set ingress.className=nginx \
+            --set ingress.host=swarm.example.com \
+            --set networkPolicy.enabled=true \
+            --set rbac.create=true \
+            > /tmp/render-full.yaml
+
+      - name: Validate — guard fires for api.replicas != 1
+        run: |
+          if helm template release ${{ env.CHART_PATH }} --set api.replicas=2 2>/dev/null; then
+            echo "::error::api.replicas=2 should have failed render"
+            exit 1
+          fi
+          echo "guard fires as expected"
+
+      - name: Validate — guard fires for lead.replicas != 1
+        run: |
+          if helm template release ${{ env.CHART_PATH }} --set 'pools.lead.replicas=2' 2>/dev/null; then
+            echo "::error::pools.lead.replicas=2 should have failed render"
+            exit 1
+          fi
+          echo "guard fires as expected"
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: kubeconform — defaults
+        run: kubeconform -summary -strict -ignore-missing-schemas /tmp/render-defaults.yaml
+
+      - name: kubeconform — full
+        run: kubeconform -summary -strict -ignore-missing-schemas /tmp/render-full.yaml
+
+  publish:
+    name: Publish to GHCR
+    needs: lint-and-render
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Detect chart version change
+        id: detect
+        run: |
+          NEW_VERSION=$(grep -E '^version:' ${{ env.CHART_PATH }}/Chart.yaml | awk '{print $2}' | tr -d '"')
+          OLD_VERSION=$(git show ${{ github.event.before }}:${{ env.CHART_PATH }}/Chart.yaml 2>/dev/null \
+            | grep -E '^version:' | awk '{print $2}' | tr -d '"' || echo "")
+          echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
+          if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "::notice::Chart version changed: $OLD_VERSION -> $NEW_VERSION"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Chart version unchanged: $NEW_VERSION"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.detect.outputs.changed == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Package + push
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          helm package ${{ env.CHART_PATH }} -d /tmp
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push /tmp/agent-swarm-${{ steps.detect.outputs.new }}.tgz oci://${{ env.REGISTRY }}/${OWNER}/charts
+          echo "::notice::Published agent-swarm-${{ steps.detect.outputs.new }} to oci://${{ env.REGISTRY }}/${OWNER}/charts/agent-swarm"

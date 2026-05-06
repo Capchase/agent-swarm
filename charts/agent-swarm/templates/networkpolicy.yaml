@@ -1,0 +1,33 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "agent-swarm.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agent-swarm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "agent-swarm.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow intra-release traffic between pool pods, the API, and agent-fs.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "agent-swarm.selectorLabels" . | nindent 14 }}
+  egress:
+    # Permit DNS, intra-release traffic, and outbound to the wider cluster
+    # network. Operators can restrict further by overriding this template.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - {}
+{{- end }}
