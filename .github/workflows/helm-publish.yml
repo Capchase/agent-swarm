@@ -50,11 +50,13 @@ jobs:
       - name: Render + validate — defaults
         run: |
           helm template release ${{ env.CHART_PATH }} \
+            --set auth.apiKey=ci-render \
             | kubectl apply --dry-run=client -f -
 
       - name: Render + validate — agent-fs + litestream + ingress + RBAC + NetworkPolicy
         run: |
           helm template release ${{ env.CHART_PATH }} \
+            --set auth.apiKey=ci-render \
             --set agentFs.enabled=true \
             --set agentFs.bucket=ci-bucket \
             --set agentFs.s3.accessKeyId=ci \
@@ -90,19 +92,40 @@ jobs:
         with:
           version: v3.14.0
 
+      - name: Verify Chart.yaml.appVersion matches package.json.version
+        run: |
+          PKG_VERSION=$(jq -r '.version' package.json)
+          CHART_APP_VERSION=$(grep -E '^appVersion:' ${{ env.CHART_PATH }}/Chart.yaml | awk '{print $2}' | tr -d '"')
+          if [ "$PKG_VERSION" != "$CHART_APP_VERSION" ]; then
+            echo "::error::Chart.yaml appVersion ($CHART_APP_VERSION) is out of sync with package.json version ($PKG_VERSION). Refusing to publish."
+            exit 1
+          fi
+          echo "appVersion in sync: $PKG_VERSION"
+
       - name: Detect chart version change
         id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+          ZERO_SHA: "0000000000000000000000000000000000000000"
         run: |
           NEW_VERSION=$(grep -E '^version:' ${{ env.CHART_PATH }}/Chart.yaml | awk '{print $2}' | tr -d '"')
-          OLD_VERSION=$(git show ${{ github.event.before }}:${{ env.CHART_PATH }}/Chart.yaml 2>/dev/null \
+          # On the first push to a branch (or after a force-push) `before`
+          # is the zero SHA — git show resolves to nothing and we'd
+          # misclassify the change as new. Fall back to HEAD~1.
+          if [ "$BEFORE" = "$ZERO_SHA" ]; then
+            BEFORE_REF="HEAD~1"
+          else
+            BEFORE_REF="$BEFORE"
+          fi
+          OLD_VERSION=$(git show "$BEFORE_REF":${{ env.CHART_PATH }}/Chart.yaml 2>/dev/null \
             | grep -E '^version:' | awk '{print $2}' | tr -d '"' || echo "")
           echo "new=$NEW_VERSION" >> $GITHUB_OUTPUT
-          if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+          if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ] && [ -n "$OLD_VERSION" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "::notice::Chart version changed: $OLD_VERSION -> $NEW_VERSION"
           else
             echo "changed=false" >> $GITHUB_OUTPUT
-            echo "Chart version unchanged: $NEW_VERSION"
+            echo "Chart version unchanged or unable to determine previous version: $NEW_VERSION"
           fi
 
       - name: Log in to GHCR
