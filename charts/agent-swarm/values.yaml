@@ -52,7 +52,9 @@ serviceAccount:
 #      External Secrets Operator, Vault, SOPS, sealed-secrets, etc.
 #
 # When existingSecret is set, all inline values are ignored. The pre-existing
-# Secret must contain (as keys) the env vars the swarm consumes. Required:
+# Secret must contain (as keys) the env vars the swarm consumes.
+#
+# Required (or render-time fail):
 #   API_KEY                       — bearer token used between API and pool pods
 # Optional, depending on configuration:
 #   CLAUDE_CODE_OAUTH_TOKEN       — for the claude harness provider
