@@ -172,15 +172,40 @@ RUN mkdir -p /home/worker/.claude/commands /home/worker/.claude/agents \
   } \
 }' > /home/worker/.claude/settings.json
 
-# Install global npm tools (pinned versions for cache stability)
+# Install global npm tools (pinned versions for cache stability).
+#
+# We use a staging-dir `npm install` + symlink pattern instead of `npm install -g`
+# so we can apply an `overrides` workaround for a broken upstream transitive:
+#   @desplega.ai/agent-fs -> chonkie -> @huggingface/hub@2.11.1
+#     -> @huggingface/xetchunk-wasm@0.0.4
+# xetchunk-wasm@0.0.4 was published with `gearhash-jit: workspace:*` and
+# `@huggingface/blake3-jit: workspace:*` — neither sibling is on npm, so a
+# global install hits EUNSUPPORTEDPROTOCOL in uncached environments. Pinning
+# `@huggingface/hub` to 2.11.0 (the last version before xetchunk-wasm became
+# a dep) sidesteps it. Drop this workaround once HF republishes a clean
+# xetchunk-wasm and chonkie / agent-fs pull it in.
 USER root
-RUN npm install -g \
-    pm2@6.0.14 \
-    @sentry/cli@3.3.4 \
-    @desplega.ai/wts@0.2.3 \
-    @desplega.ai/localtunnel@2.2.0 \
-    @desplega.ai/qa-use@2.15.3 \
-    @desplega.ai/agent-fs@0.5.1 \
+RUN mkdir -p /opt/global-deps && cat > /opt/global-deps/package.json <<'EOF'
+{
+  "name": "global-deps",
+  "private": true,
+  "dependencies": {
+    "pm2": "6.0.14",
+    "@sentry/cli": "3.3.4",
+    "@desplega.ai/wts": "0.2.3",
+    "@desplega.ai/localtunnel": "2.2.0",
+    "@desplega.ai/qa-use": "2.17.0",
+    "@desplega.ai/agent-fs": "0.5.1"
+  },
+  "overrides": {
+    "@huggingface/hub": "2.11.0"
+  }
+}
+EOF
+RUN cd /opt/global-deps && npm install --no-audit --no-fund \
+    && for bin in /opt/global-deps/node_modules/.bin/*; do \
+        ln -sf "$bin" "/usr/local/bin/$(basename "$bin")"; \
+       done \
     && qa-use install-deps
 
 # Re-assert worker ownership of $HOME — the root-side npm/qa-use installs above
