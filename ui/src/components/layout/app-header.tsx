@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useHealth } from "@/api/hooks/use-stats";
 import type { StatusHealth } from "@/api/types";
 import { useStatusContext } from "@/app/status-context";
+import { UserSwitcher } from "@/components/identity/user-switcher";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
@@ -89,11 +90,27 @@ export function AppHeader() {
           </div>
         )}
 
+        {/* Identity switcher — current user + change/create. */}
+        <UserSwitcher />
+
         {/* Theme toggle */}
-        <Button variant="ghost" size="icon" onClick={toggleTheme} className="size-8">
-          {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
-          <span className="sr-only">Toggle theme</span>
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={toggleTheme}
+              className="size-8"
+              aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            >
+              {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+              <span className="sr-only">Toggle theme</span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            {theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          </TooltipContent>
+        </Tooltip>
       </div>
     </header>
   );

@@ -9,7 +9,11 @@ import {
   maskSecrets,
   upsertSwarmConfig,
 } from "../be/db";
-import { isReservedConfigKey, reservedKeyError } from "../be/swarm-config-guard";
+import {
+  isReservedConfigKey,
+  reservedKeyError,
+  validateConfigValue,
+} from "../be/swarm-config-guard";
 import { reloadGlobalConfigsAndIntegrations } from "./core";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
@@ -227,6 +231,12 @@ export async function handleConfig(
 
     if (isReservedConfigKey(key)) {
       jsonError(res, reservedKeyError(key).message, 400);
+      return true;
+    }
+
+    const validationError = validateConfigValue(key, value);
+    if (validationError) {
+      jsonError(res, validationError, 400);
       return true;
     }
 

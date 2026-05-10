@@ -21,6 +21,7 @@ import {
   getAgentById,
   getAgentHarnessProviders,
   getDb,
+  getSwarmConfigs,
   initDb,
   setAgentHarnessProvider,
 } from "../be/db";
@@ -82,6 +83,7 @@ afterAll(async () => {
 beforeEach(() => {
   // Each test starts on an empty agents table.
   getDb().prepare("DELETE FROM agents").run();
+  getDb().prepare("DELETE FROM swarm_config").run();
 });
 
 // ─── Migration: column exists ────────────────────────────────────────────────
@@ -294,5 +296,38 @@ describe("PATCH /api/agents/:id/harness-provider", () => {
       body: JSON.stringify({ harness_provider: "claude" }),
     });
     expect(res.status).toBe(404);
+  });
+
+  test("PATCH also upserts swarm_config (scope=agent) so the worker reconciles", async () => {
+    const a = createAgent({
+      name: "patch-target-3",
+      isLead: false,
+      status: "idle",
+      capabilities: [],
+    });
+
+    const res = await fetch(`${baseUrl}/api/agents/${a.id}/harness-provider`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness_provider: "codex" }),
+    });
+    expect(res.status).toBe(200);
+
+    const rows = getSwarmConfigs({ scope: "agent", scopeId: a.id });
+    const harnessRow = rows.find((r) => r.key === "HARNESS_PROVIDER");
+    expect(harnessRow?.value).toBe("codex");
+
+    // Subsequent PATCH (different value) updates the row in place.
+    const res2 = await fetch(`${baseUrl}/api/agents/${a.id}/harness-provider`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ harness_provider: "claude" }),
+    });
+    expect(res2.status).toBe(200);
+
+    const rows2 = getSwarmConfigs({ scope: "agent", scopeId: a.id });
+    const harnessRow2 = rows2.find((r) => r.key === "HARNESS_PROVIDER");
+    expect(harnessRow2?.value).toBe("claude");
+    expect(rows2.filter((r) => r.key === "HARNESS_PROVIDER")).toHaveLength(1);
   });
 });

@@ -19,6 +19,7 @@ import {
   updateAgentProfile,
   updateAgentProvider,
   updateAgentStatus,
+  upsertSwarmConfig,
 } from "../be/db";
 import { AgentCredStatusSchema, ProviderNameSchema } from "../types";
 import { route } from "./route-def";
@@ -58,9 +59,9 @@ const setAgentHarnessProviderRoute = route({
   method: "patch",
   path: "/api/agents/{id}/harness-provider",
   pattern: ["api", "agents", null, "harness-provider"],
-  summary: "Re-assign an agent's harness_provider (planning/forecast — not live)",
+  summary: "Re-assign an agent's harness_provider (live)",
   description:
-    "Updates the `agents.harness_provider` column. Worker does NOT react in real time — the new value is picked up on the next worker restart, where the env-driven HARNESS_PROVIDER still wins on register. Live per-agent re-assignment is tracked in DES-359.",
+    "Updates `agents.harness_provider` and upserts `swarm_config` (scope=agent, key=HARNESS_PROVIDER) so the worker's poll-loop reconciliation picks up the new provider within ~10s. No restart required. The swarm_config row is what actually drives the worker; the column mirrors the latest set value for dashboards.",
   tags: ["Agents"],
   params: z.object({ id: z.string() }),
   body: z.object({
@@ -453,6 +454,16 @@ export async function handleAgentsRest(
       jsonError(res, "Agent not found", 404);
       return true;
     }
+    // Mirror to swarm_config (scope=agent) so the worker's reconciliation
+    // loop actually reads the new value. The column above is for dashboard
+    // visibility; this row is the live override.
+    upsertSwarmConfig({
+      scope: "agent",
+      scopeId: parsed.params.id,
+      key: "HARNESS_PROVIDER",
+      value: parsed.body.harness_provider,
+      description: "Set via PATCH /api/agents/{id}/harness-provider",
+    });
     json(res, agentWithCapacity(agent));
     return true;
   }

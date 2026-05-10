@@ -11,7 +11,19 @@ export type AgentTaskStatus =
   | "completed"
   | "failed"
   | "cancelled";
-export type AgentTaskSource = "mcp" | "slack" | "api";
+export type AgentTaskSource =
+  | "mcp"
+  | "slack"
+  | "api"
+  | "ui"
+  | "github"
+  | "gitlab"
+  | "agentmail"
+  | "system"
+  | "schedule"
+  | "workflow"
+  | "linear"
+  | "jira";
 export type ChannelType = "public" | "dm";
 
 export interface Agent {
@@ -110,6 +122,10 @@ export interface AgentTask {
   swarmVersion?: string;
   provider?: ProviderName;
   providerMeta?: DevinProviderMeta | Record<string, never>;
+  /** Phase 1 (≥1.76.0): canonical user who requested this task. */
+  requestedByUserId?: string;
+  /** Phase 1 (≥1.76.0): cross-ingress context key for the conversation/thread. */
+  contextKey?: string;
 }
 
 export type ProviderName = "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
@@ -121,6 +137,153 @@ export type DevinProviderMeta = {
 
 export interface AgentWithTasks extends Agent {
   tasks: AgentTask[];
+}
+
+/**
+ * Identity (Phase 2 ≥1.76.0). Mirrors `UserSchema` in `src/types.ts` —
+ * canonical row from the new `users` table.
+ */
+export interface User {
+  id: string;
+  name: string;
+  email?: string;
+  role?: string;
+  notes?: string;
+  slackUserId?: string;
+  linearUserId?: string;
+  githubUsername?: string;
+  gitlabUsername?: string;
+  emailAliases: string[];
+  preferredChannel: string;
+  timezone?: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface UsersResponse {
+  users: User[];
+}
+
+export interface CreateUserInput {
+  name: string;
+  email?: string;
+  role?: string;
+  notes?: string;
+  slackUserId?: string;
+  linearUserId?: string;
+  githubUsername?: string;
+  gitlabUsername?: string;
+  emailAliases?: string[];
+  preferredChannel?: string;
+  timezone?: string;
+}
+
+/**
+ * Sessions surface (Phase 4 ≥1.76.0). Mirrors `SessionListItem` from
+ * `src/be/db.ts:8816-8821` — root task plus chain-wide summary used by the
+ * `/sessions` sidebar.
+ */
+export interface SessionListItem {
+  root: AgentTask;
+  chainTaskCount: number;
+  lastActivityAt: string;
+  latestStatus: AgentTaskStatus;
+}
+
+/**
+ * Inbox-state (Phase 6 ≥1.76.0). Mirrors `InboxItemTypeSchema` /
+ * `InboxItemStatusSchema` / `InboxItemStateSchema` in `src/types.ts:252-276`.
+ *
+ * One row per (userId, itemType, itemId) tuple; the dashboard inbox joins
+ * server source data (approvals, agents, tasks, sessions, templates) against
+ * these rows to filter out items the user has dismissed/snoozed/done.
+ */
+export type InboxItemType =
+  | "approval"
+  | "credential_missing"
+  | "broken_task"
+  | "to_read"
+  | "to_start_template";
+
+export type InboxItemStatus = "open" | "snoozed" | "dismissed" | "done";
+
+export interface InboxItemState {
+  id: string;
+  userId: string;
+  itemType: InboxItemType;
+  itemId: string;
+  status: InboxItemStatus;
+  snoozeUntil?: string;
+  dismissedAt?: string;
+  doneAt?: string;
+  createdAt: string;
+  lastUpdatedAt: string;
+}
+
+export interface InboxStateResponse {
+  items: InboxItemState[];
+}
+
+export interface InboxStateUpsertResponse {
+  item: InboxItemState;
+}
+
+/**
+ * Task templates (Phase 6 ≥1.76.0). Mirrors `TaskTemplateSchema` in
+ * `src/types.ts:289-300`. Powers the "To start" inbox bucket.
+ */
+export type TaskTemplateKind = "task" | "workflow" | "schedule";
+
+export interface TaskTemplate {
+  id: string;
+  title: string;
+  description: string;
+  prompt: string;
+  kind: TaskTemplateKind;
+  payload: Record<string, unknown>;
+  category?: string;
+  tags: string[];
+  createdAt: string;
+}
+
+export interface TaskTemplatesResponse {
+  templates: TaskTemplate[];
+}
+
+/**
+ * Bulk credential-status row from `GET /api/agents/credential-status`. Mirrors
+ * the handler shape at `src/http/agents.ts:466-477`. Used by the Blocking
+ * inbox bucket to surface agents stuck on missing creds.
+ */
+export interface CredentialMissingAgent {
+  agentId: string;
+  name: string;
+  status: AgentStatus;
+  /** Top-level missing[] (older worker fallback). */
+  missing: string[];
+  provider: string | null;
+  harnessProvider: ProviderName | null;
+  /** Migration 055 worker self-report; richer per-harness snapshot. */
+  credStatus: AgentCredStatus | null;
+  lastCheckedAt: string;
+}
+
+export interface CredentialMissingAgentsResponse {
+  agents: CredentialMissingAgent[];
+}
+
+export interface SessionsListResponse {
+  sessions: SessionListItem[];
+}
+
+/**
+ * Full chain payload from `GET /api/sessions/:rootTaskId`. The chain is
+ * already ordered by `createdAt` server-side (via the recursive CTE) so the
+ * UI can DFS from `root` without resorting.
+ */
+export interface SessionDetailResponse {
+  root: AgentTask;
+  chain: AgentTask[];
 }
 
 export type AgentLogEventType =

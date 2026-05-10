@@ -1,9 +1,10 @@
 import type { ColDef, RowClickedEvent } from "ag-grid-community";
-import { Crown, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAgents } from "@/api/hooks/use-agents";
 import type { AgentStatus, AgentWithTasks } from "@/api/types";
+import { AgentAvatar } from "@/components/shared/agent-avatar";
 import { DataGrid } from "@/components/shared/data-grid";
 import { HarnessCell } from "@/components/shared/harness-cell";
 import { StatusBadge } from "@/components/shared/status-badge";
@@ -40,8 +41,13 @@ export default function AgentsPage() {
         width: 250,
         minWidth: 180,
         cellRenderer: (params: { value: string; data: AgentWithTasks | undefined }) => (
-          <span className="flex items-center gap-1.5 font-semibold">
-            {params.data?.isLead && <Crown className="h-3.5 w-3.5 text-primary shrink-0" />}
+          <span className="flex items-center gap-2 font-semibold">
+            <AgentAvatar
+              agentId={params.data?.id}
+              agentName={params.data?.name ?? params.value}
+              size="sm"
+              className="shrink-0"
+            />
             {params.value}
           </span>
         ),

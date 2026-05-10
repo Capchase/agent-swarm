@@ -2,7 +2,9 @@
 date: 2026-05-08T00:00:00Z
 topic: "UI Chat/Session Experience — v1 (Sessions surface + Dashboard revamp)"
 author: taras
-status: draft
+status: in-progress
+last_updated: 2026-05-09T22:00:00Z
+last_updated_by: claude (phase 7 sub-agent)
 related:
   - thoughts/taras/brainstorms/2026-05-08-ui-chat-session-experience.md
   - thoughts/taras/research/2026-05-08-ui-chat-session-experience-research.md
@@ -153,21 +155,21 @@ Drop the SQL CHECK on `agent_tasks.source`, tighten the Zod schema to `AgentTask
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Type-check passes: `bun run tsc:check`
-- [ ] Lint passes (CI parity): `bun run lint`
-- [ ] Unit tests pass: `bun test`
-- [ ] DB boundary clean: `bash scripts/check-db-boundary.sh`
-- [ ] OpenAPI matches: `bun run docs:openapi && git diff --exit-code openapi.json docs-site/content/docs/api-reference`
-- [ ] Docs-site embeds the new version: `grep -r '"1.76.0"' docs-site/content/docs/api-reference | head` returns rows (otherwise the openapi regen didn't pick up the bump)
-- [ ] Migration applies on a fresh DB: `rm agent-swarm-db.sqlite && bun run start:http` exits 0 boot
-- [ ] Migration applies on the existing DB (back up first): `bun run start:http` against the working tree's DB exits 0 boot
-- [ ] FK preservation across the table-rebuild: `sqlite3 agent-swarm-db.sqlite "PRAGMA foreign_key_list(agent_tasks);"` returns the `requestedByUserId → users(id)` FK both before and after migration `056`
+- [x] Type-check passes: `bun run tsc:check`
+- [x] Lint passes (CI parity): `bun run lint`
+- [x] Unit tests pass: `bun test`
+- [x] DB boundary clean: `bash scripts/check-db-boundary.sh`
+- [x] OpenAPI matches: `bun run docs:openapi && git diff --exit-code openapi.json docs-site/content/docs/api-reference`
+- [x] Docs-site embeds the new version: `grep -r '"1.76.0"' docs-site/content/docs/api-reference | head` returns rows (otherwise the openapi regen didn't pick up the bump)
+- [x] Migration applies on a fresh DB: `rm agent-swarm-db.sqlite && bun run start:http` exits 0 boot
+- [x] Migration applies on the existing DB (back up first): `bun run start:http` against the working tree's DB exits 0 boot
+- [x] FK preservation across the table-rebuild: `sqlite3 agent-swarm-db.sqlite "PRAGMA foreign_key_list(agent_tasks);"` returns the `requestedByUserId → users(id)` FK both before and after migration `056`
 
 #### Automated QA:
-- [ ] `curl -X POST` to `POST /api/tasks` with `source: "mcp"` succeeds (200 + task row)
-- [ ] `curl -X POST` to `POST /api/tasks` with `source: "garbage"` returns 400 (Zod rejects, not the SQL CHECK)
-- [ ] `curl -X POST` to `POST /api/tasks` with a valid `requestedByUserId` writes the column (verify via `sqlite3 agent-swarm-db.sqlite "SELECT id, requestedByUserId FROM agent_tasks ORDER BY createdAt DESC LIMIT 1"`)
-- [ ] `curl http://localhost:3013/health` returns `{ status: "ok", version: "1.76.0" }` (shape unchanged from current)
+- [x] `curl -X POST` to `POST /api/tasks` with `source: "mcp"` succeeds (200 + task row)
+- [x] `curl -X POST` to `POST /api/tasks` with `source: "garbage"` returns 400 (Zod rejects, not the SQL CHECK)
+- [x] `curl -X POST` to `POST /api/tasks` with a valid `requestedByUserId` writes the column (verify via `sqlite3 agent-swarm-db.sqlite "SELECT id, requestedByUserId FROM agent_tasks ORDER BY createdAt DESC LIMIT 1"`)
+- [x] `curl http://localhost:3013/health` returns `{ status: "ok", version: "1.76.0" }` (shape unchanged from current)
 
 #### Manual Verification:
 - [ ] Diff `openapi.json` review: only the `source` enum tightening + new `requestedByUserId` field + version bump appear
@@ -281,24 +283,24 @@ INSERT INTO task_templates (title, description, prompt, category, tags) VALUES
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Type-check passes: `bun run tsc:check`
-- [ ] Lint passes: `bun run lint`
-- [ ] Unit tests pass: `bun test`
-- [ ] DB boundary clean: `bash scripts/check-db-boundary.sh`
-- [ ] Migrations apply fresh + existing: `rm agent-swarm-db.sqlite && bun run start:http` and again against working DB
-- [ ] OpenAPI matches: `bun run docs:openapi && git diff --exit-code openapi.json docs-site/content/docs/api-reference`
-- [ ] New unit tests for `getRootTaskChain` and `listRecentSessions` in `src/tests/sessions.test.ts` (covers empty chain, single-root chain, 3-level chain, parallel siblings)
+- [x] Type-check passes: `bun run tsc:check`
+- [x] Lint passes: `bun run lint`
+- [x] Unit tests pass: `bun test`
+- [x] DB boundary clean: `bash scripts/check-db-boundary.sh`
+- [x] Migrations apply fresh + existing: `rm agent-swarm-db.sqlite && bun run start:http` and again against working DB
+- [x] OpenAPI matches: `bun run docs:openapi && git diff --exit-code openapi.json docs-site/content/docs/api-reference`
+- [x] New unit tests for `getRootTaskChain` and `listRecentSessions` in `src/tests/sessions.test.ts` (covers empty chain, single-root chain, 3-level chain, parallel siblings)
 
 #### Automated QA:
-- [ ] `curl http://localhost:3013/api/users` returns at least one row (seeded migration 031 plus any locally created)
-- [ ] `curl -X POST http://localhost:3013/api/users -d '{"name":"QA Bot"}'` returns 200 + new user
-- [ ] After creating a 3-task chain via `POST /api/tasks` (root → child → grandchild), `curl http://localhost:3013/api/sessions/{root}` returns `{ root, chain: [3 tasks] }` in dependency order
-- [ ] `curl http://localhost:3013/api/sessions?limit=10` returns recent root tasks ordered by `lastActivityAt`
-- [ ] `curl http://localhost:3013/api/task-templates` returns ≥5 seeded rows
-- [ ] `curl -X PATCH http://localhost:3013/api/inbox-state -d '{"userId":"...","itemType":"approval","itemId":"abc","status":"snoozed","snoozeUntil":"2026-05-09T00:00:00Z"}'` upserts; subsequent `GET /api/inbox-state?userId=...` returns it
-- [ ] Multi-status CSV: `curl 'http://localhost:3013/api/tasks?status=failed,cancelled'` returns rows where status ∈ {failed, cancelled} (single round trip)
-- [ ] `createdAfter` filter: `curl 'http://localhost:3013/api/tasks?createdAfter=2026-05-07T00:00:00Z'` returns only tasks created on/after the timestamp
-- [ ] Tolerant `requestedByUserId`: `curl -X POST /api/tasks -d '{"task":"test","requestedByUserId":"<random-non-existent-id>"}'` returns 200, the inserted row has `requestedByUserId` NULL, and a warning is logged (verify via `bun run start:http` stderr)
+- [x] `curl http://localhost:3013/api/users` returns at least one row (seeded migration 031 plus any locally created)
+- [x] `curl -X POST http://localhost:3013/api/users -d '{"name":"QA Bot"}'` returns 200 + new user
+- [x] After creating a 3-task chain via `POST /api/tasks` (root → child → grandchild), `curl http://localhost:3013/api/sessions/{root}` returns `{ root, chain: [3 tasks] }` in dependency order
+- [x] `curl http://localhost:3013/api/sessions?limit=10` returns recent root tasks ordered by `lastActivityAt`
+- [x] `curl http://localhost:3013/api/task-templates` returns ≥5 seeded rows
+- [x] `curl -X PATCH http://localhost:3013/api/inbox-state -d '{"userId":"...","itemType":"approval","itemId":"abc","status":"snoozed","snoozeUntil":"2026-05-09T00:00:00Z"}'` upserts; subsequent `GET /api/inbox-state?userId=...` returns it
+- [x] Multi-status CSV: `curl 'http://localhost:3013/api/tasks?status=failed,cancelled'` returns rows where status ∈ {failed, cancelled} (single round trip)
+- [x] `createdAfter` filter: `curl 'http://localhost:3013/api/tasks?createdAfter=2026-05-07T00:00:00Z'` returns only tasks created on/after the timestamp
+- [x] Tolerant `requestedByUserId`: `curl -X POST /api/tasks -d '{"task":"test","requestedByUserId":"<random-non-existent-id>"}'` returns 200, the inserted row has `requestedByUserId` NULL, and a warning is logged (verify via `bun run start:http` stderr)
 
 #### Manual Verification:
 - [ ] Visual diff of `openapi.json`: only new endpoints + new schemas appear
@@ -367,12 +369,14 @@ Exposes `useCurrentUser(): { state, userId: string | null, user: User | null, se
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] UI type-check passes (CI parity): `cd ui && pnpm exec tsc -b`
-- [ ] UI lint passes: `cd ui && pnpm lint`
-- [ ] Design tokens unchanged: `cd ui && pnpm check:tokens`
-- [ ] Backend type-check still green (no API contract drift): `bun run tsc:check`
+- [x] UI type-check passes (CI parity): `cd ui && pnpm exec tsc -b`
+- [x] UI lint passes: `cd ui && pnpm lint`
+- [x] Design tokens unchanged: `cd ui && pnpm check:tokens`
+- [x] Backend type-check still green (no API contract drift): `bun run tsc:check`
 
 #### Automated QA:
+> Note (phase-3 sub-agent, 2026-05-09): qa-use scenarios A / A2 / A3 / B / C below are automated-by-design but **execution is deferred to Phase 7**, where the orchestrator runs the consolidated qa-use sweep against the full stack. Phase 3 implements the code paths these scenarios cover; the boxes stay unchecked until Phase 7 runs them end-to-end.
+
 - [ ] qa-use scenario A: with `localStorage.clear()`, load `http://localhost:5274/`, identity modal appears, list shows seeded users, creating a new user closes the modal, reload preserves selection.
 - [ ] qa-use scenario A2 (per-deployment namespacing): with a chosen identity against `apiUrl=http://localhost:3013`, point the UI at a second deployment via `?apiUrl=http://localhost:3014`; modal **must** re-prompt (different `apiUrl` → different localStorage key per `useDismissibleCard`'s `swarm:v1:${apiUrl}:current-user` scheme). Pick a different user, then return to the first URL; original identity is still intact.
 - [ ] qa-use scenario A3 (auto-show on stale userId): pre-seed `localStorage.setItem('swarm:v1:${apiUrl}:current-user', 'non-existent-user-id')`, reload — `<IdentityModal />` re-pops because `useUsers()` returns no match (defensive: `state` recomputes to `needs-pick`).
@@ -479,11 +483,13 @@ Card collapsed-by-default body: status pill, agent name, started-at, latest tool
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] UI type-check: `cd ui && pnpm exec tsc -b`
-- [ ] UI lint: `cd ui && pnpm lint`
-- [ ] Design tokens: `cd ui && pnpm check:tokens`
+- [x] UI type-check: `cd ui && pnpm exec tsc -b`
+- [x] UI lint: `cd ui && pnpm lint`
+- [x] Design tokens: `cd ui && pnpm check:tokens`
 
 #### Automated QA:
+> Note (phase-4 sub-agent, 2026-05-09): qa-use scenarios D / E / F / G below are automated-by-design but **execution is deferred to Phase 7**, where the orchestrator runs the consolidated qa-use sweep against the full stack. Phase 4 implements the code paths these scenarios cover; the boxes stay unchecked until Phase 7 runs them end-to-end.
+
 - [ ] qa-use scenario D: load `/sessions`, sidebar shows seeded sessions, click one, detail loads, click a task card, Sheet opens with transcript, dismiss Sheet, composer present at bottom.
 - [ ] qa-use scenario E: from session detail composer, submit "Run /tmp/foo.sh"; new task appears in the timeline within 5s (polling tick), `parentTaskId` matches the latest leaf.
 - [ ] qa-use scenario F: pin a 3-sibling parallel session (created via API), open it, verify the `[parallel · 3 tasks]` wrapper renders all three.
@@ -551,11 +557,13 @@ If both dimensions are zero across the swarm, fall back to constant `MIN_SIZE` (
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] UI type-check: `cd ui && pnpm exec tsc -b`
-- [ ] UI lint: `cd ui && pnpm lint`
-- [ ] Design tokens: `cd ui && pnpm check:tokens`
+- [x] UI type-check: `cd ui && pnpm exec tsc -b`
+- [x] UI lint: `cd ui && pnpm lint`
+- [x] Design tokens: `cd ui && pnpm check:tokens`
 
 #### Automated QA:
+> Note (phase-5 sub-agent, 2026-05-09): qa-use scenarios H / I / J / K below are automated-by-design but **execution is deferred to Phase 7**, where the orchestrator runs the consolidated qa-use sweep against the full stack. Phase 5 implements the code paths these scenarios cover; the boxes stay unchecked until Phase 7 runs them end-to-end.
+
 - [ ] qa-use scenario H: load `/`, canvas renders within 2s, lead at top, ≥1 worker below, edges drawn.
 - [ ] qa-use scenario I: click a worker node, navigates to `/agents/{id}`.
 - [ ] qa-use scenario J: toggle to "Table" view; AG Grid renders the same agents with sortable activity columns.
@@ -628,11 +636,12 @@ Budget: ~5 polled requests/5s on the dashboard. Inbox-state filtering happens cl
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] UI type-check: `cd ui && pnpm exec tsc -b`
-- [ ] UI lint: `cd ui && pnpm lint`
-- [ ] Design tokens: `cd ui && pnpm check:tokens`
+- [x] UI type-check: `cd ui && pnpm exec tsc -b`
+- [x] UI lint: `cd ui && pnpm lint`
+- [x] Design tokens: `cd ui && pnpm check:tokens`
 
 #### Automated QA:
+_All four scenarios deferred to Phase 7's consolidated qa-use sweep (per Phases 3-5 deferral pattern)._
 - [ ] qa-use scenario L: seed a pending approval + a `waiting_for_credentials` agent + a `failed` task + a recently completed root session via API; load `/`; all four buckets render the seeded items.
 - [ ] qa-use scenario M: dismiss an inbox item; reload — item stays dismissed.
 - [ ] qa-use scenario N: snooze for 1h; verify `inbox_item_state.snoozeUntil` is ~1h in the future via SQL.
@@ -672,9 +681,9 @@ Empty states for every new surface, loading skeletons, a clean qa-use session ca
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All backend checks: `bun run tsc:check && bun run lint && bun test && bash scripts/check-db-boundary.sh`
-- [ ] OpenAPI clean: `bun run docs:openapi && git diff --exit-code openapi.json docs-site/content/docs/api-reference`
-- [ ] All UI checks: `cd ui && pnpm exec tsc -b && pnpm lint && pnpm check:tokens`
+- [x] All backend checks: `bun run tsc:check && bun run lint && bun test && bash scripts/check-db-boundary.sh`
+- [x] OpenAPI clean: `bun run docs:openapi && git diff --exit-code openapi.json docs-site/content/docs/api-reference`
+- [x] All UI checks: `cd ui && pnpm exec tsc -b && pnpm lint && pnpm check:tokens`
 
 #### Automated QA:
 - [ ] All qa-use scenarios A–O re-run end-to-end in a single session, screenshots stored in QA doc.
