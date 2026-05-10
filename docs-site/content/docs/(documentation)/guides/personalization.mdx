@@ -7,7 +7,7 @@ The home page (`/`) and sidebar adapt to your deployment via two layers: **ident
 
 ## Identity envs
 
-All identity envs are read on every `/status` request. Set them in your `.env`, Docker compose, or via `swarm_config` (then `POST /internal/reload-config`). Unset envs fall back to neutral defaults.
+All identity envs are read on every `/status` request. Set them in your `.env`, Docker compose, or via `swarm_config` — global-scope writes auto-trigger a reload (debounced ~250ms) so the new value lands in `process.env` and integrations re-init without an explicit `POST /api/config/reload`. Unset envs fall back to neutral defaults.
 
 | Env | Default | Where it shows |
 |---|---|---|

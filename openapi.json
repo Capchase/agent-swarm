@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.76.1",
+    "version": "1.76.2",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -1781,7 +1781,7 @@
         }
       },
       "delete": {
-        "summary": "Delete a config entry by ID (including legacy reserved rows for cleanup)",
+        "summary": "Delete a config entry by ID (including legacy reserved rows for cleanup). Global-scope deletes auto-trigger an integrations reload.",
         "tags": [
           "Config"
         ],
@@ -1858,7 +1858,7 @@
         }
       },
       "put": {
-        "summary": "Create or update a config entry (reserved env-only keys are rejected)",
+        "summary": "Create or update a config entry (reserved env-only keys are rejected). Global-scope writes auto-trigger an integrations reload (debounced ~250ms) so Slack/GitHub/Linear/Jira/AgentMail pick up new credentials without an explicit /api/config/reload call.",
         "tags": [
           "Config"
         ],
