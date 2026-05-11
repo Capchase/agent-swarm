@@ -14,6 +14,7 @@ import type {
   AgentTaskStatus,
   McpServerWithInstallInfo,
 } from "@/api/types";
+import { AgentRuntimeSettings } from "@/components/shared/agent-runtime-settings";
 import { DataGrid } from "@/components/shared/data-grid";
 import { HarnessCell } from "@/components/shared/harness-cell";
 import { StatusBadge } from "@/components/shared/status-badge";
@@ -350,6 +351,9 @@ export default function AgentDetailPage() {
                         harnessProvider={agent.harnessProvider}
                         credStatus={agent.credStatus}
                       />
+                    </InfoRow>
+                    <InfoRow label="Runtime">
+                      <AgentRuntimeSettings agent={agent} />
                     </InfoRow>
                     {agent.role && <InfoRow label="Role">{agent.role}</InfoRow>}
                     {agent.description && (

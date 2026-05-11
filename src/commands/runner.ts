@@ -33,8 +33,10 @@ import { interpolate } from "../workflows/template.ts";
 import { awaitCredentials, BootMaxWaitExceededError, EX_CONFIG } from "./credential-wait.ts";
 import {
   buildCredStatusReport,
+  buildLatestModelReport,
   isCredCheckDisabled,
   reportCredStatus,
+  reportLatestModel,
 } from "./provider-credentials.ts";
 // Side-effect import: registers runner trigger/resumption templates
 import "./templates.ts";
@@ -1752,6 +1754,7 @@ async function spawnProviderProcess(
     iteration: number;
     taskId?: string;
     model?: string;
+    harnessProvider: ProviderName;
     cwd?: string;
     vcsRepo?: string;
   },
@@ -1783,7 +1786,8 @@ async function spawnProviderProcess(
     process.env.AGENT_FS_SHARED_ORG_ID = freshEnv.AGENT_FS_SHARED_ORG_ID as string;
   }
 
-  const model = opts.model || (freshEnv.MODEL_OVERRIDE as string) || "";
+  const configModel = (freshEnv.MODEL_OVERRIDE as string | undefined) || "";
+  const model = opts.model || configModel || "";
 
   const config: ProviderSessionConfig = {
     prompt: opts.prompt,
@@ -1803,6 +1807,18 @@ async function spawnProviderProcess(
   };
 
   const session = await adapter.createSession(config);
+  const initialModelReport = buildLatestModelReport({
+    model,
+    taskModel: opts.model,
+    configModel,
+    taskId: realTaskId,
+    harnessProvider: opts.harnessProvider,
+  });
+  if (initialModelReport) {
+    reportLatestModel(opts.apiUrl, opts.apiKey, opts.agentId, initialModelReport).catch((err) =>
+      console.warn(`[runner] Failed to report latest model: ${err}`),
+    );
+  }
 
   let oauthSelection: CredentialSelection | undefined;
   if (adapter.name === "codex" && credentialSelections.length === 0) {
@@ -1960,6 +1976,20 @@ async function spawnProviderProcess(
         break;
       }
       case "result":
+        {
+          const latestModel = buildLatestModelReport({
+            model: event.cost.model,
+            taskModel: opts.model,
+            configModel,
+            taskId: realTaskId,
+            harnessProvider: opts.harnessProvider,
+          });
+          if (latestModel) {
+            reportLatestModel(opts.apiUrl, opts.apiKey, opts.agentId, latestModel).catch((err) =>
+              console.warn(`[runner] Failed to report latest model: ${err}`),
+            );
+          }
+        }
         // Cost save is handled in waitForCompletion().then() to ensure
         // it completes before the process exits (fire-and-forget here
         // races with container shutdown).
@@ -3206,6 +3236,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               iteration,
               taskId: task.id,
               model: (task as { model?: string }).model,
+              harnessProvider: state.harnessProvider,
               cwd: resumeCwd,
               vcsRepo: task.vcsRepo,
             },
@@ -3605,6 +3636,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               iteration,
               taskId: trigger.taskId,
               model: taskModel,
+              harnessProvider: state.harnessProvider,
               cwd: effectiveCwd,
               vcsRepo: taskVcsRepo,
             },
