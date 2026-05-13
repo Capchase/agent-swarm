@@ -59,11 +59,16 @@ describe("page-session HMAC helpers", () => {
     const token = await signPageSession(payload);
     const [head, sig] = token.split(".");
     expect(sig).toBeDefined();
-    // Flip the last character — keeps length identical so we exercise the
-    // constant-time compare branch (not the length-mismatch early-return).
-    const lastChar = sig!.slice(-1);
-    const flipped = lastChar === "A" ? "B" : "A";
-    const tamperedSig = sig!.slice(0, -1) + flipped;
+    // Flip a decoded HMAC byte rather than a base64url character. Flipping the
+    // last *character* is flaky: for a 32-byte (SHA-256) HMAC the final base64url
+    // char encodes 4 real bits + 2 LSB padding zeros, so "A"→"B" only toggles a
+    // padding bit and the decoded HMAC is unchanged (~1/16 probability), causing
+    // the verifier to incorrectly accept the token. Operating on decoded bytes is
+    // deterministic and still produces a same-length re-encoded token, exercising
+    // the constant-time compare branch (not the length-mismatch early-return).
+    const sigBytes = Buffer.from(sig!, "base64url");
+    sigBytes[0] ^= 0x01;
+    const tamperedSig = sigBytes.toString("base64url").replace(/=/g, "");
     const tampered = `${head}.${tamperedSig}`;
     expect(await verifyPageSession(tampered)).toBeNull();
   });
