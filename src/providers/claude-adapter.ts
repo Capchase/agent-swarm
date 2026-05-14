@@ -133,6 +133,9 @@ export async function preseedClaudeTrustDialog(
     }
   } catch {
     // missing or malformed — start from {}
+    console.warn(
+      `\x1b[33m[claude]\x1b[0m Starting with empty .claude.json for trust pre-seed at ${claudeJsonPath}`,
+    );
   }
 
   const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
@@ -150,6 +153,9 @@ export async function preseedClaudeTrustDialog(
   data.projects = projects;
 
   await writeFile(claudeJsonPath, `${JSON.stringify(data, null, 2)}\n`);
+  console.log(
+    `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${cwd} in ${claudeJsonPath}`,
+  );
 }
 
 /**
@@ -658,6 +664,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     const claudeBinaryRaw = resolveClaudeBinary(config.env || process.env);
     const claudeBinaryArgv = parseClaudeBinary(claudeBinaryRaw);
     const isShannon = claudeBinaryRaw.toLowerCase().includes("shannon");
+
+    console.log(
+      `\x1b[2m[${config.role}]\x1b[0m Resolved CLAUDE_BINARY: ${claudeBinaryArgv.join(" ")} (isShannon: ${isShannon})`,
+    );
 
     // Fail fast: shannon shells out to tmux. If it's missing, surface a
     // clear error here rather than letting the spawn fail opaquely.
