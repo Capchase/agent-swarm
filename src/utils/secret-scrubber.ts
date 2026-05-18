@@ -61,6 +61,8 @@ const SENSITIVE_KEY_EXACT = new Set<string>([
   "GSC_SERVICE_ACCOUNT_BASE64",
   "LINEAR_API_KEY",
   "LINEAR_OAUTH_CLIENT_SECRET",
+  "OTEL_EXPORTER_OTLP_HEADERS",
+  "SIGNOZ_INGESTION_KEY",
 ]);
 
 /** Suffixes that mark an env-var value as sensitive by convention. */
@@ -116,6 +118,11 @@ const TOKEN_REGEXES: ReadonlyArray<{ name: string; re: RegExp }> = [
   {
     name: "jwt",
     re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+  },
+  // SigNoz Cloud OTLP auth header values.
+  {
+    name: "signoz_ingestion_key",
+    re: /\bsignoz-ingestion-key=[A-Za-z0-9._~+/-]{20,}={0,2}\b/g,
   },
 ];
 

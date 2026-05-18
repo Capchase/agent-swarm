@@ -113,6 +113,17 @@ describe("scrubSecrets — env-based replacement", () => {
     expect(out).not.toContain("sk-proj-abcd1234567890");
   });
 
+  test("redacts OTLP exporter headers from env", () => {
+    process.env.OTEL_EXPORTER_OTLP_HEADERS = "signoz-ingestion-key=localSignozKey_1234567890abcdef";
+    refreshSecretScrubberCache();
+
+    const out = scrubSecrets(
+      "OTEL_EXPORTER_OTLP_HEADERS=signoz-ingestion-key=localSignozKey_1234567890abcdef",
+    );
+
+    expect(out).toBe("OTEL_EXPORTER_OTLP_HEADERS=[REDACTED:OTEL_EXPORTER_OTLP_HEADERS]");
+  });
+
   test("cache rebuilds after refresh when new secret is added", () => {
     const out1 = scrubSecrets("no secret yet here_abcdefghij");
     expect(out1).toBe("no secret yet here_abcdefghij");
@@ -201,6 +212,14 @@ describe("scrubSecrets — regex patterns", () => {
     // Fresh env — no secrets registered — regex should still catch well-known shapes.
     const out = scrubSecrets("token=ghp_1234567890abcdefABCDEF1234567890ABCD");
     expect(out).toContain("[REDACTED:github_token]");
+  });
+
+  test("redacts SigNoz ingestion-key headers even when env is empty", () => {
+    const out = scrubSecrets(
+      "OTEL_EXPORTER_OTLP_HEADERS=signoz-ingestion-key=localSignozKey_1234567890abcdef",
+    );
+
+    expect(out).toBe("OTEL_EXPORTER_OTLP_HEADERS=[REDACTED:signoz_ingestion_key]");
   });
 });
 

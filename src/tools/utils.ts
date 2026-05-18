@@ -12,6 +12,8 @@ import type {
   ServerRequest,
   ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
+import { withSpan } from "../otel";
+import { scrubSecrets } from "../utils/secret-scrubber";
 
 type Meta = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -45,6 +47,38 @@ export const getRequestInfo = (req: Meta): RequestInfo => {
     sourceTaskId,
   };
 };
+
+const PREVIEW_LIMIT = 500;
+
+function previewValue(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    if (!serialized) return undefined;
+    const scrubbed = scrubSecrets(serialized);
+    return scrubbed.length > PREVIEW_LIMIT ? `${scrubbed.slice(0, PREVIEW_LIMIT)}...` : scrubbed;
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function toolRequestAttributes(name: string, requestInfo: RequestInfo, args?: unknown) {
+  return {
+    "mcp.tool.name": name,
+    "mcp.session.id": requestInfo.sessionId,
+    "agent.id": requestInfo.agentId,
+    "agentswarm.task.id": requestInfo.sourceTaskId,
+    "agentswarm.tool.args_preview": previewValue(args),
+  };
+}
+
+function toolResultAttributes(result: CallToolResult) {
+  return {
+    "mcp.tool.result_content_count": Array.isArray(result.content) ? result.content.length : 0,
+    "mcp.tool.is_error": result.isError ?? false,
+    "agentswarm.tool.result_preview": previewValue(result.content),
+  };
+}
 
 // Infer the input type from the schema
 type InferInput<Args extends undefined | ZodRawShapeCompat | AnySchema> =
@@ -104,23 +138,42 @@ export const createToolRegistrar = (server: McpServer) => {
     // When inputSchema is undefined, the MCP SDK calls handler(extra) with a single arg.
     // When inputSchema is defined, it calls handler(args, extra) with two args.
     if (config.inputSchema === undefined) {
-      return server.registerTool(name, config, ((meta: Meta) => {
+      return server.registerTool(name, config, (async (meta: Meta) => {
         const requestInfo = getRequestInfo(meta);
-        return (
-          cb as (requestInfo: RequestInfo, meta: Meta) => CallToolResult | Promise<CallToolResult>
-        )(requestInfo, meta);
+        return withSpan(
+          "mcp.tool",
+          async (span) => {
+            const result = await (
+              cb as (
+                requestInfo: RequestInfo,
+                meta: Meta,
+              ) => CallToolResult | Promise<CallToolResult>
+            )(requestInfo, meta);
+            span.setAttributes(toolResultAttributes(result));
+            return result;
+          },
+          toolRequestAttributes(name, requestInfo),
+        );
       }) as Parameters<typeof server.registerTool>[2]);
     }
 
-    return server.registerTool(name, config, ((args: InferInput<InputArgs>, meta: Meta) => {
+    return server.registerTool(name, config, (async (args: InferInput<InputArgs>, meta: Meta) => {
       const requestInfo = getRequestInfo(meta);
-      return (
-        cb as (
-          args: InferInput<InputArgs>,
-          requestInfo: RequestInfo,
-          meta: Meta,
-        ) => CallToolResult | Promise<CallToolResult>
-      )(args, requestInfo, meta);
+      return withSpan(
+        "mcp.tool",
+        async (span) => {
+          const result = await (
+            cb as (
+              args: InferInput<InputArgs>,
+              requestInfo: RequestInfo,
+              meta: Meta,
+            ) => CallToolResult | Promise<CallToolResult>
+          )(args, requestInfo, meta);
+          span.setAttributes(toolResultAttributes(result));
+          return result;
+        },
+        toolRequestAttributes(name, requestInfo, args),
+      );
     }) as Parameters<typeof server.registerTool>[2]);
   };
 };

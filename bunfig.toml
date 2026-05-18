@@ -1,3 +1,4 @@
 [test]
 coverage = false
+maxConcurrency = 1
 preload = ["./src/tests/preload.ts"]

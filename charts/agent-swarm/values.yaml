@@ -289,4 +289,3 @@ litestream:
     # -- Pre-existing Secret with keys LITESTREAM_ACCESS_KEY_ID and
     # LITESTREAM_SECRET_ACCESS_KEY. When set, inline values are ignored.
     existingSecret: ""
-
