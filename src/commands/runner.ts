@@ -6,6 +6,7 @@ import {
   type Attributes,
   initOtel,
   injectTraceContext,
+  isPollTracingEnabled,
   type SwarmSpan,
   startSpan,
   withSpan,
@@ -1514,6 +1515,9 @@ async function registerAgent(opts: {
 
 /** Poll for triggers via HTTP API */
 async function pollForTrigger(opts: PollOptions): Promise<Trigger | null> {
+  if (!isPollTracingEnabled()) {
+    return pollForTriggerOnce(opts);
+  }
   return withSpan(
     "worker.poll",
     async (span) => {
