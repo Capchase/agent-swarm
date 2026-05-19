@@ -347,4 +347,57 @@ describe("/api/scripts HTTP", () => {
     expect(await del.json()).toEqual({ deleted: true });
     expect(getScript({ name: "lookup-helper", scope: "agent", scopeId: workerId })).toBeNull();
   });
+
+  test("script_query_types returns argsJsonSchema for a script with argsSchema export", async () => {
+    const source = `
+      import { z } from "zod";
+      export const argsSchema = z.object({
+        repo: z.string(),
+        limit: z.number().default(10),
+      });
+      export default async (args: z.infer<typeof argsSchema>) => ({ repo: args.repo });
+    `;
+    await upsert({ name: "schema-script", source });
+
+    const types = await dispatch("/api/scripts/schema-script/types", { agentId: workerId });
+    expect(types.status).toBe(200);
+    const body = (await types.json()) as { argsJsonSchema: unknown };
+    expect(body.argsJsonSchema).not.toBeNull();
+    expect(typeof body.argsJsonSchema).toBe("object");
+    // JSON Schema should describe the repo and limit properties
+    const schema = body.argsJsonSchema as { properties?: Record<string, unknown> };
+    expect(schema.properties).toHaveProperty("repo");
+    expect(schema.properties).toHaveProperty("limit");
+  });
+
+  test("script_query_types returns argsJsonSchema: null for a script without argsSchema", async () => {
+    await upsert({ name: "no-schema-script", source: validSource(3) });
+
+    const types = await dispatch("/api/scripts/no-schema-script/types", { agentId: workerId });
+    expect(types.status).toBe(200);
+    const body = (await types.json()) as { argsJsonSchema: unknown };
+    expect(body.argsJsonSchema).toBeNull();
+  });
+
+  test("script_search includes argsJsonSchema in results", async () => {
+    const source = `
+      import { z } from "zod";
+      export const argsSchema = z.object({ query: z.string() });
+      export default async (args: z.infer<typeof argsSchema>) => ({ result: args.query });
+    `;
+    await upsert({ name: "search-with-schema", source, description: "search result helper" });
+
+    const search = await dispatch("/api/scripts/search", {
+      method: "POST",
+      agentId: workerId,
+      body: JSON.stringify({ query: "search result helper", limit: 5 }),
+    });
+    expect(search.status).toBe(200);
+    const body = (await search.json()) as {
+      results: Array<{ name: string; argsJsonSchema: unknown }>;
+    };
+    const result = body.results.find((r) => r.name === "search-with-schema");
+    expect(result).toBeDefined();
+    expect(result?.argsJsonSchema).not.toBeNull();
+  });
 });

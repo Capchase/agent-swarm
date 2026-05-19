@@ -4,6 +4,7 @@ import { getAgentById } from "../be/db";
 import { createEvent } from "../be/events";
 import { deleteScript, getScript, upsertScriptByName } from "../be/scripts/db";
 import { searchScripts } from "../be/scripts/embeddings";
+import { extractArgsJsonSchema } from "../be/scripts/extract-schema";
 import { SCRIPT_SDK_TYPES, SCRIPT_STDLIB_TYPES, typecheckScript } from "../be/scripts/typecheck";
 import { extractScriptSignature } from "../scripts-runtime/extract-signature";
 import { runScript } from "../scripts-runtime/loader";
@@ -217,6 +218,7 @@ export async function handleScripts(
       parsed.body.scope === "global"
         ? getScript({ name: parsed.body.name, scope: "agent", scopeId: agent.id })
         : null;
+    const argsJsonSchema = await extractArgsJsonSchema(parsed.body.source);
     const result = await upsertScriptByName({
       name: parsed.body.name,
       scope: parsed.body.scope,
@@ -225,6 +227,7 @@ export async function handleScripts(
       description: parsed.body.description,
       intent: parsed.body.intent,
       signatureJson: signatureJsonFor(parsed.body.source),
+      argsJsonSchema,
       fsMode: parsed.body.fsMode,
       agentId: agent.id,
       isScratch: false,
@@ -331,6 +334,9 @@ export async function handleScripts(
       results: matches.map(({ script, score }) => ({
         name: script.name,
         signature: JSON.parse(script.signatureJson),
+        argsJsonSchema: script.argsJsonSchema
+          ? (JSON.parse(script.argsJsonSchema) as unknown)
+          : null,
         description: script.description,
         score,
       })),
@@ -351,6 +357,7 @@ export async function handleScripts(
     }
     json(res, {
       signature: JSON.parse(script.signatureJson),
+      argsJsonSchema: script.argsJsonSchema ? (JSON.parse(script.argsJsonSchema) as unknown) : null,
       sdkTypes: SCRIPT_SDK_TYPES,
       stdlibTypes: SCRIPT_STDLIB_TYPES,
     });

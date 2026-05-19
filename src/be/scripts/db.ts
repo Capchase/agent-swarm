@@ -20,6 +20,7 @@ type ScriptWriteArgs = ScriptIdentity & {
   description: string;
   intent: string;
   signatureJson: string;
+  argsJsonSchema?: string | null;
   isScratch?: boolean;
   typeChecked?: boolean;
   fsMode?: ScriptFsMode;
@@ -115,6 +116,7 @@ export function insertScript(args: ScriptWriteArgs): ScriptRecord {
           string,
           string,
           string,
+          string | null,
           string,
           number,
           number,
@@ -126,9 +128,9 @@ export function insertScript(args: ScriptWriteArgs): ScriptRecord {
       >(
         `INSERT INTO scripts (
           id, name, scope, scopeId, source, description, intent, signatureJson,
-          contentHash, isScratch, typeChecked, fsMode, createdByAgentId, createdAt, updatedAt
+          argsJsonSchema, contentHash, isScratch, typeChecked, fsMode, createdByAgentId, createdAt, updatedAt
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *`,
       )
       .get(
@@ -140,6 +142,7 @@ export function insertScript(args: ScriptWriteArgs): ScriptRecord {
         args.description,
         args.intent,
         args.signatureJson,
+        args.argsJsonSchema ?? null,
         contentHash,
         isScratch,
         typeChecked,
@@ -193,10 +196,13 @@ export async function upsertScriptByName(args: ScriptWriteArgs): Promise<UpsertS
     const fsMode = args.fsMode ?? existing.fsMode;
     const isScratch = args.isScratch ?? existing.isScratch;
     const typeChecked = args.typeChecked ?? existing.typeChecked;
+    const argsJsonSchema =
+      args.argsJsonSchema !== undefined ? args.argsJsonSchema : existing.argsJsonSchema;
     const trackedMetadataChanged =
       args.description !== existing.description ||
       args.intent !== existing.intent ||
-      args.signatureJson !== existing.signatureJson;
+      args.signatureJson !== existing.signatureJson ||
+      argsJsonSchema !== existing.argsJsonSchema;
     const promotedFromScratch = existing.isScratch && !isScratch;
     if (
       fsMode !== existing.fsMode ||
@@ -205,9 +211,12 @@ export async function upsertScriptByName(args: ScriptWriteArgs): Promise<UpsertS
       trackedMetadataChanged
     ) {
       const row = getDb()
-        .prepare<ScriptRow, [string, string, string, number, number, string, string, string]>(
+        .prepare<
+          ScriptRow,
+          [string, string, string, string | null, number, number, string, string, string]
+        >(
           `UPDATE scripts
-          SET description = ?, intent = ?, signatureJson = ?,
+          SET description = ?, intent = ?, signatureJson = ?, argsJsonSchema = ?,
             isScratch = ?, typeChecked = ?, fsMode = ?, updatedAt = ?
           WHERE id = ?
           RETURNING *`,
@@ -216,6 +225,7 @@ export async function upsertScriptByName(args: ScriptWriteArgs): Promise<UpsertS
           args.description,
           args.intent,
           args.signatureJson,
+          argsJsonSchema ?? null,
           isScratch ? 1 : 0,
           typeChecked ? 1 : 0,
           fsMode,
@@ -247,16 +257,31 @@ export async function upsertScriptByName(args: ScriptWriteArgs): Promise<UpsertS
   const fsMode = args.fsMode ?? existing.fsMode;
   const isScratch = args.isScratch ?? existing.isScratch;
   const typeChecked = args.typeChecked ?? existing.typeChecked;
+  const argsJsonSchema =
+    args.argsJsonSchema !== undefined ? args.argsJsonSchema : existing.argsJsonSchema;
 
   const txn = getDb().transaction(() => {
     const row = getDb()
       .prepare<
         ScriptRow,
-        [string, string, string, string, string, number, number, number, string, string, string]
+        [
+          string,
+          string,
+          string,
+          string,
+          string | null,
+          string,
+          number,
+          number,
+          number,
+          string,
+          string,
+          string,
+        ]
       >(
         `UPDATE scripts
-        SET source = ?, description = ?, intent = ?, signatureJson = ?, contentHash = ?,
-          version = ?, isScratch = ?, typeChecked = ?, fsMode = ?, updatedAt = ?
+        SET source = ?, description = ?, intent = ?, signatureJson = ?, argsJsonSchema = ?,
+          contentHash = ?, version = ?, isScratch = ?, typeChecked = ?, fsMode = ?, updatedAt = ?
         WHERE id = ?
         RETURNING *`,
       )
@@ -265,6 +290,7 @@ export async function upsertScriptByName(args: ScriptWriteArgs): Promise<UpsertS
         args.description,
         args.intent,
         args.signatureJson,
+        argsJsonSchema ?? null,
         contentHash,
         newVersion,
         isScratch ? 1 : 0,

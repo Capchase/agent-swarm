@@ -1320,6 +1320,7 @@ export const ScriptRecordSchema = z.object({
   description: z.string(),
   intent: z.string(),
   signatureJson: z.string(),
+  argsJsonSchema: z.string().nullable(),
   contentHash: z.string(),
   version: z.number(),
   isScratch: z.boolean(),

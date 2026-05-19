@@ -90,6 +90,9 @@ async function writeBareImportShims(tmpdir: string): Promise<void> {
   }
   await writeBareImportShim(tmpdir, "stdlib", new URL("../stdlib/index.ts", import.meta.url));
   await writeBareImportShim(tmpdir, "swarm-sdk", new URL("../swarm-sdk.ts", import.meta.url));
+  // Allow `import { z } from "zod"` in user scripts (for argsSchema definitions).
+  const zodEntry = Bun.resolveSync("zod", import.meta.dir);
+  await writeBareImportShim(tmpdir, "zod", new URL(`file://${zodEntry}`));
 }
 
 function harnessCommand(harnessPath: string, input: ExecutorInput): string[] {

@@ -31,7 +31,31 @@ try {
     throw new Error("Swarm script must export a default function");
   }
 
-  const result = await mod.default(parsedArgs, ctx);
+  let validatedArgs = parsedArgs;
+  if (mod.argsSchema && typeof mod.argsSchema === "object" && "parse" in mod.argsSchema) {
+    try {
+      // biome-ignore lint/suspicious/noExplicitAny: argsSchema is a Zod schema at runtime
+      validatedArgs = (mod.argsSchema as any).parse(parsedArgs);
+    } catch (err) {
+      // Format ZodError issues into a readable message
+      if (
+        err &&
+        typeof err === "object" &&
+        "issues" in err &&
+        Array.isArray((err as { issues: unknown[] }).issues)
+      ) {
+        const issues = (
+          err as { issues: Array<{ path: (string | number)[]; message: string }> }
+        ).issues
+          .map((i) => `  ${i.path.length ? i.path.join(".") : "(root)"}: ${i.message}`)
+          .join("\n");
+        throw new Error(`argsSchema validation failed:\n${issues}`);
+      }
+      throw err;
+    }
+  }
+
+  const result = await mod.default(validatedArgs, ctx);
   await Bun.write(requiredEnv("SWARM_SCRIPT_RESULT_FILE"), JSON.stringify(result ?? null));
 } catch (error) {
   console.error(error instanceof Error ? error.stack || error.message : String(error));

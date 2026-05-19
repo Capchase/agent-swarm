@@ -22,6 +22,7 @@ type ScriptEmbeddingCandidateRow = ScriptEmbeddingRow & {
   description: string;
   intent: string;
   signatureJson: string;
+  argsJsonSchema: string | null;
   contentHash: string;
   version: number;
   isScratch: number;
@@ -63,6 +64,7 @@ function rowToScript(row: ScriptEmbeddingCandidateRow): ScriptRecord {
     description: row.description,
     intent: row.intent,
     signatureJson: row.signatureJson,
+    argsJsonSchema: row.argsJsonSchema ?? null,
     contentHash: row.contentHash,
     version: row.version,
     isScratch: row.isScratch === 1,

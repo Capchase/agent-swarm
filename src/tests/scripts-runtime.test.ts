@@ -286,4 +286,59 @@ describe("runScript", () => {
       await Bun.$`rm -rf ${tmpdir}`;
     }
   });
+
+  test("argsSchema rejects invalid args with a formatted Zod error", async () => {
+    const output = await runScript({
+      agentId: "agent-1",
+      args: {},
+      resources,
+      source: `
+        import { z } from "zod";
+        export const argsSchema = z.object({
+          repo: z.string(),
+        });
+        export default async (args: z.infer<typeof argsSchema>) => ({ repo: args.repo });
+      `,
+    });
+
+    expect(output.error).toBeDefined();
+    expect(output.exitCode).not.toBe(0);
+    expect(output.stderr).toContain("argsSchema validation failed");
+    expect(output.stderr).toContain("repo");
+  });
+
+  test("argsSchema applies .default() values when fields are omitted", async () => {
+    const output = await runScript({
+      agentId: "agent-1",
+      args: { repo: "owner/name" },
+      resources,
+      source: `
+        import { z } from "zod";
+        export const argsSchema = z.object({
+          repo: z.string(),
+          limit: z.number().default(10),
+        });
+        export default async (args: z.infer<typeof argsSchema>) => ({ repo: args.repo, limit: args.limit });
+      `,
+    });
+
+    expect(output.error).toBeUndefined();
+    expect(output.result).toEqual({ repo: "owner/name", limit: 10 });
+    expect(output.exitCode).toBe(0);
+  });
+
+  test("script without argsSchema still works (backward-compat)", async () => {
+    const output = await runScript({
+      agentId: "agent-1",
+      args: { value: 42 },
+      resources,
+      source: `
+        export default async (args: { value: number }) => ({ doubled: args.value * 2 });
+      `,
+    });
+
+    expect(output.error).toBeUndefined();
+    expect(output.result).toEqual({ doubled: 84 });
+    expect(output.exitCode).toBe(0);
+  });
 });
