@@ -9186,6 +9186,8 @@ export function listRecentSessions(opts?: {
   source?: string[];
   /** Case-insensitive substring match against `r.task`. */
   q?: string;
+  /** Filter to sessions requested by this user ID. Omit to include all. */
+  requestedByUserId?: string;
 }): SessionListItem[] {
   const limit = opts?.limit ?? 25;
   const offset = opts?.offset ?? 0;
@@ -9202,6 +9204,10 @@ export function listRecentSessions(opts?: {
   if (q && q.length > 0) {
     conditions.push("lower(r.task) LIKE ?");
     params.push(`%${q.toLowerCase()}%`);
+  }
+  if (opts?.requestedByUserId) {
+    conditions.push("r.requestedByUserId = ?");
+    params.push(opts.requestedByUserId);
   }
   params.push(limit, offset);
 

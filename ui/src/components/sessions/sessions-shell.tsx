@@ -47,6 +47,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useCurrentUser } from "@/contexts/current-user-context";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { cn, formatRelativeTime } from "@/lib/utils";
 
@@ -343,6 +344,7 @@ export interface SessionsShellProps {
 
 export function SessionsShell({ activeRootTaskId, children }: SessionsShellProps) {
   const navigate = useNavigate();
+  const { userId } = useCurrentUser();
   const [collapsed, setCollapsed] = useState<boolean>(() => readBool(COLLAPSE_STORAGE_KEY, false));
   const [showSystem, setShowSystem] = useState<boolean>(() =>
     readBool(SHOW_SYSTEM_STORAGE_KEY, false),
@@ -367,6 +369,7 @@ export function SessionsShell({ activeRootTaskId, children }: SessionsShellProps
     limit: 50,
     source: sourceFilter,
     q: debouncedQuery.trim() || undefined,
+    requestedByUserId: userId ?? undefined,
   });
 
   const openNew = useCallback(() => navigate("/sessions"), [navigate]);

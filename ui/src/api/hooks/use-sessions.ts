@@ -22,6 +22,8 @@ export interface UseSessionsOptions {
   source?: string[];
   /** Case-insensitive substring search against the root task's text. */
   q?: string;
+  /** Filter to sessions requested by this user ID. Omit to include all. */
+  requestedByUserId?: string;
 }
 
 export function useSessions(options?: UseSessionsOptions) {
@@ -29,9 +31,10 @@ export function useSessions(options?: UseSessionsOptions) {
   const offset = options?.offset;
   const source = options?.source;
   const q = options?.q;
+  const requestedByUserId = options?.requestedByUserId;
   return useQuery({
-    queryKey: ["sessions", { limit, offset, source, q }],
-    queryFn: () => api.listSessions({ limit, offset, source, q }),
+    queryKey: ["sessions", { limit, offset, source, q, requestedByUserId }],
+    queryFn: () => api.listSessions({ limit, offset, source, q, requestedByUserId }),
   });
 }
 
