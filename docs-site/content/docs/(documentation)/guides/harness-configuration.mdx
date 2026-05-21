@@ -300,6 +300,8 @@ For full provider design rationale (why we don't `agents.create` at runtime, the
 
 ## Multi-Credential Pools
 
+### Claude Code
+
 Both `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` support comma-separated values for load balancing across multiple subscriptions:
 
 ```bash
@@ -313,6 +315,26 @@ ANTHROPIC_API_KEY=sk-ant-api-key1,sk-ant-api-key2
 Each session randomly selects one credential from the pool. A log line indicates the selected index (never the credential itself). Single values work unchanged.
 
 This is useful when running multiple concurrent workers that would otherwise hit rate limits on a single subscription.
+
+### Codex OAuth Pool
+
+Codex workers support a **database-backed** multi-credential pool stored as `codex_oauth_0`, `codex_oauth_1`, ... in the swarm config store. Unlike the Claude comma-separated approach, Codex slots are provisioned via `codex-login` and persisted centrally so all workers can access them.
+
+Key properties:
+
+- **Rate-limit-aware selection**: the runner queries `/api/keys/available?keyType=CODEX_OAUTH` before each task spawn and picks from non-rate-limited slots only. When a task hits a rate limit, the slot is marked unavailable for ~5 minutes (until structured `rate_limit_event` capture lands — tracked separately).
+- **Token-refresh write-back**: refreshed OAuth tokens are written back to the same `codex_oauth_<slot>` key the task started with. Other slots are never touched.
+- **Backwards compatible**: single-credential deploys work unchanged. The boot entrypoint seeds `codex_oauth_0` from the legacy `codex_oauth` key on first run.
+- **Global scope**: no per-agent or per-task affinity — any worker can pick any slot.
+
+Provision additional slots:
+
+```bash
+# Run once per ChatGPT account; each call appends a new slot
+bun run src/cli.tsx codex-login --api-url http://localhost:3013 --api-key YOUR_API_KEY
+```
+
+For the full provisioning guide, rate-limit detection details, and verification commands, see [Provider Auth: Codex OAuth](/docs/guides/provider-auth/codex-oauth#multi-credential-pool).
 
 ---
 

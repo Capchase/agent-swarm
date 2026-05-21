@@ -7,9 +7,9 @@ Codex workers can authenticate in three different ways:
 
 1. `OPENAI_API_KEY`
 2. A pre-seeded `~/.codex/auth.json`
-3. ChatGPT OAuth stored centrally in the swarm config store as `codex_oauth`
+3. ChatGPT OAuth stored centrally in the swarm config store as `codex_oauth_0`, `codex_oauth_1`, ... (multi-credential pool)
 
-This page covers the third option: **run the login flow once from your laptop, then let Codex workers restore the credential automatically at boot**.
+This page covers the third option: **run the login flow once (or multiple times for a pool), then let Codex workers restore the credential automatically at boot**.
 
 ## When To Use This
 
@@ -171,9 +171,77 @@ Check that your laptop and the workers are talking to the same swarm API/databas
 
 ### I want different credentials for different workers
 
-That is not supported by the current Codex OAuth path because `codex_oauth` is global to the swarm.
+The Codex OAuth pool (see [Multi-Credential Pool](#multi-credential-pool) above) runs at **global swarm scope** — all workers share the same pool, and the runner selects a slot per task. There is no per-worker or per-agent slot affinity by design.
 
-If you need per-worker separation today, use separate swarm deployments or `OPENAI_API_KEY` instead.
+If you need true per-worker credential isolation, use separate swarm deployments or `OPENAI_API_KEY` instead.
+
+## Multi-Credential Pool
+
+Migration 068 (`src/be/migrations/068_codex_oauth_pool.sql`) added `api_key_status` rows for `CODEX_OAUTH` keys, enabling the same rate-limit-aware pool logic already used for Claude OAuth tokens.
+
+### Provisioning slots
+
+Run `codex-login` once per account you want to add to the pool:
+
+```bash
+# First account → stored as codex_oauth_0
+bun run src/cli.tsx codex-login --api-url http://localhost:3013 --api-key YOUR_API_KEY
+
+# Second account → stored as codex_oauth_1
+bun run src/cli.tsx codex-login --api-url http://localhost:3013 --api-key YOUR_API_KEY
+```
+
+Each successive `codex-login` call increments the slot index automatically (`codex_oauth_0`, `codex_oauth_1`, `codex_oauth_2`, …). You can provision as many slots as you have ChatGPT accounts.
+
+### How slot selection works
+
+At task-spawn time the runner:
+
+1. Calls `loadAllCodexOAuthSlots` to enumerate all `codex_oauth_N` keys from the config store.
+2. Queries `GET /api/keys/available?keyType=CODEX_OAUTH&totalKeys=<N>` to get the list of non-rate-limited slot indices.
+3. Picks **randomly** from the available slots. If the availability endpoint is unreachable, falls back to random pick across all slots (best-effort).
+4. Calls `materializeCodexAuthJson` to write the selected slot's credentials into `~/.codex/auth.json` atomically (tmp → rename).
+5. Passes `codexSlot` through to the adapter so token refreshes write back to the correct slot key.
+
+Selection is **global** — there is no per-agent or per-task affinity. Any worker can pick any slot.
+
+### Token-refresh write-back
+
+When the Codex CLI refreshes an OAuth token mid-session, the adapter writes the new credentials back to `codex_oauth_<picked-slot>` via `persistCodexOAuth`. The legacy `codex_oauth` key and other slots are never touched by the refresh path.
+
+### Rate-limit detection
+
+The adapter's `formatTerminalError` method matches incoming Codex error messages against two patterns:
+
+- `[rate-limit]` — HTTP 429 / per-minute / per-hour API rate limit. Prefix added by the `rate limit`, `rate_limit`, `too many requests`, or similar patterns.
+- `[usage-limit]` — Monthly quota exhausted (`usage limit`, `upgrade to pro`, `usagelimitexceeded`).
+
+When the runner sees either prefix in a task's `failureReason`, it calls `POST /api/keys/report-rate-limit` to mark the used slot as unavailable. The `rateLimitedUntil` timestamp is:
+
+- Parsed from the error message if it contains an ISO 8601 or Unix-epoch reset time.
+- Otherwise set to **now + 5 minutes** as a conservative fallback until structured `rate_limit_event` capture lands (tracked as a separate follow-up PR).
+
+The slot is excluded from future `availableIndices` responses until `rateLimitedUntil` passes.
+
+### Backwards compatibility
+
+Single-credential deploys keep working unchanged:
+
+- The Docker entrypoint seeds `codex_oauth_0` from the legacy `codex_oauth` config key at boot (if `codex_oauth_0` does not yet exist). Workers never see the legacy key name at runtime.
+- If only one slot is provisioned, the pool still runs correctly — slot 0 is always selected and the availability filter is a no-op.
+
+### Verification
+
+```bash
+# List all provisioned slots
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  "http://localhost:3013/api/config/resolved?includeSecrets=false" \
+  | jq '[.configs[] | select(.key | test("^codex_oauth_\\d+$")) | {slot: .key, id: .id}]'
+
+# Check rate-limit status for CODEX_OAUTH slots
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  "http://localhost:3013/api/keys/available?keyType=CODEX_OAUTH&totalKeys=3"
+```
 
 ## Related
 
