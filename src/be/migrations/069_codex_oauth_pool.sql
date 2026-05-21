@@ -1,4 +1,4 @@
--- Migration 068: Rename legacy codex_oauth config key to codex_oauth_0
+-- Migration 069: Rename legacy codex_oauth config key to codex_oauth_0
 -- This is idempotent: only renames if the legacy key exists and the new key doesn't.
 -- After this migration, all Codex OAuth credentials use the slot-keyed naming
 -- convention (codex_oauth_0, codex_oauth_1, etc.) introduced in CAI-1280.
