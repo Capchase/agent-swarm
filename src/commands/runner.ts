@@ -22,6 +22,8 @@ import {
 import { renderMemoriesPrompt } from "../prompts/memories.ts";
 import { configureHttpResolver, resolveTemplateAsync } from "../prompts/resolver.ts";
 import { authJsonToCredentialSelection } from "../providers/codex-oauth/auth-json.js";
+import { materializeCodexAuthJson } from "../providers/codex-oauth/auth-json-fs.js";
+import { loadAllCodexOAuthSlots } from "../providers/codex-oauth/storage.js";
 import {
   type CostData,
   createProviderAdapter,
@@ -821,7 +823,73 @@ async function reportKeyUsage(
   }
 }
 
-async function resolveCodexOAuthCredentialInfo(): Promise<CredentialSelection | null> {
+async function resolveCodexOAuthCredentialInfo(
+  apiUrl?: string,
+  apiKey?: string,
+): Promise<CredentialSelection | null> {
+  // Pool path: enumerate slots from the config store, pick one with rate-limit
+  // awareness, materialise auth.json for the selected slot.
+  if (apiUrl && apiKey) {
+    try {
+      const slots = await loadAllCodexOAuthSlots(apiUrl, apiKey);
+      if (slots.length > 0) {
+        let availableIndices: number[] | undefined;
+        try {
+          const resp = await fetch(
+            `${apiUrl}/api/keys/available?keyType=CODEX_OAUTH&totalKeys=${slots.length}`,
+            { headers: { Authorization: `Bearer ${apiKey}` } },
+          );
+          if (resp.ok) {
+            const data = (await resp.json()) as { availableIndices: number[] };
+            availableIndices = data.availableIndices;
+            if (availableIndices.length < slots.length) {
+              console.log(
+                `[credentials] CODEX_OAUTH: ${availableIndices.length}/${slots.length} slots available (${slots.length - availableIndices.length} rate-limited)`,
+              );
+            }
+          }
+        } catch {
+          // Non-critical — fall through to random selection
+        }
+
+        const allSlotIndices = slots.map((s) => s.slot);
+        let selectedSlot: number;
+        if (availableIndices && availableIndices.length > 0) {
+          const eligible = allSlotIndices.filter((i) => availableIndices!.includes(i));
+          const pool = eligible.length > 0 ? eligible : allSlotIndices;
+          selectedSlot = pool[Math.floor(Math.random() * pool.length)]!;
+        } else {
+          // No availability info or all rate-limited — pick randomly (best effort)
+          selectedSlot = allSlotIndices[Math.floor(Math.random() * allSlotIndices.length)]!;
+        }
+
+        const slotEntry = slots.find((s) => s.slot === selectedSlot);
+        if (slotEntry) {
+          await materializeCodexAuthJson(selectedSlot, slotEntry.creds);
+          const authJson = {
+            auth_mode: "chatgpt" as const,
+            OPENAI_API_KEY: null,
+            tokens: {
+              id_token: slotEntry.creds.access,
+              access_token: slotEntry.creds.access,
+              refresh_token: slotEntry.creds.refresh,
+              account_id: slotEntry.creds.accountId,
+            },
+            last_refresh: new Date(slotEntry.creds.expires).toISOString(),
+          };
+          const sel = authJsonToCredentialSelection(authJson, selectedSlot, slots.length);
+          console.log(
+            `[credentials] Selected CODEX_OAUTH slot ${selectedSlot + 1}/${slots.length} [...${sel.keySuffix}]`,
+          );
+          return sel;
+        }
+      }
+    } catch (err) {
+      console.warn(`[credentials] Codex OAuth pool selection failed (non-fatal): ${err}`);
+    }
+  }
+
+  // Fallback: read existing auth.json (single-credential or pre-pool deploy)
   try {
     const home = process.env.HOME;
     if (!home) return null;
@@ -2068,6 +2136,23 @@ async function spawnProviderProcess(
   const configModel = (freshEnv.MODEL_OVERRIDE as string | undefined) || "";
   const model = opts.model || configModel || "";
 
+  // Resolve Codex OAuth pool slot BEFORE building ProviderSessionConfig so we
+  // can pass codexSlot through and the adapter writes token refreshes back to
+  // the correct slot key (codex_oauth_<slot>) instead of defaulting to slot 0.
+  let oauthSelection: CredentialSelection | undefined;
+  if (adapter.name === "codex" && credentialSelections.length === 0) {
+    oauthSelection = (await resolveCodexOAuthCredentialInfo(opts.apiUrl, opts.apiKey)) ?? undefined;
+    if (oauthSelection && realTaskId) {
+      reportKeyUsage(
+        opts.apiUrl,
+        opts.apiKey,
+        oauthSelection.keyType,
+        oauthSelection,
+        realTaskId,
+      ).catch(() => {});
+    }
+  }
+
   const config: ProviderSessionConfig = {
     prompt: opts.prompt,
     systemPrompt: opts.systemPrompt || "",
@@ -2083,6 +2168,9 @@ async function spawnProviderProcess(
     additionalArgs: opts.additionalArgs,
     iteration: opts.iteration,
     env: freshEnv as Record<string, string>,
+    // Propagate the selected OAuth slot so the adapter refreshes back to the
+    // correct pool key. Undefined for non-codex providers and single-cred deploys.
+    codexSlot: oauthSelection?.index,
   };
 
   const session = await withSpan(
@@ -2115,20 +2203,6 @@ async function spawnProviderProcess(
     reportLatestModel(opts.apiUrl, opts.apiKey, opts.agentId, initialModelReport).catch((err) =>
       console.warn(`[runner] Failed to report latest model: ${err}`),
     );
-  }
-
-  let oauthSelection: CredentialSelection | undefined;
-  if (adapter.name === "codex" && credentialSelections.length === 0) {
-    oauthSelection = (await resolveCodexOAuthCredentialInfo()) ?? undefined;
-    if (oauthSelection && realTaskId) {
-      reportKeyUsage(
-        opts.apiUrl,
-        opts.apiKey,
-        oauthSelection.keyType,
-        oauthSelection,
-        realTaskId,
-      ).catch(() => {});
-    }
   }
 
   // Set up log streaming
