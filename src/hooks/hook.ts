@@ -117,6 +117,16 @@ interface HookBlockResponse {
 }
 
 /**
+ * Hook response for modifying tool input
+ * See: https://code.claude.com/docs/en/hooks
+ */
+interface HookModifyResponse {
+  hookSpecificOutput: {
+    updatedInput: Record<string, unknown>;
+  };
+}
+
+/**
  * Task file data written by runner to /tmp for hook to read
  */
 interface TaskFileData {
@@ -390,6 +400,106 @@ export async function runStopHookSessionSummary(
     }
   } catch {
     // Non-blocking — session summarization failure should never block shutdown
+  }
+}
+
+/**
+ * Detect and inject a --assignee (gh) or --assignee-username (glab) flag into a
+ * PR/MR create command, using the swarm task's requestedByUserId to resolve the
+ * requester's GitHub identity.
+ *
+ * Exported for unit testing. Never throws — returns the original command on any
+ * error so the hook never blocks a PR-create.
+ */
+export async function injectPrAssignee(
+  command: string,
+  opts: {
+    taskFilePath?: string;
+    apiUrl: string;
+    apiHeaders: Record<string, string>;
+  },
+): Promise<string> {
+  // gh pr create — be conservative: lookahead prevents matching gh pr create-comment etc.
+  const isGhCreate = /\bgh\s+pr\s+create(?=\s|$)/.test(command);
+  // glab mr create
+  const isGlabCreate = /\bglab\s+mr\s+create(?=\s|\n|$)/.test(command);
+
+  if (!isGhCreate && !isGlabCreate) return command;
+
+  // Skip if assignee flag already present
+  if (isGhCreate && /--assignee[\s=]/.test(command)) return command;
+  if (isGlabCreate && /--assignee-username[\s=]/.test(command)) return command;
+
+  try {
+    if (!opts.taskFilePath) {
+      console.log("[pr-assignee] TASK_FILE not set, PR will have no assignee");
+      return command;
+    }
+
+    const file = Bun.file(opts.taskFilePath);
+    if (!(await file.exists())) {
+      console.log("[pr-assignee] TASK_FILE not found, PR will have no assignee");
+      return command;
+    }
+
+    const taskFileData = (await file.json()) as { taskId?: string };
+    const taskId = taskFileData.taskId;
+    if (!taskId) {
+      console.log("[pr-assignee] TASK_FILE has no taskId, PR will have no assignee");
+      return command;
+    }
+
+    // Fetch task to get requestedByUserId
+    const taskResp = await fetch(`${opts.apiUrl}/api/tasks/${taskId}`, {
+      headers: opts.apiHeaders,
+    });
+    if (!taskResp.ok) {
+      console.log(
+        `[pr-assignee] Failed to fetch task ${taskId} (${taskResp.status}), PR will have no assignee`,
+      );
+      return command;
+    }
+    const task = (await taskResp.json()) as { requestedByUserId?: string };
+
+    if (!task.requestedByUserId) {
+      console.log(
+        `[pr-assignee] Task ${taskId} has no requestedByUserId (autonomous run?), PR will have no assignee`,
+      );
+      return command;
+    }
+
+    // Fetch user to get GitHub identity
+    const userResp = await fetch(`${opts.apiUrl}/api/users/${task.requestedByUserId}`, {
+      headers: opts.apiHeaders,
+    });
+    if (!userResp.ok) {
+      console.log(
+        `[pr-assignee] Failed to fetch user ${task.requestedByUserId} (${userResp.status}), PR will have no assignee`,
+      );
+      return command;
+    }
+    const user = (await userResp.json()) as {
+      identities?: Array<{ kind: string; externalId: string }>;
+    };
+
+    const githubIdentity = user.identities?.find((i) => i.kind === "github");
+    if (!githubIdentity) {
+      console.log(
+        `[pr-assignee] User ${task.requestedByUserId} has no github identity, PR will have no assignee`,
+      );
+      return command;
+    }
+
+    const username = githubIdentity.externalId;
+    if (isGhCreate) {
+      return `${command} --assignee ${username}`;
+    }
+    return `${command} --assignee-username ${username}`;
+  } catch (err) {
+    console.log(
+      `[pr-assignee] Error injecting assignee: ${(err as Error).message}, PR will proceed without assignee`,
+    );
+    return command;
   }
 }
 
@@ -1063,6 +1173,29 @@ ${hasAgentIdHeader() ? `You have a pre-defined agent ID via header: ${mcpConfig?
           }
         }
       }
+
+      // PR assignee injection — rewrite gh/glab PR-create commands to include
+      // --assignee so GitHub analytics can attribute capchase-bot PRs to the real human.
+      if (msg.tool_name === "Bash" && mcpConfig) {
+        const bashCmd = (msg.tool_input as { command?: string } | undefined)?.command;
+        if (bashCmd) {
+          const rewritten = await injectPrAssignee(bashCmd, {
+            taskFilePath: process.env.TASK_FILE,
+            apiUrl: getBaseUrl(),
+            apiHeaders: mcpConfig.headers,
+          });
+          if (rewritten !== bashCmd) {
+            const modifyResponse: HookModifyResponse = {
+              hookSpecificOutput: {
+                updatedInput: { ...msg.tool_input, command: rewritten },
+              },
+            };
+            console.log(JSON.stringify(modifyResponse));
+            return;
+          }
+        }
+      }
+
       break;
     }
 
