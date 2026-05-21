@@ -96,6 +96,11 @@ export interface ProviderSessionConfig {
   additionalArgs?: string[];
   /** Resolved environment variables to pass to the spawned process. */
   env?: Record<string, string>;
+  /**
+   * Codex OAuth pool slot selected for this task. When set, the Codex adapter
+   * uses this slot for token refresh write-back instead of defaulting to slot 0.
+   */
+  codexSlot?: number;
 }
 
 /** A running provider session. */

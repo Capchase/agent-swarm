@@ -125,6 +125,16 @@ export function checkCodexCredentials(
       hint: "Credential present in env; entrypoint will materialise ~/.codex/auth.json on next boot.",
     };
   }
+  // Pool credentials: codex_oauth_0, codex_oauth_1, ... loaded from swarm_config
+  // into the resolved env. Runner materialises auth.json per-task from the pool.
+  if (Object.keys(env).some((k) => /^codex_oauth_\d+$/.test(k))) {
+    return {
+      ready: true,
+      missing: [],
+      satisfiedBy: "side-effect-pending",
+      hint: "Codex OAuth credential pool configured; runner will materialise auth.json per-task.",
+    };
+  }
   return {
     ready: false,
     missing: ["OPENAI_API_KEY", "CODEX_OAUTH", authFile],
@@ -190,8 +200,11 @@ async function resolveCodexAuthMode(
   // api-key mode, try to restore/upgrade to OAuth. Don't touch a file that's
   // already in chatgpt mode — `getValidCodexOAuth` refreshes and writes back
   // to the config store on its own when called next time.
+  // Use the slot recorded by the runner for this task so refresh writes back
+  // to the correct pool key (codex_oauth_<slot>) instead of always slot 0.
+  const slot = config.codexSlot ?? 0;
   if (config.apiUrl && config.apiKey && currentMode !== "chatgpt") {
-    const oauthCreds = await getValidCodexOAuth(config.apiUrl, config.apiKey);
+    const oauthCreds = await getValidCodexOAuth(config.apiUrl, config.apiKey, slot);
     if (oauthCreds) {
       try {
         const authJson = credentialsToAuthJson(oauthCreds);
