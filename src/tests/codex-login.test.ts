@@ -179,11 +179,9 @@ describe("runCodexLogin", () => {
 
   it("uses explicit --slot when provided", async () => {
     let storedSlot: number | undefined;
-    const store = mock(
-      async (_apiUrl: string, _apiKey: string, _creds: unknown, slot?: number) => {
-        storedSlot = slot;
-      },
-    );
+    const store = mock(async (_apiUrl: string, _apiKey: string, _creds: unknown, slot?: number) => {
+      storedSlot = slot;
+    });
 
     await runCodexLogin([], {
       resolveConfig: async () => ({
@@ -209,11 +207,9 @@ describe("runCodexLogin", () => {
 
   it("auto-picks next free slot when --slot not provided", async () => {
     let storedSlot: number | undefined;
-    const store = mock(
-      async (_apiUrl: string, _apiKey: string, _creds: unknown, slot?: number) => {
-        storedSlot = slot;
-      },
-    );
+    const store = mock(async (_apiUrl: string, _apiKey: string, _creds: unknown, slot?: number) => {
+      storedSlot = slot;
+    });
 
     await runCodexLogin([], {
       resolveConfig: async () => ({

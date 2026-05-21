@@ -197,8 +197,7 @@ describe("loadCodexOAuth", () => {
   });
 
   it("returns null when no config found", async () => {
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ configs: [] }), { status: 200 });
+    globalThis.fetch = async () => new Response(JSON.stringify({ configs: [] }), { status: 200 });
 
     const result = await loadCodexOAuth(MOCK_API_URL, MOCK_API_KEY);
     expect(result).toBeNull();
@@ -244,8 +243,7 @@ describe("loadAllCodexOAuthSlots", () => {
   });
 
   it("returns empty array when no slots exist", async () => {
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ configs: [] }), { status: 200 });
+    globalThis.fetch = async () => new Response(JSON.stringify({ configs: [] }), { status: 200 });
 
     const result = await loadAllCodexOAuthSlots(MOCK_API_URL, MOCK_API_KEY);
     expect(result).toEqual([]);
@@ -452,8 +450,7 @@ describe("getValidCodexOAuth", () => {
   });
 
   it("returns null when no credentials stored", async () => {
-    globalThis.fetch = async () =>
-      new Response(JSON.stringify({ configs: [] }), { status: 200 });
+    globalThis.fetch = async () => new Response(JSON.stringify({ configs: [] }), { status: 200 });
 
     const result = await getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY);
     expect(result).toBeNull();
