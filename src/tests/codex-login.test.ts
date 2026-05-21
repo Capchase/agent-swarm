@@ -125,6 +125,30 @@ describe("resolveCodexLoginConfig", () => {
   });
 });
 
+describe("resolveCodexLoginConfig --slot", () => {
+  it("passes slot from --slot flag through", async () => {
+    const result = await resolveCodexLoginConfig(["--slot", "2"], {
+      env: {},
+      isInteractive: false,
+      promptText: mock(async () => ""),
+      promptSecret: mock(async () => ""),
+    });
+
+    expect(result.slot).toBe(2);
+  });
+
+  it("slot is undefined when --slot not provided", async () => {
+    const result = await resolveCodexLoginConfig([], {
+      env: {},
+      isInteractive: false,
+      promptText: mock(async () => ""),
+      promptSecret: mock(async () => ""),
+    });
+
+    expect(result.slot).toBeUndefined();
+  });
+});
+
 describe("runCodexLogin", () => {
   it("handles prompt cancellation cleanly before starting OAuth", async () => {
     const error = mock(() => {});
@@ -151,5 +175,127 @@ describe("runCodexLogin", () => {
     expect(exit).toHaveBeenCalledWith(1);
     expect(login).not.toHaveBeenCalled();
     expect(store).not.toHaveBeenCalled();
+  });
+
+  it("uses explicit --slot when provided", async () => {
+    let storedSlot: number | undefined;
+    const store = mock(
+      async (_apiUrl: string, _apiKey: string, _creds: unknown, slot?: number) => {
+        storedSlot = slot;
+      },
+    );
+
+    await runCodexLogin([], {
+      resolveConfig: async () => ({
+        apiUrl: "http://localhost:3013",
+        apiKey: "test-key",
+        slot: 3,
+      }),
+      login: mock(async () => ({
+        access: "at_test",
+        refresh: "rt_test",
+        expires: Date.now() + 3600000,
+        accountId: "acc-test",
+      })),
+      store,
+      loadAllSlots: mock(async () => []),
+      log: () => {},
+      error: () => {},
+      exit: () => {},
+    });
+
+    expect(storedSlot).toBe(3);
+  });
+
+  it("auto-picks next free slot when --slot not provided", async () => {
+    let storedSlot: number | undefined;
+    const store = mock(
+      async (_apiUrl: string, _apiKey: string, _creds: unknown, slot?: number) => {
+        storedSlot = slot;
+      },
+    );
+
+    await runCodexLogin([], {
+      resolveConfig: async () => ({
+        apiUrl: "http://localhost:3013",
+        apiKey: "test-key",
+        slot: undefined,
+      }),
+      login: mock(async () => ({
+        access: "at_test",
+        refresh: "rt_test",
+        expires: Date.now() + 3600000,
+        accountId: "acc-test",
+      })),
+      store,
+      // slots 0 and 1 already occupied — next free should be 2
+      loadAllSlots: mock(async () => [
+        { slot: 0, creds: { access: "", refresh: "", expires: 0, accountId: "" } },
+        { slot: 1, creds: { access: "", refresh: "", expires: 0, accountId: "" } },
+      ]),
+      log: () => {},
+      error: () => {},
+      exit: () => {},
+    });
+
+    expect(storedSlot).toBe(2);
+  });
+
+  it("rejects invalid slot (out of range)", async () => {
+    const error = mock(() => {});
+    const exit = mock(() => {});
+    const store = mock(async () => {});
+
+    await runCodexLogin([], {
+      resolveConfig: async () => ({
+        apiUrl: "http://localhost:3013",
+        apiKey: "test-key",
+        slot: 15,
+      }),
+      login: mock(async () => {
+        throw new Error("should not start oauth");
+      }),
+      store,
+      loadAllSlots: mock(async () => []),
+      log: () => {},
+      error,
+      exit,
+    });
+
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("--slot must be an integer between 0 and 9"),
+    );
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(store).not.toHaveBeenCalled();
+  });
+
+  it("errors when all slots are occupied", async () => {
+    const error = mock(() => {});
+    const exit = mock(() => {});
+
+    // All 10 slots occupied
+    const allSlots = Array.from({ length: 10 }, (_, i) => ({
+      slot: i,
+      creds: { access: "", refresh: "", expires: 0, accountId: "" },
+    }));
+
+    await runCodexLogin([], {
+      resolveConfig: async () => ({
+        apiUrl: "http://localhost:3013",
+        apiKey: "test-key",
+        slot: undefined,
+      }),
+      login: mock(async () => {
+        throw new Error("should not start oauth");
+      }),
+      store: mock(async () => {}),
+      loadAllSlots: mock(async () => allSlots),
+      log: () => {},
+      error,
+      exit,
+    });
+
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("All credential slots"));
+    expect(exit).toHaveBeenCalledWith(1);
   });
 });
