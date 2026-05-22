@@ -93,6 +93,13 @@ export const registerSendTaskTool = (server: McpServer) => {
             "Slack thread timestamp. Required with slackChannelId for thread-level updates.",
           ),
         slackUserId: z.string().optional().describe("Slack user ID of the original requester."),
+        requestedByUserId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            "ID of the human user who originally requested this task chain. When omitted, inherited from the caller's current task so the attribution flows through multi-hop delegation automatically.",
+          ),
       }),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),
@@ -118,6 +125,7 @@ export const registerSendTaskTool = (server: McpServer) => {
         slackChannelId,
         slackThreadTs,
         slackUserId,
+        requestedByUserId,
       },
       requestInfo,
       _meta,
@@ -158,6 +166,10 @@ export const registerSendTaskTool = (server: McpServer) => {
 
       // Auto-default parentTaskId to caller's current task for tree tracking
       const effectiveParentTaskId = parentTaskId ?? requestInfo.sourceTaskId;
+
+      // Inherit requestedByUserId from the caller's current task when not explicitly provided
+      const callerTask = requestInfo.sourceTaskId ? getTaskById(requestInfo.sourceTaskId) : null;
+      const effectiveRequestedByUserId = requestedByUserId ?? callerTask?.requestedByUserId ?? undefined;
 
       // Auto-route to parent's worker if parentTaskId is set and no explicit agentId
       let effectiveAgentId = agentId;
@@ -237,6 +249,7 @@ export const registerSendTaskTool = (server: McpServer) => {
             slackChannelId,
             slackThreadTs,
             slackUserId,
+            requestedByUserId: effectiveRequestedByUserId,
           });
 
           return {
@@ -288,6 +301,7 @@ export const registerSendTaskTool = (server: McpServer) => {
             slackChannelId,
             slackThreadTs,
             slackUserId,
+            requestedByUserId: effectiveRequestedByUserId,
           });
 
           return {
@@ -313,6 +327,7 @@ export const registerSendTaskTool = (server: McpServer) => {
           slackChannelId,
           slackThreadTs,
           slackUserId,
+          requestedByUserId: effectiveRequestedByUserId,
         });
 
         return {
