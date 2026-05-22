@@ -128,6 +128,10 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
   database.run("PRAGMA journal_mode = WAL;");
   database.run("PRAGMA busy_timeout = 5000;");
   database.run("PRAGMA foreign_keys = ON;");
+  database.run("PRAGMA synchronous = NORMAL;");
+  database.run("PRAGMA cache_size = -64000;");
+  database.run("PRAGMA mmap_size = 268435456;");
+  database.run("PRAGMA temp_store = MEMORY;");
 
   // Load sqlite-vec extension for vector search.
   // In compiled binaries (`bun build --compile`) the JS lives in /$bunfs/ and
@@ -1224,7 +1228,7 @@ export function markTaskSlackReplySent(taskId: string): void {
 export function getChildTasks(parentTaskId: string): AgentTask[] {
   return getDb()
     .prepare<AgentTaskRow, [string]>(
-      `SELECT * FROM agent_tasks WHERE parentTaskId = ? ORDER BY createdAt ASC`,
+      `SELECT * FROM agent_tasks WHERE parentTaskId = ? ORDER BY createdAt ASC, rowid ASC`,
     )
     .all(parentTaskId)
     .map(rowToAgentTask);
@@ -2000,7 +2004,7 @@ export function getPausedTasksForAgent(agentId: string): AgentTask[] {
     .prepare<AgentTaskRow, [string]>(
       `SELECT * FROM agent_tasks
        WHERE agentId = ? AND status = 'paused'
-       ORDER BY createdAt ASC`,
+       ORDER BY createdAt ASC, rowid ASC`,
     )
     .all(agentId);
   return rows.map(rowToAgentTask);
@@ -2629,7 +2633,7 @@ export function releaseStaleReviewingTasks(timeoutMinutes: number = 30): number 
 export function getOfferedTasksForAgent(agentId: string): AgentTask[] {
   return getDb()
     .prepare<AgentTaskRow, [string]>(
-      "SELECT * FROM agent_tasks WHERE offeredTo = ? AND status = 'offered' ORDER BY createdAt ASC",
+      "SELECT * FROM agent_tasks WHERE offeredTo = ? AND status = 'offered' ORDER BY createdAt ASC, rowid ASC",
     )
     .all(agentId)
     .map(rowToAgentTask);
@@ -2682,7 +2686,7 @@ export function getUnassignedTasksCount(): number {
 export function getUnassignedTaskIds(limit = 10): string[] {
   const rows = getDb()
     .prepare<{ id: string }, [number]>(
-      "SELECT id FROM agent_tasks WHERE status = 'unassigned' ORDER BY priority DESC, createdAt ASC LIMIT ?",
+      "SELECT id FROM agent_tasks WHERE status = 'unassigned' ORDER BY priority DESC, createdAt ASC, rowid ASC LIMIT ?",
     )
     .all(limit);
   return rows.map((r) => r.id);
