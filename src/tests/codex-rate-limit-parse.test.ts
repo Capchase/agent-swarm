@@ -151,9 +151,7 @@ describe("parseCodexRateLimitResetTime — invalid component rejection (CAI-1284
   });
 
   test("'Try again at 0:30 PM.' → undefined (hour 0 is not 1–12)", () => {
-    expect(
-      parseCodexRateLimitResetTime("usage limit. Try again at 0:30 PM.", now),
-    ).toBeUndefined();
+    expect(parseCodexRateLimitResetTime("usage limit. Try again at 0:30 PM.", now)).toBeUndefined();
   });
 
   test("'Try again at 12:60 PM.' → undefined (minute 60 out of range)", () => {

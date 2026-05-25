@@ -466,11 +466,11 @@ export async function handleSchedules(
         const mergedTimezone =
           parsed.body.timezone !== undefined ? parsed.body.timezone : existing.timezone;
         if (timing.mergedCron || timing.mergedInterval) {
-          // biome-ignore lint/suspicious/noExplicitAny: need partial ScheduledTask for calculateNextRun
           body.nextRunAt = calculateNextRun({
             cronExpression: timing.mergedCron,
             intervalMs: timing.mergedInterval,
             timezone: mergedTimezone,
+            // biome-ignore lint/suspicious/noExplicitAny: need partial ScheduledTask for calculateNextRun
           } as any);
         }
       }
