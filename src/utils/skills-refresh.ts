@@ -76,6 +76,7 @@ export async function refreshSkillsIfChanged(
   }
 
   // Step 3: filesystem sync (claude/pi/codex dirs)
+  let syncOk = false;
   try {
     const syncHeaders: Record<string, string> = {
       "Content-Type": "application/json",
@@ -98,6 +99,7 @@ export async function refreshSkillsIfChanged(
       if (syncResult.errors.length > 0) {
         console.warn(`[${role}] Skill sync errors: ${syncResult.errors.join(", ")}`);
       }
+      syncOk = true;
     } else {
       console.warn(`[${role}] Skill sync failed: HTTP ${syncRes.status}`);
     }
@@ -109,7 +111,12 @@ export async function refreshSkillsIfChanged(
     return { changed: false };
   }
 
-  if (newHash !== null) {
+  // Only cache the new hash once the FS sync has actually succeeded —
+  // otherwise a transient sync failure would leave the cached hash matching
+  // the current signature, causing later polls to short-circuit and the
+  // disk state to stay stale until an unrelated skill mutation. The next
+  // poll re-enters this code path (lastHashRef unchanged) and retries.
+  if (syncOk && newHash !== null) {
     lastHashRef.current = newHash;
   }
   return { changed: true, summary };

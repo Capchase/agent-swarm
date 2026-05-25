@@ -1,10 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb, createAgent, createSkill, initDb, installSkill } from "../be/db";
 import { syncSkillsToFilesystem } from "../be/skill-sync";
+
+const SWARM_MARKER = ".swarm-managed";
 
 const TEST_DB_PATH = `./test-skill-sync-${process.pid}.sqlite`;
 const FAKE_HOME = join(tmpdir(), `skill-sync-test-${process.pid}`);
@@ -123,9 +125,11 @@ describe("syncSkillsToFilesystem", () => {
     expect(existsSync(complexDir)).toBe(false);
   });
 
-  test("removes stale skill directories", () => {
+  test("removes stale swarm-managed skill directories", () => {
+    // Mark this stale dir as swarm-managed (mirrors what an earlier sync would have done)
     const staleDir = join(FAKE_HOME, ".claude", "skills", "old-removed-skill");
     mkdirSync(staleDir, { recursive: true });
+    writeFileSync(join(staleDir, SWARM_MARKER), "");
     expect(existsSync(staleDir)).toBe(true);
 
     const result = syncSkillsToFilesystem(agentId, "claude", FAKE_HOME);
@@ -134,15 +138,41 @@ describe("syncSkillsToFilesystem", () => {
     expect(existsSync(staleDir)).toBe(false);
   });
 
-  test("removes stale codex skill directories", () => {
+  test("removes stale swarm-managed codex skill directories", () => {
     const staleCodexDir = join(FAKE_HOME, ".codex", "skills", "old-codex-skill");
     mkdirSync(staleCodexDir, { recursive: true });
+    writeFileSync(join(staleCodexDir, SWARM_MARKER), "");
     expect(existsSync(staleCodexDir)).toBe(true);
 
     const result = syncSkillsToFilesystem(agentId, "codex", FAKE_HOME);
 
     expect(result.removed).toBeGreaterThanOrEqual(1);
     expect(existsSync(staleCodexDir)).toBe(false);
+  });
+
+  test("leaves foreign (unmarked) skill directories alone — local-dev safety", () => {
+    // Simulate a user-installed codex skill in their personal ~/.codex/skills
+    // that the swarm did NOT create. The cleanup pass MUST NOT remove it.
+    const foreignDir = join(FAKE_HOME, ".codex", "skills", "user-personal-skill");
+    mkdirSync(foreignDir, { recursive: true });
+    writeFileSync(join(foreignDir, "SKILL.md"), "user's own skill — keep me");
+    // No SWARM_MARKER file → not ours to manage.
+    expect(existsSync(foreignDir)).toBe(true);
+
+    syncSkillsToFilesystem(agentId, "codex", FAKE_HOME);
+
+    expect(existsSync(foreignDir)).toBe(true);
+    expect(readFileSync(join(foreignDir, "SKILL.md"), "utf-8")).toBe("user's own skill — keep me");
+  });
+
+  test("written skill directories carry the swarm-managed marker", () => {
+    // Clean up first
+    rmSync(join(FAKE_HOME, ".claude"), { recursive: true, force: true });
+
+    syncSkillsToFilesystem(agentId, "claude", FAKE_HOME);
+
+    const marker = join(FAKE_HOME, ".claude", "skills", "test-skill", SWARM_MARKER);
+    expect(existsSync(marker)).toBe(true);
   });
 
   test("defaults to 'all' when no harnessType provided", () => {

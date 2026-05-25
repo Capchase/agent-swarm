@@ -13,6 +13,7 @@ import { refreshSkillsIfChanged, type SkillsRefreshContext } from "../utils/skil
 type StubState = {
   signatureHash: string;
   signatureStatus: number;
+  syncStatus: number;
   skillsBody: {
     skills: { name: string; description: string; isActive: boolean; isEnabled: boolean }[];
     signature: string;
@@ -23,6 +24,7 @@ type StubState = {
 const state: StubState = {
   signatureHash: "hash-v1",
   signatureStatus: 200,
+  syncStatus: 200,
   skillsBody: {
     skills: [
       { name: "alpha", description: "first skill", isActive: true, isEnabled: true },
@@ -63,6 +65,9 @@ describe("refreshSkillsIfChanged", () => {
         }
         if (url.pathname === "/api/skills/sync-filesystem") {
           state.calls.sync++;
+          if (state.syncStatus !== 200) {
+            return new Response("sync err", { status: state.syncStatus });
+          }
           return Response.json({ synced: 2, removed: 0, errors: [] });
         }
         return new Response("not found", { status: 404 });
@@ -162,5 +167,34 @@ describe("refreshSkillsIfChanged", () => {
     expect(state.calls).toEqual({ signature: 1, list: 0, sync: 0 });
 
     state.signatureStatus = 200; // restore for any later tests
+  });
+
+  test("sync-filesystem failure leaves cached hash unchanged so the next poll retries", async () => {
+    // Server-side state: a new hash + skill set, sync endpoint failing.
+    state.signatureHash = "hash-v4";
+    state.skillsBody.signature = "hash-v4";
+    state.skillsBody.skills = [
+      { name: "alpha", description: "first", isActive: true, isEnabled: true },
+    ];
+    state.syncStatus = 503;
+    state.calls = { signature: 0, list: 0, sync: 0 };
+
+    const lastHash = { current: "hash-prev" };
+    const first = await refreshSkillsIfChanged(makeCtx(), lastHash);
+
+    // Summary still returns (the list call succeeded), but the cached
+    // hash must NOT advance — otherwise the next signature probe would
+    // short-circuit and the FS would stay stale forever.
+    expect(first.changed).toBe(true);
+    expect(first.summary).toEqual([{ name: "alpha", description: "first" }]);
+    expect(lastHash.current).toBe("hash-prev");
+    expect(state.calls).toEqual({ signature: 1, list: 1, sync: 1 });
+
+    // Sync recovers — next poll retries because cached hash still differs.
+    state.syncStatus = 200;
+    const second = await refreshSkillsIfChanged(makeCtx(), lastHash);
+    expect(second.changed).toBe(true);
+    expect(lastHash.current).toBe("hash-v4");
+    expect(state.calls).toEqual({ signature: 2, list: 2, sync: 2 });
   });
 });

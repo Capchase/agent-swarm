@@ -20,6 +20,16 @@ export interface SkillSyncResult {
 }
 
 /**
+ * Marker file written into every swarm-managed skill directory. Cleanup
+ * only ever removes directories that contain this marker, so unrelated
+ * personal skills the user installed via the harness's own tooling (e.g.
+ * `codex skills add ...` writing into `~/.codex/skills/<name>/`) are left
+ * untouched even when the API server shares a HOME with the worker (local
+ * dev). See `~/.codex/skills` blast-radius note in PR #555.
+ */
+const SWARM_MARKER_FILE = ".swarm-managed";
+
+/**
  * Sync agent's installed skills to the filesystem.
  *
  * For simple skills (content in DB): writes SKILL.md to ~/.claude/skills/<name>/
@@ -69,10 +79,12 @@ export function syncSkillsToFilesystem(
     for (const baseDir of skillDirs) {
       const skillDir = join(baseDir, safeName);
       const skillFile = join(skillDir, "SKILL.md");
+      const markerFile = join(skillDir, SWARM_MARKER_FILE);
 
       try {
         mkdirSync(skillDir, { recursive: true });
         writeFileSync(skillFile, skill.content, "utf-8");
+        writeFileSync(markerFile, "", "utf-8");
         synced++;
       } catch (err) {
         errors.push(
@@ -82,7 +94,10 @@ export function syncSkillsToFilesystem(
     }
   }
 
-  // Cleanup: remove skill directories that are no longer installed
+  // Cleanup: only remove directories WE previously created (marker file
+  // present). Leaves user-installed personal skills alone — important on
+  // local dev where ~/.codex/skills holds skills the user installed
+  // outside the swarm.
   let removed = 0;
   for (const baseDir of skillDirs) {
     if (!existsSync(baseDir)) continue;
@@ -90,14 +105,15 @@ export function syncSkillsToFilesystem(
     try {
       const existing = readdirSync(baseDir, { withFileTypes: true });
       for (const entry of existing) {
-        if (entry.isDirectory() && !writtenNames.has(entry.name)) {
-          const skillDir = join(baseDir, entry.name);
-          try {
-            rmSync(skillDir, { recursive: true, force: true });
-            removed++;
-          } catch {
-            // Non-fatal — skip cleanup errors
-          }
+        if (!entry.isDirectory()) continue;
+        if (writtenNames.has(entry.name)) continue;
+        const skillDir = join(baseDir, entry.name);
+        if (!existsSync(join(skillDir, SWARM_MARKER_FILE))) continue;
+        try {
+          rmSync(skillDir, { recursive: true, force: true });
+          removed++;
+        } catch {
+          // Non-fatal — skip cleanup errors
         }
       }
     } catch {
