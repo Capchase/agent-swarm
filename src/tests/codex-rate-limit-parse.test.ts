@@ -18,17 +18,26 @@ describe("parseCodexRateLimitResetTime — verbatim CAI-1284 fixture", () => {
     expect(result).toBe("2026-05-26T20:35:00.000Z");
   });
 
-  test("rolls to next day when 'now' equals the parsed wall-clock exactly", () => {
+  test("keeps same day when 'now' equals the parsed wall-clock exactly (clock-skew window)", () => {
     const now = new Date("2026-05-25T20:35:00Z");
     const result = parseCodexRateLimitResetTime(VERBATIM_ERROR_MESSAGE, now);
-    expect(result).toBe("2026-05-26T20:35:00.000Z");
+    // Within 2-min skew window → same day; clampRateLimitResetMs applies now+60s floor.
+    expect(result).toBe("2026-05-25T20:35:00.000Z");
+  });
+
+  test("clock-skew regression: 30s past 8:35 PM does NOT roll to tomorrow (CAI-1284)", () => {
+    // Worker receives the usage-limit event 30 seconds after the wall-clock reset time.
+    // Should stay same-day; clampRateLimitResetMs applies now+60s floor instead.
+    const now = new Date("2026-05-25T20:35:30Z");
+    const result = parseCodexRateLimitResetTime(VERBATIM_ERROR_MESSAGE, now);
+    expect(result).toBe("2026-05-25T20:35:00.000Z");
   });
 });
 
 describe("parseCodexRateLimitResetTime — same-day format variants", () => {
   test.each([
     // [time string, expected ISO, now ISO]
-    ["12:00 AM", "2026-05-26T00:00:00.000Z", "2026-05-25T00:00:00Z"], // midnight: past, rolls
+    ["12:00 AM", "2026-05-25T00:00:00.000Z", "2026-05-25T00:00:00Z"], // midnight == now: within skew, stays same day
     ["12:00 PM", "2026-05-25T12:00:00.000Z", "2026-05-25T00:00:00Z"], // noon: future
     ["1:00 PM", "2026-05-25T13:00:00.000Z", "2026-05-25T00:00:00Z"],
     ["11:59 PM", "2026-05-25T23:59:00.000Z", "2026-05-25T00:00:00Z"],

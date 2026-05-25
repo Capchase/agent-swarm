@@ -318,10 +318,11 @@ export function parseCodexRateLimitResetTime(
     const candidate = new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hours, minutes, 0),
     );
-    // Rollover: if the parsed wall-clock is at-or-before "now", assume tomorrow.
-    // Codex uses same-day format only when the reset is on the current calendar day,
-    // so a past time almost certainly means tomorrow (the next quota bucket).
-    if (candidate.getTime() <= now.getTime()) {
+    // Rollover: if the parsed wall-clock is more than SKEW_MS before "now", assume tomorrow.
+    // At-or-just-before-now candidates (clock skew, second truncation) stay same-day and
+    // flow to clampRateLimitResetMs which applies the now+60s floor.
+    const SKEW_MS = 2 * 60 * 1000;
+    if (candidate.getTime() < now.getTime() - SKEW_MS) {
       candidate.setUTCDate(candidate.getUTCDate() + 1);
     }
     return candidate.toISOString();
