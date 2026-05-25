@@ -172,9 +172,7 @@ describe("SessionErrorTracker — Codex usage-limit integration", () => {
   test("last call wins on multiple usage-limit events", () => {
     const tracker = new SessionErrorTracker();
     // First: a past-sounding time that would be clamped to now+60s
-    tracker.processCodexUsageLimitMessage(
-      "You've hit your usage limit. Try again at 1:00 AM.",
-    );
+    tracker.processCodexUsageLimitMessage("You've hit your usage limit. Try again at 1:00 AM.");
     const firstIso = tracker.getRateLimitResetAt();
     expect(firstIso).toBeDefined();
 

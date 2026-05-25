@@ -1619,10 +1619,11 @@ describe("CodexSession — rate-limit error preservation", () => {
       },
     };
 
-    (sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }).startThread =
-      function startThread(): unknown {
-        return fakeThread as unknown;
-      };
+    (
+      sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }
+    ).startThread = function startThread(): unknown {
+      return fakeThread as unknown;
+    };
 
     try {
       const adapter = new CodexAdapter();
