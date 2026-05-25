@@ -53,6 +53,63 @@ function makeFakeThread(events: ThreadEvent[]): {
 }
 
 /**
+ * Like `makeFakeThread` but throws the given error after all events have been
+ * yielded. Simulates the SDK's "Codex Exec exited with code 1: Reading prompt
+ * from stdin" throw that fires after the event stream closes.
+ */
+function makeFakeThreadWithThrow(
+  events: ThreadEvent[],
+  throwAfterStream: Error,
+): ReturnType<typeof makeFakeThread> {
+  return {
+    id: null,
+    async runStreamed(_input, _opts) {
+      async function* generate(): AsyncGenerator<ThreadEvent> {
+        for (const event of events) {
+          yield event;
+        }
+        throw throwAfterStream;
+      }
+      return { events: generate() };
+    },
+  };
+}
+
+/**
+ * Like `runSessionWithFakeThread` but injects a thread that throws after its
+ * event stream ends (simulating the SDK exit-code throw).
+ */
+async function runSessionWithThrowingThread(
+  events: ThreadEvent[],
+  throwAfterStream: Error,
+  config: ProviderSessionConfig,
+): Promise<{ emitted: ProviderEvent[]; result: ProviderResult }> {
+  const sdk = await import("@openai/codex-sdk");
+  const originalStartThread = (
+    sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }
+  ).startThread;
+
+  const fakeThread = makeFakeThreadWithThrow(events, throwAfterStream);
+  (sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }).startThread =
+    function startThread(): unknown {
+      return fakeThread as unknown;
+    };
+
+  try {
+    const adapter = new CodexAdapter();
+    const session = await adapter.createSession(config);
+    const emitted: ProviderEvent[] = [];
+    session.onEvent((e) => emitted.push(e));
+    const result = await session.waitForCompletion();
+    return { emitted, result };
+  } finally {
+    (
+      sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }
+    ).startThread = originalStartThread;
+  }
+}
+
+/**
  * Drive a CodexSession manually by constructing the private class via the
  * adapter's own factory path. We can't import the class directly because it
  * is not exported, so we use a runtime trick: import the module object and
@@ -1476,5 +1533,139 @@ describe("CodexSession session-end summarization", () => {
     );
     expect(matching.length).toBe(1);
     expect(matching[0]![1]).toBe(500);
+  });
+});
+
+describe("CodexSession — rate-limit error preservation", () => {
+  const tmpLogDir = `/tmp/codex-rate-limit-test-${Date.now()}`;
+  let prevSkipEnv: string | undefined;
+
+  beforeAll(() => {
+    mkdirSync(tmpLogDir, { recursive: true });
+    prevSkipEnv = process.env.SKIP_SESSION_SUMMARY;
+    process.env.SKIP_SESSION_SUMMARY = "1";
+  });
+
+  afterAll(() => {
+    rmSync(tmpLogDir, { recursive: true, force: true });
+    if (prevSkipEnv === undefined) delete process.env.SKIP_SESSION_SUMMARY;
+    else process.env.SKIP_SESSION_SUMMARY = prevSkipEnv;
+  });
+
+  afterEach(() => {
+    // Keep afterEach from the test runner clean
+  });
+
+  test("terminalError survives SDK post-stream throw and surfaces as [usage-limit] failureReason", async () => {
+    const usageLimitMsg =
+      "You've hit your usage limit. To get more access now, send a request to your admin or try again at 8:35 PM.";
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thread-ratelimit-1" },
+      { type: "turn.started" },
+      { type: "error", message: usageLimitMsg },
+      { type: "turn.failed", error: { message: usageLimitMsg } },
+    ];
+    const sdkThrow = new Error("Codex Exec exited with code 1: Reading prompt from stdin");
+
+    const { result } = await runSessionWithThrowingThread(
+      events,
+      sdkThrow,
+      testConfig({ logFile: join(tmpLogDir, "ratelimit-preserve.log"), cwd: "" }),
+    );
+
+    // Bug #1 fix: structured failureReason must survive the SDK throw
+    expect(result.failureReason).toMatch(/\[usage-limit\]/);
+    expect(result.failureReason).not.toContain("Reading prompt from stdin");
+    expect(result.isError).toBe(true);
+    // Parser must have extracted a reset time
+    expect(result.rateLimitResetAt).toBeDefined();
+    const resetMs = new Date(result.rateLimitResetAt!).getTime();
+    expect(resetMs).toBeGreaterThan(Date.now());
+  });
+
+  test("AbortError still settles as cancelled even when terminalError is absent (regression guard)", async () => {
+    // If the session is aborted before any error event, the AbortError path
+    // must still win over the terminalError preservation branch.
+    const sdk = await import("@openai/codex-sdk");
+    const originalStartThread = (
+      sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }
+    ).startThread;
+
+    const fakeThread = {
+      id: null,
+      runStreamed: async (_input: string, opts?: { signal?: AbortSignal }) => {
+        async function* generate(): AsyncGenerator<ThreadEvent> {
+          yield { type: "thread.started", thread_id: "thread-abort-guard" };
+          yield { type: "turn.started" };
+          await new Promise<void>((resolve) => {
+            const onAbort = () => {
+              opts?.signal?.removeEventListener("abort", onAbort);
+              resolve();
+            };
+            if (opts?.signal?.aborted) {
+              resolve();
+              return;
+            }
+            opts?.signal?.addEventListener("abort", onAbort);
+            setTimeout(resolve, 5000);
+          });
+          if (opts?.signal?.aborted) {
+            const err = new Error("aborted");
+            err.name = "AbortError";
+            throw err;
+          }
+        }
+        return { events: generate() };
+      },
+    };
+
+    (sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }).startThread =
+      function startThread(): unknown {
+        return fakeThread as unknown;
+      };
+
+    try {
+      const adapter = new CodexAdapter();
+      const config = testConfig({
+        logFile: join(tmpLogDir, "abort-guard.log"),
+        cwd: "",
+        taskId: "",
+        apiUrl: "",
+        apiKey: "",
+      });
+      const session = await adapter.createSession(config);
+      const emitted: ProviderEvent[] = [];
+      session.onEvent((e) => emitted.push(e));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await session.abort();
+      const result = await session.waitForCompletion();
+
+      expect(result.failureReason).toBe("cancelled");
+      expect(result.exitCode).toBe(130);
+    } finally {
+      (
+        sdk.Codex.prototype as unknown as { startThread: (...args: unknown[]) => unknown }
+      ).startThread = originalStartThread;
+    }
+  });
+
+  test("real unexpected exception (no terminalError) still falls through to outer catch", async () => {
+    // When the SDK throws before any error event, the outer catch must fire normally.
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thread-unexpected" },
+      { type: "turn.started" },
+    ];
+    const unexpectedErr = new Error("unexpected network failure");
+
+    const { result } = await runSessionWithThrowingThread(
+      events,
+      unexpectedErr,
+      testConfig({ logFile: join(tmpLogDir, "unexpected-err.log"), cwd: "" }),
+    );
+
+    // No terminalError → outer catch fires → failureReason is the raw exception message
+    expect(result.failureReason).toBe("unexpected network failure");
+    expect(result.isError).toBe(true);
+    expect(result.rateLimitResetAt).toBeUndefined();
   });
 });
