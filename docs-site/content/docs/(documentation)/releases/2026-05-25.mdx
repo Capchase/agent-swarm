@@ -1,0 +1,71 @@
+---
+title: "Release Notes — Week of May 19-25, 2026"
+description: "Five releases ship end-to-end OpenTelemetry tracing, pointer-based task attachments, a reusable scripts runtime, and promote humans to first-class users."
+---
+
+## Highlights
+
+Five releases (v1.80.0 → v1.83.0) in seven days turn agent-swarm production-grade. The hero this week is full-stack distributed tracing; the supporting cast is a new scripts runtime, pointer-based attachments, and a People page that finally treats humans like the users they are.
+
+### OpenTelemetry tracing across the stack
+
+Every task, MCP tool call, and Claude Code session is now a span in a single distributed trace. TRACEPARENT propagates from worker tasks into API calls, MCP tool spans, and the spawned Claude Code subprocess — so "where did this task spend its time?" is now answerable without sprinkling timers across the codebase.
+
+- API spans are named by Hono route template instead of the generic `http.server`, with proper nesting for child requests (`033890f7`, `12434583`).
+- HTTP semantic conventions (`http.route`, `http.method`, `http.status_code`) attached to every span (`55725280`).
+- MCP tool calls show up as named spans — no more anonymous tool entries (`75b720d4`).
+- Implicit-close on assistant-message boundaries prevents leaked open spans (`609cf6d6`).
+- Eight follow-up PRs (#488, #492, #496, #497, #516, #528, #531, #535) landed the polish in the same week.
+
+Drop a TRACEPARENT into any task and follow it end-to-end in SigNoz, Jaeger, or Tempo.
+
+### Pointer-based task attachments + agent-fs integration
+
+`store-progress` now accepts attachments as pointers (agent-fs path, URL, shared-fs path, or swarm Page) instead of inline blobs. Slack threads render them as live agent-fs URLs, the UI surfaces them in the task tree, and terminal tasks still accept attachments after they've completed.
+
+- Phase 1: pointer-based attachments on `store-progress` (`831ce2ed`).
+- Phase 2a: Slack tree-message render + live agent-fs URLs (`96342ddf`, `62a39c9e`).
+- Late attachments allowed on already-terminal tasks — useful for audit screenshots and follow-up logs (`67622114`).
+- Org/drive IDs auto-resolve from swarm config — no more boilerplate (`c8e634e2`).
+
+Attachments stop bloating task records. Store the pointer, render the URL, ship.
+
+### Reusable scripts runtime + 10 seeded global scripts
+
+A new scripts runtime foundation with a Zod-first `argsSchema` convention exposed as `argsJsonSchema`. 10 built-in scripts seed into the catalog on startup, so a fresh swarm ships with ready-made utilities out of the box.
+
+- Typed once, runnable from any agent or workflow node (`49626825`, `6d74b356`).
+- Typecheck relaxed to match runtime semantics — no more false positives on runtime globals (`9b81f912`).
+- 10 global scripts seeded at startup (`9d7e61a9`).
+
+### Humans as first-class users
+
+The People page is now a proper directory: humans live alongside agents, GitHub/Linear/AgentMail externalIds are exposed, and webhook-triggered tasks correctly inherit the requesting user.
+
+- `send-task` and `resolve-user` inherit `requestedByUserId` and expose `externalIds` (`5859616f`, `8b8eb862`).
+- Sessions list can filter by active user — no SQL required (`e988b093`).
+- GitHub webhook tasks (comment + review events) set `requestedByUserId` correctly (`90a01bec`).
+
+Every task now traces back to the human who triggered it.
+
+## Improvements
+
+- **Codex OAuth multi-credential pool** — Multiple Codex OAuth credentials can be pooled and rotated, removing single-credential rate-limit bottlenecks at scale (`7d22c44c`).
+- **API + DB performance pass** — List-endpoint payloads slimmed by default with a `?fields=full` opt-in; filter-aware pagination; `listRecentSessions` single-pass; `getLogsByTaskId` LIMIT clamp; `refetchInterval` bumped 5s → 10s; three new indexes on `agent_tasks` plus SQLite PRAGMAs from the Linear-fast-UI research (`9f3b63af`, `da94261b`, `d1e4a2fd`, `6e4928bf`).
+- **Resilient 5h cooldown on Claude rate-limit events** — Runner captures `rate_limit_event` and waits out the 5h cooldown instead of crash-looping (CAI-1279, `81d62260`).
+- **Bedrock authentication via AWS SDK** — `pi-mono` delegates Amazon Bedrock auth to the AWS SDK instead of hand-rolling credential resolution; bun-compile entry points correctly wired (`4773b8c2`, `09e293ea`).
+- **First-party Helm chart** — Self-hosted users get a Helm chart for Kubernetes deployments (`24d8a472`).
+- **tini as PID 1 in worker containers** — Workers run tini as PID 1 to reap orphaned grandchildren and avoid zombie accumulation in long-running containers (`9e71e1fe`).
+- **CI guard for DB migration numbering conflicts** — PRs with duplicate or out-of-order migration numbers fail CI instead of silently colliding at runtime (`4baca519`).
+- **AgentMail integration card requires `AGENTMAIL_API_KEY`** — The integrations UI now surfaces `AGENTMAIL_API_KEY` as a required field on the AgentMail card (`b82fef6e`).
+
+## Bug Fixes
+
+- **Docker entrypoint: split `CLAUDE_BINARY` into argv before PATH lookup** — Multi-word `CLAUDE_BINARY` values (e.g. `claude --foo bar`) are split into argv before the PATH lookup, fixing "command not found" on custom binaries (`2e9e67da`).
+- **Workflow webhook trigger honors `hmacHeader` + resolves `hmacSecret` refs** — Webhook triggers read the configured `hmacHeader` and resolve `hmacSecret` references through the swarm config instead of hardcoding `X-Signature` (`de8bcfde`).
+- **Workflow graph connects single-branch condition node edges** — Conditional nodes with only one branch wired up no longer leave dangling edges in the UI graph view (`b72c34d1`).
+- **Workflows redact resolved secrets from persisted step inputs** — Resolved secrets from refs like `${{ secrets.FOO }}` are redacted before being persisted to step inputs, closing a credential-leak vector in the audit log (`545e1ae6`).
+- **Linear: post `task.progress` as action activity** — `task.progress` updates post as Linear action activities with the required `actionId` parameter, fixing silent dropped updates (`9d553f22`).
+- **Scripts runtime: defensive `rawArgs` parsing + compiled-binary path resolution** — `eval-harness` parses `rawArgs` defensively and resolves the `/$bunfs/` path correctly in the compiled binary, fixing crashes in production builds (`58924378`, `1bea6708`, `14020277`).
+- **Workflows populate script executor output on timeout/spawn-error** — Script executor failures (timeout, spawn error) populate the step output so downstream nodes can branch on the failure instead of receiving null (`4def062e`).
+- **AgentMail events** — Event-handling fixes (`ed22cc4d`).
