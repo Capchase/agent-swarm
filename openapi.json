@@ -11394,6 +11394,25 @@
         }
       }
     },
+    "/api/integrations/kapso/webhook": {
+      "post": {
+        "summary": "Handle native Kapso/WhatsApp webhook events",
+        "tags": [
+          "Webhooks"
+        ],
+        "responses": {
+          "200": {
+            "description": "Event received"
+          },
+          "401": {
+            "description": "Invalid signature"
+          },
+          "503": {
+            "description": "Kapso integration not configured"
+          }
+        }
+      }
+    },
     "/api/workflow-runs/{runId}/events": {
       "post": {
         "summary": "Fire a run-scoped event signal",
