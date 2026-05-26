@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   isRateLimitMessage,
+  MAX_RATE_LIMIT_RESET_MS,
   parseStderrForErrors,
   SessionErrorTracker,
   trackErrorFromJson,
@@ -30,7 +31,7 @@ describe("SessionErrorTracker — rate_limit_event processing", () => {
     expect(result).toBeDefined();
 
     // resetsAt: 1779202200 sec → 2026-05-19T14:50:00.000Z
-    // But since we clamp to [now+60s, now+6h] and this is a past timestamp,
+    // But since we clamp to [now+60s, now+7d] and this is a past timestamp,
     // the value will be clamped to now+60s. What matters is the sec→ms conversion works.
     // We verify the unit is correct by checking that 1779202200 * 1000 = ms,
     // which is NOT the same as treating it as ms (would be 1970-01-21).
@@ -142,7 +143,7 @@ describe("SessionErrorTracker — rate_limit_event processing", () => {
     expect(result).toBeDefined();
     const parsedMs = new Date(result!).getTime();
     const nowMs = Date.now();
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const sevenDaysMs = MAX_RATE_LIMIT_RESET_MS;
     expect(parsedMs).toBeLessThanOrEqual(nowMs + sevenDaysMs + 1000); // within 7d (+1s tolerance)
   });
 
@@ -277,7 +278,7 @@ describe("three-tier resolver logic (unit test via clamp helper)", () => {
   function clampResetTime(isoString: string): string {
     const nowMs = Date.now();
     const minMs = nowMs + 60_000;
-    const maxMs = nowMs + 6 * 60 * 60 * 1000;
+    const maxMs = nowMs + MAX_RATE_LIMIT_RESET_MS;
     const candidateMs = new Date(isoString).getTime();
     return new Date(Math.min(Math.max(candidateMs, minMs), maxMs)).toISOString();
   }

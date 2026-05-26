@@ -2,7 +2,11 @@ import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { BROWSER_SDK_JS } from "../artifact-sdk/browser-sdk";
 import { getAvailablePort } from "../artifact-sdk/port";
-import { createArtifactServer } from "../artifact-sdk/server";
+import {
+  createArtifactServer,
+  createBunHonoFetchHandler,
+  createBunResponse,
+} from "../artifact-sdk/server";
 import { getBasePrompt } from "../prompts/base-prompt";
 
 // ─── Port allocation tests ──────────────────────────────────────────────
@@ -25,7 +29,7 @@ describe("getAvailablePort", () => {
     // Try to start a Bun server on the port — should succeed
     const server = Bun.serve({
       port,
-      fetch: () => new Response("ok"),
+      fetch: () => createBunResponse("ok"),
     });
     expect(server.port).toBe(port);
     server.stop();
@@ -172,7 +176,7 @@ describe("createArtifactServer", () => {
       });
       honoApp.route("/", app);
 
-      const server = Bun.serve({ port, fetch: honoApp.fetch });
+      const server = Bun.serve({ port, fetch: createBunHonoFetchHandler(honoApp) });
 
       try {
         // Test content serving
@@ -211,7 +215,7 @@ describe("createArtifactServer", () => {
       const app = new Hono();
       app.use("/*", serveStatic({ root: testDir }));
 
-      const server = Bun.serve({ port, fetch: app.fetch });
+      const server = Bun.serve({ port, fetch: createBunHonoFetchHandler(app) });
 
       try {
         const res = await fetch(`http://localhost:${port}/index.html`);
@@ -244,7 +248,7 @@ describe("createArtifactServer", () => {
         }
       });
 
-      const server = Bun.serve({ port, fetch: app.fetch });
+      const server = Bun.serve({ port, fetch: createBunHonoFetchHandler(app) });
 
       try {
         const res = await fetch(`http://localhost:${port}/@swarm/api/agents`);
@@ -272,7 +276,7 @@ describe("createArtifactServer", () => {
         });
       });
 
-      const server = Bun.serve({ port, fetch: app.fetch });
+      const server = Bun.serve({ port, fetch: createBunHonoFetchHandler(app) });
 
       try {
         const res = await fetch(`http://localhost:${port}/@swarm/api/tasks`, {
@@ -303,7 +307,7 @@ describe("createArtifactServer", () => {
           for (const [key, value] of req.headers.entries()) {
             capturedHeaders[key.toLowerCase()] = value;
           }
-          return new Response(JSON.stringify({ success: true }), {
+          return createBunResponse(JSON.stringify({ success: true }), {
             headers: { "Content-Type": "application/json" },
           });
         },
@@ -336,7 +340,7 @@ describe("createArtifactServer", () => {
         }
       });
 
-      const proxy = Bun.serve({ port: proxyPort, fetch: app.fetch });
+      const proxy = Bun.serve({ port: proxyPort, fetch: createBunHonoFetchHandler(app) });
 
       try {
         // Test GET request headers
@@ -369,7 +373,7 @@ describe("createArtifactServer", () => {
       const mockMcp = Bun.serve({
         port: mockMcpPort,
         fetch: () =>
-          new Response(JSON.stringify({ ok: true }), {
+          createBunResponse(JSON.stringify({ ok: true }), {
             headers: { "Content-Type": "application/json" },
           }),
       });
@@ -393,7 +397,7 @@ describe("createArtifactServer", () => {
         }
       });
 
-      const proxy = Bun.serve({ port: proxyPort, fetch: app.fetch });
+      const proxy = Bun.serve({ port: proxyPort, fetch: createBunHonoFetchHandler(app) });
 
       try {
         const res = await fetch(`http://localhost:${proxyPort}/@swarm/api/agents`);
@@ -415,7 +419,7 @@ describe("createArtifactServer", () => {
         port: mockMcpPort,
         fetch: (req) => {
           capturedPath = new URL(req.url).pathname;
-          return new Response(JSON.stringify({ ok: true }));
+          return createBunResponse(JSON.stringify({ ok: true }));
         },
       });
 
@@ -431,7 +435,7 @@ describe("createArtifactServer", () => {
         }
       });
 
-      const proxy = Bun.serve({ port: proxyPort, fetch: app.fetch });
+      const proxy = Bun.serve({ port: proxyPort, fetch: createBunHonoFetchHandler(app) });
 
       try {
         await fetch(`http://localhost:${proxyPort}/@swarm/api/tasks/123/progress`);
@@ -535,7 +539,7 @@ describe("artifact CLI command", () => {
         fetch: (req) => {
           const url = new URL(req.url);
           if (url.pathname === "/api/services") {
-            return new Response(
+            return createBunResponse(
               JSON.stringify({
                 services: [
                   {
@@ -561,7 +565,7 @@ describe("artifact CLI command", () => {
               }),
             );
           }
-          return new Response("Not found", { status: 404 });
+          return createBunResponse("Not found", { status: 404 });
         },
       });
 
@@ -595,7 +599,7 @@ describe("artifact CLI command", () => {
       const mockPort = await getAvailablePort();
       const mockServer = Bun.serve({
         port: mockPort,
-        fetch: () => new Response(JSON.stringify({ services: [] })),
+        fetch: () => createBunResponse(JSON.stringify({ services: [] })),
       });
 
       const origEnv = { ...process.env };
@@ -627,7 +631,7 @@ describe("artifact CLI command", () => {
       const mockServer = Bun.serve({
         port: mockPort,
         fetch: () =>
-          new Response(
+          createBunResponse(
             JSON.stringify({
               services: [
                 {
@@ -685,7 +689,7 @@ describe("artifact CLI command", () => {
         fetch: (req) => {
           const url = new URL(req.url);
           if (req.method === "GET" && url.pathname === "/api/services") {
-            return new Response(
+            return createBunResponse(
               JSON.stringify({
                 services: [
                   {
@@ -699,9 +703,9 @@ describe("artifact CLI command", () => {
           }
           if (req.method === "DELETE" && url.pathname.startsWith("/api/services/")) {
             deletedServiceId = url.pathname.split("/").pop() || "";
-            return new Response(JSON.stringify({ success: true }));
+            return createBunResponse(JSON.stringify({ success: true }));
           }
-          return new Response("Not found", { status: 404 });
+          return createBunResponse("Not found", { status: 404 });
         },
       });
 

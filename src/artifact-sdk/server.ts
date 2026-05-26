@@ -22,6 +22,28 @@ export interface ArtifactServer {
   tunnel: ReturnType<typeof createTunnel> extends Promise<infer T> ? T | null : never;
 }
 
+const NativeResponse = globalThis.Response;
+
+type NativeResponseArgs = ConstructorParameters<typeof Response>;
+
+export function createBunResponse(
+  body?: NativeResponseArgs[0],
+  init?: NativeResponseArgs[1],
+): Response {
+  return new NativeResponse(body, init);
+}
+
+export function createBunHonoFetchHandler(app: Hono): (req: Request) => Promise<Response> {
+  return async (req: Request) => {
+    const response = await app.fetch(req);
+    return createBunResponse(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
+}
+
 export function createArtifactServer(opts: ArtifactServerOptions): ArtifactServer {
   const agentId = process.env.AGENT_ID || "unknown";
   const apiKey = getApiKey();
@@ -100,7 +122,7 @@ export function createArtifactServer(opts: ArtifactServerOptions): ArtifactServe
 
     async start() {
       actualPort = opts.port || (await getAvailablePort());
-      server = Bun.serve({ port: actualPort, fetch: app.fetch });
+      server = Bun.serve({ port: actualPort, fetch: createBunHonoFetchHandler(app) });
       artifact.port = actualPort;
 
       const subdomain = opts.subdomain || `${agentId}-${opts.name}`;

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { parseCodexRateLimitResetTime, SessionErrorTracker } from "../utils/error-tracker";
+import {
+  MAX_RATE_LIMIT_RESET_MS,
+  parseCodexRateLimitResetTime,
+  SessionErrorTracker,
+} from "../utils/error-tracker";
 
 // Verbatim from Linear CAI-1284 issue body (Team/Business plan fixture)
 const VERBATIM_ERROR_MESSAGE =
@@ -195,9 +199,9 @@ describe("SessionErrorTracker — Codex usage-limit integration", () => {
     expect(iso).toBeDefined();
     const ms = new Date(iso!).getTime();
     const nowMs = Date.now();
-    // Clamped to [now+60s, now+6h]
+    // Bounded to [now+60s, now+7d]. The same-day wall-clock fixture may be >6h away.
     expect(ms).toBeGreaterThanOrEqual(nowMs + 59_000);
-    expect(ms).toBeLessThanOrEqual(nowMs + 6 * 60 * 60 * 1000 + 1000);
+    expect(ms).toBeLessThanOrEqual(nowMs + MAX_RATE_LIMIT_RESET_MS + 1000);
   });
 
   test("non-usage-limit error does not stash", () => {
