@@ -503,8 +503,8 @@ Upload a file (image, document, etc.) to a Slack channel or thread. Use inboxMes
 | `taskId` | `uuid` | No | - | The task ID with Slack context (for task-related threads). |
 | `channelId` | `string` | No | - | Direct channel ID to upload to (requires lead privileges). |
 | `threadTs` | `string` | No | - | Thread timestamp to upload as a thread reply (used with channelId). |
-| `filePath` | `string` | No | - | Path to the file to upload. Either filePath OR content must be provided. Relative paths are resolved from /workspace (e.g., 'shared/file.png' -> '/workspace/shared/file.png'). Absolute paths work if they exist or if the file exists under /workspace with that path (e.g., '/tmp/file.png' checks '/tmp/file.png' then '/workspace/tmp/file.png'). |
-| `content` | `string` | No | - | Base64-encoded file content. Use this when the file is not on the local filesystem. Either filePath OR content must be provided. |
+| `filePath` | `string` | No | - | Path to the file to upload. Either filePath OR content must be provided. IMPORTANT: the file is read on the API server's filesystem (where this tool runs), NOT on the caller's. Worker/lead containers do NOT share /tmp or /workspace/personal/ with the API server — the only shared volume is /workspace/shared/. Use /workspace/shared/<agent-id>/file.png (or a relative path like 'shared/<agent-id>/file.png'). For files that only live on the caller (e.g. /tmp), pass them inline via `content` (base64) instead. |
+| `content` | `string` | No | - | Base64-encoded file content. Use this when the file lives on the caller's filesystem and isn't reachable by the API server (e.g. anything under /tmp on a worker/lead container). Either filePath OR content must be provided. |
 | `filename` | `string` | No | - | Name to give the file in Slack. Required when using content, defaults to original filename when using filePath. |
 | `initialComment` | `string` | No | - | Optional message to post with the file. |
 
@@ -742,8 +742,8 @@ Update an existing scheduled task. Only the creator or lead agent can update sch
 | `name` | `string` | No | - | Schedule name to update (alternative to ID) |
 | `newName` | `string` | No | - | New name for the schedule |
 | `taskTemplate` | `string` | No | - | New task template |
-| `cronExpression` | `string` | No | - | New cron expression |
-| `intervalMs` | `number` | No | - | New interval in milliseconds |
+| `cronExpression` | `string` | No | - | New cron expression (null to clear) |
+| `intervalMs` | `number` | No | - | New interval in milliseconds (null to clear) |
 | `description` | `string` | No | - | New description |
 | `taskType` | `string` | No | - | New task type |
 | `tags` | `array` | No | - | New tags |
