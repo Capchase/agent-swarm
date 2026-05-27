@@ -229,6 +229,117 @@ describe("Heartbeat Triage", () => {
       expect(updated?.failureReason).toContain("no active session");
     });
 
+    test("OOM path: creates retry child for orphaned task with no session", async () => {
+      const agent = createAgent({ name: "oom-worker", isLead: false, status: "busy" });
+      const task = createTaskExtended("Important task", { agentId: agent.id, priority: 80 });
+      startTask(task.id);
+
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [oldTime, task.id]);
+
+      await codeLevelTriage();
+
+      // Parent must be failed
+      const updated = getTaskById(task.id);
+      expect(updated?.status).toBe("failed");
+      expect(updated?.failureReason).toContain("no active session");
+
+      // Retry child must exist with correct tags and parentTaskId
+      const child = getDb()
+        .query<{ id: string; tags: string; parentTaskId: string; status: string }, [string]>(
+          "SELECT id, tags, parentTaskId, status FROM agent_tasks WHERE parentTaskId = ?",
+        )
+        .get(task.id);
+      expect(child).not.toBeNull();
+      expect(child!.parentTaskId).toBe(task.id);
+      // Status may be unassigned or pending (auto-assign runs in same sweep)
+      expect(child!.status).not.toBe("failed");
+      expect(child!.status).not.toBe("completed");
+      const childTags = JSON.parse(child!.tags) as string[];
+      expect(childTags).toContain("oom-retry");
+      expect(childTags).toContain("auto-generated");
+    });
+
+    test("OOM retry cap: task tagged oom-retry hard-fails without creating child", async () => {
+      const agent = createAgent({ name: "oom-worker-2", isLead: false, status: "busy" });
+      const task = createTaskExtended("Retry task", {
+        agentId: agent.id,
+        tags: ["oom-retry", "auto-generated"],
+      });
+      startTask(task.id);
+
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [oldTime, task.id]);
+
+      await codeLevelTriage();
+
+      // Must hard-fail with cap reason
+      const updated = getTaskById(task.id);
+      expect(updated?.status).toBe("failed");
+      expect(updated?.failureReason).toContain("OOM retry cap reached");
+
+      // No child must be created
+      const children = getDb()
+        .query("SELECT id FROM agent_tasks WHERE parentTaskId = ?")
+        .all(task.id);
+      expect(children.length).toBe(0);
+    });
+
+    test("OOM retry dedup: skips child creation when non-terminal child already exists", async () => {
+      const agent = createAgent({ name: "oom-worker-3", isLead: false, status: "busy" });
+      const task = createTaskExtended("Important task 2", { agentId: agent.id });
+      startTask(task.id);
+
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [oldTime, task.id]);
+
+      // Pre-existing child (e.g. from runRebootSweep)
+      createTaskExtended("Existing retry", { parentTaskId: task.id });
+
+      await codeLevelTriage();
+
+      // Parent is still failed (clean up)
+      const updated = getTaskById(task.id);
+      expect(updated?.status).toBe("failed");
+
+      // Only the one pre-existing child — no duplicate
+      const children = getDb()
+        .query("SELECT id FROM agent_tasks WHERE parentTaskId = ?")
+        .all(task.id);
+      expect(children.length).toBe(1);
+    });
+
+    test("OOM path: multiple orphaned tasks for same agent all get retry children", async () => {
+      const agent = createAgent({ name: "oom-worker-multi", isLead: false, status: "busy" });
+      const task1 = createTaskExtended("Task A", { agentId: agent.id });
+      const task2 = createTaskExtended("Task B", { agentId: agent.id });
+      startTask(task1.id);
+      startTask(task2.id);
+
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id IN (?, ?)", [
+        oldTime,
+        task1.id,
+        task2.id,
+      ]);
+
+      await codeLevelTriage();
+
+      // Both parents failed
+      expect(getTaskById(task1.id)?.status).toBe("failed");
+      expect(getTaskById(task2.id)?.status).toBe("failed");
+
+      // Each gets its own retry child
+      const children1 = getDb()
+        .query("SELECT id FROM agent_tasks WHERE parentTaskId = ?")
+        .all(task1.id);
+      const children2 = getDb()
+        .query("SELECT id FROM agent_tasks WHERE parentTaskId = ?")
+        .all(task2.id);
+      expect(children1.length).toBe(1);
+      expect(children2.length).toBe(1);
+    });
+
     test("auto-fails stalled task with stale session heartbeat", async () => {
       const agent = createAgent({ name: "crashed-worker", isLead: false, status: "busy" });
       const task = createTaskExtended("Stalled task", { agentId: agent.id });
