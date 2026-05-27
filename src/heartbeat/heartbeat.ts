@@ -213,10 +213,7 @@ function detectAndRemediateStalledTasks(findings: HeartbeatFindings): void {
                   `[Heartbeat] OOM retry created: ${retryTask.id} (parent: ${task.id.slice(0, 8)})`,
                 );
               } catch (err) {
-                console.error(
-                  `[Heartbeat] Failed to create OOM retry task for ${task.id}:`,
-                  err,
-                );
+                console.error(`[Heartbeat] Failed to create OOM retry task for ${task.id}:`, err);
               }
             }
           }
