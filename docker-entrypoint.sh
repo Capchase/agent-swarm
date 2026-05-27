@@ -376,7 +376,14 @@ if [ -n "$AGENT_ID" ]; then
             #   - HARNESS_PROVIDER: live-reconciled by runner.ts poll loop;
             #     baking it would also defeat the precedence invariant
             #     (swarm_config > env > "claude")
-            jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER") | "\(.key)=" + (.value | @sh)' /tmp/swarm_config.json > /tmp/swarm_config.env 2>/dev/null || true
+            # Warn about keys that can't be exported as env vars (non-POSIX identifiers).
+            # These are still kept in swarm_config (e.g. MCP header names like
+            # CF-Access-Client-Id resolved via headerConfigKeys at request time).
+            SKIPPED_KEYS=$(jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER") | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not) | .key' /tmp/swarm_config.json 2>/dev/null || true)
+            if [ -n "$SKIPPED_KEYS" ]; then
+                echo "[debug] skipping non-identifier config keys (not valid POSIX shell variable names): $(echo "$SKIPPED_KEYS" | tr '\n' ' ')" >&2
+            fi
+            jq -r '.configs[] | select(.key != "codex_oauth" and .key != "HARNESS_PROVIDER") | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) | "\(.key)=" + (.value | @sh)' /tmp/swarm_config.json > /tmp/swarm_config.env 2>/dev/null || true
             if [ -f /tmp/swarm_config.env ]; then
                 set -a
                 . /tmp/swarm_config.env
