@@ -173,14 +173,53 @@ function detectAndRemediateStalledTasks(findings: HeartbeatFindings): void {
     const taskAgeMs = Date.now() - new Date(task.lastUpdatedAt).getTime();
 
     if (!session) {
-      // Case A: No active session — worker is dead
+      // Case A: No active session — worker is dead (likely OOMKilled or pod restart)
       if (taskAgeMs >= STALL_THRESHOLD_NO_SESSION_MIN * 60 * 1000) {
-        const reason =
-          "Auto-failed by heartbeat: worker session not found (no active session for task)";
+        const skipRetryTypes = ["heartbeat-checklist", "boot-triage", "heartbeat"];
+        const isSystemTask = skipRetryTypes.includes(task.taskType ?? "");
+        const isOomRetry = task.tags.includes("oom-retry");
+
+        const reason = isOomRetry
+          ? "Auto-failed by heartbeat: no active session (OOM retry cap reached after 1 attempt)"
+          : "Auto-failed by heartbeat: worker session not found (no active session for task)";
+
         const failed = failTask(task.id, reason);
         if (failed) {
           findings.autoFailedTasks.push({ taskId: task.id, agentId: task.agentId, reason });
           console.log(`[Heartbeat] Auto-failed task ${task.id.slice(0, 8)} — no active session`);
+
+          // Auto-retry: queue a replacement task (mirrors runRebootSweep logic).
+          // Skip for system tasks and tasks that are already a retry (cap = 1).
+          if (!isSystemTask && !isOomRetry) {
+            const existingRetry = getDb()
+              .prepare<{ id: string }, [string]>(
+                `SELECT id FROM agent_tasks
+                 WHERE parentTaskId = ?
+                   AND status NOT IN ('completed', 'failed', 'cancelled')
+                 LIMIT 1`,
+              )
+              .get(task.id);
+
+            if (!existingRetry) {
+              try {
+                const retryTask = createTaskExtended(task.task, {
+                  parentTaskId: task.id,
+                  tags: ["oom-retry", "auto-generated"],
+                  priority: task.priority,
+                  source: task.source,
+                  taskType: task.taskType ?? undefined,
+                });
+                console.log(
+                  `[Heartbeat] OOM retry created: ${retryTask.id} (parent: ${task.id.slice(0, 8)})`,
+                );
+              } catch (err) {
+                console.error(
+                  `[Heartbeat] Failed to create OOM retry task for ${task.id}:`,
+                  err,
+                );
+              }
+            }
+          }
 
           // Fix agent status if no other active tasks
           const remaining = getActiveTaskCount(task.agentId);
