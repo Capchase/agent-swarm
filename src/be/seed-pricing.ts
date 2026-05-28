@@ -1,7 +1,7 @@
 /**
  * Phase 2 of the cost-tracking plan — seed the `pricing` table at server boot.
  *
- * The vendored models.dev snapshot at `ui/src/lib/modelsdev-cache.json` is the
+ * The vendored models.dev snapshot at `src/be/modelsdev-cache.json` is the
  * single source of truth for per-token rates. We project it into rows keyed by
  * `(provider, model, token_class)` so the recompute path in
  * `src/http/session-data.ts` can rebuild USD from tokens regardless of which
@@ -17,29 +17,14 @@
  * admin route (`POST /api/pricing`) — we don't overwrite seed rows.
  */
 
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import type { PricingProvider, PricingTokenClass } from "../types";
 import { getDb } from "./db";
+import {
+  loadModelsDevCache,
+  type ModelsDevCache,
+  type ModelsDevCostBlock,
+} from "./modelsdev-cache";
 import { normalizeModelKey } from "./pricing-normalize";
-
-interface ModelsDevCostBlock {
-  input?: number;
-  output?: number;
-  cache_read?: number;
-  cache_write?: number;
-}
-
-interface ModelsDevModel {
-  id?: string;
-  cost?: ModelsDevCostBlock;
-}
-
-interface ModelsDevProvider {
-  models?: Record<string, ModelsDevModel>;
-}
-
-type ModelsDevCache = Record<string, ModelsDevProvider>;
 
 /**
  * Per-harness manual rates that models.dev doesn't carry. Keep the source URL
@@ -86,28 +71,6 @@ const ANTHROPIC_SHORTNAME_TO_MODELSDEV: Record<string, string> = {
   sonnet: "claude-sonnet-4-6",
   haiku: "claude-haiku-4-5",
 };
-
-/**
- * Resolve the path to the vendored models.dev cache. The UI copy is canonical.
- * We treat this as best-effort: if the file is missing (developer ran the
- * server without `ui/` checked out), we log and continue with manual rates
- * only — better than crashing the boot.
- */
-function loadModelsDevCache(): ModelsDevCache | null {
-  const candidates = [
-    path.join(process.cwd(), "ui", "src", "lib", "modelsdev-cache.json"),
-    path.join(process.cwd(), "..", "ui", "src", "lib", "modelsdev-cache.json"),
-  ];
-  for (const cand of candidates) {
-    try {
-      const raw = readFileSync(cand, "utf-8");
-      return JSON.parse(raw) as ModelsDevCache;
-    } catch {
-      // try next candidate
-    }
-  }
-  return null;
-}
 
 interface PricingSeedRow {
   provider: PricingProvider;
