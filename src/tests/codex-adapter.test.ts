@@ -96,7 +96,7 @@ async function runSessionWithThrowingThread(
     };
 
   try {
-    const adapter = new CodexAdapter();
+    const adapter = new CodexAdapter({ bypassSubprocess: true });
     const session = await adapter.createSession(config);
     const emitted: ProviderEvent[] = [];
     session.onEvent((e) => emitted.push(e));
@@ -175,7 +175,7 @@ async function runSessionWithFakeThread(
   };
 
   try {
-    const adapter = new CodexAdapter();
+    const adapter = new CodexAdapter({ bypassSubprocess: true });
     const session = await adapter.createSession(config);
 
     const emitted: ProviderEvent[] = [];
@@ -575,7 +575,7 @@ describe("CodexSession event mapping", () => {
     };
 
     try {
-      const adapter = new CodexAdapter();
+      const adapter = new CodexAdapter({ bypassSubprocess: true });
       const config = testConfig({
         logFile: join(tmpLogDir, "abort.log"),
         cwd: "",
@@ -612,7 +612,7 @@ describe("CodexSession event mapping", () => {
 
 describe("CodexAdapter.canResume", () => {
   test("returns false for empty / non-string session ids", async () => {
-    const adapter = new CodexAdapter();
+    const adapter = new CodexAdapter({ bypassSubprocess: true });
     expect(await adapter.canResume("")).toBe(false);
     // @ts-expect-error: deliberate runtime check for non-string input
     expect(await adapter.canResume(undefined)).toBe(false);
@@ -631,7 +631,7 @@ describe("CodexAdapter.canResume", () => {
       ).resumeThread = function resumeThread(): unknown {
         return { id: "thread-resumed" };
       };
-      const adapter = new CodexAdapter();
+      const adapter = new CodexAdapter({ bypassSubprocess: true });
       expect(await adapter.canResume("thread-resumed")).toBe(true);
 
       // Failure path
@@ -1149,7 +1149,7 @@ async function runSessionWithFakeThreadAndDeps(
     };
 
   try {
-    const adapter = new CodexAdapter({ summarizeDeps });
+    const adapter = new CodexAdapter({ summarizeDeps, bypassSubprocess: true });
     const session = await adapter.createSession(config);
     const emitted: ProviderEvent[] = [];
     session.onEvent((e) => emitted.push(e));
@@ -1639,7 +1639,7 @@ describe("CodexSession — rate-limit error preservation", () => {
     };
 
     try {
-      const adapter = new CodexAdapter();
+      const adapter = new CodexAdapter({ bypassSubprocess: true });
       const config = testConfig({
         logFile: join(tmpLogDir, "abort-guard.log"),
         cwd: "",
