@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { closeDb, createAgent, createUser, getKv, getTaskById, initDb } from "../be/db";
@@ -11,6 +11,7 @@ const TEST_DB_PATH = "./test-kapso-inbound.sqlite";
 const HMAC_SECRET = "kapso-test-hmac-secret";
 
 let agentId: string;
+const originalFetch = globalThis.fetch;
 
 function makePayload(opts: {
   phoneNumberId: string;
@@ -77,13 +78,21 @@ beforeAll(() => {
   }
   initDb(TEST_DB_PATH);
   process.env.KAPSO_WEBHOOK_HMAC_SECRET = HMAC_SECRET;
+  process.env.KAPSO_API_KEY = "kapso-test-api-key";
+  process.env.KAPSO_API_BASE_URL = "https://kapso.test";
   const agent = createAgent({ name: "KapsoWorker", isLead: false, status: "idle" });
   agentId = agent.id;
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
 });
 
 afterAll(() => {
   closeDb();
   delete process.env.KAPSO_WEBHOOK_HMAC_SECRET;
+  delete process.env.KAPSO_API_KEY;
+  delete process.env.KAPSO_API_BASE_URL;
   for (const suffix of ["", "-wal", "-shm"]) {
     try {
       require("node:fs").unlinkSync(`${TEST_DB_PATH}${suffix}`);
@@ -205,12 +214,18 @@ describe("routeKapsoInbound", () => {
 });
 
 describe("handleWebhooks — Kapso HMAC gate", () => {
-  test("valid HMAC + mapping hit → 200 and task routing", async () => {
+  test("valid HMAC + mapping hit → auto-acknowledges inbound, then 200 and task routing", async () => {
     putKapsoNumberMapping({
       phoneNumberId: "pn-http",
       agentId,
       createdAt: new Date().toISOString(),
     });
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (url: string, init: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init.body as string) });
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch;
+
     const rawBody = JSON.stringify(
       makePayload({ phoneNumberId: "pn-http", messageId: "wamid.HTTP_OK" }),
     );
@@ -221,9 +236,52 @@ describe("handleWebhooks — Kapso HMAC gate", () => {
     expect(handled).toBe(true);
     expect(captured.status).toBe(200);
     expect(JSON.parse(captured.body)).toMatchObject({ received: true, routing: "task" });
+    expect(calls).toHaveLength(2);
+    expect(
+      calls.every((call) => call.url === "https://kapso.test/meta/whatsapp/v24.0/pn-http/messages"),
+    ).toBe(true);
+    expect(calls.map((call) => call.body)).toContainEqual({
+      messaging_product: "whatsapp",
+      status: "read",
+      message_id: "wamid.HTTP_OK",
+      typing_indicator: { type: "text" },
+    });
+    expect(calls.map((call) => call.body)).toContainEqual({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: "34679077777",
+      type: "reaction",
+      reaction: { message_id: "wamid.HTTP_OK", emoji: "👀" },
+    });
+  });
+
+  test("Kapso acknowledgement failures do not block webhook success", async () => {
+    putKapsoNumberMapping({
+      phoneNumberId: "pn-http-ack-fail",
+      agentId,
+      createdAt: new Date().toISOString(),
+    });
+    globalThis.fetch = (async () => {
+      throw new Error("kapso unavailable");
+    }) as typeof fetch;
+
+    const rawBody = JSON.stringify(
+      makePayload({ phoneNumberId: "pn-http-ack-fail", messageId: "wamid.HTTP_ACK_FAIL" }),
+    );
+    const { req, res, captured } = fakeReqRes(rawBody, {
+      "x-webhook-signature": sign(HMAC_SECRET, rawBody),
+    });
+    const handled = await handleWebhooks(req, res, KAPSO_PATH);
+
+    expect(handled).toBe(true);
+    expect(captured.status).toBe(200);
+    expect(JSON.parse(captured.body)).toMatchObject({ received: true, routing: "task" });
   });
 
   test("valid HMAC + no mapping → 200 no_mapping (fallback, does not break)", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ success: true }), { status: 200 })) as typeof fetch;
+
     const rawBody = JSON.stringify(
       makePayload({ phoneNumberId: "pn-http-unmapped", messageId: "wamid.HTTP_NOMAP" }),
     );
