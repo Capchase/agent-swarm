@@ -83,11 +83,18 @@ Score 0..1.`;
 type ClaudeCliEnvelope = { result?: unknown };
 
 function buildPrompt(input: LlmRaterInput): string {
-  return PROMPT_TEMPLATE.replace("${query}", input.query)
-    .replace("${memoryId}", input.memory.id)
-    .replace("${memoryName}", input.memory.name)
-    .replace("${memoryContent}", input.memory.content)
-    .replace("${response}", input.response);
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional string placeholders for .replace()
+  return (
+    PROMPT_TEMPLATE.replace("${query}", input.query)
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional string placeholders for .replace()
+      .replace("${memoryId}", input.memory.id)
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional string placeholders for .replace()
+      .replace("${memoryName}", input.memory.name)
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional string placeholders for .replace()
+      .replace("${memoryContent}", input.memory.content)
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional string placeholders for .replace()
+      .replace("${response}", input.response)
+  );
 }
 
 function parseScoreAndReasoning(raw: unknown): LlmRaterResult | null {
