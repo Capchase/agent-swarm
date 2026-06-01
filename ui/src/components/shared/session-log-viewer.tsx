@@ -1,5 +1,16 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, Brain, Check, ChevronRight, Copy, Scissors, Search } from "lucide-react";
+import {
+  Activity,
+  ArrowDown,
+  Brain,
+  Check,
+  ChevronRight,
+  Copy,
+  Gauge,
+  Scissors,
+  Search,
+  Wrench,
+} from "lucide-react";
 import { Highlight, themes } from "prism-react-renderer";
 import {
   type CSSProperties,
@@ -19,439 +30,11 @@ import "streamdown/styles.css";
 import type { ContextSnapshot, SessionLog } from "@/api/types";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { JsonTree } from "@/components/workflows/json-tree";
 import { useTheme } from "@/hooks/use-theme";
 import { formatTokens } from "@/lib/format-tokens";
 import { cn, normalizeNewlines } from "@/lib/utils";
-
-// --- Parsed message types ---
-
-interface TextBlock {
-  type: "text";
-  text: string;
-}
-
-interface ToolUseBlock {
-  type: "tool_use";
-  id: string;
-  name: string;
-  input: unknown;
-}
-
-interface ToolResultBlock {
-  type: "tool_result";
-  tool_use_id: string;
-  content: string;
-  isError?: boolean;
-}
-
-interface ThinkingBlock {
-  type: "thinking";
-  thinking: string;
-}
-
-interface ProviderMetaBlock {
-  type: "provider_meta";
-  kind: "status" | "structured_output";
-  provider: string;
-  data: Record<string, unknown>;
-}
-
-type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | ProviderMetaBlock;
-
-interface ParsedMessage {
-  id: string;
-  role: "user" | "assistant" | "system";
-  content: ContentBlock[];
-  model?: string;
-  iteration: number;
-  timestamp: string;
-}
-
-// --- Parsing ---
-
-/** Flatten an Anthropic tool_result `content` (string | array of blocks) to text. */
-function resultBlockText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((c) => {
-        if (typeof c === "string") return c;
-        if (c && typeof c === "object") {
-          if (c.type === "text") return String(c.text ?? "");
-          if (c.type === "image") return "[image]";
-        }
-        return JSON.stringify(c);
-      })
-      .join("\n");
-  }
-  if (content == null) return "";
-  return JSON.stringify(content);
-}
-
-/**
- * Parse a codex SDK event row into a ParsedMessage. Codex uses a different
- * event shape than Claude — each row is one of:
- *   - { type: "thread.started", thread_id }                 → skip (no content)
- *   - { type: "turn.started" } / "turn.completed" / "turn.failed" → skip
- *   - { type: "item.started"|"item.completed"|"item.updated", item: {...} }
- *
- * Items further branch on `item.type`: "agent_message" → assistant text,
- * "command_execution" → tool_use(bash), "mcp_tool_call" → tool_use(<tool>),
- * "reasoning" → thinking block, "file_change"/"web_search"/"todo_list" →
- * tool_use with the SDK item type as the name.
- *
- * We only emit on the *completed* item (skip started/updated to avoid
- * duplicates) so the dashboard sees one ParsedMessage per logical event.
- */
-function parseCodexLog(log: SessionLog): ParsedMessage | null {
-  let evt: {
-    type?: string;
-    item?: {
-      id?: string;
-      type?: string;
-      text?: string;
-      command?: string | string[];
-      aggregated_output?: string;
-      exit_code?: number | null;
-      server?: string;
-      tool?: string;
-      arguments?: unknown;
-      result?: unknown;
-      summary?: string;
-      items?: unknown;
-    };
-  } | null = null;
-  try {
-    evt = JSON.parse(log.content);
-  } catch {
-    return null;
-  }
-
-  // Only render `item.completed` events to avoid duplicates from item.started/updated.
-  if (evt?.type !== "item.completed" || !evt.item) return null;
-
-  const item = evt.item;
-  const blocks: ContentBlock[] = [];
-  const role: "assistant" | "user" | "system" = "assistant";
-
-  switch (item.type) {
-    case "agent_message": {
-      if (item.text) blocks.push({ type: "text", text: item.text });
-      break;
-    }
-    case "reasoning": {
-      const text = item.text ?? item.summary ?? "";
-      if (text) blocks.push({ type: "thinking", thinking: text });
-      break;
-    }
-    case "command_execution": {
-      const cmdStr = Array.isArray(item.command) ? item.command.join(" ") : (item.command ?? "");
-      blocks.push({
-        type: "tool_use",
-        id: item.id ?? "",
-        name: "bash",
-        input: { command: cmdStr },
-      });
-      if (item.aggregated_output) {
-        blocks.push({
-          type: "tool_result",
-          tool_use_id: item.id ?? "",
-          content: item.aggregated_output,
-          isError: typeof item.exit_code === "number" && item.exit_code !== 0,
-        });
-      }
-      break;
-    }
-    case "mcp_tool_call": {
-      blocks.push({
-        type: "tool_use",
-        id: item.id ?? "",
-        name: `${item.server ?? "mcp"}.${item.tool ?? "unknown"}`,
-        input: item.arguments,
-      });
-      if (item.result !== undefined) {
-        const text = typeof item.result === "string" ? item.result : JSON.stringify(item.result);
-        blocks.push({
-          type: "tool_result",
-          tool_use_id: item.id ?? "",
-          content: text,
-        });
-      }
-      break;
-    }
-    case "file_change":
-    case "web_search":
-    case "todo_list": {
-      blocks.push({
-        type: "tool_use",
-        id: item.id ?? "",
-        name: item.type,
-        input: item,
-      });
-      break;
-    }
-    default:
-      return null;
-  }
-
-  if (blocks.length === 0) return null;
-
-  return {
-    id: log.id,
-    role,
-    content: blocks,
-    iteration: log.iteration,
-    timestamp: log.createdAt,
-  };
-}
-
-/**
- * Parse a single opencode event row into a ParsedMessage.
- *
- * opencode's protocol streams the same logical message many times: a text part
- * grows delta-by-delta via `message.part.updated`, a tool call cycles through
- * pending → running → completed. To avoid 50 "partial" frames per message we
- * dedupe in the caller via `latestByPart` and only render when the log row
- * we're handed IS the latest entry for that part.id.
- *
- * Events we render:
- *   - message.part.updated (text)        → assistant/user text
- *   - message.part.updated (reasoning)   → thinking
- *   - message.part.updated (tool, completed) → tool_use [+ tool_result if output]
- *   - session.error                      → system error message
- * Everything else (deltas, heartbeats, status, file watcher) returns null.
- */
-function parseOpencodeLog(
-  log: SessionLog,
-  latestByPart: Map<string, SessionLog>,
-): ParsedMessage | null {
-  let evt: {
-    type?: string;
-    properties?: {
-      sessionID?: string;
-      part?: {
-        id?: string;
-        type?: string;
-        text?: string;
-        messageID?: string;
-        tool?: string;
-        callID?: string;
-        state?: {
-          status?: string;
-          input?: unknown;
-          output?: string;
-        };
-      };
-      info?: {
-        role?: string;
-        time?: { created?: number };
-      };
-      error?: { name?: string; data?: { message?: string } };
-    };
-  } | null = null;
-  try {
-    evt = JSON.parse(log.content);
-  } catch {
-    return null;
-  }
-
-  if (evt?.type === "session.error") {
-    const msg =
-      evt.properties?.error?.data?.message ?? evt.properties?.error?.name ?? "session error";
-    return {
-      id: log.id,
-      role: "system",
-      content: [{ type: "text", text: `opencode error: ${msg}` }],
-      iteration: log.iteration,
-      timestamp: log.createdAt,
-    };
-  }
-
-  if (evt?.type !== "message.part.updated") return null;
-  const part = evt.properties?.part;
-  if (!part?.id) return null;
-
-  // Dedup: only render when this row is the latest update for the part.
-  if (latestByPart.get(part.id)?.id !== log.id) return null;
-
-  const blocks: ContentBlock[] = [];
-
-  switch (part.type) {
-    case "text": {
-      if (part.text) blocks.push({ type: "text", text: part.text });
-      break;
-    }
-    case "reasoning": {
-      if (part.text) blocks.push({ type: "thinking", thinking: part.text });
-      break;
-    }
-    case "tool": {
-      if (part.state?.status !== "completed") return null;
-      blocks.push({
-        type: "tool_use",
-        id: part.callID ?? part.id,
-        name: part.tool ?? "tool",
-        input: part.state.input,
-      });
-      if (part.state.output !== undefined) {
-        const text =
-          typeof part.state.output === "string"
-            ? part.state.output
-            : JSON.stringify(part.state.output);
-        blocks.push({
-          type: "tool_result",
-          tool_use_id: part.callID ?? part.id,
-          content: text,
-        });
-      }
-      break;
-    }
-    default:
-      return null;
-  }
-
-  if (blocks.length === 0) return null;
-
-  // Best-effort role inference: text and tool parts are assistant-emitted unless
-  // we explicitly know the message was the user prompt.
-  return {
-    id: log.id,
-    role: "assistant",
-    content: blocks,
-    iteration: log.iteration,
-    timestamp: log.createdAt,
-  };
-}
-
-function parseSessionLogs(logs: SessionLog[]): ParsedMessage[] {
-  // Sort chronologically: by timestamp first, then lineNumber as tiebreaker
-  // lineNumber represents parallel messages within the same turn (e.g. parallel tool calls)
-  const sorted = [...logs].sort((a, b) => {
-    const timeA = new Date(a.createdAt).getTime();
-    const timeB = new Date(b.createdAt).getTime();
-    if (timeA !== timeB) return timeA - timeB;
-    return a.lineNumber - b.lineNumber;
-  });
-
-  // opencode emits one event per part-update during streaming; collapse to the
-  // last update per partId before rendering so we don't show intermediate frames.
-  const opencodeLatestByPart = new Map<string, SessionLog>();
-  for (const log of sorted) {
-    if (log.cli !== "opencode") continue;
-    let evt: { type?: string; properties?: { part?: { id?: string } } } | null = null;
-    try {
-      evt = JSON.parse(log.content);
-    } catch {
-      continue;
-    }
-    if (evt?.type !== "message.part.updated") continue;
-    const partId = evt.properties?.part?.id;
-    if (partId) opencodeLatestByPart.set(partId, log);
-  }
-
-  const messages: ParsedMessage[] = [];
-
-  for (const log of sorted) {
-    if (log.cli === "codex") {
-      const codexMsg = parseCodexLog(log);
-      if (codexMsg) messages.push(codexMsg);
-      continue;
-    }
-
-    if (log.cli === "opencode") {
-      const ocMsg = parseOpencodeLog(log, opencodeLatestByPart);
-      if (ocMsg) messages.push(ocMsg);
-      continue;
-    }
-
-    let parsed: {
-      type?: string;
-      message?: { role?: string; content?: unknown; model?: string; id?: string };
-      provider_meta?: { provider: string; kind: string; [key: string]: unknown };
-    } | null = null;
-    try {
-      parsed = JSON.parse(log.content);
-    } catch {
-      // Non-JSON line — treat as system/raw text
-      messages.push({
-        id: log.id,
-        role: "system",
-        content: [{ type: "text", text: log.content }],
-        iteration: log.iteration,
-        timestamp: log.createdAt,
-      });
-      continue;
-    }
-
-    // Provider meta events (status transitions, structured output)
-    if (parsed?.provider_meta) {
-      const { kind, provider, ...data } = parsed.provider_meta;
-      messages.push({
-        id: log.id,
-        role: "system",
-        content: [
-          {
-            type: "provider_meta",
-            kind: kind as "status" | "structured_output",
-            provider,
-            data,
-          },
-        ],
-        iteration: log.iteration,
-        timestamp: log.createdAt,
-      });
-      continue;
-    }
-
-    if (!parsed?.message?.content) continue;
-
-    const rawContent = parsed.message.content;
-    const blocks: ContentBlock[] = [];
-
-    if (typeof rawContent === "string") {
-      blocks.push({ type: "text", text: rawContent });
-    } else if (Array.isArray(rawContent)) {
-      for (const block of rawContent) {
-        if (!block || typeof block !== "object") continue;
-        if (block.type === "text" && block.text) {
-          blocks.push({ type: "text", text: block.text });
-        } else if (block.type === "thinking" && block.thinking) {
-          blocks.push({ type: "thinking", thinking: block.thinking });
-        } else if (block.type === "tool_use") {
-          blocks.push({
-            type: "tool_use",
-            id: block.id ?? "",
-            name: block.name ?? "unknown",
-            input: block.input,
-          });
-        } else if (block.type === "tool_result") {
-          blocks.push({
-            type: "tool_result",
-            tool_use_id: block.tool_use_id ?? "",
-            content: resultBlockText(block.content),
-            isError: block.is_error === true,
-          });
-        }
-      }
-    }
-
-    if (blocks.length === 0) continue;
-
-    const role =
-      parsed.type === "assistant" || parsed.message.role === "assistant" ? "assistant" : "user";
-
-    messages.push({
-      id: log.id,
-      role,
-      content: blocks,
-      model: parsed.message.model,
-      iteration: log.iteration,
-      timestamp: log.createdAt,
-    });
-  }
-
-  return messages;
-}
+import { type ParsedMessage, type ProviderMetaBlock, parseSessionLogs } from "@/logs-parser";
 
 // --- Stream model ---
 
@@ -585,7 +168,20 @@ function classifyTool(
       detail: shortDetail(inp),
     };
   }
-  if (name === "Bash") {
+  if (name.includes(".") && !name.startsWith(".") && !name.endsWith(".")) {
+    const [server, ...toolParts] = name.split(".");
+    const tool = toolParts.join(".");
+    if (server && tool) {
+      return {
+        kind: "mcp",
+        name: tool,
+        server,
+        title: `${server}.${tool}`,
+        detail: shortDetail(inp),
+      };
+    }
+  }
+  if (name.toLowerCase() === "bash") {
     return {
       kind: "bash",
       name: "bash",
@@ -685,16 +281,233 @@ function tidyMarkdown(text: string): string {
     .join("");
 }
 
+type MetaRow = Extract<StreamRow, { type: "meta" }>;
+
+interface HookRun {
+  hookId: string;
+  hookName?: string;
+  events: Record<string, unknown>[];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return isPlainObject(value) ? value : undefined;
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function shortId(value: string | undefined): string {
+  if (!value) return "unknown";
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
+function formatCompactNumber(value: number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: value < 10 ? 2 : 1 }).format(
+    value,
+  );
+}
+
+function formatUsd(value: number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === 0) return "$0";
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: value < 0.01 ? 4 : 2,
+    maximumFractionDigits: value < 0.01 ? 6 : 4,
+  }).format(value);
+}
+
+function formatMaybeTokens(value: number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return formatTokens(value);
+}
+
+function formatPercent(value: number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return `${value.toFixed(value < 10 ? 1 : 0)}%`;
+}
+
+function formatResetAt(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return fmtFull(new Date(parsed).toISOString());
+    return value;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  const ms = value < 10_000_000_000 ? value * 1000 : value;
+  return fmtFull(new Date(ms).toISOString());
+}
+
+function isHookMetaBlock(block: ProviderMetaBlock): boolean {
+  return block.kind === "internal" && block.data.internalType === "hook";
+}
+
+function hookEventName(data: Record<string, unknown>): string {
+  return stringValue(data.hook_event) ?? "Hook";
+}
+
+function hookRunId(data: Record<string, unknown>): string {
+  return stringValue(data.hook_id) ?? "unknown";
+}
+
+function isThinkingTokensBlock(block: ProviderMetaBlock): boolean {
+  return block.kind === "helper" && block.data.helperType === "thinking_tokens";
+}
+
+function appendProviderMetaRow(rows: StreamRow[], row: MetaRow) {
+  if (isThinkingTokensBlock(row.block)) {
+    appendThinkingTokenRow(rows, row);
+    return;
+  }
+
+  if (!isHookMetaBlock(row.block)) {
+    rows.push(row);
+    return;
+  }
+
+  const hookEvent = hookEventName(row.block.data);
+  const last = rows[rows.length - 1];
+  if (
+    last?.type === "meta" &&
+    last.block.kind === "internal" &&
+    last.block.data.internalType === "hook_group" &&
+    last.block.data.hookEvent === hookEvent
+  ) {
+    appendHookEvent(last.block.data, row.block.data);
+    return;
+  }
+
+  rows.push({
+    ...row,
+    block: {
+      ...row.block,
+      data: {
+        internalType: "hook_group",
+        hookEvent,
+        hooks: [createHookRun(row.block.data)],
+      },
+    },
+  });
+}
+
+function createHookRun(data: Record<string, unknown>): HookRun {
+  return {
+    hookId: hookRunId(data),
+    hookName: stringValue(data.hook_name),
+    events: [data],
+  };
+}
+
+function appendHookEvent(groupData: Record<string, unknown>, data: Record<string, unknown>) {
+  const hooks = Array.isArray(groupData.hooks) ? (groupData.hooks as HookRun[]) : [];
+  const hookId = hookRunId(data);
+  let hook = hooks.find((candidate) => candidate.hookId === hookId);
+  if (!hook) {
+    hook = createHookRun(data);
+    hooks.push(hook);
+  } else {
+    hook.events.push(data);
+    hook.hookName = hook.hookName ?? stringValue(data.hook_name);
+  }
+  groupData.hooks = hooks;
+}
+
+function appendThinkingTokenRow(rows: StreamRow[], row: MetaRow) {
+  const last = rows[rows.length - 1];
+  if (
+    last?.type === "meta" &&
+    last.block.kind === "helper" &&
+    last.block.data.helperType === "thinking_token_group"
+  ) {
+    appendThinkingTokenEvent(last.block.data, row.block.data, row.iso);
+    return;
+  }
+
+  rows.push({
+    ...row,
+    block: {
+      ...row.block,
+      data: {
+        helperType: "thinking_token_group",
+        provider: row.block.provider,
+        firstIso: row.iso,
+        lastIso: row.iso,
+        estimatedTokens: numberValue(row.block.data.estimated_tokens),
+        estimatedDelta: numberValue(row.block.data.estimated_tokens_delta),
+        events: [row.block.data],
+        active: false,
+      },
+    },
+  });
+}
+
+function appendThinkingTokenEvent(
+  groupData: Record<string, unknown>,
+  data: Record<string, unknown>,
+  iso: string,
+) {
+  const events = Array.isArray(groupData.events)
+    ? (groupData.events as Record<string, unknown>[])
+    : [];
+  events.push(data);
+  groupData.events = events;
+  groupData.lastIso = iso;
+
+  const estimated = numberValue(data.estimated_tokens);
+  if (estimated !== undefined) groupData.estimatedTokens = estimated;
+  const delta = numberValue(data.estimated_tokens_delta);
+  if (delta !== undefined) {
+    groupData.estimatedDelta = numberValue(groupData.estimatedDelta) ?? 0;
+    groupData.estimatedDelta = (groupData.estimatedDelta as number) + delta;
+  }
+}
+
+function markLiveThinkingGroup(rows: StreamRow[], isRunning?: boolean) {
+  const last = rows[rows.length - 1];
+  if (
+    last?.type === "meta" &&
+    last.block.kind === "helper" &&
+    last.block.data.helperType === "thinking_token_group"
+  ) {
+    last.block.data.active = isRunning === true;
+  }
+}
+
 function buildStream(
   messages: ParsedMessage[],
   snapshots: ContextSnapshot[],
   newIds: Set<string>,
+  isRunning?: boolean,
 ): StreamRow[] {
   // Index every tool_result by the id of the call it answers (+ its timestamp).
   const resultById = new Map<string, { content: string; isError: boolean; at: number }>();
+  const callIds = new Set<string>();
   for (const m of messages) {
     const at = new Date(m.timestamp).getTime();
     for (const b of m.content) {
+      if (b.type === "tool_use" && b.id) {
+        callIds.add(b.id);
+      }
       if (b.type === "tool_result" && b.tool_use_id) {
         resultById.set(b.tool_use_id, { content: b.content, isError: b.isError === true, at });
       }
@@ -732,7 +545,37 @@ function buildStream(
     const time = fmtClock(m.timestamp);
     m.content.forEach((b, i) => {
       const blockId = `${m.id}-${i}`;
-      if (b.type === "tool_result") return; // folded into its tool_use group
+      if (b.type === "tool_result") {
+        if (!b.tool_use_id || callIds.has(b.tool_use_id)) return; // folded into its tool_use group
+        closeGroup();
+        rows.push({
+          type: "toolgroup",
+          id: `orphan-${blockId}:${b.tool_use_id}`,
+          time,
+          iso: m.timestamp,
+          tools: [
+            {
+              id: `${blockId}:${b.tool_use_id}`,
+              kind: "other",
+              name: "tool_result",
+              server: "",
+              title: "tool result",
+              detail: b.tool_use_id,
+              input: "",
+              preview: previewOf(b.content),
+              body: b.content,
+              ok: b.isError !== true,
+              hasResult: true,
+              durMs: 0,
+            },
+          ],
+          names: ["tool result"],
+          durMs: 0,
+          defaultOpen: true,
+          isNew: newIds.has(m.id),
+        });
+        return;
+      }
 
       if (b.type === "tool_use") {
         const c = classifyTool(b.name, b.input);
@@ -801,11 +644,19 @@ function buildStream(
           isNew,
         });
       } else if (b.type === "provider_meta") {
-        rows.push({ type: "meta", id: blockId, time, iso: m.timestamp, block: b, isNew });
+        appendProviderMetaRow(rows, {
+          type: "meta",
+          id: blockId,
+          time,
+          iso: m.timestamp,
+          block: b,
+          isNew,
+        });
       }
     });
   }
   closeGroup();
+  markLiveThinkingGroup(rows, isRunning);
 
   // The trailing tool group (if the stream ends on one) stays open by default —
   // this is committed here, not derived from a moving "last index", so a group
@@ -848,10 +699,49 @@ function outlineLabel(row: StreamRow): string {
     case "thinking":
       return `Thinking · ${truncate(row.text.replace(/\s+/g, " ").trim(), 60)}`;
     case "meta":
-      return `${row.block.provider} ${row.block.kind === "status" ? "status" : "result"}`;
+      return metaOutlineLabel(row.block);
     case "compaction":
       return "Compaction";
   }
+}
+
+function metaOutlineLabel(block: ProviderMetaBlock): string {
+  if (block.kind === "status") return "Status";
+  if (block.kind === "result") {
+    const data = block.data;
+    const cost = recordValue(data.cost);
+    const status =
+      data.subtype ?? (data.isError === true || data.is_error === true ? "error" : "ok");
+    const model = stringValue(cost?.model) ?? stringValue(data.model);
+    return `Result · ${status}${model ? ` · ${model}` : ""}`;
+  }
+  if (block.kind === "helper") {
+    if (block.data.helperType === "thinking_tokens") {
+      return `Thinking tokens · ${formatMaybeTokens(numberValue(block.data.estimated_tokens)) ?? "helper"}`;
+    }
+    if (block.data.helperType === "thinking_token_group") {
+      return `Thinking · ${formatMaybeTokens(numberValue(block.data.estimatedTokens)) ?? "tokens"}`;
+    }
+    if (block.data.helperType === "context_usage") {
+      return `Context · ${formatPercent(numberValue(block.data.contextPercent)) ?? "usage"}`;
+    }
+    if (block.data.helperType === "turn_usage") return "Turn usage";
+    return "Helper";
+  }
+  if (block.kind === "internal") {
+    if (block.data.internalType === "rate_limit") {
+      const info = recordValue(block.data.rate_limit_info) ?? block.data;
+      return `Rate limit · ${stringValue(info.status) ?? "event"}`;
+    }
+    if (block.data.internalType === "hook_group") {
+      const hooks = Array.isArray(block.data.hooks) ? block.data.hooks : [];
+      return `Hooks · ${String(block.data.hookEvent ?? "Hook")} · ${hooks.length}`;
+    }
+    return stringValue(block.data.type) ?? "Runtime";
+  }
+  if (block.kind === "lifecycle") return stringValue(block.data.type) ?? "Lifecycle";
+  const raw = recordValue(block.data.raw);
+  return stringValue(raw?.type) ?? block.kind.replaceAll("_", " ");
 }
 
 type TickTone = "agent" | "tool" | "user" | "muted";
@@ -1050,12 +940,21 @@ const PROVIDER_STATUS_STYLES: Record<string, { label: string; bg: string; text: 
   },
   completed: { label: "Completed", bg: "bg-status-success/15", text: "text-status-success-strong" },
   done: { label: "Done", bg: "bg-status-success/15", text: "text-status-success-strong" },
+  success: { label: "Success", bg: "bg-status-success/15", text: "text-status-success-strong" },
+  allowed: { label: "Allowed", bg: "bg-status-success/15", text: "text-status-success-strong" },
+  allowed_warning: {
+    label: "Allowed Warning",
+    bg: "bg-status-warning/15",
+    text: "text-status-warning-strong",
+  },
+  rejected: { label: "Rejected", bg: "bg-status-error/15", text: "text-status-error-strong" },
   needs_input: {
     label: "Needs Input",
     bg: "bg-status-active/15",
     text: "text-status-active-strong",
   },
   error: { label: "Error", bg: "bg-status-error/15", text: "text-status-error-strong" },
+  failed: { label: "Failed", bg: "bg-status-error/15", text: "text-status-error-strong" },
 };
 
 function ProviderStatusPill({ value }: { value: string }) {
@@ -1078,43 +977,591 @@ function ProviderStatusPill({ value }: { value: string }) {
 }
 
 function ProviderMetaBubble({ block }: { block: ProviderMetaBlock }) {
-  const label = block.provider.charAt(0).toUpperCase() + block.provider.slice(1);
+  if (block.kind === "status") return <ProviderStatusMeta block={block} />;
+  if (block.kind === "helper") return <HelperMetaBubble block={block} />;
+  if (block.kind === "internal") return <InternalMetaBubble block={block} />;
+  if (block.kind === "result") return <ResultMetaBubble block={block} />;
+  if (block.kind === "file_change") return <FileChangeMeta block={block} />;
+  if (block.kind !== "structured_output") return <GenericMetaBubble block={block} />;
 
-  if (block.kind === "status") {
-    const status = String(block.data.status ?? "");
-    const detail = block.data.statusDetail ? String(block.data.statusDetail) : undefined;
-    const acus = block.data.acusConsumed as number | undefined;
-    return (
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-          {label}
-        </span>
-        <ProviderStatusPill value={detail ?? status} />
-        {acus !== undefined && acus > 0 && (
-          <span className="text-[10px] text-muted-foreground">{acus.toFixed(2)} ACUs</span>
-        )}
-      </div>
-    );
-  }
+  return <ProviderStructuredOutputMeta block={block} />;
+}
 
-  const taskStatus = block.data.taskStatus ? String(block.data.taskStatus) : undefined;
-  const output = block.data.output ? String(block.data.output) : undefined;
-  const summary = block.data.summary ? String(block.data.summary) : undefined;
+function ProviderStatusMeta({ block }: { block: ProviderMetaBlock }) {
+  const status = stringValue(block.data.status) ?? "status";
+  const detail = stringValue(block.data.statusDetail);
+  const acus = numberValue(block.data.acusConsumed);
   return (
-    <div className="space-y-1.5 rounded-md border border-border/60 bg-surface px-3 py-2">
-      <div className="flex items-center gap-2">
-        <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-          {label} Result
-        </span>
-        {taskStatus && <ProviderStatusPill value={taskStatus} />}
-      </div>
-      {summary && <p className="text-xs text-muted-foreground">{summary}</p>}
+    <LowKeyMetaLine
+      icon={<Activity className="size-3" />}
+      title="status"
+      detail={detail && detail !== status ? detail : undefined}
+      raw={block.data}
+      stats={
+        <>
+          <ProviderStatusPill value={detail ?? status} />
+          <LowKeyStat
+            label="ACUs"
+            value={acus !== undefined && acus > 0 ? acus.toFixed(2) : undefined}
+          />
+        </>
+      }
+    />
+  );
+}
+
+function ProviderStructuredOutputMeta({ block }: { block: ProviderMetaBlock }) {
+  const taskStatus = stringValue(block.data.taskStatus);
+  const output = stringValue(block.data.output);
+  const summary = stringValue(block.data.summary);
+  return (
+    <LowKeyMetaLine
+      icon={<Check className="size-3" />}
+      title="result"
+      detail={summary && !output ? summary : undefined}
+      raw={block.data}
+      stats={taskStatus ? <ProviderStatusPill value={taskStatus} /> : undefined}
+    >
+      {summary && output && (
+        <p className="max-w-4xl text-[11.5px] leading-snug text-muted-foreground">{summary}</p>
+      )}
       {output && (
-        <div className="prose-chat prose-session-log text-sm text-foreground">
+        <div className="prose-chat prose-session-log max-w-4xl text-xs text-foreground/90">
           <LogMarkdown>{output}</LogMarkdown>
         </div>
       )}
+    </LowKeyMetaLine>
+  );
+}
+
+function HelperMetaBubble({ block }: { block: ProviderMetaBlock }) {
+  if (block.data.helperType === "thinking_tokens") return <ThinkingTokensMeta block={block} />;
+  if (block.data.helperType === "thinking_token_group") {
+    return <ThinkingTokenGroupMeta block={block} />;
+  }
+  if (block.data.helperType === "context_usage") return <ContextUsageMeta block={block} />;
+  if (block.data.helperType === "turn_usage") return <TurnUsageMeta block={block} />;
+  return <GenericMetaBubble block={block} />;
+}
+
+function InternalMetaBubble({ block }: { block: ProviderMetaBlock }) {
+  if (block.data.internalType === "rate_limit") return <RateLimitMeta block={block} />;
+  if (block.data.internalType === "hook_group") return <HookGroupMeta block={block} />;
+  if (block.data.internalType === "runtime") return <RuntimeInternalMeta block={block} />;
+  return <GenericMetaBubble block={block} />;
+}
+
+function MetaPanel({
+  icon,
+  title,
+  badge,
+  children,
+  raw,
+  tone = "muted",
+}: {
+  icon: ReactNode;
+  title: string;
+  badge?: ReactNode;
+  children?: ReactNode;
+  raw: unknown;
+  tone?: "muted" | "info" | "success" | "warning" | "error";
+}) {
+  const toneClass = {
+    muted: "border-border/60 bg-muted/25",
+    info: "border-status-info/30 bg-status-info/5",
+    success: "border-status-success/30 bg-status-success/5",
+    warning: "border-status-warning/30 bg-status-warning/5",
+    error: "border-status-error/30 bg-status-error/5",
+  }[tone];
+  return (
+    <div className={cn("overflow-hidden rounded-lg border px-3 py-2", toneClass)}>
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="grid size-5 shrink-0 place-items-center rounded-md bg-background/60 text-muted-foreground">
+          {icon}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          {title}
+        </span>
+        {badge}
+      </div>
+      {children && <div className="mt-2">{children}</div>}
+      <RawDetails data={raw} />
     </div>
+  );
+}
+
+function MetaStat({ label, value }: { label: string; value?: string }) {
+  if (!value) return null;
+  return (
+    <span className="inline-flex min-w-0 items-baseline gap-1 rounded-md border border-border/60 bg-background/60 px-1.5 py-1">
+      <span className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </span>
+      <span className="truncate font-mono text-[11px] text-foreground">{value}</span>
+    </span>
+  );
+}
+
+function RawDetails({ data }: { data: unknown }) {
+  const [open, setOpen] = useState(false);
+  const text = useMemo(() => safeJson(data), [data]);
+  return (
+    <div className="mt-1.5">
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          className="inline-flex cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 font-mono text-[10px] uppercase tracking-wider text-muted-foreground hover:bg-background/60 hover:text-foreground"
+        >
+          <ChevronRight
+            className={cn("size-3 transition-transform duration-200", open && "rotate-90")}
+          />
+          Raw
+        </button>
+        <CopyIconButton text={text} label="Copy raw event" className="size-5" />
+      </div>
+      {open && (
+        <JsonTree
+          data={data}
+          defaultExpandDepth={1}
+          maxHeight="260px"
+          className="mt-1 bg-muted/50"
+        />
+      )}
+    </div>
+  );
+}
+
+function LowKeyMetaLine({
+  icon,
+  title,
+  detail,
+  stats,
+  raw,
+  children,
+}: {
+  icon: ReactNode;
+  title?: string;
+  detail?: string;
+  stats?: ReactNode;
+  raw: unknown;
+  children?: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const text = useMemo(() => safeJson(raw), [raw]);
+  return (
+    <div className="py-0.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+        <span className="inline-flex size-4 shrink-0 items-center justify-center text-muted-foreground/75">
+          {icon}
+        </span>
+        {title && <span className="font-mono uppercase tracking-wider">{title}</span>}
+        {detail && <span className="min-w-0 max-w-full truncate">{detail}</span>}
+        {stats}
+        <span className="ml-auto inline-flex items-center gap-0.5">
+          <button
+            type="button"
+            onClick={() => setOpen((value) => !value)}
+            className="inline-flex cursor-pointer items-center gap-0.5 rounded px-1 py-0.5 font-mono text-[9.5px] uppercase tracking-wider text-muted-foreground/80 hover:bg-muted hover:text-foreground"
+          >
+            <ChevronRight
+              className={cn("size-2.5 transition-transform duration-200", open && "rotate-90")}
+            />
+            Raw
+          </button>
+          <CopyIconButton text={text} label="Copy raw event" className="size-5" />
+        </span>
+      </div>
+      {children && <div className="ml-6 mt-1 space-y-1">{children}</div>}
+      {open && (
+        <JsonTree
+          data={raw}
+          defaultExpandDepth={1}
+          maxHeight="220px"
+          className="mt-1.5 bg-muted/50"
+        />
+      )}
+    </div>
+  );
+}
+
+function LowKeyStat({ label, value }: { label: string; value?: string }) {
+  if (!value) return null;
+  return (
+    <span className="inline-flex items-baseline gap-1 font-mono text-[10.5px] text-muted-foreground">
+      <span className="uppercase tracking-wider text-muted-foreground/75">{label}</span>
+      <span className="text-foreground/80">{value}</span>
+    </span>
+  );
+}
+
+function formatThoughtDuration(firstIso: unknown, lastIso: unknown): string {
+  if (typeof firstIso !== "string" || typeof lastIso !== "string") return "briefly";
+  const first = Date.parse(firstIso);
+  const last = Date.parse(lastIso);
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return "briefly";
+  const ms = Math.max(0, last - first);
+  return formatDur(ms) || "<1s";
+}
+
+function ThinkingTokensMeta({ block }: { block: ProviderMetaBlock }) {
+  const total = formatMaybeTokens(numberValue(block.data.estimated_tokens));
+  const delta = formatMaybeTokens(numberValue(block.data.estimated_tokens_delta));
+  return (
+    <LowKeyMetaLine
+      icon={<Brain className="size-3" />}
+      raw={block.data}
+      detail={`Thinking${total ? ` · ${total} estimated tokens` : ""}`}
+      stats={<LowKeyStat label="Delta" value={delta ? `+${delta}` : undefined} />}
+    />
+  );
+}
+
+function ThinkingTokenGroupMeta({ block }: { block: ProviderMetaBlock }) {
+  const active = block.data.active === true;
+  const tokens = formatMaybeTokens(numberValue(block.data.estimatedTokens));
+  const duration = formatThoughtDuration(block.data.firstIso, block.data.lastIso);
+  const text = active
+    ? `Thinking${tokens ? ` · ${tokens} estimated tokens` : ""}`
+    : `Thought for ${duration}${tokens ? ` · ${tokens} estimated thinking tokens` : ""}`;
+  return (
+    <LowKeyMetaLine
+      icon={<Brain className="size-3" />}
+      detail={active ? undefined : text}
+      raw={block.data}
+      stats={
+        active ? (
+          <span className="shimmer-text font-mono text-[11px] font-medium">{text}</span>
+        ) : undefined
+      }
+    />
+  );
+}
+
+function ContextUsageMeta({ block }: { block: ProviderMetaBlock }) {
+  const used = formatMaybeTokens(numberValue(block.data.contextUsedTokens));
+  const total = formatMaybeTokens(numberValue(block.data.contextTotalTokens));
+  const percent = formatPercent(numberValue(block.data.contextPercent));
+  const output = formatMaybeTokens(numberValue(block.data.outputTokens));
+  return (
+    <LowKeyMetaLine
+      icon={<Gauge className="size-3" />}
+      title="context"
+      raw={block.data}
+      stats={
+        <>
+          <LowKeyStat label="Used" value={used && total ? `${used} / ${total}` : used} />
+          <LowKeyStat label="Out" value={output} />
+          <LowKeyStat label="Pct" value={percent} />
+          <LowKeyStat label="Formula" value={stringValue(block.data.contextFormula)} />
+        </>
+      }
+    />
+  );
+}
+
+function TurnUsageMeta({ block }: { block: ProviderMetaBlock }) {
+  const usage = recordValue(block.data.usage) ?? {};
+  return (
+    <LowKeyMetaLine
+      icon={<Gauge className="size-3" />}
+      raw={block.data}
+      stats={
+        <>
+          <LowKeyStat label="In" value={formatMaybeTokens(numberValue(usage.input_tokens))} />
+          <LowKeyStat
+            label="Cached"
+            value={formatMaybeTokens(numberValue(usage.cached_input_tokens))}
+          />
+          <LowKeyStat label="Out" value={formatMaybeTokens(numberValue(usage.output_tokens))} />
+          <LowKeyStat
+            label="Reasoning"
+            value={formatMaybeTokens(numberValue(usage.reasoning_output_tokens))}
+          />
+        </>
+      }
+    />
+  );
+}
+
+function RateLimitMeta({ block }: { block: ProviderMetaBlock }) {
+  const info = recordValue(block.data.rate_limit_info) ?? block.data;
+  const status = stringValue(info.status) ?? "rate limit";
+  const reset = formatResetAt(info.resetsAt ?? info.resets_at ?? block.data.rateLimitResetAt);
+  return (
+    <LowKeyMetaLine
+      icon={<Activity className="size-3" />}
+      title="rate limit"
+      detail={status}
+      raw={block.data}
+      stats={
+        <>
+          <LowKeyStat
+            label="Type"
+            value={stringValue(info.rateLimitType ?? info.rate_limit_type)}
+          />
+          <LowKeyStat label="Resets" value={reset} />
+          <LowKeyStat label="Overage" value={stringValue(info.overageStatus)} />
+        </>
+      }
+    />
+  );
+}
+
+function HookGroupMeta({ block }: { block: ProviderMetaBlock }) {
+  const hookEvent = String(block.data.hookEvent ?? "Hook");
+  const hooks = Array.isArray(block.data.hooks) ? (block.data.hooks as HookRun[]) : [];
+  return (
+    <LowKeyMetaLine
+      icon={<Wrench className="size-3" />}
+      title="hooks"
+      detail={hookEvent}
+      raw={block.data}
+      stats={
+        <LowKeyStat
+          label="Runs"
+          value={`${hooks.length} ${hooks.length === 1 ? "hook" : "hooks"}`}
+        />
+      }
+    >
+      {hooks.map((hook) => (
+        <HookRunRow key={hook.hookId} hook={hook} />
+      ))}
+    </LowKeyMetaLine>
+  );
+}
+
+function HookRunRow({ hook }: { hook: HookRun }) {
+  const response = hook.events.find((event) => event.subtype === "hook_response");
+  const started = hook.events.find((event) => event.subtype === "hook_started");
+  const outcome = stringValue(response?.outcome);
+  const exit = numberValue(response?.exit_code);
+  const output = stringValue(response?.output ?? response?.stdout);
+  const ok = !response || outcome === "success" || exit === 0;
+  return (
+    <div className="text-[11px] text-muted-foreground">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="min-w-0 flex-1 truncate font-mono text-foreground/80">
+          {hook.hookName ?? stringValue(started?.hook_name) ?? "hook"}
+        </span>
+        <span className="shrink-0 font-mono text-[10px]">{shortId(hook.hookId)}</span>
+        {response && (
+          <span
+            className={cn(
+              "shrink-0 font-mono text-[10px] uppercase tracking-wide",
+              ok ? "text-status-success-strong/85" : "text-status-error-strong/85",
+            )}
+          >
+            {outcome ?? (ok ? "ok" : "error")}
+          </span>
+        )}
+      </div>
+      {output && (
+        <p className="mt-1 truncate text-[11px] leading-snug text-muted-foreground">
+          {output.replace(/\s+/g, " ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function RuntimeInternalMeta({ block }: { block: ProviderMetaBlock }) {
+  const type = stringValue(block.data.type) ?? "runtime";
+  const props = recordValue(block.data.properties);
+  const info = recordValue(props?.info);
+  const model = recordValue(info?.model);
+  const status = recordValue(props?.status);
+  const sessionId =
+    stringValue(block.data.sessionId) ??
+    stringValue(block.data.sessionID) ??
+    stringValue(props?.sessionID);
+  const title =
+    stringValue(info?.title) ??
+    stringValue(status?.type) ??
+    stringValue(props?.event) ??
+    stringValue(props?.file);
+  return (
+    <LowKeyMetaLine
+      icon={<Activity className="size-3" />}
+      title={type}
+      detail={title}
+      raw={block.data}
+      stats={
+        <>
+          <LowKeyStat label="Session" value={sessionId ? shortId(sessionId) : undefined} />
+          <LowKeyStat label="Agent" value={stringValue(info?.agent)} />
+          <LowKeyStat
+            label="Model"
+            value={
+              stringValue(model?.id) ?? stringValue(model?.modelID) ?? stringValue(model?.modelId)
+            }
+          />
+        </>
+      }
+    />
+  );
+}
+
+function ResultMetaBubble({ block }: { block: ProviderMetaBlock }) {
+  const data = block.data;
+  const cost: Record<string, unknown> = recordValue(data.cost) ?? {};
+  const usage: Record<string, unknown> = recordValue(data.usage) ?? {};
+  const isError = data.isError === true || data.is_error === true || cost.isError === true;
+  const status = stringValue(data.subtype) ?? (isError ? "error" : "success");
+  const output = stringValue(data.output) ?? stringValue(data.result);
+  const model = stringValue(cost.model) ?? stringValue(data.model);
+  return (
+    <MetaPanel
+      icon={<Check className="size-3" />}
+      title="Result"
+      raw={data}
+      tone={isError ? "error" : "success"}
+      badge={<ProviderStatusPill value={status} />}
+    >
+      <div className="flex flex-wrap gap-1.5">
+        <MetaStat label="Model" value={model} />
+        <MetaStat
+          label="Cost"
+          value={formatUsd(numberValue(cost.totalCostUsd) ?? numberValue(data.total_cost_usd))}
+        />
+        <MetaStat
+          label="Duration"
+          value={formatDur(numberValue(cost.durationMs) ?? numberValue(data.duration_ms) ?? 0)}
+        />
+        <MetaStat
+          label="Turns"
+          value={formatCompactNumber(numberValue(cost.numTurns) ?? numberValue(data.num_turns))}
+        />
+        <MetaStat
+          label="Input"
+          value={formatMaybeTokens(
+            numberValue(cost.inputTokens) ?? numberValue(usage.input_tokens),
+          )}
+        />
+        <MetaStat
+          label="Output"
+          value={formatMaybeTokens(
+            numberValue(cost.outputTokens) ?? numberValue(usage.output_tokens),
+          )}
+        />
+        <MetaStat
+          label="Cache R"
+          value={formatMaybeTokens(
+            numberValue(cost.cacheReadTokens) ?? numberValue(usage.cache_read_input_tokens),
+          )}
+        />
+        <MetaStat
+          label="Cache W"
+          value={formatMaybeTokens(
+            numberValue(cost.cacheWriteTokens) ?? numberValue(usage.cache_creation_input_tokens),
+          )}
+        />
+      </div>
+      {output && (
+        <div className="prose-chat prose-session-log mt-2 border-t border-border/50 pt-2 text-sm text-foreground">
+          <LogMarkdown>{output}</LogMarkdown>
+        </div>
+      )}
+    </MetaPanel>
+  );
+}
+
+function FileChangeMeta({ block }: { block: ProviderMetaBlock }) {
+  const diff = block.data.diff;
+  const changes = extractFileChanges(diff);
+  return (
+    <MetaPanel
+      icon={<Scissors className="size-3" />}
+      title="File changes"
+      raw={block.data}
+      tone="muted"
+      badge={
+        <span className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+          {changes.length || 1} {changes.length === 1 ? "file" : "files"}
+        </span>
+      }
+    >
+      {changes.length > 0 ? (
+        <div className="space-y-1">
+          {changes.slice(0, 8).map((change, index) => (
+            <div
+              key={`${change.path}-${index}`}
+              className="flex min-w-0 items-center gap-2 rounded-md border border-border/60 bg-background/55 px-2 py-1"
+            >
+              <span className="shrink-0 rounded bg-muted px-1 font-mono text-[9px] uppercase tracking-wide text-muted-foreground">
+                {change.kind ?? "change"}
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground">
+                {change.path}
+              </span>
+            </div>
+          ))}
+          {changes.length > 8 && (
+            <div className="px-1 font-mono text-[10px] text-muted-foreground">
+              +{changes.length - 8} more files
+            </div>
+          )}
+        </div>
+      ) : null}
+    </MetaPanel>
+  );
+}
+
+function extractFileChanges(value: unknown): Array<{ path: string; kind?: string }> {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => extractFileChanges(item));
+  }
+  const obj = recordValue(value);
+  if (!obj) return [];
+  const nested = obj.diff ?? obj.changes;
+  if (Array.isArray(nested)) return extractFileChanges(nested);
+  const path = stringValue(obj.path) ?? stringValue(obj.file);
+  if (!path) return [];
+  return [{ path, kind: stringValue(obj.kind) ?? stringValue(obj.event) }];
+}
+
+function GenericMetaBubble({ block }: { block: ProviderMetaBlock }) {
+  const kindLabel: Record<ProviderMetaBlock["kind"], string> = {
+    status: "Status",
+    structured_output: "Result",
+    internal: "Internal",
+    helper: "Helper",
+    lifecycle: "Lifecycle",
+    result: "Result",
+    file_change: "File Change",
+    parse_error: "Parse Error",
+    unknown: "Unknown",
+  };
+  const raw = recordValue(block.data.raw);
+  const eventName = stringValue(block.data.type) ?? stringValue(raw?.type);
+  const subtype = stringValue(block.data.subtype) ?? stringValue(raw?.subtype);
+  if (block.kind === "lifecycle") {
+    return (
+      <LowKeyMetaLine
+        icon={<Activity className="size-3" />}
+        title={eventName ?? "lifecycle"}
+        detail={subtype}
+        raw={block.data}
+      />
+    );
+  }
+
+  return (
+    <MetaPanel
+      icon={<Activity className="size-3" />}
+      title={eventName ? `${kindLabel[block.kind]} · ${eventName}` : kindLabel[block.kind]}
+      raw={block.data}
+      tone={block.kind === "parse_error" ? "error" : "muted"}
+    >
+      {block.kind === "parse_error" && (
+        <JsonTree
+          data={block.data}
+          defaultExpandDepth={1}
+          maxHeight="260px"
+          className="bg-muted/50"
+        />
+      )}
+    </MetaPanel>
   );
 }
 
@@ -1435,8 +1882,8 @@ export function SessionLogViewer({
   }, [messages]);
 
   const rows = useMemo(
-    () => buildStream(messages, compactionSnapshots ?? [], newIds),
-    [messages, compactionSnapshots, newIds],
+    () => buildStream(messages, compactionSnapshots ?? [], newIds, isRunning),
+    [messages, compactionSnapshots, newIds, isRunning],
   );
 
   const [query, setQuery] = useState("");
