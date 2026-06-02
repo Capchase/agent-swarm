@@ -206,10 +206,33 @@ All steps live in [`src/commands/runner.ts`](https://github.com/desplega-ai/agen
 | `session.onEvent(...)` | Each `ProviderEvent` → API call (progress, logs, cost, context) |
 | `session.waitForCompletion` | Blocks until the adapter resolves |
 | `ensureTaskFinished` | `POST /api/tasks/{id}/finish` |
+| `syncProfileFilesToServer` | Session-end FS → DB sync of the agent's self-editable files (see below). Runs for every `hasLocalEnvironment` harness. |
 
 <Callout type="info">
   **One task → one session.** The runner tracks concurrent tasks in `state.activeTasks: Map<taskId, RunningTask>` up to `MAX_CONCURRENT_TASKS`. An adapter never needs to multiplex tasks internally — if the worker should handle two at once, the runner spawns two sessions.
 </Callout>
+
+### Session-end identity / config sync (FS → DB)
+
+When a session finishes, the runner syncs the agent's **self-editable** files back to the API so edits the agent made during the session persist into its profile (`context_versions`):
+
+- `SOUL.md` / `IDENTITY.md` / `TOOLS.md` / `HEARTBEAT.md` (bundled identity update)
+- `~/.claude/CLAUDE.md`
+- the agent-managed section of `/workspace/start-up.sh` (`setupScript`)
+
+The sync lives in [`src/commands/profile-sync.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/commands/profile-sync.ts) (`syncProfileFilesToServer`) and is called once per completed session from `checkCompletedProcesses` in `runner.ts`, **gated on `adapter.traits.hasLocalEnvironment`**:
+
+| Provider | `hasLocalEnvironment` | Session-end sync |
+|---|---|---|
+| `claude`, `pi`, `codex`, `opencode` | `true` | **Yes** — runs every session end |
+| `devin`, `claude-managed` | `false` | No — these have no `/workspace` FS |
+
+Notes:
+
+- **Harness-agnostic, runner-driven.** Because the sync runs in the runner — at the single point where every completed session converges, including crashes — it does **not** depend on the harness emitting a shutdown event. This is what makes it reliable for `codex`/`opencode` (which previously had no sync path) and for `pi` (whose in-extension `session_shutdown` sync could silently not-fire). The Claude plugin Stop hook ([`src/hooks/hook.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/hooks/hook.ts)) and the pi extension ([`src/providers/pi-mono-extension.ts`](https://github.com/desplega-ai/agent-swarm/blob/main/src/providers/pi-mono-extension.ts)) still run their own sync; the runner-level call is the authoritative backstop.
+- **Idempotent.** The profile route only writes a new `context_versions` row when the content hash changes (`updateAgentProfile` in `src/be/db.ts`), so a redundant sync — pi's extension + runner double-POST, or an unchanged file — collapses to a no-op.
+- **Non-fatal but visible.** A failed sync never fails the task, but unlike the original copies it checks `resp.ok` and logs a scrubbed warning instead of silently swallowing the error.
+- **Consequence (the "Rule 19" reversion).** Because the FS is now the authoritative source at session end for all local-environment harnesses, a Lead `update-profile` edit to *another* agent's `SOUL.md`/`IDENTITY.md`/`setupScript` (which writes only the DB row, not the remote container's FS) is reverted on that agent's next session end. Previously only `claude` exhibited this; now `pi` (reliably), `codex`, and `opencode` do too. Pushing Lead edits all the way to a remote agent's FS is a separate, unsolved problem.
 
 ### What fields on the task become `ProviderSessionConfig`
 
