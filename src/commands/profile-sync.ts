@@ -34,7 +34,20 @@ export const IDENTITY_MD_PATH = "/workspace/IDENTITY.md";
 export const TOOLS_MD_PATH = "/workspace/TOOLS.md";
 export const HEARTBEAT_MD_PATH = "/workspace/HEARTBEAT.md";
 export const SETUP_SCRIPT_PATH = "/workspace/start-up.sh";
+/**
+ * Claude Code's personal-file CLAUDE.md path. This is what the Claude plugin
+ * Stop hook reads and owns — the runner only uses it as a backstop for an
+ * all-Claude batch (never overwriting it with the workspace materialization).
+ */
 export const CLAUDE_MD_PATH = `${process.env.HOME}/.claude/CLAUDE.md`;
+/**
+ * Workspace CLAUDE.md — the agent-level instructions file the runner
+ * materializes from the `claudeMd` DB field at boot (`runner.ts`) and that the
+ * base-prompt truncation notice tells NON-Claude harnesses (codex/pi/opencode)
+ * to edit. Distinct from CLAUDE_MD_PATH; this is the FS→DB source for the
+ * non-Claude providers that previously had no sync path at all.
+ */
+export const WORKSPACE_CLAUDE_MD_PATH = "/workspace/CLAUDE.md";
 
 // Minimum length for SOUL.md and IDENTITY.md to prevent accidental corruption.
 // Mirrors `hook.ts` (raised from 100 to 500 after profile-corruption recurrences
@@ -58,8 +71,31 @@ export interface ProfileSyncOptions {
   changeSource?: ProfileChangeSource;
   /** Subset of field groups to sync. Defaults to all three. */
   fields?: ProfileSyncField[];
+  /**
+   * Path to read the CLAUDE.md source from. Defaults to CLAUDE_MD_PATH (Claude
+   * Code's personal-file path). Non-Claude local harnesses must pass
+   * WORKSPACE_CLAUDE_MD_PATH so their `/workspace/CLAUDE.md` edits sync. See
+   * `resolveClaudeMdPath`.
+   */
+  claudeMdPath?: string;
   /** Injectable fetch for tests. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
+}
+
+/**
+ * Choose which CLAUDE.md source the runner should sync, given the harness
+ * providers of the completed local sessions in a batch. Claude Code's personal
+ * file lives at `~/.claude/CLAUDE.md` (CLAUDE_MD_PATH — the Stop hook's path);
+ * every other local harness edits `/workspace/CLAUDE.md` (the file the runner
+ * materializes and the base prompt points them to). When a batch mixes
+ * providers, the presence of any non-Claude session means the workspace file is
+ * the edited source of truth; an all-Claude batch uses the personal-file path,
+ * where the runner only acts as a backstop for a Stop hook that didn't fire and
+ * never clobbers a real personal-file edit with the stale workspace copy.
+ */
+export function resolveClaudeMdPath(completedProviders: readonly string[]): string {
+  const anyNonClaude = completedProviders.some((p) => p !== "claude");
+  return anyNonClaude ? WORKSPACE_CLAUDE_MD_PATH : CLAUDE_MD_PATH;
 }
 
 /** A single profile-update POST body, tagged with a label for logging. */
@@ -174,6 +210,7 @@ export async function collectProfilePayloads(
   fields: ProfileSyncField[],
   changeSource: ProfileChangeSource,
   readFile: FileReader = readFileIfExists,
+  claudeMdPath: string = CLAUDE_MD_PATH,
 ): Promise<ProfilePayload[]> {
   const payloads: ProfilePayload[] = [];
 
@@ -190,7 +227,7 @@ export async function collectProfilePayloads(
   }
 
   if (fields.includes("claude")) {
-    const raw = await readFile(CLAUDE_MD_PATH);
+    const raw = await readFile(claudeMdPath);
     if (raw?.trim() && raw.length <= MAX_FILE_LENGTH) {
       payloads.push({ label: "claude", body: { claudeMd: raw, changeSource } });
     }
@@ -261,7 +298,12 @@ export async function syncProfileFilesToServer(opts: ProfileSyncOptions): Promis
   const changeSource = opts.changeSource ?? "session_sync";
   const fields = opts.fields ?? ["identity", "claude", "setup"];
 
-  const payloads = await collectProfilePayloads(fields, changeSource);
+  const payloads = await collectProfilePayloads(
+    fields,
+    changeSource,
+    readFileIfExists,
+    opts.claudeMdPath ?? CLAUDE_MD_PATH,
+  );
   for (const payload of payloads) {
     await postProfileUpdate(opts, payload);
   }
