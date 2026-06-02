@@ -29,12 +29,12 @@
 
 import { scrubSecrets } from "../utils/secret-scrubber.ts";
 
-const SOUL_MD_PATH = "/workspace/SOUL.md";
-const IDENTITY_MD_PATH = "/workspace/IDENTITY.md";
-const TOOLS_MD_PATH = "/workspace/TOOLS.md";
-const HEARTBEAT_MD_PATH = "/workspace/HEARTBEAT.md";
-const SETUP_SCRIPT_PATH = "/workspace/start-up.sh";
-const CLAUDE_MD_PATH = `${process.env.HOME}/.claude/CLAUDE.md`;
+export const SOUL_MD_PATH = "/workspace/SOUL.md";
+export const IDENTITY_MD_PATH = "/workspace/IDENTITY.md";
+export const TOOLS_MD_PATH = "/workspace/TOOLS.md";
+export const HEARTBEAT_MD_PATH = "/workspace/HEARTBEAT.md";
+export const SETUP_SCRIPT_PATH = "/workspace/start-up.sh";
+export const CLAUDE_MD_PATH = `${process.env.HOME}/.claude/CLAUDE.md`;
 
 // Minimum length for SOUL.md and IDENTITY.md to prevent accidental corruption.
 // Mirrors `hook.ts` (raised from 100 to 500 after profile-corruption recurrences
@@ -151,7 +151,10 @@ export function buildIdentityPayload(files: {
   return updates;
 }
 
-/** Read a file's text, returning `undefined` when it does not exist. */
+/** Reads a file's text, returning `undefined` when it does not exist. */
+export type FileReader = (path: string) => Promise<string | undefined>;
+
+/** Default file reader — reads from the worker's local FS via Bun. */
 async function readFileIfExists(path: string): Promise<string | undefined> {
   try {
     const file = Bun.file(path);
@@ -163,21 +166,23 @@ async function readFileIfExists(path: string): Promise<string | undefined> {
 }
 
 /**
- * Collect the profile-update POST bodies to send, reading from the local FS.
- * Each entry is one POST. `fields` selects which groups to include.
+ * Collect the profile-update POST bodies to send. Each entry is one POST.
+ * `fields` selects which groups to include. The file reader is injectable so
+ * the field-selection / guard logic can be unit-tested without touching the FS.
  */
-async function collectProfilePayloads(
+export async function collectProfilePayloads(
   fields: ProfileSyncField[],
   changeSource: ProfileChangeSource,
+  readFile: FileReader = readFileIfExists,
 ): Promise<ProfilePayload[]> {
   const payloads: ProfilePayload[] = [];
 
   if (fields.includes("identity")) {
     const updates = buildIdentityPayload({
-      soulMd: await readFileIfExists(SOUL_MD_PATH),
-      identityMd: await readFileIfExists(IDENTITY_MD_PATH),
-      toolsMd: await readFileIfExists(TOOLS_MD_PATH),
-      heartbeatMd: await readFileIfExists(HEARTBEAT_MD_PATH),
+      soulMd: await readFile(SOUL_MD_PATH),
+      identityMd: await readFile(IDENTITY_MD_PATH),
+      toolsMd: await readFile(TOOLS_MD_PATH),
+      heartbeatMd: await readFile(HEARTBEAT_MD_PATH),
     });
     if (Object.keys(updates).length > 0) {
       payloads.push({ label: "identity", body: { ...updates, changeSource } });
@@ -185,14 +190,14 @@ async function collectProfilePayloads(
   }
 
   if (fields.includes("claude")) {
-    const raw = await readFileIfExists(CLAUDE_MD_PATH);
+    const raw = await readFile(CLAUDE_MD_PATH);
     if (raw?.trim() && raw.length <= MAX_FILE_LENGTH) {
       payloads.push({ label: "claude", body: { claudeMd: raw, changeSource } });
     }
   }
 
   if (fields.includes("setup")) {
-    const raw = await readFileIfExists(SETUP_SCRIPT_PATH);
+    const raw = await readFile(SETUP_SCRIPT_PATH);
     if (raw !== undefined) {
       const content = extractSetupScriptContent(raw);
       if (content !== null) {
