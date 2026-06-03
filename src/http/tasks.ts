@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { ensure } from "@desplega.ai/business-use";
 import { z } from "zod";
 import {
+  backfillSupersedeTaskResumeTaskId,
   cancelTask,
   completeTask,
   failTask,
@@ -34,6 +35,7 @@ import {
   ProviderNameSchema,
   ResumeReasonSchema,
 } from "../types";
+import { getRequestAuth } from "../utils/request-auth-context";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -354,7 +356,9 @@ export async function handleTasks(
     // Tolerant `requestedByUserId`: prevent the deleted-user race from
     // becoming a 500 — if the referenced user doesn't exist, log and drop
     // the field rather than letting the FK fail at INSERT.
-    let requestedByUserId = parsed.body.requestedByUserId || undefined;
+    const auth = getRequestAuth(req);
+    let requestedByUserId =
+      auth?.kind === "user" ? auth.userId : parsed.body.requestedByUserId || undefined;
     if (requestedByUserId && !getUserById(requestedByUserId)) {
       console.warn(
         `[tasks] requestedByUserId ${requestedByUserId} does not exist — coercing to NULL`,
@@ -902,6 +906,7 @@ export async function handleTasks(
     }
 
     const resumeTaskId = followUp.task.id;
+    backfillSupersedeTaskResumeTaskId(parsed.params.id, resumeTaskId);
 
     ensure({
       id: "task.superseded",

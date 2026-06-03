@@ -1017,6 +1017,7 @@ export const ExecutorMetaSchema = z.object({
   nodeId: z.string(),
   workflowId: z.string().uuid(),
   dryRun: z.boolean().default(false),
+  requestedByUserId: z.string().optional(),
 });
 export type ExecutorMeta = z.infer<typeof ExecutorMetaSchema>;
 

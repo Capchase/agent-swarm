@@ -95,6 +95,7 @@ import type {
 } from "../types";
 import { FollowUpConfigSchema, isTerminalTaskStatus } from "../types";
 import { deriveProviderFromKeyType } from "../utils/credentials";
+import { getCurrentRequestUserId } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { decryptSecret, encryptSecret, getEncryptionKey, resolveEncryptionKey } from "./crypto";
 import { normalizeDate, normalizeDateRequired } from "./date-utils";
@@ -2197,6 +2198,34 @@ export function supersedeTask(
   return row ? rowToAgentTask(row) : null;
 }
 
+export function backfillSupersedeTaskResumeTaskId(taskId: string, resumeTaskId: string): boolean {
+  const row = getDb()
+    .prepare<{ id: string; metadata: string | null }, [string]>(
+      `SELECT id, metadata
+       FROM agent_log
+       WHERE taskId = ? AND eventType = 'task_superseded'
+       ORDER BY createdAt DESC
+       LIMIT 1`,
+    )
+    .get(taskId);
+  if (!row) return false;
+
+  let metadata: Record<string, unknown> = {};
+  if (row.metadata) {
+    try {
+      metadata = JSON.parse(row.metadata) as Record<string, unknown>;
+    } catch {
+      metadata = {};
+    }
+  }
+  metadata.resumeTaskId = resumeTaskId;
+
+  const result = getDb()
+    .prepare("UPDATE agent_log SET metadata = ? WHERE id = ?")
+    .run(JSON.stringify(metadata), row.id);
+  return result.changes > 0;
+}
+
 /**
  * Pause a task that is currently in progress.
  * Used during graceful shutdown to allow tasks to resume after container restart.
@@ -2957,6 +2986,7 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
     }
   }
 
+  const auditUserId = getCurrentRequestUserId() ?? null;
   const row = getDb()
     .prepare<AgentTaskRow, (string | number | null)[]>(
       `INSERT INTO agent_tasks (
@@ -2967,8 +2997,8 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
         vcsInstallationId, vcsNodeId,
         agentmailInboxId, agentmailMessageId, agentmailThreadId,
         mentionMessageId, mentionChannelId, dir, parentTaskId, model, scheduleId,
-        workflowRunId, workflowRunStepId, outputSchema, followUpConfig, requestedByUserId, contextKey, swarmVersion, createdAt, lastUpdatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        workflowRunId, workflowRunStepId, outputSchema, followUpConfig, requestedByUserId, contextKey, swarmVersion, createdAt, lastUpdatedAt, created_by, updated_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -3013,6 +3043,8 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
       pkg.version,
       now,
       now,
+      auditUserId,
+      auditUserId,
     );
 
   if (!row) throw new Error("Failed to create task");

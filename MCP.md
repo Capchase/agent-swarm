@@ -36,6 +36,7 @@
   - [script-upsert](#script-upsert)
   - [script-delete](#script-delete)
   - [script-query-types](#script-query-types)
+  - [swarm_x](#swarm_x)
   - [slack-reply](#slack-reply)
   - [slack-read](#slack-read)
   - [slack-post](#slack-post)
@@ -412,6 +413,24 @@ Dry-run render a prompt template with provided variables. Optionally supply a cu
 **Script Query Types**
 
 *No parameters*
+
+### swarm_x
+
+**Swarm X**
+
+Execute an Agent Swarm external command route. v1 supports target='composio' and mirrors `agent-swarm x composio <method> <path>` with the Composio API key injected server-side.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `target` | `unknown` | No | "composio" | External route target. Only 'composio' is supported in v1. |
+| `method` | `unknown` | Yes | - | HTTP method to route to Composio. |
+| `path` | `string` | Yes | - | Composio API path relative to the configured base URL, e.g. /tool_router/session. |
+| `body` | `unknown` | No | - | Optional JSON request body. |
+| `query` | `object` | No | - | Optional query parameters appended to the Composio path. |
+| `headers` | `object` | No | - | Optional extra headers. Auth headers are injected by the server. |
+| `baseUrl` | `string` | No | - | Optional Composio API base URL override. |
+| `useOrgKey` | `boolean` | No | false | Use COMPOSIO_ORG_API_KEY/x-org-api-key instead of COMPOSIO_API_KEY/x-api-key. |
+| `raw` | `boolean` | No | false | Return raw text instead of JSON-pretty output text. |
 
 ### slack-reply
 
@@ -1080,6 +1099,18 @@ List KV entries in the resolved namespace (optionally filtered by key prefix). E
 ## Other Tools
 
 *Tools not assigned to a capability group*
+
+### create_metric
+
+**Create or update a metric**
+
+Stores a config-driven dashboard backed by read-only SQL widget queries. Calls are upsert-by-(agent, slug), mirroring create_page: same slug updates the existing dashboard and snapshots the prior JSON definition.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `title` | `string` | Yes | - | Human-readable dashboard title. |
+| `slug` | `string` | No | - | URL-safe slug. Defaults to the kebab-cased title. |
+| `description` | `string` | No | - | Short description shown in the dashboard. |
 
 ### post-message
 
