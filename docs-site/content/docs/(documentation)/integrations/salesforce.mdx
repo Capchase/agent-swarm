@@ -1,19 +1,19 @@
 ---
 title: Salesforce
-description: Salesforce MCP connector authenticated via OAuth. Lets agents access Salesforce sObjects using Salesforce's hosted MCP endpoint.
+description: Connect Salesforce as an MCP server over OAuth so agents can use any of Salesforce's hosted MCP endpoints.
 ---
 
-Agent Swarm can connect to Salesforce as an MCP server over HTTP, authenticated via OAuth. The connector gives agents access to Salesforce sObjects through Salesforce's native hosted MCP endpoint — no proxy, no middleware.
+Agent Swarm can connect to Salesforce as an MCP server over HTTP, authenticated via OAuth. Salesforce exposes several native hosted MCP endpoints — no proxy, no middleware required.
 
 <Callout type="info">
-This guide covers Salesforce's `sobject-reads` MCP endpoint, which provides SOQL read access to sObjects. Write operations use a different endpoint and are not covered here. Choose the OAuth scopes appropriate for your use case.
+The OAuth setup (Connected App, redirect URI, global secrets) is the same regardless of which Salesforce MCP endpoint you use. Register whichever endpoint fits your use case and choose the OAuth scopes accordingly.
 </Callout>
 
 ## What it does
 
-- **Registers Salesforce as an MCP server** on the HTTP transport using Salesforce's hosted `platform/mcp/v1/platform/sobject-reads` endpoint.
+- **Registers Salesforce as an MCP server** on the HTTP transport pointing at one of Salesforce's hosted MCP endpoints (for example, `platform/mcp/v1/platform/sobject-reads` for sObject reads — see Step 1).
 - **Authenticates with OAuth** using a Salesforce Connected App. The swarm handles the OAuth round-trip; agents call MCP tools without managing tokens directly.
-- **Gives agents sObject access.** Once connected, any agent with the Salesforce server in scope can run sObject queries.
+- **Gives agents access to Salesforce data.** Once connected, any agent with the Salesforce server in scope can use the MCP tools exposed by the registered endpoint.
 
 ## Setup
 
@@ -23,7 +23,7 @@ In the Agent Swarm dashboard (or via the CLI), register a new MCP server with HT
 
 - **Name:** `salesforce` (or any name you choose)
 - **Transport:** HTTP
-- **URL:** `https://api.salesforce.com/platform/mcp/v1/platform/sobject-reads` (adjust the path if you are targeting a different Salesforce MCP endpoint)
+- **URL:** the Salesforce MCP endpoint you want to expose. For example, `https://api.salesforce.com/platform/mcp/v1/platform/sobject-reads` gives agents sObject read access. Salesforce hosts additional MCP endpoints — use the path that matches your use case.
 
 Leave authentication unconfigured for now — you'll wire up OAuth in the next steps.
 
@@ -87,7 +87,7 @@ In the swarm dashboard, go to Settings → MCP Servers → your Salesforce serve
 
 ### 6. Verify
 
-Run a small SOQL read to confirm the connection:
+Trigger a tool call to confirm the connection is working. The tools available depend on the endpoint you registered. For example, if you registered the sObject reads endpoint:
 
 ```sql
 SELECT Id, Name, Industry FROM Account ORDER BY CreatedDate DESC LIMIT 3
