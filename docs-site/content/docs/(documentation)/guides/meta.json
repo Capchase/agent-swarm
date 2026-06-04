@@ -10,6 +10,7 @@
     "observability-opentelemetry",
     "cost-and-context-computation",
     "scripts-runtime",
+    "script-workflow-runs",
     "shannon-experimental",
     "worker-credential-recovery",
     "provider-auth",
