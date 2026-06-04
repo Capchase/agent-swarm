@@ -123,4 +123,84 @@ describe("extractSlackMessageText", () => {
       expect(extractSlackMessageText(msg)).toBe("");
     });
   });
+
+  describe("malformed input — never throws", () => {
+    test("blocks: [null] — skips null entry, returns empty string", () => {
+      expect(() => extractSlackMessageText({ text: "", blocks: [null] } as any)).not.toThrow();
+      expect(extractSlackMessageText({ text: "", blocks: [null] } as any)).toBe("");
+    });
+
+    test("attachments: [null] — skips null entry, returns empty string", () => {
+      expect(() => extractSlackMessageText({ text: "", attachments: [null] } as any)).not.toThrow();
+      expect(extractSlackMessageText({ text: "", attachments: [null] } as any)).toBe("");
+    });
+
+    test("attachments: 'oops' (non-array) — returns empty string without throwing", () => {
+      expect(() => extractSlackMessageText({ text: "", attachments: "oops" } as any)).not.toThrow();
+      expect(extractSlackMessageText({ text: "", attachments: "oops" } as any)).toBe("");
+    });
+
+    test("blocks: 'x' (non-array) — returns empty string without throwing", () => {
+      expect(() => extractSlackMessageText({ text: "", blocks: "x" } as any)).not.toThrow();
+      expect(extractSlackMessageText({ text: "", blocks: "x" } as any)).toBe("");
+    });
+
+    test("blocks: [null, { type: 'section', text: { text: 'ok' } }] — skips null, returns valid text", () => {
+      const msg = {
+        text: "",
+        blocks: [null, { type: "section", text: { type: "plain_text", text: "ok" } }],
+      } as any;
+      expect(() => extractSlackMessageText(msg)).not.toThrow();
+      expect(extractSlackMessageText(msg)).toBe("ok");
+    });
+
+    test("rich_text block with null element in elements array — skips null inner", () => {
+      const msg = {
+        text: "",
+        blocks: [
+          {
+            type: "rich_text",
+            elements: [
+              null,
+              { type: "rich_text_section", elements: [{ type: "text", text: "hi" }] },
+            ],
+          },
+        ],
+      } as any;
+      expect(() => extractSlackMessageText(msg)).not.toThrow();
+      expect(extractSlackMessageText(msg)).toBe("hi");
+    });
+
+    test("rich_text block where elements is not an array — skips block", () => {
+      const msg = {
+        text: "",
+        blocks: [{ type: "rich_text", elements: "not-an-array" }],
+      } as any;
+      expect(() => extractSlackMessageText(msg)).not.toThrow();
+      expect(extractSlackMessageText(msg)).toBe("");
+    });
+
+    test("rich_text inner elements non-array — skips safely", () => {
+      const msg = {
+        text: "",
+        blocks: [
+          {
+            type: "rich_text",
+            elements: [{ type: "rich_text_section", elements: "oops" }],
+          },
+        ],
+      } as any;
+      expect(() => extractSlackMessageText(msg)).not.toThrow();
+      expect(extractSlackMessageText(msg)).toBe("");
+    });
+
+    test("attachments mixed null and valid entries — returns valid text only", () => {
+      const msg = {
+        text: "",
+        attachments: [null, { fallback: "real" }, null],
+      } as any;
+      expect(() => extractSlackMessageText(msg)).not.toThrow();
+      expect(extractSlackMessageText(msg)).toBe("real");
+    });
+  });
 });

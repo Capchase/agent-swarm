@@ -45,24 +45,28 @@ export function extractSlackMessageText(msg: SlackMessageLike): string {
   if (msg.text?.trim()) return msg.text;
 
   // Legacy attachments (Datadog, PagerDuty, GitHub alert apps)
-  if (msg.attachments && msg.attachments.length > 0) {
+  if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
     const parts = msg.attachments
+      .filter((a): a is SlackAttachment => a != null && typeof a === "object")
       .map((a) => a.fallback || a.text || a.title || a.pretext || "")
       .filter(Boolean);
     if (parts.length > 0) return parts.join("\n");
   }
 
   // Block Kit blocks
-  if (msg.blocks && msg.blocks.length > 0) {
+  if (Array.isArray(msg.blocks) && msg.blocks.length > 0) {
     const parts: string[] = [];
     for (const rawBlock of msg.blocks) {
+      if (rawBlock == null || typeof rawBlock !== "object") continue;
       const block = rawBlock as SlackBlockInternal;
       if (block.type === "section" && block.text?.text) {
         parts.push(block.text.text);
-      } else if (block.type === "rich_text" && block.elements) {
+      } else if (block.type === "rich_text" && Array.isArray(block.elements)) {
         for (const el of block.elements) {
-          if (el.elements) {
+          if (el == null || typeof el !== "object") continue;
+          if (Array.isArray(el.elements)) {
             for (const inner of el.elements) {
+              if (inner == null || typeof inner !== "object") continue;
               if (inner.type === "text" && inner.text) parts.push(inner.text);
             }
           }
