@@ -1,19 +1,19 @@
 ---
 title: Salesforce
-description: Read-only Salesforce MCP connector authenticated via OAuth. Lets agents run SOQL reads against sObjects using Salesforce's hosted MCP endpoint.
+description: Salesforce MCP connector authenticated via OAuth. Lets agents access Salesforce sObjects using Salesforce's hosted MCP endpoint.
 ---
 
-Agent Swarm can connect to Salesforce as an MCP server over HTTP, authenticated via OAuth. The connector gives agents read access to Salesforce sObjects (SOQL queries) through Salesforce's native hosted MCP endpoint — no proxy, no middleware.
+Agent Swarm can connect to Salesforce as an MCP server over HTTP, authenticated via OAuth. The connector gives agents access to Salesforce sObjects through Salesforce's native hosted MCP endpoint — no proxy, no middleware.
 
 <Callout type="info">
-This is a **read-only** connector using Salesforce's `sobject-reads` MCP endpoint. Write operations require a separate Connected App with additional scopes and are not covered here.
+This guide covers Salesforce's `sobject-reads` MCP endpoint, which provides SOQL read access to sObjects. Write operations use a different endpoint and are not covered here. Choose the OAuth scopes appropriate for your use case.
 </Callout>
 
 ## What it does
 
 - **Registers Salesforce as an MCP server** on the HTTP transport using Salesforce's hosted `platform/mcp/v1/platform/sobject-reads` endpoint.
 - **Authenticates with OAuth** using a Salesforce Connected App. The swarm handles the OAuth round-trip; agents call MCP tools without managing tokens directly.
-- **Gives agents SOQL read access.** Once connected, any agent with the `salesforce-ro` (or your named) server in scope can run sObject queries.
+- **Gives agents sObject access.** Once connected, any agent with the Salesforce server in scope can run sObject queries.
 
 ## Setup
 
@@ -21,9 +21,9 @@ This is a **read-only** connector using Salesforce's `sobject-reads` MCP endpoin
 
 In the Agent Swarm dashboard (or via the CLI), register a new MCP server with HTTP transport:
 
-- **Name:** `salesforce-ro` (or any name you choose)
+- **Name:** `salesforce` (or any name you choose)
 - **Transport:** HTTP
-- **URL:** `https://api.salesforce.com/platform/mcp/v1/platform/sobject-reads`
+- **URL:** `https://api.salesforce.com/platform/mcp/v1/platform/sobject-reads` (adjust the path if you are targeting a different Salesforce MCP endpoint)
 
 Leave authentication unconfigured for now — you'll wire up OAuth in the next steps.
 
@@ -37,7 +37,7 @@ In Salesforce Setup, go to **App Manager → New Connected App** (or **External 
 https://<your-swarm-api-host>/api/mcp-oauth/callback
 ```
 
-For example: `https://agent-swarm.sandbox.example.com/api/mcp-oauth/callback`
+For example: `https://your-swarm.example.com/api/mcp-oauth/callback`
 
 <Callout type="warn">
 **Exact match required.** No trailing slash, no port, no `www`. Salesforce's OAuth server does a literal string comparison. See [Gotchas](#gotchas) for the most common failure mode.
@@ -70,11 +70,11 @@ Two global secrets govern how the swarm builds the OAuth redirect URI and where 
 | `MCP_BASE_URL` | `https://<your-swarm-api-host>` | Builds the `redirect_uri` sent to Salesforce |
 | `APP_URL` | `https://<your-dashboard-host>` | Where the browser lands after OAuth succeeds |
 
-Example (Capchase sandbox):
+Example:
 
 ```bash
-MCP_BASE_URL=https://agent-swarm.sandbox.example.com
-APP_URL=https://app.agent-swarm.dev
+MCP_BASE_URL=https://your-swarm-api.example.com
+APP_URL=https://your-swarm-dashboard.example.com
 ```
 
 <Callout type="info">
@@ -117,7 +117,7 @@ The `resource=https://api.salesforce.com:443` parameter that appears in the auth
 
 ## Gotchas
 
-These are the failure modes we hit during initial setup. Read them before you start.
+Common failure modes during initial setup. Read them before you start.
 
 ### `redirect_uri_mismatch` (the #1 failure)
 
