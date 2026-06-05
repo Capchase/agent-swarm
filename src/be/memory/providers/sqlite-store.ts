@@ -1,15 +1,19 @@
 import { getDb, isSqliteVecAvailable } from "@/be/db";
 import { cosineSimilarity, deserializeEmbedding, serializeEmbedding } from "@/be/embedding";
 import type { AgentMemory, AgentMemoryScope, AgentMemorySource } from "@/types";
-import { TTL_DEFAULTS } from "../constants";
+import { EMBEDDING_DIMENSIONS, TTL_DEFAULTS } from "../constants";
 import type {
   MemoryCandidate,
+  MemoryHealth,
   MemoryInput,
   MemoryListOptions,
   MemorySearchOptions,
   MemoryStats,
   MemoryStore,
+  MemoryVecPopulateStats,
 } from "../types";
+
+const VECTOR_BYTES = EMBEDDING_DIMENSIONS * Float32Array.BYTES_PER_ELEMENT;
 
 type AgentMemoryRow = {
   id: string;
@@ -76,54 +80,152 @@ function computeExpiresAt(source: AgentMemorySource): string | null {
 
 export class SqliteMemoryStore implements MemoryStore {
   private vecInitialized = false;
+  private lastPopulate: MemoryVecPopulateStats | null = null;
 
   constructor() {
     this.ensureVecTable();
   }
 
   private ensureVecTable(): void {
-    if (this.vecInitialized || !isSqliteVecAvailable()) return;
+    if (this.vecInitialized) return;
+
+    if (!isSqliteVecAvailable()) {
+      console.warn("[memory-vec] sqlite-vec extension_loaded=false; retrieval_mode=fallback");
+      return;
+    }
 
     const db = getDb();
-    // Create the virtual table if it doesn't exist
     try {
+      console.log(
+        `[memory-vec] sqlite-vec extension_loaded=true vector_dimensions=${EMBEDDING_DIMENSIONS}`,
+      );
+
+      const existingSchema = this.getVecTableSchema();
+      if (existingSchema && !existingSchema.includes("distance_metric=cosine")) {
+        console.warn(
+          "[memory-vec] Existing memory_vec table is missing cosine distance metric; rebuilding from agent_memory",
+        );
+        db.run("DROP TABLE memory_vec");
+      }
+
       db.run(`
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
           memory_id TEXT PRIMARY KEY,
-          embedding float[512]
+          embedding float[${EMBEDDING_DIMENSIONS}] distance_metric=cosine
         )
       `);
 
-      // Populate from existing embeddings that aren't yet in the vec table
-      const existing = db
-        .prepare<{ id: string; embedding: Buffer }, []>(
-          "SELECT id, embedding FROM agent_memory WHERE embedding IS NOT NULL",
-        )
-        .all();
-
-      if (existing.length > 0) {
-        const vecCount = db
-          .prepare<{ count: number }, []>("SELECT COUNT(*) as count FROM memory_vec")
-          .get();
-
-        if ((vecCount?.count ?? 0) < existing.length) {
-          const insert = db.prepare(
-            "INSERT OR IGNORE INTO memory_vec(memory_id, embedding) VALUES (?, ?)",
-          );
-          const tx = db.transaction(() => {
-            for (const row of existing) {
-              insert.run(row.id, row.embedding);
-            }
-          });
-          tx();
-          console.log(`[memory] Synced ${existing.length} embeddings to memory_vec`);
-        }
+      const healthBefore = this.getHealthCounts();
+      if (healthBefore.missingFromVec > 0 || healthBefore.extraInVec > 0) {
+        this.populateVecTable(healthBefore.memoryVec);
+      } else {
+        console.log(
+          `[memory-vec] populate skipped attempted=0 inserted=0 memory_vec=${healthBefore.memoryVec} valid_embedding=${healthBefore.validEmbedding}`,
+        );
       }
 
       this.vecInitialized = true;
     } catch (err) {
-      console.warn("[memory] Failed to initialize memory_vec:", (err as Error).message);
+      this.vecInitialized = false;
+      console.error("[memory-vec] Failed to initialize memory_vec:", (err as Error).message);
     }
+  }
+
+  private getVecTableSchema(): string | null {
+    try {
+      return (
+        getDb()
+          .prepare<{ sql: string | null }, []>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_vec'",
+          )
+          .get()?.sql ?? null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private getVecCount(): number {
+    if (!this.getVecTableSchema()) return 0;
+    return (
+      getDb().prepare<{ count: number }, []>("SELECT COUNT(*) as count FROM memory_vec").get()
+        ?.count ?? 0
+    );
+  }
+
+  private populateVecTable(beforeCount: number): void {
+    const db = getDb();
+    const deletedExtra = db
+      .prepare(
+        `DELETE FROM memory_vec
+         WHERE memory_id NOT IN (SELECT id FROM agent_memory)`,
+      )
+      .run();
+    if (deletedExtra.changes > 0) {
+      console.warn(`[memory-vec] removed_extra_rows count=${deletedExtra.changes}`);
+    }
+
+    const rows = db
+      .prepare<{ id: string; embedding: Buffer }, []>(
+        "SELECT id, embedding FROM agent_memory WHERE embedding IS NOT NULL",
+      )
+      .all();
+    const deleteVec = db.prepare("DELETE FROM memory_vec WHERE memory_id = ?");
+    const insertVec = db.prepare("INSERT INTO memory_vec(memory_id, embedding) VALUES (?, ?)");
+
+    let attempted = 0;
+    let inserted = 0;
+    let skippedInvalidDimensions = 0;
+    let failed = 0;
+
+    for (const row of rows) {
+      const embeddingBuffer = this.toVecBuffer(row.embedding);
+      if (!embeddingBuffer) {
+        skippedInvalidDimensions++;
+        continue;
+      }
+
+      attempted++;
+      try {
+        deleteVec.run(row.id);
+        insertVec.run(row.id, embeddingBuffer);
+        inserted++;
+      } catch (err) {
+        failed++;
+        console.error(
+          `[memory-vec] populate failed memory_id=${row.id}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    const afterCount = this.getVecCount();
+    this.lastPopulate = {
+      attempted,
+      inserted,
+      skippedInvalidDimensions,
+      failed,
+      beforeCount,
+      afterCount,
+    };
+
+    console.log(
+      `[memory-vec] populate attempted=${attempted} inserted=${inserted} skipped_invalid_dimensions=${skippedInvalidDimensions} failed=${failed} before_count=${beforeCount} after_count=${afterCount}`,
+    );
+
+    if (failed > 0 || afterCount < attempted) {
+      console.error(
+        `[memory-vec] populate incomplete attempted=${attempted} after_count=${afterCount} failed=${failed}`,
+      );
+    }
+  }
+
+  private toVecBuffer(embedding: Buffer | Float32Array): Buffer | null {
+    if (embedding instanceof Float32Array) {
+      if (embedding.length !== EMBEDDING_DIMENSIONS) return null;
+      return serializeEmbedding(embedding);
+    }
+    if (embedding.length !== VECTOR_BYTES) return null;
+    return embedding;
   }
 
   store(input: MemoryInput): AgentMemory {
@@ -223,7 +325,11 @@ export class SqliteMemoryStore implements MemoryStore {
   ): MemoryCandidate[] {
     const { scope = "all", limit = 10, source, isLead = false, includeExpired = false } = options;
 
-    if (isSqliteVecAvailable() && this.vecInitialized) {
+    const health = this.getHealth();
+    if (health.retrievalMode === "vec" && embedding.length === EMBEDDING_DIMENSIONS) {
+      console.log(
+        `[memory-search] retrieval_path=vec scope=${scope} limit=${limit} vec_rows=${health.counts.memoryVec} searchable=${health.counts.searchable}`,
+      );
       return this.searchWithVec(embedding, agentId, {
         scope,
         limit,
@@ -232,6 +338,10 @@ export class SqliteMemoryStore implements MemoryStore {
         includeExpired,
       });
     }
+
+    console.log(
+      `[memory-search] retrieval_path=fallback scope=${scope} limit=${limit} reason=${embedding.length !== EMBEDDING_DIMENSIONS ? "query_dimension_mismatch" : health.reasons.join("|") || "vec_unavailable"}`,
+    );
     return this.searchBruteForce(embedding, agentId, {
       scope,
       limit,
@@ -255,58 +365,44 @@ export class SqliteMemoryStore implements MemoryStore {
     const db = getDb();
     const { scope, limit, source, isLead, includeExpired } = options;
 
-    // KNN query — fetch more candidates than needed for post-filtering
-    const knnLimit = limit * 5; // over-fetch to account for scope/expiry filters
     const embeddingBuffer = serializeEmbedding(queryEmbedding);
+    const knnLimit = Math.max(limit, this.getVecCount());
 
-    const vecRows = db
-      .prepare<{ memory_id: string; distance: number }, [Buffer, number]>(
-        "SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?",
-      )
-      .all(embeddingBuffer, knnLimit);
+    const conditions: string[] = ["v.embedding MATCH ?"];
+    const params: (Buffer | string | number | null)[] = [embeddingBuffer];
 
-    if (vecRows.length === 0) return [];
-
-    // Build ID list and distance map
-    const distanceMap = new Map<string, number>();
-    const ids: string[] = [];
-    for (const vr of vecRows) {
-      distanceMap.set(vr.memory_id, vr.distance);
-      ids.push(vr.memory_id);
-    }
-
-    // Hydrate from agent_memory with filters
-    const placeholders = ids.map(() => "?").join(",");
-    const conditions: string[] = [`id IN (${placeholders})`];
-    const params: (string | null)[] = [...ids];
-
-    this.addScopeConditions(conditions, params, agentId, scope, isLead);
+    this.addScopeConditions(conditions, params, agentId, scope, isLead, "m");
 
     if (source) {
-      conditions.push("source = ?");
+      conditions.push("m.source = ?");
       params.push(source);
     }
 
     if (!includeExpired) {
-      conditions.push("(expiresAt IS NULL OR expiresAt > datetime('now'))");
+      conditions.push("(m.expiresAt IS NULL OR m.expiresAt > datetime('now'))");
     }
 
-    const rows = db
-      .prepare<AgentMemoryRow, (string | null)[]>(
-        `SELECT * FROM agent_memory WHERE ${conditions.join(" AND ")}`,
-      )
-      .all(...params);
+    conditions.push("v.k = ?");
+    params.push(knnLimit);
 
-    // Map to candidates with similarity scores
+    const rows = db
+      .prepare<AgentMemoryRow & { distance: number }, (Buffer | string | number | null)[]>(
+        `SELECT m.*, v.distance
+         FROM memory_vec v
+         JOIN agent_memory m ON m.id = v.memory_id
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY v.distance
+         LIMIT ?`,
+      )
+      .all(...params, limit);
+
     const candidates: MemoryCandidate[] = [];
     for (const row of rows) {
-      const distance = distanceMap.get(row.id) ?? 1;
-      const similarity = 1 - distance; // cosine distance to similarity
+      const similarity = 1 - row.distance;
       candidates.push(rowToCandidate(row, similarity));
     }
 
-    candidates.sort((a, b) => b.similarity - a.similarity);
-    return candidates.slice(0, limit);
+    return candidates;
   }
 
   private searchBruteForce(
@@ -358,26 +454,28 @@ export class SqliteMemoryStore implements MemoryStore {
 
   private addScopeConditions(
     conditions: string[],
-    params: (string | null)[],
+    params: (Buffer | string | number | null)[],
     agentId: string,
     scope: string,
     isLead: boolean,
+    tableAlias = "",
   ): void {
+    const col = (name: string) => (tableAlias ? `${tableAlias}.${name}` : name);
     if (!isLead) {
       if (scope === "agent") {
-        conditions.push("agentId = ? AND scope = 'agent'");
+        conditions.push(`${col("agentId")} = ? AND ${col("scope")} = 'agent'`);
         params.push(agentId);
       } else if (scope === "swarm") {
-        conditions.push("scope = 'swarm'");
+        conditions.push(`${col("scope")} = 'swarm'`);
       } else {
-        conditions.push("(agentId = ? OR scope = 'swarm')");
+        conditions.push(`(${col("agentId")} = ? OR ${col("scope")} = 'swarm')`);
         params.push(agentId);
       }
     } else {
       if (scope === "agent") {
-        conditions.push("scope = 'agent'");
+        conditions.push(`${col("scope")} = 'agent'`);
       } else if (scope === "swarm") {
-        conditions.push("scope = 'swarm'");
+        conditions.push(`${col("scope")} = 'swarm'`);
       }
     }
   }
@@ -440,7 +538,7 @@ export class SqliteMemoryStore implements MemoryStore {
 
   delete(id: string): boolean {
     const db = getDb();
-    if (isSqliteVecAvailable() && this.vecInitialized) {
+    if (this.vecInitialized && this.getVecTableSchema()) {
       db.prepare("DELETE FROM memory_vec WHERE memory_id = ?").run(id);
     }
     const result = db.prepare("DELETE FROM agent_memory WHERE id = ?").run(id);
@@ -450,7 +548,7 @@ export class SqliteMemoryStore implements MemoryStore {
   deleteBySourcePath(sourcePath: string, agentId: string): number {
     const db = getDb();
 
-    if (isSqliteVecAvailable() && this.vecInitialized) {
+    if (this.vecInitialized && this.getVecTableSchema()) {
       // Get IDs first for vec table cleanup
       const ids = db
         .prepare<{ id: string }, [string, string]>(
@@ -481,11 +579,20 @@ export class SqliteMemoryStore implements MemoryStore {
       id,
     );
 
-    if (isSqliteVecAvailable() && this.vecInitialized) {
-      db.prepare("INSERT OR REPLACE INTO memory_vec(memory_id, embedding) VALUES (?, ?)").run(
-        id,
-        buffer,
-      );
+    if (this.vecInitialized && this.getVecTableSchema()) {
+      const vecBuffer = this.toVecBuffer(embedding);
+      if (!vecBuffer) {
+        console.warn(
+          `[memory-vec] update skipped memory_id=${id} reason=invalid_dimensions dimensions=${embedding.length} expected=${EMBEDDING_DIMENSIONS}`,
+        );
+        return;
+      }
+      try {
+        db.prepare("DELETE FROM memory_vec WHERE memory_id = ?").run(id);
+        db.prepare("INSERT INTO memory_vec(memory_id, embedding) VALUES (?, ?)").run(id, vecBuffer);
+      } catch (err) {
+        console.error(`[memory-vec] update failed memory_id=${id}: ${(err as Error).message}`);
+      }
     }
   }
 
@@ -534,6 +641,81 @@ export class SqliteMemoryStore implements MemoryStore {
       byScope,
       withEmbeddings: withEmbeddings?.count ?? 0,
       expired: expired?.count ?? 0,
+    };
+  }
+
+  private getHealthCounts(): MemoryHealth["counts"] {
+    const db = getDb();
+    const tableExists = this.getVecTableSchema() !== null;
+    const tableUsable = tableExists && isSqliteVecAvailable();
+    const count = (sql: string) => db.prepare<{ count: number }, []>(sql).get()?.count ?? 0;
+
+    return {
+      total: count("SELECT COUNT(*) as count FROM agent_memory"),
+      withEmbedding: count(
+        "SELECT COUNT(*) as count FROM agent_memory WHERE embedding IS NOT NULL",
+      ),
+      validEmbedding: count(
+        `SELECT COUNT(*) as count FROM agent_memory WHERE embedding IS NOT NULL AND length(embedding) = ${VECTOR_BYTES}`,
+      ),
+      invalidEmbedding: count(
+        `SELECT COUNT(*) as count FROM agent_memory WHERE embedding IS NOT NULL AND length(embedding) != ${VECTOR_BYTES}`,
+      ),
+      searchable: count(
+        `SELECT COUNT(*) as count FROM agent_memory
+         WHERE embedding IS NOT NULL
+           AND length(embedding) = ${VECTOR_BYTES}
+           AND (expiresAt IS NULL OR expiresAt > datetime('now'))`,
+      ),
+      memoryVec: tableUsable ? count("SELECT COUNT(*) as count FROM memory_vec") : 0,
+      missingFromVec: tableUsable
+        ? count(
+            `SELECT COUNT(*) as count
+             FROM agent_memory m
+             LEFT JOIN memory_vec v ON v.memory_id = m.id
+             WHERE m.embedding IS NOT NULL
+               AND length(m.embedding) = ${VECTOR_BYTES}
+               AND v.memory_id IS NULL`,
+          )
+        : count(
+            `SELECT COUNT(*) as count FROM agent_memory WHERE embedding IS NOT NULL AND length(embedding) = ${VECTOR_BYTES}`,
+          ),
+      extraInVec: tableUsable
+        ? count(
+            `SELECT COUNT(*) as count
+             FROM memory_vec v
+             LEFT JOIN agent_memory m ON m.id = v.memory_id
+             WHERE m.id IS NULL`,
+          )
+        : 0,
+    };
+  }
+
+  getHealth(): MemoryHealth {
+    const schema = this.getVecTableSchema();
+    const counts = this.getHealthCounts();
+    const reasons: string[] = [];
+
+    if (!isSqliteVecAvailable()) reasons.push("sqlite_vec_extension_unavailable");
+    if (!schema) reasons.push("memory_vec_table_missing");
+    if (!this.vecInitialized) reasons.push("memory_vec_not_initialized");
+    if (counts.memoryVec === 0) reasons.push("memory_vec_empty");
+    if (counts.missingFromVec > 0) reasons.push("memory_vec_missing_embeddings");
+    if (counts.extraInVec > 0) reasons.push("memory_vec_extra_rows");
+
+    return {
+      sqliteVec: {
+        extensionLoaded: isSqliteVecAvailable(),
+        tableExists: schema !== null,
+        initialized: this.vecInitialized,
+        vectorDimensions: EMBEDDING_DIMENSIONS,
+        distanceMetric: "cosine",
+        schema,
+        lastPopulate: this.lastPopulate,
+      },
+      counts,
+      retrievalMode: reasons.length === 0 ? "vec" : "fallback",
+      reasons,
     };
   }
 }

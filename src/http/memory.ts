@@ -115,6 +115,18 @@ const listMemory = route({
   },
 });
 
+const memoryHealth = route({
+  method: "get",
+  path: "/api/memory/health",
+  pattern: ["api", "memory", "health"],
+  summary: "Report memory vector index health and retrieval mode",
+  tags: ["Memory"],
+  auth: { apiKey: true },
+  responses: {
+    200: { description: "Memory vector index health" },
+  },
+});
+
 const deleteMemoryById = route({
   method: "delete",
   path: "/api/memory/{id}",
@@ -495,6 +507,14 @@ export async function handleMemory(
       console.error("[memory-list] Error:", (err as Error).message);
       jsonError(res, "Memory list failed", 500);
     }
+    return true;
+  }
+
+  if (memoryHealth.match(req.method, pathSegments)) {
+    const parsed = await memoryHealth.parse(req, res, pathSegments, new URLSearchParams());
+    if (!parsed) return true;
+
+    json(res, getMemoryStore().getHealth());
     return true;
   }
 

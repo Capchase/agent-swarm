@@ -114,6 +114,26 @@ export function isSqliteVecAvailable(): boolean {
   return sqliteVecAvailable;
 }
 
+function loadSqliteVec(database: Database): void {
+  sqliteVecAvailable = false;
+  try {
+    const extensionPath = process.env.SQLITE_VEC_EXTENSION_PATH;
+    if (extensionPath) {
+      database.loadExtension(extensionPath);
+    } else {
+      const sqliteVec = require("sqlite-vec");
+      sqliteVec.load(database);
+    }
+    sqliteVecAvailable = true;
+    console.log(`[db] sqlite-vec loaded${extensionPath ? ` from ${extensionPath}` : ""}`);
+  } catch (err) {
+    console.warn(
+      "[db] sqlite-vec not available, falling back to in-memory cosine:",
+      (err as Error).message,
+    );
+  }
+}
+
 export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
   if (db) {
     return db;
@@ -130,6 +150,7 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
     db = Database.deserialize(templateBytes);
     db.run("PRAGMA busy_timeout = 5000;");
     db.run("PRAGMA foreign_keys = ON;");
+    loadSqliteVec(db);
     configureDbResolver(resolvePromptTemplate);
     // Ensure the encryption key is resolved even when restoring from the test
     // template. The cache may have been cleared via __resetEncryptionKeyForTests
@@ -155,22 +176,7 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
   // `require.resolve("sqlite-vec-<platform>/vec0.so")` can't find the native
   // asset — so we prefer an explicit filesystem path when set, and only fall
   // back to the npm resolver for normal dev runs.
-  try {
-    const extensionPath = process.env.SQLITE_VEC_EXTENSION_PATH;
-    if (extensionPath) {
-      database.loadExtension(extensionPath);
-    } else {
-      const sqliteVec = require("sqlite-vec");
-      sqliteVec.load(database);
-    }
-    sqliteVecAvailable = true;
-    console.log(`[db] sqlite-vec loaded${extensionPath ? ` from ${extensionPath}` : ""}`);
-  } catch (err) {
-    console.warn(
-      "[db] sqlite-vec not available, falling back to in-memory cosine:",
-      (err as Error).message,
-    );
-  }
+  loadSqliteVec(database);
 
   // Run database migrations (schema creation + incremental changes)
   runMigrations(database);
@@ -348,6 +354,7 @@ export function closeDb(): void {
     db.close();
     db = null;
   }
+  sqliteVecAvailable = false;
 }
 
 // ============================================================================

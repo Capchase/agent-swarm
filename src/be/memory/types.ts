@@ -27,6 +27,7 @@ export interface MemoryStore {
   deleteBySourcePath(sourcePath: string, agentId: string): number;
   updateEmbedding(id: string, embedding: Float32Array, model: string): void;
   getStats(agentId: string): MemoryStats;
+  getHealth(): MemoryHealth;
 }
 
 // ============================================================================
@@ -79,6 +80,39 @@ export interface MemoryStats {
   byScope: Record<string, number>;
   withEmbeddings: number;
   expired: number;
+}
+
+export interface MemoryHealth {
+  sqliteVec: {
+    extensionLoaded: boolean;
+    tableExists: boolean;
+    initialized: boolean;
+    vectorDimensions: number;
+    distanceMetric: "cosine";
+    schema: string | null;
+    lastPopulate: MemoryVecPopulateStats | null;
+  };
+  counts: {
+    total: number;
+    withEmbedding: number;
+    validEmbedding: number;
+    invalidEmbedding: number;
+    searchable: number;
+    memoryVec: number;
+    missingFromVec: number;
+    extraInVec: number;
+  };
+  retrievalMode: "vec" | "fallback";
+  reasons: string[];
+}
+
+export interface MemoryVecPopulateStats {
+  attempted: number;
+  inserted: number;
+  skippedInvalidDimensions: number;
+  failed: number;
+  beforeCount: number;
+  afterCount: number;
 }
 
 export interface RerankOptions {

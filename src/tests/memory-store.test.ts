@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, createAgent, initDb } from "../be/db";
+import { closeDb, createAgent, getDb, initDb } from "../be/db";
+import { serializeEmbedding } from "../be/embedding";
 import { SqliteMemoryStore } from "../be/memory/providers/sqlite-store";
 
 const TEST_DB_PATH = "./test-memory-store.sqlite";
@@ -9,6 +10,14 @@ describe("SqliteMemoryStore", () => {
   const agentA = "aaaa0000-0000-4000-8000-000000000001";
   const agentB = "bbbb0000-0000-4000-8000-000000000002";
   let store: SqliteMemoryStore;
+
+  function vector(values: Record<number, number>): Float32Array {
+    const embedding = new Float32Array(512);
+    for (const [index, value] of Object.entries(values)) {
+      embedding[Number(index)] = value;
+    }
+    return embedding;
+  }
 
   beforeAll(async () => {
     for (const suffix of ["", "-wal", "-shm"]) {
@@ -209,6 +218,95 @@ describe("SqliteMemoryStore", () => {
       // Lead should see both agentA and agentB memories
       const agents = new Set(results.map((r) => r.agentId));
       expect(agents.size).toBeGreaterThanOrEqual(1);
+    });
+
+    test("uses sqlite-vec for 512d embeddings with scope-filter parity", () => {
+      for (let i = 0; i < 6; i++) {
+        const otherAgent = store.store({
+          agentId: agentB,
+          scope: "agent",
+          name: `vec-other-agent-exact-${i}`,
+          content: "exact but invisible to agentA",
+          source: "manual",
+        });
+        store.updateEmbedding(otherAgent.id, vector({ 0: 1 }), "test-model");
+      }
+
+      const visible = store.store({
+        agentId: agentA,
+        scope: "agent",
+        name: "vec-agent-visible",
+        content: "visible to agentA",
+        source: "manual",
+      });
+      store.updateEmbedding(visible.id, vector({ 0: 0.8, 1: 0.2 }), "test-model");
+
+      const query = vector({ 0: 1 });
+      const results = store.search(query, agentA, { scope: "agent", limit: 5 });
+
+      expect(results[0]!.id).toBe(visible.id);
+      expect(results.every((r) => r.agentId === agentA && r.scope === "agent")).toBe(true);
+
+      const health = store.getHealth();
+      expect(health.sqliteVec.schema).toContain("distance_metric=cosine");
+      expect(health.counts.memoryVec).toBeGreaterThanOrEqual(2);
+      expect(health.retrievalMode).toBe("vec");
+    });
+  });
+
+  describe("memory_vec population", () => {
+    test("populates existing embeddings on startup and reports health counts", () => {
+      const raw = store.store({
+        agentId: agentA,
+        scope: "agent",
+        name: "raw-existing-embedding",
+        content: "raw existing embedding",
+        source: "manual",
+      });
+      getDb()
+        .prepare("UPDATE agent_memory SET embedding = ?, embeddingModel = ? WHERE id = ?")
+        .run(serializeEmbedding(vector({ 2: 1 })), "test-model", raw.id);
+      getDb().prepare("DELETE FROM memory_vec WHERE memory_id = ?").run(raw.id);
+
+      const freshStore = new SqliteMemoryStore();
+      const health = freshStore.getHealth();
+
+      expect(health.counts.missingFromVec).toBe(0);
+      expect(health.sqliteVec.lastPopulate?.attempted).toBeGreaterThanOrEqual(1);
+      expect(health.sqliteVec.lastPopulate?.failed).toBe(0);
+
+      const resultIds = freshStore
+        .search(vector({ 2: 1 }), agentA, { scope: "agent", limit: 20 })
+        .map((r) => r.id);
+      expect(resultIds).toContain(raw.id);
+    });
+
+    test("rebuilds an old non-cosine memory_vec table from agent_memory", () => {
+      const raw = store.store({
+        agentId: agentA,
+        scope: "agent",
+        name: "stale-schema-embedding",
+        content: "stale schema embedding",
+        source: "manual",
+      });
+      getDb()
+        .prepare("UPDATE agent_memory SET embedding = ?, embeddingModel = ? WHERE id = ?")
+        .run(serializeEmbedding(vector({ 3: 1 })), "test-model", raw.id);
+
+      getDb().run("DROP TABLE memory_vec");
+      getDb().run(`
+        CREATE VIRTUAL TABLE memory_vec USING vec0(
+          memory_id TEXT PRIMARY KEY,
+          embedding float[512]
+        )
+      `);
+
+      const freshStore = new SqliteMemoryStore();
+      const health = freshStore.getHealth();
+
+      expect(health.sqliteVec.schema).toContain("distance_metric=cosine");
+      expect(health.counts.missingFromVec).toBe(0);
+      expect(health.retrievalMode).toBe("vec");
     });
   });
 

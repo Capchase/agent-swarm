@@ -4260,6 +4260,24 @@
         }
       }
     },
+    "/api/memory/health": {
+      "get": {
+        "summary": "Report memory vector index health and retrieval mode",
+        "tags": [
+          "Memory"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Memory vector index health"
+          }
+        }
+      }
+    },
     "/api/memory/{id}": {
       "delete": {
         "summary": "Delete a single memory by ID (debug/admin)",
