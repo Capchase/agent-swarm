@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, getDb, initDb } from "../be/db";
+import { deserializeEmbedding, serializeEmbedding } from "../be/embedding";
 import type { EmbeddingProvider } from "../be/memory/types";
+import { runScriptsBootReembed } from "../be/scripts/boot-reembed";
 import { getScript, upsertScriptByName } from "../be/scripts/db";
 import {
   reembedAllScripts,
@@ -82,6 +84,21 @@ function embeddedText(scriptId: string): string | null {
       )
       .get(scriptId)?.embeddedText ?? null
   );
+}
+
+function storedEmbeddingLength(scriptId: string): number | null {
+  const row = getDb()
+    .prepare<{ embedding: Buffer }, [string]>(
+      "SELECT embedding FROM script_embeddings WHERE scriptId = ?",
+    )
+    .get(scriptId);
+  return row ? deserializeEmbedding(row.embedding).length : null;
+}
+
+function replaceStoredEmbedding(scriptId: string, embedding: Float32Array): void {
+  getDb()
+    .prepare("UPDATE script_embeddings SET embedding = ? WHERE scriptId = ?")
+    .run(serializeEmbedding(embedding), scriptId);
 }
 
 async function upsertFixture(args: {
@@ -232,6 +249,25 @@ describe("script embeddings", () => {
     expect(results[0]?.script.name).toBe("exact-name");
   });
 
+  test("search skips wrong-dimension script embeddings instead of throwing", async () => {
+    const bad = await upsertFixture({
+      name: "wrong-dim-memory-helper",
+      description: "Memory search helper",
+    });
+    const good = await upsertFixture({
+      name: "valid-linear-helper",
+      description: "Linear issue triage helper",
+    });
+
+    replaceStoredEmbedding(bad.script.id, new Float32Array([1, 0]));
+
+    provider.reset();
+    const results = await searchScripts({ query: "linear issue", scopeId: "agent-1", limit: 5 });
+
+    expect(results.map((result) => result.script.id)).toContain(good.script.id);
+    expect(results.map((result) => result.script.id)).not.toContain(bad.script.id);
+  });
+
   test("semantic recall returns expected top results for overlapping intents", async () => {
     const fixtures = [
       ["linear-json-parser", "Parse Linear issue JSON into task fields"],
@@ -275,6 +311,27 @@ describe("script embeddings", () => {
     provider.reset();
     await reembedAllScripts();
     expect(provider.calls).toHaveLength(2);
+  });
+
+  test("runScriptsBootReembed re-embeds wrong-dimension rows and no-ops when clean", async () => {
+    const created = await upsertFixture({
+      name: "boot-reembed-invalid",
+      description: "Parse Linear issue payloads",
+    });
+    replaceStoredEmbedding(created.script.id, new Float32Array([1, 0]));
+    expect(storedEmbeddingLength(created.script.id)).toBe(2);
+
+    provider.reset();
+    await runScriptsBootReembed();
+
+    expect(storedEmbeddingLength(created.script.id)).toBe(provider.dimensions);
+    expect(provider.calls).toHaveLength(2);
+    expect(provider.calls[0]).toBe("test");
+    expect(provider.calls[1]).toContain("Parse Linear issue payloads");
+
+    provider.reset();
+    await runScriptsBootReembed();
+    expect(provider.calls).toHaveLength(0);
   });
 
   test("delete cascades script_embeddings", async () => {

@@ -565,6 +565,14 @@ httpServer
       .catch((err) => {
         console.error("[boot-reembed] startup backfill failed (non-fatal):", err);
       });
+
+    // Background backfill: re-embed any script_embeddings rows with
+    // wrong-dimension embeddings. Non-blocking and no-op when clean.
+    import("../be/scripts/boot-reembed")
+      .then(({ runScriptsBootReembed }) => runScriptsBootReembed())
+      .catch((err) => {
+        console.error("[scripts-boot-reembed] startup backfill failed (non-fatal):", err);
+      });
   })
   .on("error", (err) => {
     console.error("HTTP Server Error:", err);

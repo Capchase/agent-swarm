@@ -42,7 +42,7 @@ export type ScriptSearchResult = {
 
 let providerOverride: EmbeddingProvider | null = null;
 
-function embeddingProvider(): EmbeddingProvider {
+export function getScriptEmbeddingProvider(): EmbeddingProvider {
   return providerOverride ?? getEmbeddingProvider();
 }
 
@@ -78,7 +78,7 @@ function rowToScript(row: ScriptEmbeddingCandidateRow): ScriptRecord {
 
 export async function embedScript(script: ScriptRecord): Promise<void> {
   const text = scriptEmbeddingText(script);
-  const provider = embeddingProvider();
+  const provider = getScriptEmbeddingProvider();
   const embedding = await provider.embed(text);
   if (!embedding) return;
 
@@ -197,7 +197,7 @@ export async function searchScripts(args: {
   scopeId?: string | null;
   limit?: number;
 }): Promise<ScriptSearchResult[]> {
-  const provider = embeddingProvider();
+  const provider = getScriptEmbeddingProvider();
   const queryEmbedding = await provider.embed(args.query);
   if (!queryEmbedding) return lexicalFallback(args);
 
@@ -205,9 +205,14 @@ export async function searchScripts(args: {
   if (candidates.length === 0) return lexicalFallback(args);
 
   return candidates
-    .map((row) => {
+    .map((row): ScriptSearchResult | null => {
       const script = rowToScript(row);
-      const semanticScore = cosineSimilarity(queryEmbedding, deserializeEmbedding(row.embedding));
+      const rowEmbedding = deserializeEmbedding(row.embedding);
+      if (rowEmbedding.length !== queryEmbedding.length) {
+        return null;
+      }
+
+      const semanticScore = cosineSimilarity(queryEmbedding, rowEmbedding);
       const bonus = nameMatchBonus(script, args.query);
       return {
         script,
@@ -216,6 +221,7 @@ export async function searchScripts(args: {
         nameMatchBonus: bonus,
       };
     })
+    .filter((result): result is ScriptSearchResult => result !== null)
     .sort((a, b) => b.score - a.score)
     .slice(0, args.limit ?? 10);
 }
