@@ -85,10 +85,7 @@ export async function runScriptsBootReembed(): Promise<void> {
         reembedded++;
       } catch (err) {
         failed++;
-        console.error(
-          `[scripts-boot-reembed] script ${script.id} failed:`,
-          (err as Error).message,
-        );
+        console.error(`[scripts-boot-reembed] script ${script.id} failed:`, (err as Error).message);
       }
     }
   }
