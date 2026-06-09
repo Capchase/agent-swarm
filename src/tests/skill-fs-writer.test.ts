@@ -10,11 +10,17 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type SkillFsEntry, SWARM_MARKER_FILE, writeSkillsToFilesystem } from "../utils/skill-fs-writer";
+import {
+  type SkillFsEntry,
+  SWARM_MARKER_FILE,
+  writeSkillsToFilesystem,
+} from "../utils/skill-fs-writer";
 
 const FAKE_HOME = join(tmpdir(), `skill-fs-writer-test-${process.pid}`);
 
-function skillEntry(overrides: Partial<SkillFsEntry> & { name: string; content: string }): SkillFsEntry {
+function skillEntry(
+  overrides: Partial<SkillFsEntry> & { name: string; content: string },
+): SkillFsEntry {
   return {
     id: `id-${overrides.name}`,
     isComplex: false,
@@ -67,7 +73,9 @@ describe("writeSkillsToFilesystem", () => {
 
     expect(result.synced).toBe(3); // claude + pi + codex
     expect(existsSync(join(FAKE_HOME, ".claude", "skills", "multi-skill", "SKILL.md"))).toBe(true);
-    expect(existsSync(join(FAKE_HOME, ".pi", "agent", "skills", "multi-skill", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(FAKE_HOME, ".pi", "agent", "skills", "multi-skill", "SKILL.md"))).toBe(
+      true,
+    );
     expect(existsSync(join(FAKE_HOME, ".codex", "skills", "multi-skill", "SKILL.md"))).toBe(true);
   });
 
@@ -78,7 +86,11 @@ describe("writeSkillsToFilesystem", () => {
         content: "# Complex Skill",
         isComplex: true,
         files: [
-          { path: "references/guide.md", content: "# Guide\n\nBundled reference.", isBinary: false },
+          {
+            path: "references/guide.md",
+            content: "# Guide\n\nBundled reference.",
+            isBinary: false,
+          },
         ],
       }),
     ];
@@ -88,7 +100,14 @@ describe("writeSkillsToFilesystem", () => {
     expect(result.synced).toBe(1);
 
     const skillFile = join(FAKE_HOME, ".claude", "skills", "complex-skill", "SKILL.md");
-    const bundledFile = join(FAKE_HOME, ".claude", "skills", "complex-skill", "references", "guide.md");
+    const bundledFile = join(
+      FAKE_HOME,
+      ".claude",
+      "skills",
+      "complex-skill",
+      "references",
+      "guide.md",
+    );
     expect(existsSync(skillFile)).toBe(true);
     expect(existsSync(bundledFile)).toBe(true);
     expect(readFileSync(bundledFile, "utf-8")).toContain("Bundled reference.");
@@ -109,7 +128,14 @@ describe("writeSkillsToFilesystem", () => {
     writeSkillsToFilesystem(entries, "claude", FAKE_HOME);
 
     const binaryFile = join(FAKE_HOME, ".claude", "skills", "complex-skill", "assets", "logo.png");
-    const textFile = join(FAKE_HOME, ".claude", "skills", "complex-skill", "references", "guide.md");
+    const textFile = join(
+      FAKE_HOME,
+      ".claude",
+      "skills",
+      "complex-skill",
+      "references",
+      "guide.md",
+    );
     expect(existsSync(binaryFile)).toBe(false);
     expect(existsSync(textFile)).toBe(true);
   });
@@ -130,7 +156,9 @@ describe("writeSkillsToFilesystem", () => {
   });
 
   test("skips inactive skills", () => {
-    const entries = [skillEntry({ name: "inactive-skill", content: "# Inactive", isActive: false })];
+    const entries = [
+      skillEntry({ name: "inactive-skill", content: "# Inactive", isActive: false }),
+    ];
     const result = writeSkillsToFilesystem(entries, "claude", FAKE_HOME);
 
     expect(result.synced).toBe(0);
@@ -138,7 +166,9 @@ describe("writeSkillsToFilesystem", () => {
   });
 
   test("skips disabled skills", () => {
-    const entries = [skillEntry({ name: "disabled-skill", content: "# Disabled", isEnabled: false })];
+    const entries = [
+      skillEntry({ name: "disabled-skill", content: "# Disabled", isEnabled: false }),
+    ];
     const result = writeSkillsToFilesystem(entries, "claude", FAKE_HOME);
 
     expect(result.synced).toBe(0);

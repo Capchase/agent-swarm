@@ -11,8 +11,12 @@
  */
 
 import { homedir } from "node:os";
+import {
+  type SkillFsEntry,
+  type SkillSyncResult,
+  writeSkillsToFilesystem,
+} from "../utils/skill-fs-writer";
 import { getAgentSkills, getSkillFiles } from "./db";
-import { type SkillFsEntry, type SkillSyncResult, writeSkillsToFilesystem } from "../utils/skill-fs-writer";
 
 export type { SkillSyncResult };
 
