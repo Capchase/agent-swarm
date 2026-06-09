@@ -941,7 +941,6 @@ function mkAttachment(overrides: Partial<TaskAttachment>): TaskAttachment {
   };
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: section blocks are loose plain objects
 type AnyBlock = any;
 
 function sectionTexts(blocks: AnyBlock[]): string[] {

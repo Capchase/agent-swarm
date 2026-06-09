@@ -233,7 +233,6 @@ describe("AgentTaskConfigSchema — outputSchema", () => {
   test("accepts outputSchema in config", async () => {
     const { AgentTaskExecutor } = await import("../workflows/executors/agent-task");
     const executor = new AgentTaskExecutor({
-      // biome-ignore lint/suspicious/noExplicitAny: mock DB for test
       db: {} as any,
       eventBus: { emit: () => {}, on: () => {}, off: () => {} },
       interpolate: (t: string) => t,
@@ -257,7 +256,6 @@ describe("AgentTaskConfigSchema — outputSchema", () => {
   test("accepts followUpConfig in config", async () => {
     const { AgentTaskExecutor } = await import("../workflows/executors/agent-task");
     const executor = new AgentTaskExecutor({
-      // biome-ignore lint/suspicious/noExplicitAny: mock DB for test
       db: {} as any,
       eventBus: { emit: () => {}, on: () => {}, off: () => {} },
       interpolate: (t: string) => t,

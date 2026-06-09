@@ -25,7 +25,6 @@ async function api(
   method: string,
   path: string,
   opts: { body?: unknown; agentId?: string; headers?: Record<string, string> } = {},
-  // biome-ignore lint/suspicious/noExplicitAny: test helper needs flexible body type
 ): Promise<{ status: number; body: any; ok: boolean }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -41,7 +40,6 @@ async function api(
   });
 
   const text = await res.text();
-  // biome-ignore lint/suspicious/noExplicitAny: body can be parsed JSON or raw text
   let body: any;
   try {
     body = JSON.parse(text);

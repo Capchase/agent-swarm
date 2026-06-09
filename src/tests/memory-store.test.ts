@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, createAgent, getDb, initDb } from "../be/db";
+import { closeDb, createAgent, getDb, initDb, isSqliteVecAvailable } from "../be/db";
 import { serializeEmbedding } from "../be/embedding";
 import { SqliteMemoryStore } from "../be/memory/providers/sqlite-store";
 
@@ -17,6 +17,16 @@ describe("SqliteMemoryStore", () => {
       embedding[Number(index)] = value;
     }
     return embedding;
+  }
+
+  function skipVecAssertionsWhenUnavailable(): boolean {
+    if (isSqliteVecAvailable()) return false;
+
+    const health = store.getHealth();
+    expect(health.sqliteVec.extensionLoaded).toBe(false);
+    expect(health.retrievalMode).toBe("fallback");
+    expect(health.reasons).toContain("sqlite_vec_extension_unavailable");
+    return true;
   }
 
   beforeAll(async () => {
@@ -221,6 +231,8 @@ describe("SqliteMemoryStore", () => {
     });
 
     test("uses sqlite-vec for 512d embeddings with scope-filter parity", () => {
+      if (skipVecAssertionsWhenUnavailable()) return;
+
       for (let i = 0; i < 6; i++) {
         const otherAgent = store.store({
           agentId: agentB,
@@ -256,6 +268,8 @@ describe("SqliteMemoryStore", () => {
 
   describe("memory_vec population", () => {
     test("populates existing embeddings on startup and reports health counts", () => {
+      if (skipVecAssertionsWhenUnavailable()) return;
+
       const raw = store.store({
         agentId: agentA,
         scope: "agent",
@@ -282,6 +296,8 @@ describe("SqliteMemoryStore", () => {
     });
 
     test("rebuilds an old non-cosine memory_vec table from agent_memory", () => {
+      if (skipVecAssertionsWhenUnavailable()) return;
+
       const raw = store.store({
         agentId: agentA,
         scope: "agent",
@@ -473,6 +489,8 @@ describe("SqliteMemoryStore", () => {
     });
 
     test("also removes corresponding vec rows", () => {
+      if (skipVecAssertionsWhenUnavailable()) return;
+
       const db = getDb();
       const emb = vector({ 0: 0.9, 100: 0.1 });
 

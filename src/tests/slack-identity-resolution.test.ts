@@ -62,7 +62,6 @@ function makeMockClient(byUserId: Record<string, MockUsersInfoResponse | "throw"
     },
   };
   return {
-    // biome-ignore lint/suspicious/noExplicitAny: shape-matched to WebClient's users.info call site.
     client: client as any,
     callCounts,
   };

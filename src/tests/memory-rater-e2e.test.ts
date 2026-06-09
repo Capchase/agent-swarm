@@ -64,7 +64,6 @@ async function api(
   method: string,
   path: string,
   opts: { body?: unknown; agentId?: string; sourceTaskId?: string } = {},
-  // biome-ignore lint/suspicious/noExplicitAny: test helper
 ): Promise<{ status: number; body: any }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -78,7 +77,6 @@ async function api(
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
   const text = await res.text();
-  // biome-ignore lint/suspicious/noExplicitAny: body may be JSON or text
   let body: any;
   try {
     body = JSON.parse(text);

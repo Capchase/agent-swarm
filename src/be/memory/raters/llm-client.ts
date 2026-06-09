@@ -75,6 +75,13 @@ AGENT RESPONSE / SUMMARY:
 
 Score 0..1.`;
 
+const PLACEHOLDER_PREFIX = "$";
+const QUERY_PLACEHOLDER = `${PLACEHOLDER_PREFIX}{query}`;
+const MEMORY_ID_PLACEHOLDER = `${PLACEHOLDER_PREFIX}{memoryId}`;
+const MEMORY_NAME_PLACEHOLDER = `${PLACEHOLDER_PREFIX}{memoryName}`;
+const MEMORY_CONTENT_PLACEHOLDER = `${PLACEHOLDER_PREFIX}{memoryContent}`;
+const RESPONSE_PLACEHOLDER = `${PLACEHOLDER_PREFIX}{response}`;
+
 /**
  * `claude -p --output-format json` returns a JSON envelope of the shape
  * `{ result: string, ... }`. We parse the envelope, then JSON-parse the
@@ -83,11 +90,11 @@ Score 0..1.`;
 type ClaudeCliEnvelope = { result?: unknown };
 
 function buildPrompt(input: LlmRaterInput): string {
-  return PROMPT_TEMPLATE.replace("${query}", input.query)
-    .replace("${memoryId}", input.memory.id)
-    .replace("${memoryName}", input.memory.name)
-    .replace("${memoryContent}", input.memory.content)
-    .replace("${response}", input.response);
+  return PROMPT_TEMPLATE.replace(QUERY_PLACEHOLDER, input.query)
+    .replace(MEMORY_ID_PLACEHOLDER, input.memory.id)
+    .replace(MEMORY_NAME_PLACEHOLDER, input.memory.name)
+    .replace(MEMORY_CONTENT_PLACEHOLDER, input.memory.content)
+    .replace(RESPONSE_PLACEHOLDER, input.response);
 }
 
 function parseScoreAndReasoning(raw: unknown): LlmRaterResult | null {
