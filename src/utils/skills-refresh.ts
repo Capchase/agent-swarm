@@ -79,6 +79,7 @@ export async function refreshSkillsIfChanged(
   };
   let skillRows: SkillRow[] = [];
   let newHash: string | null = null;
+  let listFetchOk = false;
   try {
     const skillsResp = await fetch(`${apiUrl}/api/agents/${agentId}/skills`, {
       headers: authHeaders,
@@ -92,9 +93,17 @@ export async function refreshSkillsIfChanged(
       if (typeof skillsData.signature === "string") {
         newHash = skillsData.signature;
       }
+      listFetchOk = true;
     }
   } catch {
-    // Non-fatal — skills are optional
+    // Transient network / parse error — bail out without touching the local FS
+  }
+
+  // Guard: a failed list fetch must not proceed to writeSkillsToFilesystem.
+  // An empty entries array would wipe every swarm-managed skill directory from
+  // the worker disk, which is worse than leaving the cache stale.
+  if (!listFetchOk) {
+    return { changed: false };
   }
 
   const summary = skillRows

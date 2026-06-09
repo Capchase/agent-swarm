@@ -27,6 +27,7 @@ type SkillStub = {
 type StubState = {
   signatureHash: string;
   signatureStatus: number;
+  listStatus: number;
   skillsBody: {
     skills: SkillStub[];
     signature: string;
@@ -40,6 +41,7 @@ const FAKE_HOME = join(tmpdir(), `runner-refresh-test-${process.pid}`);
 const state: StubState = {
   signatureHash: "hash-v1",
   signatureStatus: 200,
+  listStatus: 200,
   skillFilesStatus: 200,
   skillsBody: {
     skills: [
@@ -91,6 +93,9 @@ describe("refreshSkillsIfChanged", () => {
         }
         if (url.pathname.match(/\/api\/agents\/[^/]+\/skills$/)) {
           state.calls.list++;
+          if (state.listStatus !== 200) {
+            return new Response("err", { status: state.listStatus });
+          }
           return Response.json({
             skills: state.skillsBody.skills,
             total: state.skillsBody.skills.length,
@@ -330,5 +335,36 @@ describe("refreshSkillsIfChanged", () => {
     expect(lastHash.current).toBe("hash-v4");
     expect(state.calls.sync).toBe(0);
     rmSync(cleanHome, { recursive: true, force: true });
+  });
+
+  test("list fetch failure after signature drift leaves pre-existing skills on disk and does not advance hash", async () => {
+    // Arrange: fresh isolated home with a pre-existing swarm-managed skill
+    const isolatedHome = join(FAKE_HOME, "list-fail-home");
+    const skillDir = join(isolatedHome, ".claude", "skills", "pre-existing");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, ".swarm-managed"), "");
+    writeFileSync(join(skillDir, "SKILL.md"), "# Pre-existing skill");
+
+    // Simulate signature drift so the list endpoint is called
+    state.signatureHash = "hash-new";
+    state.listStatus = 503; // List fetch fails
+    state.calls = { signature: 0, list: 0, sync: 0 };
+
+    const lastHash = { current: "hash-old" };
+    const result = await refreshWithHome(makeCtx(), lastHash, isolatedHome);
+
+    // Must bail out without touching disk
+    expect(result.changed).toBe(false);
+    // Cached hash must NOT advance — disk is still in "old" state
+    expect(lastHash.current).toBe("hash-old");
+    // List endpoint was called (signature differed) but the failure must bail early
+    expect(state.calls.list).toBe(1);
+    // Pre-existing managed skill file must survive
+    expect(existsSync(join(skillDir, "SKILL.md"))).toBe(true);
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf-8")).toBe("# Pre-existing skill");
+
+    // Restore
+    state.listStatus = 200;
+    rmSync(isolatedHome, { recursive: true, force: true });
   });
 });
