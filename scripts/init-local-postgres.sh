@@ -17,10 +17,10 @@ PG_BINDIR="/usr/lib/postgresql/${PG_VERSION}/bin"
 PG_CLUSTER_DIR="${LOCAL_POSTGRES_DATA_DIR:-/tmp/postgres-test}"
 PG_DATA_DIR="${PG_CLUSTER_DIR}/data"
 PG_LOG="${PG_CLUSTER_DIR}/postgres.log"
-PG_PORT=5433
-PG_USER=prisma
-PG_PASSWORD=prisma
-PG_DB=tests
+PG_PORT="${LOCAL_POSTGRES_PORT:-5433}"
+PG_USER="${LOCAL_POSTGRES_USER:-postgres}"
+PG_PASSWORD="${LOCAL_POSTGRES_PASSWORD:-postgres}"
+PG_DB="${LOCAL_POSTGRES_DB:-app}"
 
 log() { printf '[init-local-postgres] %s\n' "$1"; }
 
@@ -55,7 +55,7 @@ host    all   all   127.0.0.1/32   trust
 host    all   all   ::1/128        trust
 EOF
 
-  # Set password for the superuser role so client-monorepo's SCRAM connections work
+  # Set password for the superuser role so password-based SCRAM clients can authenticate
   gosu worker "${PG_BINDIR}/pg_ctl" -D "$PG_DATA_DIR" -l "$PG_LOG" start -w -t 60 > /dev/null
   gosu worker "${PG_BINDIR}/psql" \
     -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres \
