@@ -15,7 +15,12 @@ import { buildTreeBlocks, type TreeNode } from "./blocks";
 import { enrichSlackUserEmail, resolveSlackUserId } from "./enrich";
 import { wasEventSeen } from "./event-dedup";
 import type { SlackFile } from "./files";
-import { extractTaskFromMessage, hasOtherUserMention, routeMessage } from "./router";
+import {
+  extractTaskFromMessage,
+  hasOtherUserMention,
+  mentionsCompetingAgent,
+  routeMessage,
+} from "./router";
 // Side-effect import: registers all Slack event templates in the in-memory registry
 import "./templates";
 import { extractSlackMessageText } from "./message-text";
@@ -45,6 +50,16 @@ const autoReplyChannels = new Set(
 
 // Agent ID to route data-reply tasks to (must have bq runtime). Falls back to lead.
 const SLACK_AUTO_REPLY_AGENT_ID = (process.env.SLACK_AUTO_REPLY_AGENT_ID || "").trim();
+
+// Known competing AI agent/bot user IDs (e.g. Devin: U0831BS93V1).
+// When our bot is co-mentioned alongside one of these, the swarm stays silent.
+// Populated without an API call — set SLACK_COMPETING_AGENT_USER_IDS=U0831BS93V1,...
+const competingAgentIds = new Set(
+  (process.env.SLACK_COMPETING_AGENT_USER_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
 
 // Disclaimer prefix prepended to every auto-reply
 export const AUTO_REPLY_DISCLAIMER =
@@ -284,6 +299,46 @@ async function wasThreadStartedBySwarm(
 
 // Cache for user display names
 const userNameCache = new Map<string, string>();
+
+// Cache for is_bot / is_app_user results (permanent — bot status never changes at runtime)
+const botCheckCache = new Map<string, boolean>();
+
+/**
+ * Returns true when the message @-mentions another AI agent/bot alongside our own bot.
+ * Uses two-tier detection:
+ *  1. Fast path: checks `competingAgentIds` (SLACK_COMPETING_AGENT_USER_IDS env var) — no API call.
+ *  2. Slow path: calls `users.info` for any unrecognised co-mentioned user and caches the result.
+ * Returns false when all co-mentioned users are humans.
+ */
+async function isCoMentionedWithCompetingBot(
+  text: string,
+  botUserId: string,
+  client: WebClient,
+): Promise<boolean> {
+  // Fast path: check the pre-configured competing-agent set
+  if (mentionsCompetingAgent(text, botUserId, competingAgentIds)) return true;
+
+  // Slow path: inspect each co-mentioned user via users.info
+  const mentions = text.match(/<@([A-Z0-9]+)>/g) ?? [];
+  for (const m of mentions) {
+    const uid = m.slice(2, -1);
+    if (uid === botUserId) continue;
+    if (competingAgentIds.has(uid)) continue; // already handled by fast path above
+
+    let isBot = botCheckCache.get(uid);
+    if (isBot === undefined) {
+      try {
+        const res = await client.users.info({ user: uid });
+        isBot = !!(res.user?.is_bot || res.user?.is_app_user);
+      } catch {
+        isBot = false;
+      }
+      botCheckCache.set(uid, isBot);
+    }
+    if (isBot) return true;
+  }
+  return false;
+}
 
 async function getUserDisplayName(client: WebClient, userId: string): Promise<string> {
   if (userNameCache.has(userId)) {
@@ -602,6 +657,23 @@ export function registerMessageHandler(app: App): void {
 
     // Route message to agents (use original text for routing to preserve mention/name matching)
     const routingText = msg.text || effectiveText;
+
+    // Suppress task creation when our bot is co-mentioned with another AI agent/bot.
+    // Explicit swarm#<uuid> / swarm#all targeting always overrides this guard.
+    // Assistant-thread implicit mentions are not suppressed (the human is addressing us directly).
+    if (botMentioned && !isImplicitMention && hasOtherUserMention(routingText, botUserId)) {
+      const hasExplicitTarget = /swarm#([a-f0-9-]{36}|all)/i.test(routingText);
+      if (
+        !hasExplicitTarget &&
+        (await isCoMentionedWithCompetingBot(routingText, botUserId, client))
+      ) {
+        console.log(
+          `[Slack] Suppressing task: bot co-mentioned with competing agent in ${msg.channel}`,
+        );
+        return;
+      }
+    }
+
     const routingThreadContext = msg.thread_ts
       ? { channelId: msg.channel, threadTs: msg.thread_ts }
       : undefined;

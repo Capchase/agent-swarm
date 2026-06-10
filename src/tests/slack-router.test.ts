@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import { closeDb, createAgent, createTaskExtended, initDb } from "../be/db";
-import { routeMessage } from "../slack/router";
+import { mentionsCompetingAgent, routeMessage } from "../slack/router";
 import type { Agent } from "../types";
 
 const TEST_DB_PATH = "./test-slack-router.sqlite";
@@ -177,5 +177,83 @@ describe("Slack router — thread follow-up routing", () => {
 
       expect(matches).toHaveLength(0);
     });
+  });
+});
+
+describe("mentionsCompetingAgent", () => {
+  const botUserId = "BOT123";
+  const devinId = "DEVIN456";
+  const humanId = "HUMAN789";
+  const competing = new Set([devinId]);
+
+  test("returns true when co-mentioned user is in competing set", () => {
+    expect(
+      mentionsCompetingAgent(`<@${botUserId}> <@${devinId}> build this`, botUserId, competing),
+    ).toBe(true);
+  });
+
+  test("returns false when only a human is co-mentioned (not in competing set)", () => {
+    expect(
+      mentionsCompetingAgent(`<@${botUserId}> <@${humanId}> build this`, botUserId, competing),
+    ).toBe(false);
+  });
+
+  test("returns false when only the bot is mentioned", () => {
+    expect(mentionsCompetingAgent(`<@${botUserId}> build this`, botUserId, competing)).toBe(false);
+  });
+
+  test("returns false with empty competing set", () => {
+    expect(mentionsCompetingAgent(`<@${botUserId}> <@${devinId}> hi`, botUserId, new Set())).toBe(
+      false,
+    );
+  });
+
+  test("returns true when competing agent is the only mention besides bot", () => {
+    expect(
+      mentionsCompetingAgent(`hey <@${devinId}> and <@${botUserId}>`, botUserId, competing),
+    ).toBe(true);
+  });
+
+  test("ignores the bot's own mention — does not count bot as competing", () => {
+    expect(mentionsCompetingAgent(`<@${botUserId}> do x`, botUserId, new Set([botUserId]))).toBe(
+      false,
+    );
+  });
+});
+
+describe("competing-agent suppression decision (pure-logic coverage)", () => {
+  const botUserId = "BOT123";
+  const devinId = "DEVIN456";
+  const humanId = "HUMAN789";
+  const competing = new Set([devinId]);
+
+  // Helper: mirrors the guard logic in handlers.ts before routeMessage()
+  function shouldSuppress(text: string): boolean {
+    const hasExplicitTarget = /swarm#([a-f0-9-]{36}|all)/i.test(text);
+    if (hasExplicitTarget) return false;
+    const hasOther = text.match(/<@([A-Z0-9]+)>/g)?.some((m) => m !== `<@${botUserId}>`) ?? false;
+    if (!hasOther) return false;
+    return mentionsCompetingAgent(text, botUserId, competing);
+  }
+
+  test("co-mention with competing agent → suppress", () => {
+    expect(shouldSuppress(`<@${botUserId}> <@${devinId}> build this feature`)).toBe(true);
+  });
+
+  test("co-mention with human only → do NOT suppress", () => {
+    expect(shouldSuppress(`<@${botUserId}> <@${humanId}> can you help?`)).toBe(false);
+  });
+
+  test("swarm#<uuid> + competing agent co-mention → do NOT suppress (explicit override)", () => {
+    const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    expect(shouldSuppress(`<@${botUserId}> <@${devinId}> swarm#${uuid} do this`)).toBe(false);
+  });
+
+  test("swarm#all + competing agent co-mention → do NOT suppress (explicit override)", () => {
+    expect(shouldSuppress(`<@${botUserId}> <@${devinId}> swarm#all deploy`)).toBe(false);
+  });
+
+  test("only our bot mentioned → do NOT suppress", () => {
+    expect(shouldSuppress(`<@${botUserId}> do something`)).toBe(false);
   });
 });

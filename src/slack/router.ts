@@ -16,6 +16,25 @@ export function hasOtherUserMention(text: string, botUserId: string): boolean {
 }
 
 /**
+ * Returns true if the text @-mentions at least one user ID that is in the
+ * `competingAgentIds` set (and is not our own bot). Used as a fast-path check
+ * before falling back to the async `users.info` bot-detection call.
+ * Exported for unit testing.
+ */
+export function mentionsCompetingAgent(
+  text: string,
+  botUserId: string,
+  competingAgentIds: Set<string>,
+): boolean {
+  if (competingAgentIds.size === 0) return false;
+  const mentions = text.match(/<@([A-Z0-9]+)>/g) ?? [];
+  return mentions.some((m) => {
+    const uid = m.slice(2, -1);
+    return uid !== botUserId && competingAgentIds.has(uid);
+  });
+}
+
+/**
  * Routes a Slack message to the appropriate agent(s) based on mentions.
  *
  * Routing rules:
