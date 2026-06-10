@@ -1110,6 +1110,35 @@ async function reportKeyRateLimit(
   }
 }
 
+/** Clear a stale rate-limit record after a successful task (fire-and-forget) */
+async function reportKeyClearRateLimit(
+  apiUrl: string,
+  apiKey: string,
+  keyType: string,
+  keySuffix: string,
+): Promise<void> {
+  try {
+    const resp = await fetch(`${apiUrl}/api/keys/clear-rate-limit`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ keyType, keySuffix }),
+    });
+    if (resp.ok) {
+      const data = (await resp.json()) as { cleared?: boolean };
+      if (data.cleared) {
+        console.log(
+          `[credentials] Cleared stale rate-limit for ...${keySuffix} after successful task`,
+        );
+      }
+    }
+  } catch {
+    // Non-blocking
+  }
+}
+
 /**
  * Supersede a task via the API (for graceful shutdown / context-limit /
  * operator-triggered). Returns `{ ok: true, resumeTaskId }` on success.
@@ -1472,6 +1501,8 @@ interface RunningTask {
    * provider before it completed, and vice versa).
    */
   hasLocalEnvironment: boolean;
+  /** Harness variant captured on session_init (e.g. "bridge" or "stock") */
+  harnessVariant?: string;
 }
 
 /** Runner state for tracking concurrent tasks */
@@ -1590,6 +1621,8 @@ async function saveProviderSessionId(
   provider?: ProviderName,
   providerMeta?: Record<string, unknown>,
   model?: string,
+  harnessVariant?: string,
+  harnessVariantMeta?: Record<string, unknown>,
 ): Promise<void> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
@@ -1597,10 +1630,42 @@ async function saveProviderSessionId(
   if (provider !== undefined) body.provider = provider;
   if (providerMeta !== undefined) body.providerMeta = providerMeta;
   if (model !== undefined && model !== "") body.model = model;
-  await fetch(`${apiUrl}/api/tasks/${taskId}/claude-session`, {
+  if (harnessVariant !== undefined) body.harnessVariant = harnessVariant;
+  if (harnessVariantMeta !== undefined) body.harnessVariantMeta = harnessVariantMeta;
+  await fetch(`${apiUrl}/api/tasks/${taskId}/session`, {
     method: "PUT",
     headers,
     body: JSON.stringify(body),
+  });
+}
+
+async function findBridgeFailureArtifact(cwd: string): Promise<string | undefined> {
+  try {
+    const bridgeDir = `${cwd}/.claude-bridge/runs`;
+    const dir = await Array.fromAsync(
+      new Bun.Glob("*/tmux-pane-final.txt").scan({ cwd: bridgeDir, absolute: true }),
+    );
+    if (dir.length === 0) return undefined;
+    dir.sort();
+    return dir[dir.length - 1];
+  } catch {
+    return undefined;
+  }
+}
+
+async function updateHarnessVariantMeta(
+  apiUrl: string,
+  apiKey: string,
+  taskId: string,
+  claudeSessionId: string,
+  meta: Record<string, unknown>,
+): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  await fetch(`${apiUrl}/api/tasks/${taskId}/session`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ claudeSessionId, harnessVariantMeta: meta }),
   });
 }
 
@@ -2493,10 +2558,19 @@ async function spawnProviderProcess(
   // Resolve Codex OAuth pool slot BEFORE building ProviderSessionConfig so we
   // can pass codexSlot through and the adapter writes token refreshes back to
   // the correct slot key (codex_oauth_<slot>) instead of defaulting to slot 0.
+  //
+  // Always resolve for codex (not just when credentialSelections is empty) so
+  // that if the OPENAI_API_KEY credential is rate-limited we can fail over to
+  // a CODEX_OAUTH slot — even though the keyType differs.
   let oauthSelection: CredentialSelection | undefined;
-  if (adapter.name === "codex" && credentialSelections.length === 0) {
+  if (adapter.name === "codex") {
     oauthSelection = (await resolveCodexOAuthCredentialInfo(opts.apiUrl, opts.apiKey)) ?? undefined;
-    if (oauthSelection && realTaskId) {
+    const oauthIsPrimary =
+      credentialSelections.length === 0 ||
+      (credentialSelections[0]?.isRateLimitFallback &&
+        oauthSelection &&
+        !oauthSelection.isRateLimitFallback);
+    if (oauthSelection && realTaskId && oauthIsPrimary) {
       reportKeyUsage(
         opts.apiUrl,
         opts.apiKey,
@@ -2676,6 +2750,8 @@ async function spawnProviderProcess(
               event.provider,
               event.providerMeta,
               model,
+              event.harnessVariant,
+              event.harnessVariantMeta,
             ).catch((err) => console.warn(`[runner] Failed to save session ID: ${err}`));
           } else {
             // Pool task: save provider session ID on active session so it can be
@@ -3085,8 +3161,23 @@ async function spawnProviderProcess(
       }),
     );
 
-  // Build credential info for rate limit tracking
-  const primarySelection = credentialSelections[0] ?? oauthSelection;
+  // Build credential info for rate limit tracking.
+  // For codex: when OPENAI_API_KEY is rate-limited but CODEX_OAUTH has
+  // available slots (or vice versa), prefer the healthy credential.
+  let primarySelection: CredentialSelection | undefined;
+  const firstCred = credentialSelections[0];
+  if (firstCred && oauthSelection) {
+    if (firstCred.isRateLimitFallback && !oauthSelection.isRateLimitFallback) {
+      primarySelection = oauthSelection;
+      console.log(
+        `[credentials] Cross-keyType failover: ${firstCred.keyType} all rate-limited, using ${oauthSelection.keyType} [...${oauthSelection.keySuffix}]`,
+      );
+    } else {
+      primarySelection = firstCred;
+    }
+  } else {
+    primarySelection = firstCred ?? oauthSelection;
+  }
   const credentialInfo = primarySelection
     ? {
         keyType: primarySelection.keyType,
@@ -3160,7 +3251,14 @@ async function checkCompletedProcesses(
   }
 
   // Remove completed tasks from the map and ensure they're marked as finished
-  for (const { taskId, result, cursorUpdates, workingDir, credentialInfo } of completedTasks) {
+  for (const {
+    taskId,
+    result,
+    cursorUpdates,
+    workingDir,
+    credentialInfo,
+    harnessProvider,
+  } of completedTasks) {
     state.activeTasks.delete(taskId);
     vcsDetectedTasks.delete(taskId);
     vcsCheckTimestamps.delete(taskId);
@@ -3251,8 +3349,27 @@ async function checkCompletedProcesses(
         result.exitCode,
         failureReason,
         result.output,
-        state.harnessProvider,
+        harnessProvider,
       );
+
+      if (result.exitCode === 0 && credentialInfo) {
+        reportKeyClearRateLimit(
+          apiConfig.apiUrl,
+          apiConfig.apiKey,
+          credentialInfo.keyType,
+          credentialInfo.keySuffix,
+        ).catch(() => {});
+      }
+
+      if (result.exitCode !== 0 && harnessProvider === "claude" && workingDir && result.sessionId) {
+        const artifactPath = await findBridgeFailureArtifact(workingDir);
+        if (artifactPath) {
+          console.log(`[${role}] Bridge failure artifact found: ${artifactPath}`);
+          updateHarnessVariantMeta(apiConfig.apiUrl, apiConfig.apiKey, taskId, result.sessionId, {
+            failureArtifact: artifactPath,
+          }).catch((err) => console.warn(`[runner] Failed to update harness variant meta: ${err}`));
+        }
+      }
 
       ensure({
         id: "worker_process_finished",

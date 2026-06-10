@@ -16,7 +16,7 @@ function getBridgeServer(): McpServer {
 }
 
 type RegisteredTool = {
-  handler: Function;
+  handler: (argsOrExtra: unknown, extra?: unknown) => unknown | Promise<unknown>;
   inputSchema?: unknown;
   enabled?: boolean;
 };

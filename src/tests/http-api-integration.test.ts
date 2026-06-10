@@ -25,7 +25,6 @@ async function api(
   method: string,
   path: string,
   opts: { body?: unknown; agentId?: string; headers?: Record<string, string> } = {},
-  // biome-ignore lint/suspicious/noExplicitAny: test helper needs flexible body type
 ): Promise<{ status: number; body: any; ok: boolean }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -41,7 +40,6 @@ async function api(
   });
 
   const text = await res.text();
-  // biome-ignore lint/suspicious/noExplicitAny: body can be parsed JSON or raw text
   let body: any;
   try {
     body = JSON.parse(text);
@@ -427,9 +425,9 @@ describe("Tasks", () => {
     expect(status).toBe(404);
   });
 
-  test("PUT /api/tasks/:id/claude-session — update session ID", async () => {
+  test("PUT /api/tasks/:id/session — update session ID", async () => {
     const sessionId = randomUUID();
-    const { status, body } = await put(`/api/tasks/${ids.task2}/claude-session`, {
+    const { status, body } = await put(`/api/tasks/${ids.task2}/session`, {
       agentId: ids.workerAgent,
       body: { claudeSessionId: sessionId },
     });
@@ -437,8 +435,8 @@ describe("Tasks", () => {
     expect(body.claudeSessionId).toBe(sessionId);
   });
 
-  test("PUT /api/tasks/:id/claude-session — missing fields returns 400", async () => {
-    const { status } = await put(`/api/tasks/${ids.task2}/claude-session`, {
+  test("PUT /api/tasks/:id/session — missing fields returns 400", async () => {
+    const { status } = await put(`/api/tasks/${ids.task2}/session`, {
       body: {},
     });
     expect(status).toBe(400);

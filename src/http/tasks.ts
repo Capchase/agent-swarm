@@ -98,11 +98,11 @@ const createTask = route({
   },
 });
 
-const updateClaudeSession = route({
+const updateSession = route({
   method: "put",
-  path: "/api/tasks/{id}/claude-session",
-  pattern: ["api", "tasks", null, "claude-session"],
-  summary: "Update Claude session ID for a task",
+  path: "/api/tasks/{id}/session",
+  pattern: ["api", "tasks", null, "session"],
+  summary: "Update provider session ID and harness metadata for a task",
   tags: ["Tasks"],
   params: z.object({ id: z.string() }),
   body: z.union([
@@ -121,6 +121,8 @@ const updateClaudeSession = route({
       provider: ProviderNameSchema.exclude(["devin"]).optional(),
       model: z.string().optional(),
       providerMeta: z.object({}).optional(),
+      harnessVariant: z.string().optional(),
+      harnessVariantMeta: z.record(z.string(), z.unknown()).optional(),
     }),
   ]),
   responses: {
@@ -427,8 +429,8 @@ export async function handleTasks(
     return true;
   }
 
-  if (updateClaudeSession.match(req.method, pathSegments)) {
-    const parsed = await updateClaudeSession.parse(req, res, pathSegments, queryParams);
+  if (updateSession.match(req.method, pathSegments)) {
+    const parsed = await updateSession.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     const task = updateTaskClaudeSessionId(
       parsed.params.id,
@@ -436,6 +438,8 @@ export async function handleTasks(
       parsed.body.provider,
       parsed.body.providerMeta,
       parsed.body.model,
+      "harnessVariant" in parsed.body ? parsed.body.harnessVariant : undefined,
+      "harnessVariantMeta" in parsed.body ? parsed.body.harnessVariantMeta : undefined,
     );
     if (!task) {
       jsonError(res, "Task not found", 404);

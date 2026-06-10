@@ -2740,6 +2740,59 @@
         }
       }
     },
+    "/api/keys/clear-rate-limit": {
+      "post": {
+        "summary": "Clear rate-limited status for a key after a successful use proves it is healthy",
+        "tags": [
+          "API Keys"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "keyType": {
+                    "type": "string"
+                  },
+                  "keySuffix": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 10
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "scopeId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "keyType",
+                  "keySuffix"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rate limit cleared (or key was not rate-limited)"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        }
+      }
+    },
     "/api/events": {
       "post": {
         "summary": "Store a single event",
@@ -10711,9 +10764,9 @@
         }
       }
     },
-    "/api/tasks/{id}/claude-session": {
+    "/api/tasks/{id}/session": {
       "put": {
-        "summary": "Update Claude session ID for a task",
+        "summary": "Update provider session ID and harness metadata for a task",
         "tags": [
           "Tasks"
         ],
@@ -10800,6 +10853,13 @@
                       "providerMeta": {
                         "type": "object",
                         "properties": {}
+                      },
+                      "harnessVariant": {
+                        "type": "string"
+                      },
+                      "harnessVariantMeta": {
+                        "type": "object",
+                        "additionalProperties": {}
                       }
                     },
                     "required": [

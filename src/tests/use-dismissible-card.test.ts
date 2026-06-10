@@ -49,7 +49,6 @@ class MemoryStorage {
 
 afterEach(() => {
   // Clean up the global between tests so leakage can't mask bugs.
-  // biome-ignore lint/suspicious/noExplicitAny: test-only shim
   delete (globalThis as any).localStorage;
 });
 
@@ -82,7 +81,6 @@ describe("deriveStorageKey", () => {
 describe("dismiss / restore round-trip via localStorage shape", () => {
   test("dismiss writes '1' under the namespaced key; restore removes it", () => {
     const storage = new MemoryStorage();
-    // biome-ignore lint/suspicious/noExplicitAny: test-only shim
     (globalThis as any).localStorage = storage;
 
     const key = deriveStorageKey("http://localhost:3013", "home-welcome");
@@ -101,7 +99,6 @@ describe("dismiss / restore round-trip via localStorage shape", () => {
 
   test("namespace isolation: dismissing on apiUrl A does not affect apiUrl B", () => {
     const storage = new MemoryStorage();
-    // biome-ignore lint/suspicious/noExplicitAny: test-only shim
     (globalThis as any).localStorage = storage;
 
     const keyA = deriveStorageKey("http://a.local:3013", "home-welcome");
@@ -118,7 +115,6 @@ describe("graceful failure when localStorage throws", () => {
   test("setItem throw is swallowed by the hook's try/catch contract", () => {
     const storage = new MemoryStorage();
     storage.setThrowOnSet(true);
-    // biome-ignore lint/suspicious/noExplicitAny: test-only shim
     (globalThis as any).localStorage = storage;
 
     const key = deriveStorageKey("http://localhost:3013", "home-welcome");

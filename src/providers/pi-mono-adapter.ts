@@ -26,6 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { readPkgVersion } from "./harness-version";
 import { createSwarmHooksExtension } from "./pi-mono-extension";
 import { McpHttpClient } from "./pi-mono-mcp-client";
 import type {
@@ -173,6 +174,7 @@ function mcpToolsToDefinitions(
  * (`anthropic/claude-{opus,sonnet,haiku}-*`).
  */
 const ANTHROPIC_SHORTNAME_OPENROUTER_MIRROR: Record<string, string> = {
+  fable: "anthropic/claude-fable-5",
   opus: "anthropic/claude-opus-4",
   sonnet: "anthropic/claude-sonnet-4",
   haiku: "anthropic/claude-haiku-4.5",
@@ -233,7 +235,8 @@ export function resolveModel(
   if (!modelStr) return undefined;
 
   const lower = modelStr.toLowerCase();
-  const isAnthropicShortname = lower === "opus" || lower === "sonnet" || lower === "haiku";
+  const isAnthropicShortname =
+    lower === "opus" || lower === "sonnet" || lower === "haiku" || lower === "fable";
 
   // Reroute anthropic shortnames through OpenRouter when no anthropic cred
   // is available. The OpenRouter mirror IDs (`anthropic/claude-sonnet-4`,
@@ -251,6 +254,7 @@ export function resolveModel(
 
   // Map common shortnames to provider/model pairs (native anthropic path).
   const shortnames: Record<string, [string, string]> = {
+    fable: ["anthropic", "claude-fable-5"],
     opus: ["anthropic", "claude-opus-4-20250514"],
     sonnet: ["anthropic", "claude-sonnet-4-20250514"],
     haiku: ["anthropic", "claude-haiku-4-5-20251001"],
@@ -367,7 +371,13 @@ export class PiMonoSession implements ProviderSession {
     this.sessionStartedAt = Date.now();
 
     // Emit session_init immediately
-    this.emit({ type: "session_init", sessionId: this._sessionId, provider: "pi" });
+    const piVersion = readPkgVersion("@earendil-works/pi-coding-agent");
+    this.emit({
+      type: "session_init",
+      sessionId: this._sessionId,
+      provider: "pi",
+      ...(piVersion ? { harnessVariantMeta: { version: piVersion } } : {}),
+    });
 
     // Subscribe to agent events and normalize
     this.agentSession.subscribe((event) => this.handleAgentEvent(event));

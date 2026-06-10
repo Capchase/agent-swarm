@@ -65,6 +65,7 @@ import type {
   ScriptRun,
   ScriptRunJournalEntry,
   ScriptRunKind,
+  ScriptRunListItem,
   ScriptRunStatus,
   Service,
   ServiceStatus,
@@ -1041,6 +1042,8 @@ type AgentTaskRow = {
   swarmVersion: string | null;
   provider: string | null;
   providerMeta: string | null;
+  harnessVariant: string | null;
+  harnessVariantMeta: string | null;
   totalCostUsd?: number | null;
 };
 
@@ -1102,7 +1105,7 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     dir: row.dir ?? undefined,
     parentTaskId: row.parentTaskId ?? undefined,
     claudeSessionId: row.claudeSessionId ?? undefined,
-    model: (row.model as "haiku" | "sonnet" | "opus" | null) ?? undefined,
+    model: (row.model as "haiku" | "sonnet" | "opus" | "fable" | null) ?? undefined,
     scheduleId: row.scheduleId ?? undefined,
     workflowRunId: row.workflowRunId ?? undefined,
     workflowRunStepId: row.workflowRunStepId ?? undefined,
@@ -1127,6 +1130,8 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     swarmVersion: row.swarmVersion ?? undefined,
     provider: (row.provider as ProviderName | null) ?? undefined,
     providerMeta: parseProviderMeta(row.provider as ProviderName | null, row.providerMeta),
+    harnessVariant: row.harnessVariant ?? undefined,
+    harnessVariantMeta: row.harnessVariantMeta ? JSON.parse(row.harnessVariantMeta) : undefined,
     totalCostUsd: row.totalCostUsd ?? undefined,
   };
 }
@@ -1398,6 +1403,8 @@ export function updateTaskClaudeSessionId(
   provider?: ProviderName,
   providerMeta?: Record<string, unknown>,
   model?: string,
+  harnessVariant?: string,
+  harnessVariantMeta?: Record<string, unknown>,
 ): AgentTask | null {
   const setClauses = ["claudeSessionId = ?", "lastUpdatedAt = ?"];
   const params: (string | null)[] = [claudeSessionId, new Date().toISOString()];
@@ -1413,6 +1420,14 @@ export function updateTaskClaudeSessionId(
   if (model !== undefined) {
     setClauses.push("model = ?");
     params.push(model);
+  }
+  if (harnessVariant !== undefined) {
+    setClauses.push("harnessVariant = ?");
+    params.push(harnessVariant);
+  }
+  if (harnessVariantMeta !== undefined) {
+    setClauses.push("harnessVariantMeta = ?");
+    params.push(JSON.stringify(harnessVariantMeta));
   }
 
   params.push(taskId);
@@ -5291,7 +5306,7 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
     consecutiveErrors: row.consecutiveErrors ?? 0,
     lastErrorAt: normalizeDate(row.lastErrorAt) ?? undefined,
     lastErrorMessage: row.lastErrorMessage ?? undefined,
-    model: (row.model as "haiku" | "sonnet" | "opus" | null) ?? undefined,
+    model: (row.model as "haiku" | "sonnet" | "opus" | "fable" | null) ?? undefined,
     scheduleType: row.scheduleType as "recurring" | "one_time",
     createdAt: normalizeDateRequired(row.createdAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
@@ -10059,6 +10074,28 @@ export function setApiKeyName(
 }
 
 /**
+ * Clear a stale rate-limit record after a successful use proves the key is healthy.
+ */
+export function clearKeyRateLimit(
+  keyType: string,
+  keySuffix: string,
+  scope = "global",
+  scopeId: string | null = null,
+): boolean {
+  const now = new Date().toISOString();
+  const effectiveScopeId = scopeId ?? "";
+  const result = getDb()
+    .prepare(
+      `UPDATE api_key_status
+       SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
+       WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?
+         AND status = 'rate_limited'`,
+    )
+    .run(now, keyType, keySuffix, scope, effectiveScopeId);
+  return result.changes > 0;
+}
+
+/**
  * Get all key status records for a credential type.
  */
 export function getKeyStatuses(
@@ -11574,6 +11611,22 @@ type ScriptRunRow = {
   updated_by: string | null;
 };
 
+type ScriptRunListRow = Pick<
+  ScriptRunRow,
+  | "id"
+  | "agentId"
+  | "scriptName"
+  | "kind"
+  | "status"
+  | "pid"
+  | "startedAt"
+  | "finishedAt"
+  | "error"
+  | "last_heartbeat_at"
+  | "idempotencyKey"
+  | "requestedByUserId"
+>;
+
 function parseJsonColumn(value: string | null): unknown | undefined {
   if (value === null) return undefined;
   return JSON.parse(value);
@@ -11592,6 +11645,23 @@ function rowToScriptRun(row: ScriptRunRow): ScriptRun {
     startedAt: row.startedAt,
     finishedAt: row.finishedAt ?? undefined,
     output: parseJsonColumn(row.output),
+    error: row.error ?? undefined,
+    lastHeartbeatAt: row.last_heartbeat_at ?? undefined,
+    idempotencyKey: row.idempotencyKey ?? undefined,
+    requestedByUserId: row.requestedByUserId ?? undefined,
+  };
+}
+
+function rowToScriptRunListItem(row: ScriptRunListRow): ScriptRunListItem {
+  return {
+    id: row.id,
+    agentId: row.agentId,
+    scriptName: row.scriptName ?? undefined,
+    kind: row.kind as ScriptRunKind,
+    status: row.status as ScriptRunStatus,
+    pid: row.pid ?? undefined,
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt ?? undefined,
     error: row.error ?? undefined,
     lastHeartbeatAt: row.last_heartbeat_at ?? undefined,
     idempotencyKey: row.idempotencyKey ?? undefined,
@@ -11733,7 +11803,7 @@ export function listScriptRuns(opts?: {
   agentId?: string;
   limit?: number;
   offset?: number;
-}): ScriptRun[] {
+}): ScriptRunListItem[] {
   const conditions: string[] = [];
   const params: Array<string | number> = [];
   if (opts?.status) {
@@ -11750,11 +11820,26 @@ export function listScriptRuns(opts?: {
   params.push(limit, offset);
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = getDb()
-    .prepare<ScriptRunRow, Array<string | number>>(
-      `SELECT * FROM script_runs ${where} ORDER BY startedAt DESC LIMIT ? OFFSET ?`,
+    .prepare<ScriptRunListRow, Array<string | number>>(
+      `SELECT
+        id,
+        agentId,
+        scriptName,
+        kind,
+        status,
+        pid,
+        startedAt,
+        finishedAt,
+        error,
+        last_heartbeat_at,
+        idempotencyKey,
+        requestedByUserId
+       FROM script_runs ${where}
+       ORDER BY startedAt DESC
+       LIMIT ? OFFSET ?`,
     )
     .all(...params);
-  return rows.map(rowToScriptRun);
+  return rows.map(rowToScriptRunListItem);
 }
 
 export function countScriptRuns(opts?: { status?: ScriptRunStatus; agentId?: string }): number {

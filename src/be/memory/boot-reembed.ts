@@ -13,7 +13,6 @@ import { getEmbeddingProvider, getMemoryStore } from "./index";
 
 const VECTOR_BYTES = EMBEDDING_DIMENSIONS * Float32Array.BYTES_PER_ELEMENT;
 const BATCH_SIZE = 20;
-const BACKFILL_KV_KEY = "memory:reembed:backfill_complete";
 
 export async function runBootReembed(): Promise<void> {
   const db = getDb();

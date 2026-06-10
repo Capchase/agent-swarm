@@ -59,7 +59,6 @@ describe("runClaudeManagedSetupFlow — happy path", () => {
     const log = mock((_msg: string) => undefined);
 
     const result = await runClaudeManagedSetupFlow(baseConfig, {
-      // biome-ignore lint/suspicious/noExplicitAny: fake client subset for mock
       client: client as any,
       fetchConfig,
       upsert,
@@ -132,7 +131,6 @@ describe("runClaudeManagedSetupFlow — happy path", () => {
     await runClaudeManagedSetupFlow(
       { ...baseConfig, mcpBaseUrl: "https://swarm.example.com/" },
       {
-        // biome-ignore lint/suspicious/noExplicitAny: fake client subset for mock
         client: client as any,
         fetchConfig: mock(async () => null),
         upsert: mock(async () => undefined),
@@ -175,7 +173,6 @@ describe("runClaudeManagedSetupFlow — idempotent re-run", () => {
     const uploadOne = mock(async () => null);
 
     const result = await runClaudeManagedSetupFlow(baseConfig, {
-      // biome-ignore lint/suspicious/noExplicitAny: fake client subset for mock
       client: client as any,
       fetchConfig,
       upsert,
@@ -208,7 +205,6 @@ describe("runClaudeManagedSetupFlow — idempotent re-run", () => {
     await runClaudeManagedSetupFlow(
       { ...baseConfig, force: true },
       {
-        // biome-ignore lint/suspicious/noExplicitAny: fake client subset for mock
         client: client as any,
         fetchConfig,
         upsert,

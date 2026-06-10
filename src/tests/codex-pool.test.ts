@@ -24,11 +24,7 @@ import {
   credentialsToAuthJson,
 } from "../providers/codex-oauth/auth-json.js";
 import { materializeCodexAuthJson } from "../providers/codex-oauth/auth-json-fs.js";
-import {
-  loadAllCodexOAuthSlots,
-  persistCodexOAuth,
-  storeCodexOAuth,
-} from "../providers/codex-oauth/storage.js";
+import { loadAllCodexOAuthSlots, persistCodexOAuth } from "../providers/codex-oauth/storage.js";
 import type { CodexOAuthCredentials } from "../providers/codex-oauth/types.js";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -117,7 +113,7 @@ afterEach(() => {
 describe("Scenario 1 — 3-slot round-trip with availability filter", () => {
   it("selects from available slots [1,2] and materialises the correct creds into auth.json", async () => {
     // Mock API: three slots in config store.
-    globalThis.fetch = async (url: string | URL | Request) => {
+    globalThis.fetch = async (_url: string | URL | Request) => {
       return makeConfigResponse();
       // (available-indices endpoint not called by loadAllCodexOAuthSlots)
     };

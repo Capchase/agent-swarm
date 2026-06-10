@@ -577,11 +577,8 @@ describe("Approval Requests", () => {
       });
 
       expect(result.status).toBe("success");
-      // biome-ignore lint/suspicious/noExplicitAny: test assertion on untyped executor result
       expect((result as any).async).toBe(true);
-      // biome-ignore lint/suspicious/noExplicitAny: test assertion on untyped executor result
       expect((result as any).waitFor).toBe("approval.resolved");
-      // biome-ignore lint/suspicious/noExplicitAny: test assertion on untyped executor result
       expect((result as any).correlationId).toBeTruthy();
 
       // Verify the request was created in DB
@@ -616,9 +613,7 @@ describe("Approval Requests", () => {
       });
 
       expect(result.status).toBe("success");
-      // biome-ignore lint/suspicious/noExplicitAny: test assertion on untyped executor result
       expect((result as any).async).toBe(true);
-      // biome-ignore lint/suspicious/noExplicitAny: test assertion on untyped executor result
       expect((result as any).correlationId).toBe(existingId);
     });
 
@@ -650,7 +645,6 @@ describe("Approval Requests", () => {
       });
 
       expect(result.status).toBe("success");
-      // biome-ignore lint/suspicious/noExplicitAny: test assertion on untyped executor result
       expect((result as any).async).toBeUndefined();
       expect(result.output).toBeDefined();
       expect(result.output!.requestId).toBe(existingId);

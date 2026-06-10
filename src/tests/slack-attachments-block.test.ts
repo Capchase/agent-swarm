@@ -4,7 +4,6 @@ import type { TaskAttachment } from "../types";
 
 // Slack block types are open unions — the builder returns `any`; we read it
 // as `any` in the test to inspect the runtime shape.
-// biome-ignore lint/suspicious/noExplicitAny: see comment above
 type SlackBlock = any;
 
 function mkAttachment(overrides: Partial<TaskAttachment>): TaskAttachment {

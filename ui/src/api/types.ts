@@ -132,6 +132,8 @@ export interface AgentTask {
   swarmVersion?: string;
   provider?: ProviderName;
   providerMeta?: DevinProviderMeta | Record<string, never>;
+  harnessVariant?: string;
+  harnessVariantMeta?: { version?: string; failureArtifact?: string };
   /** Sum of recorded session costs for this task. Missing when no cost rows exist. */
   totalCostUsd?: number;
   /** Phase 1 (≥1.76.0): canonical user who requested this task. */
@@ -973,6 +975,8 @@ export interface ScriptRun {
   requestedByUserId?: string;
 }
 
+export type ScriptRunListItem = Omit<ScriptRun, "source" | "args" | "output">;
+
 export type ScriptRunJournalStepType = "swarm-script" | "raw-llm" | "agent-task" | string;
 
 export interface ScriptRunJournalEntry {
@@ -995,7 +999,7 @@ export interface ScriptRunJournalEntry {
 }
 
 export interface ScriptRunsResponse {
-  runs: ScriptRun[];
+  runs: ScriptRunListItem[];
   total: number;
 }
 
@@ -1433,6 +1437,8 @@ export interface MemoryEntry {
 export interface MemoryListResponse {
   results: MemoryEntry[];
   total: number;
+  limit?: number;
+  offset?: number;
   mode: "semantic" | "list";
 }
 

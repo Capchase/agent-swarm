@@ -247,6 +247,10 @@ export const AgentTaskSchema = z.object({
   provider: ProviderNameSchema.optional(),
   providerMeta: z.record(z.string(), z.unknown()).optional(),
 
+  // Harness variant — sub-variant within a provider (e.g. "bridge" vs "stock" for claude)
+  harnessVariant: z.string().optional(),
+  harnessVariantMeta: z.record(z.string(), z.unknown()).optional(),
+
   // Aggregated session cost for task list/read models. Undefined means no
   // session cost rows have been recorded for this task.
   totalCostUsd: z.number().min(0).optional(),
@@ -1578,6 +1582,13 @@ export const ScriptRunSchema = z.object({
   requestedByUserId: z.string().optional(),
 });
 export type ScriptRun = z.infer<typeof ScriptRunSchema>;
+
+export const ScriptRunListItemSchema = ScriptRunSchema.omit({
+  source: true,
+  args: true,
+  output: true,
+});
+export type ScriptRunListItem = z.infer<typeof ScriptRunListItemSchema>;
 
 export const ScriptRunJournalEntrySchema = z.object({
   id: z.string().uuid(),

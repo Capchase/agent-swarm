@@ -22,10 +22,10 @@ import { getScript, upsertScriptByName } from "../scripts/db";
 import { extractArgsJsonSchema } from "../scripts/extract-schema";
 import { typecheckScript } from "../scripts/typecheck";
 import type { Seeder, SeedItem } from "../seed/types";
-import bootTriageSrc from "./catalog/boot-triage.ts" with { type: "text" };
-// @ts-expect-error Bun text imports return the raw source string for bundling standalone scripts.
-import catalogReportSrc from "./catalog/catalog-report.ts" with { type: "text" };
-import compoundInsightsSrc from "./catalog/compound-insights.ts" with { type: "text" };
+import bootTriageSrc from "./catalog/boot-triage.inline.ts" with { type: "text" };
+// @ts-expect-error Bun text imports synthesize a default string for this helper.
+import catalogReportSrc from "./catalog/catalog-report.inline.ts" with { type: "text" };
+import compoundInsightsSrc from "./catalog/compound-insights.inline.ts" with { type: "text" };
 import dateResolveSrc from "./catalog/date-resolve.ts" with { type: "text" };
 import fetchReadableSrc from "./catalog/fetch-readable.ts" with { type: "text" };
 import ghPrSnapshotSrc from "./catalog/gh-pr-snapshot.ts" with { type: "text" };
@@ -34,7 +34,7 @@ import jsonQuerySrc from "./catalog/json-query.ts" with { type: "text" };
 import linearIssueSrc from "./catalog/linear-issue.ts" with { type: "text" };
 import memoryDedupCheckSrc from "./catalog/memory-dedup-check.ts" with { type: "text" };
 import memoryEvalSrc from "./catalog/memory-eval.ts" with { type: "text" };
-import opsCatalogAuditSrc from "./catalog/ops-catalog-audit.ts" with { type: "text" };
+import opsCatalogAuditSrc from "./catalog/ops-catalog-audit.inline.ts" with { type: "text" };
 import scheduleHealthSrc from "./catalog/schedule-health.ts" with { type: "text" };
 import slackThreadFlattenSrc from "./catalog/slack-thread-flatten.ts" with { type: "text" };
 import smartRecallSrc from "./catalog/smart-recall.ts" with { type: "text" };

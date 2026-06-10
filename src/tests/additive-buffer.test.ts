@@ -15,7 +15,6 @@ describe("createAdditiveBuffer", () => {
       /positive number/,
     );
     expect(() => createAdditiveBuffer({ timeoutMs: -1, onFlush: () => {} })).toThrow();
-    // biome-ignore lint/suspicious/noExplicitAny: type-guard test
     expect(() => createAdditiveBuffer({ timeoutMs: NaN as any, onFlush: () => {} })).toThrow();
   });
 

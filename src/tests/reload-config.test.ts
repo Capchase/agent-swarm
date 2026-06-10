@@ -14,6 +14,37 @@ import {
 
 const TEST_DB_PATH = "./test-reload-config.sqlite";
 const TEST_PORT = 13023;
+const INTEGRATION_DISABLE_KEYS = [
+  "AGENTMAIL_DISABLE",
+  "GITHUB_DISABLE",
+  "JIRA_DISABLE",
+  "LINEAR_DISABLE",
+  "SLACK_DISABLE",
+] as const;
+const originalIntegrationDisableValues = new Map<
+  (typeof INTEGRATION_DISABLE_KEYS)[number],
+  string | undefined
+>();
+
+beforeAll(() => {
+  for (const key of INTEGRATION_DISABLE_KEYS) {
+    originalIntegrationDisableValues.set(key, process.env[key]);
+    process.env[key] = "true";
+  }
+  _resetAutoReloadForTests();
+});
+
+afterAll(() => {
+  for (const key of INTEGRATION_DISABLE_KEYS) {
+    const originalValue = originalIntegrationDisableValues.get(key);
+    if (originalValue === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = originalValue;
+    }
+  }
+  originalIntegrationDisableValues.clear();
+});
 
 function insertLegacyReservedRow(key: string, value = "legacy"): string {
   const id = crypto.randomUUID();
@@ -207,23 +238,8 @@ describe("reload-config", () => {
 });
 
 describe("auto-reload debouncer", () => {
-  // The reload calls into stopSlackApp/startSlackApp + GH/Linear/Jira/AgentMail
-  // init. They are no-ops without credentials, so we explicitly disable Slack
-  // (it has its own DISABLE switch) and rely on the others being unconfigured.
-  let originalSlackDisable: string | undefined;
-
-  beforeAll(() => {
-    originalSlackDisable = process.env.SLACK_DISABLE;
-    process.env.SLACK_DISABLE = "true";
-  });
-
-  afterAll(() => {
-    if (originalSlackDisable === undefined) {
-      delete process.env.SLACK_DISABLE;
-    } else {
-      process.env.SLACK_DISABLE = originalSlackDisable;
-    }
-  });
+  // The reload path reinitializes every integration. Keep these tests focused
+  // on debounce semantics rather than local .env / CI credential side effects.
 
   beforeEach(async () => {
     // Drain any reload state that leaked from earlier test files in the full
