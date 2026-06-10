@@ -5,6 +5,7 @@ import { api } from "../client";
 export function useScriptRuns(filters?: {
   status?: ScriptRunStatus | "all";
   agentId?: string;
+  scriptName?: string;
   limit?: number;
   offset?: number;
 }) {

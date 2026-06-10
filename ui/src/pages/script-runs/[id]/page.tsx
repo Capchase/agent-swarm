@@ -1,7 +1,8 @@
 import { ArrowLeft, Check, Copy, RefreshCw } from "lucide-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useMemo } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useScriptRun } from "@/api/hooks/use-script-runs";
+import { useScripts } from "@/api/hooks/use-scripts";
 import type { ScriptRunJournalEntry } from "@/api/types";
 import {
   mapStepsToBlocks,
@@ -23,6 +24,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import { cn, formatElapsed, formatSmartTime } from "@/lib/utils";
 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
@@ -69,11 +71,37 @@ function stepCounts(journal: ScriptRunJournalEntry[]) {
   return { scripts, llm, tasks };
 }
 
+function formatSelectionParam(selection: Selection): string {
+  if (!selection) return "";
+  if (selection.kind === "step") return `step:${selection.stepId}`;
+  return selection.kind;
+}
+
+function parseSelectionParam(value: string | null): Selection {
+  if (!value) return null;
+  if (value === "input" || value === "output") return { kind: value };
+  if (value.startsWith("step:")) {
+    const stepId = value.slice("step:".length);
+    return stepId ? { kind: "step", stepId } : null;
+  }
+  return null;
+}
+
 export default function ScriptRunDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const { searchParams, setParam } = useUrlSearchState();
   const { data, isLoading, refetch, isFetching } = useScriptRun(id ?? "");
   const run = data?.run;
   const journal = useMemo(() => data?.journal ?? [], [data]);
+
+  // Run → Script backlink: runs reference scripts by name (no FK), so resolve
+  // the saved script's id from the catalog (scratch included — inline runs
+  // auto-save scratch scripts). Unresolved names (deleted script) fall back to
+  // a pre-filtered /scripts search link.
+  const { data: scripts } = useScripts({ includeScratch: true });
+  const linkedScriptId = run?.scriptName
+    ? scripts?.find((s) => s.name === run.scriptName)?.id
+    : undefined;
 
   const counts = useMemo(() => stepCounts(journal), [journal]);
   const blocks = useMemo(() => (run?.source ? parseStepBlocks(run.source) : []), [run?.source]);
@@ -83,8 +111,10 @@ export default function ScriptRunDetailPage() {
   );
   const mapping = useMemo(() => mapStepsToBlocks(journal, blocks), [journal, blocks]);
 
-  const [selection, setSelection] = useState<Selection>(null);
-  const [view, setView] = useState<"detail" | "waterfall">("detail");
+  const selection = parseSelectionParam(searchParams.get("selection"));
+  const view =
+    readStringParam(searchParams, "view", "detail") === "waterfall" ? "waterfall" : "detail";
+  const setSelection = (next: Selection) => setParam("selection", formatSelectionParam(next));
   const { steps, totalMs, hasTiming } = useMemo(() => buildSteps(journal), [journal]);
 
   const selectedBlock =
@@ -119,7 +149,7 @@ export default function ScriptRunDetailPage() {
     <div className="flex-1 min-h-0 space-y-4 overflow-y-auto">
       <div className="space-y-3">
         <Link
-          to="/script-runs"
+          to="/scripts?tab=runs"
           className="inline-flex items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground"
         >
           <ArrowLeft className="h-4 w-4" /> Back to Script Runs
@@ -162,6 +192,20 @@ export default function ScriptRunDetailPage() {
         <Fact label="Agent">
           <AgentLink agentId={run.agentId} />
         </Fact>
+        {run.scriptName && (
+          <Fact label="Script">
+            <Link
+              to={
+                linkedScriptId
+                  ? `/scripts/${linkedScriptId}`
+                  : `/scripts?tab=scripts&search=${encodeURIComponent(run.scriptName)}`
+              }
+              className="text-xs text-foreground underline-offset-2 transition-colors hover:underline"
+            >
+              {run.scriptName}
+            </Link>
+          </Fact>
+        )}
         <Fact label="Started">
           <span className="font-mono text-xs">{formatSmartTime(run.startedAt)}</span>
         </Fact>
@@ -194,7 +238,7 @@ export default function ScriptRunDetailPage() {
 
       <Tabs
         value={view}
-        onValueChange={(v) => setView(v as "detail" | "waterfall")}
+        onValueChange={(value) => setParam("view", value, { defaultValue: "detail" })}
         className="gap-3"
       >
         <TabsList variant="line">

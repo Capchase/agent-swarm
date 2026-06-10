@@ -31,7 +31,8 @@ const RepoDetailPage = lazy(() => import("@/pages/repos/[id]/page"));
 const WorkflowsPage = lazy(() => import("@/pages/workflows/page"));
 const WorkflowDetailPage = lazy(() => import("@/pages/workflows/[id]/page"));
 const WorkflowRunDetailPage = lazy(() => import("@/pages/workflow-runs/[id]/page"));
-const ScriptRunsPage = lazy(() => import("@/pages/script-runs/page"));
+const ScriptsPage = lazy(() => import("@/pages/scripts/page"));
+const ScriptDetailPage = lazy(() => import("@/pages/scripts/[id]/page"));
 const ScriptRunDetailPage = lazy(() => import("@/pages/script-runs/[id]/page"));
 const TemplatesPage = lazy(() => import("@/pages/templates/page"));
 const TemplateDetailPage = lazy(() => import("@/pages/templates/[id]/page"));
@@ -69,6 +70,8 @@ const REDIRECTS: Record<string, string> = {
   repos: "/settings/repos",
   debug: "/settings/debug",
   metrics: "/usage/metrics",
+  // The standalone script-runs list folded into the Scripts page's Runs tab.
+  "script-runs": "/scripts?tab=runs",
 };
 
 const redirectRoutes: RouteObject[] = [
@@ -104,7 +107,8 @@ export const router = createBrowserRouter([
       { path: "workflows", element: <WorkflowsPage /> },
       { path: "workflows/:id", element: <WorkflowDetailPage /> },
       { path: "workflow-runs/:id", element: <WorkflowRunDetailPage /> },
-      { path: "script-runs", element: <ScriptRunsPage /> },
+      { path: "scripts", element: <ScriptsPage /> },
+      { path: "scripts/:id", element: <ScriptDetailPage /> },
       { path: "script-runs/:id", element: <ScriptRunDetailPage /> },
       { path: "approval-requests", element: <ApprovalRequestsPage /> },
       { path: "approval-requests/:id", element: <ApprovalRequestDetailPage /> },

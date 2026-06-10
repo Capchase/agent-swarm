@@ -100,7 +100,7 @@ const navGroups: NavGroup[] = [
       { title: "Agents", path: "/agents", icon: Users },
       { title: "People", path: "/people", icon: Contact, gate: { minVersion: "1.80.0" } },
       { title: "Workflows", path: "/workflows", icon: Workflow },
-      { title: "Script Runs", path: "/script-runs", icon: FileClock },
+      { title: "Scripts", path: "/scripts", icon: FileClock },
       { title: "Schedules", path: "/schedules", icon: Clock },
     ],
   },

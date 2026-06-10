@@ -52,9 +52,14 @@ import type {
   ResolveUnmappedInput,
   ScheduledTask,
   ScheduledTasksResponse,
+  ScriptDetail,
   ScriptRunStatus,
   ScriptRunsResponse,
   ScriptRunWithJournal,
+  ScriptScope,
+  ScriptsResponse,
+  ScriptTypeDefs,
+  ScriptVersion,
   ServicesResponse,
   SessionCostsResponse,
   SessionDetailResponse,
@@ -919,12 +924,14 @@ class ApiClient {
   async fetchScriptRuns(filters?: {
     status?: ScriptRunStatus | "all";
     agentId?: string;
+    scriptName?: string;
     limit?: number;
     offset?: number;
   }): Promise<ScriptRunsResponse> {
     const params = new URLSearchParams();
     if (filters?.status && filters.status !== "all") params.set("status", filters.status);
     if (filters?.agentId) params.set("agentId", filters.agentId);
+    if (filters?.scriptName) params.set("scriptName", filters.scriptName);
     if (filters?.limit) params.set("limit", String(filters.limit));
     if (filters?.offset) params.set("offset", String(filters.offset));
     const suffix = params.toString() ? `?${params.toString()}` : "";
@@ -938,6 +945,46 @@ class ApiClient {
     const url = `${this.getBaseUrl()}/api/script-runs/${id}`;
     const res = await fetch(url, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch script run: ${res.status}`);
+    return res.json();
+  }
+
+  // Saved scripts catalog — dashboard reads (API-key auth, no X-Agent-ID; see src/http/scripts.ts)
+
+  async fetchScripts(filters?: {
+    scope?: ScriptScope | "all";
+    includeScratch?: boolean;
+  }): Promise<ScriptsResponse> {
+    const params = new URLSearchParams();
+    if (filters?.scope && filters.scope !== "all") params.set("scope", filters.scope);
+    // Backend defaults to excluding scratch — only send the flag when opting in.
+    if (filters?.includeScratch) params.set("includeScratch", "true");
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const url = `${this.getBaseUrl()}/api/scripts${suffix}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch scripts: ${res.status}`);
+    return res.json();
+  }
+
+  async fetchScript(id: string): Promise<ScriptDetail> {
+    const url = `${this.getBaseUrl()}/api/scripts/${id}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch script: ${res.status}`);
+    const data = (await res.json()) as { script: ScriptDetail };
+    return data.script;
+  }
+
+  async fetchScriptVersions(id: string): Promise<ScriptVersion[]> {
+    const url = `${this.getBaseUrl()}/api/scripts/${id}/versions`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch script versions: ${res.status}`);
+    const data = (await res.json()) as { versions: ScriptVersion[] };
+    return data.versions;
+  }
+
+  async fetchScriptTypeDefs(): Promise<ScriptTypeDefs> {
+    const url = `${this.getBaseUrl()}/api/scripts/type-defs`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch script type defs: ${res.status}`);
     return res.json();
   }
 

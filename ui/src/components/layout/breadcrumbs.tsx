@@ -7,6 +7,7 @@ import { usePage } from "@/api/hooks/use-pages";
 import { useRepo } from "@/api/hooks/use-repos";
 import { useScheduledTask } from "@/api/hooks/use-schedules";
 import { useScriptRun } from "@/api/hooks/use-script-runs";
+import { useScript } from "@/api/hooks/use-scripts";
 import { useSession } from "@/api/hooks/use-sessions";
 import { useSkill } from "@/api/hooks/use-skills";
 import { useTask } from "@/api/hooks/use-tasks";
@@ -24,6 +25,7 @@ const routeLabels: Record<string, string> = {
   schedules: "Schedules",
   workflows: "Workflows",
   "workflow-runs": "Workflow Runs",
+  scripts: "Scripts",
   "script-runs": "Script Runs",
   "approval-requests": "Approvals",
   skills: "Skills",
@@ -54,6 +56,7 @@ const INTEGRATION_NAME_BY_ID: Record<string, string> = Object.fromEntries(
 /** Routes that don't have their own list page — redirect breadcrumb to a parent. */
 const routeRedirects: Record<string, string> = {
   "workflow-runs": "/workflows",
+  "script-runs": "/scripts?tab=runs",
 };
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -115,6 +118,7 @@ export function Breadcrumbs() {
   const { data: workflowMeta } = useWorkflow(idFor("workflows"));
   const { data: scheduleMeta } = useScheduledTask(idFor("schedules"));
   const { data: scriptRunMeta } = useScriptRun(idFor("script-runs"));
+  const { data: scriptMeta } = useScript(idFor("scripts"));
   const { data: skillMeta } = useSkill(idFor("skills"));
   const { data: mcpServerMeta } = useMcpServer(idFor("mcp-servers"));
   const { data: repoMeta } = useRepo(idFor("repos"));
@@ -139,17 +143,19 @@ export function Breadcrumbs() {
                 ? workflowMeta?.name
                 : parent === "schedules"
                   ? scheduleMeta?.name
-                  : parent === "script-runs"
-                    ? scriptRunMeta?.run.scriptName
-                    : parent === "skills"
-                      ? skillMeta?.name
-                      : parent === "mcp-servers"
-                        ? mcpServerMeta?.name
-                        : parent === "repos"
-                          ? repoMeta?.name
-                          : parent === "approval-requests"
-                            ? approvalMeta?.title
-                            : undefined
+                  : parent === "scripts"
+                    ? scriptMeta?.name
+                    : parent === "script-runs"
+                      ? scriptRunMeta?.run.scriptName
+                      : parent === "skills"
+                        ? skillMeta?.name
+                        : parent === "mcp-servers"
+                          ? mcpServerMeta?.name
+                          : parent === "repos"
+                            ? repoMeta?.name
+                            : parent === "approval-requests"
+                              ? approvalMeta?.title
+                              : undefined
     : undefined;
 
   const crumbs = segments.map((segment, index) => {

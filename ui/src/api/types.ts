@@ -1008,6 +1008,63 @@ export interface ScriptRunWithJournal {
   journal: ScriptRunJournalEntry[];
 }
 
+// Saved scripts catalog (`scripts` table — mirrors ScriptListItem/ScriptDetail in src/types.ts)
+
+export type ScriptScope = "global" | "agent";
+
+export type ScriptFsMode = "none" | "workspace-rw";
+
+/** Lean projection served by `GET /api/scripts` — omits `source` and raw JSON blobs. */
+export interface ScriptListItem {
+  id: string;
+  name: string;
+  scope: ScriptScope;
+  scopeId: string | null;
+  description: string;
+  intent: string;
+  version: number;
+  isScratch: boolean;
+  typeChecked: boolean;
+  fsMode: ScriptFsMode;
+  createdByAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Full record served by `GET /api/scripts/{id}` — includes `source` plus parsed `signature`/`argsJsonSchema`. */
+export interface ScriptDetail extends ScriptListItem {
+  source: string;
+  signatureJson: string;
+  contentHash: string;
+  signature: unknown;
+  argsJsonSchema: unknown;
+}
+
+/** Row served by `GET /api/scripts/{id}/versions` — mirrors ScriptVersionRecord in src/types.ts. */
+export interface ScriptVersion {
+  id: string;
+  scriptId: string;
+  version: number;
+  source: string;
+  description: string;
+  intent: string;
+  signatureJson: string;
+  contentHash: string;
+  changedByAgentId: string | null;
+  changedAt: string;
+  changeReason: string | null;
+}
+
+/** `GET /api/scripts/type-defs` — static SDK + stdlib .d.ts for the Monaco editor. */
+export interface ScriptTypeDefs {
+  sdkTypes: string;
+  stdlibTypes: string;
+}
+
+export interface ScriptsResponse {
+  scripts: ScriptListItem[];
+}
+
 // Prompt Templates
 
 export interface PromptTemplate {

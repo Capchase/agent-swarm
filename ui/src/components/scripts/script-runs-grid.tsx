@@ -1,16 +1,12 @@
 import type { ColDef, RowClickedEvent } from "ag-grid-community";
-import { ChevronLeft, ChevronRight, FileClock, Search } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { useScriptRuns } from "@/api/hooks/use-script-runs";
 import type { ScriptRunKind, ScriptRunListItem, ScriptRunStatus } from "@/api/types";
 import { AgentLink } from "@/components/shared/agent-link";
 import { DataGrid } from "@/components/shared/data-grid";
 import { ScriptRunKindBadge } from "@/components/shared/script-run-kind-badge";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { PageHeader } from "@/components/ui/page-header";
 import {
   Select,
   SelectContent,
@@ -19,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import { formatElapsed, formatSmartTime } from "@/lib/utils";
 
 const STATUS_OPTIONS: Array<ScriptRunStatus | "all"> = [
@@ -31,37 +28,66 @@ const STATUS_OPTIONS: Array<ScriptRunStatus | "all"> = [
   "aborted_limit",
 ];
 
-const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
-const DEFAULT_PAGE_SIZE = 50;
-
 function formatDuration(startedAt: string, finishedAt?: string): string {
   if (!finishedAt) return "—";
   return formatElapsed(startedAt, finishedAt);
 }
 
-export default function ScriptRunsPage() {
-  const navigate = useNavigate();
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<ScriptRunStatus | "all">("all");
-  const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
-  const { data, isLoading } = useScriptRuns({
-    status: statusFilter,
-    limit: pageSize,
-    offset: page * pageSize,
-  });
+interface ScriptRunsGridProps {
+  rows: ScriptRunListItem[];
+  loading: boolean;
+  /** Hide the script-name column (per-script Runs tab already scopes by name). */
+  hideNameColumn?: boolean;
+  /** URL search-param key backing the status filter (default `status`). */
+  statusParamKey?: string;
+  /** Forwarded to DataGrid — keeps the grid page index in the URL. */
+  paginationQueryKey?: string;
+}
 
-  const columns = useMemo<ColDef<ScriptRunListItem>[]>(
-    () => [
-      {
-        field: "scriptName",
-        headerName: "Name",
-        minWidth: 200,
-        flex: 1,
-        cellRenderer: (params: { value?: string }) => (
-          <span className="truncate font-medium">{params.value || "One-off script"}</span>
-        ),
-      },
+/**
+ * Reusable script-runs list: status filter toolbar + DataGrid.
+ * Used by the global Runs tab on /scripts and the per-script Runs tab
+ * on /scripts/:id. Row click navigates to /script-runs/:id.
+ */
+export function ScriptRunsGrid({
+  rows,
+  loading,
+  hideNameColumn = false,
+  statusParamKey = "status",
+  paginationQueryKey,
+}: ScriptRunsGridProps) {
+  const navigate = useNavigate();
+  const { searchParams, setParam } = useUrlSearchState();
+  const statusParam = readStringParam(searchParams, statusParamKey, "all");
+  const statusFilter = STATUS_OPTIONS.includes(statusParam as ScriptRunStatus | "all")
+    ? (statusParam as ScriptRunStatus | "all")
+    : "all";
+
+  const filteredRows = useMemo(
+    () => (statusFilter === "all" ? rows : rows.filter((r) => r.status === statusFilter)),
+    [rows, statusFilter],
+  );
+
+  const setStatusFilter = useCallback(
+    (value: string) =>
+      setParam(statusParamKey, value, {
+        defaultValue: "all",
+        reset: paginationQueryKey ? [`${paginationQueryKey}Page`] : [],
+      }),
+    [paginationQueryKey, setParam, statusParamKey],
+  );
+
+  const columns = useMemo<ColDef<ScriptRunListItem>[]>(() => {
+    const nameColumn: ColDef<ScriptRunListItem> = {
+      field: "scriptName",
+      headerName: "Name",
+      minWidth: 200,
+      flex: 1,
+      cellRenderer: (params: { value?: string }) => (
+        <span className="truncate font-medium">{params.value || "One-off script"}</span>
+      ),
+    };
+    const baseColumns: ColDef<ScriptRunListItem>[] = [
       {
         field: "id",
         headerName: "Run ID",
@@ -130,9 +156,9 @@ export default function ScriptRunsPage() {
             </Tooltip>
           ) : null,
       },
-    ],
-    [],
-  );
+    ];
+    return hideNameColumn ? baseColumns : [nameColumn, ...baseColumns];
+  }, [hideNameColumn]);
 
   const onRowClicked = useCallback(
     (event: RowClickedEvent<ScriptRunListItem>) => {
@@ -146,33 +172,10 @@ export default function ScriptRunsPage() {
     [navigate],
   );
 
-  const runs = data?.runs ?? [];
-  const total = data?.total ?? 0;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const firstVisible = total > 0 ? page * pageSize + 1 : 0;
-  const lastVisible = Math.min((page + 1) * pageSize, total);
-
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      <PageHeader title="Script Runs" />
-
+    <>
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative w-full max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="Search runs…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="pl-9"
-          />
-        </div>
-        <Select
-          value={statusFilter}
-          onValueChange={(value) => {
-            setStatusFilter(value as ScriptRunStatus | "all");
-            setPage(0);
-          }}
-        >
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
           <SelectTrigger className="w-[170px]">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
@@ -185,86 +188,19 @@ export default function ScriptRunsPage() {
           </SelectContent>
         </Select>
         {statusFilter !== "all" && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setStatusFilter("all");
-              setPage(0);
-            }}
-          >
+          <Button variant="ghost" size="sm" onClick={() => setStatusFilter("all")}>
             Clear filters
           </Button>
         )}
-        <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-          <FileClock className="h-4 w-4" />
-          <span>{total.toLocaleString()} total</span>
-        </div>
       </div>
-
       <DataGrid
-        rowData={runs}
+        rowData={filteredRows}
         columnDefs={columns}
-        quickFilterText={search}
         onRowClicked={onRowClicked}
-        loading={isLoading}
+        loading={loading}
         emptyMessage="No script runs"
-        pagination={false}
+        paginationQueryKey={paginationQueryKey}
       />
-
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
-        <span>
-          {total > 0
-            ? `${firstVisible.toLocaleString()}-${lastVisible.toLocaleString()} of ${total.toLocaleString()}`
-            : "0 script runs"}
-        </span>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs">Rows</span>
-            <Select
-              value={String(pageSize)}
-              onValueChange={(value) => {
-                setPageSize(Number(value));
-                setPage(0);
-              }}
-            >
-              <SelectTrigger className="h-8 w-[72px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {PAGE_SIZE_OPTIONS.map((size) => (
-                  <SelectItem key={size} value={String(size)}>
-                    {size}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <Button
-            variant="outline"
-            size="icon"
-            className="h-8 w-8"
-            disabled={page === 0}
-            onClick={() => setPage((current) => Math.max(0, current - 1))}
-            aria-label="Previous page"
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          <span className="px-2 text-xs">
-            Page {page + 1} of {totalPages}
-          </span>
-          <Button
-            variant="outline"
-            size="icon"
-            className="h-8 w-8"
-            disabled={page >= totalPages - 1}
-            onClick={() => setPage((current) => current + 1)}
-            aria-label="Next page"
-          >
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-    </div>
+    </>
   );
 }
