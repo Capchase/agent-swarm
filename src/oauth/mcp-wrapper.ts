@@ -298,7 +298,7 @@ export async function buildAuthorizeUrl(input: BuildAuthorizeInput): Promise<Bui
       "resource",
     ]);
     for (const [k, v] of Object.entries(input.extraParams)) {
-      if (RESERVED.has(k)) {
+      if (RESERVED.has(k.toLowerCase())) {
         console.warn(`[mcp-oauth] extraParams key "${k}" is reserved and skipped`);
         continue;
       }

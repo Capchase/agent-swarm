@@ -181,6 +181,39 @@ describe("buildAuthorizeUrl (PKCE S256, RFC 8707)", () => {
     expect(u.searchParams.get("response_type")).toBe("code");
     expect(u.searchParams.get("client_id")).toBe("c");
     expect(u.searchParams.get("resource")).toBe("https://mcp.example.com/");
+    // Attacker values must not have landed
+    const challenge = u.searchParams.get("code_challenge");
+    expect(challenge).not.toBeNull();
+    expect(challenge).not.toBe("malicious");
+    expect(u.searchParams.get("scope")).toBe("read");
+  });
+
+  test("mixed-case reserved keys in extraParams are rejected (case-insensitive guard)", async () => {
+    const result = await buildAuthorizeUrl({
+      authorizeUrl: "https://as.example.com/authorize",
+      tokenUrl: "https://as.example.com/token",
+      clientId: "c",
+      redirectUri: "https://swarm.example.com/cb",
+      scopes: ["read"],
+      resource: "https://mcp.example.com/",
+      state: "safe-state",
+      extraParams: {
+        Redirect_Uri: "https://evil.example",
+        STATE: "evil-state",
+        Code_Challenge: "malicious-challenge",
+        SCOPE: "admin",
+      },
+    });
+    const u = new URL(result.url);
+    // Attacker mixed-case keys must NOT appear in the URL
+    expect(u.searchParams.get("Redirect_Uri")).toBeNull();
+    expect(u.searchParams.get("STATE")).toBeNull();
+    expect(u.searchParams.get("Code_Challenge")).toBeNull();
+    expect(u.searchParams.get("SCOPE")).toBeNull();
+    // Core params must retain their original legitimate values
+    expect(u.searchParams.get("redirect_uri")).toBe("https://swarm.example.com/cb");
+    expect(u.searchParams.get("state")).toBe("safe-state");
+    expect(u.searchParams.get("scope")).toBe("read");
   });
 
   test("null/undefined extraParams leaves URL unchanged (no blast radius for existing servers)", async () => {
