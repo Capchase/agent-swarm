@@ -9,7 +9,7 @@
 
 import { getDb } from "@/be/db";
 import type { ScriptScope } from "@/types";
-import { embedScript } from "./embeddings";
+import { embedScript, reembedMismatchedScripts } from "./embeddings";
 
 type ScriptMissingEmbedding = {
   id: string;
@@ -42,33 +42,36 @@ export async function runBootReembedScripts(): Promise<void> {
     )
     .all();
 
-  if (missing.length === 0) {
-    return;
-  }
+  if (missing.length > 0) {
+    console.log(`[boot-reembed-scripts] starting: ${missing.length} scripts missing embeddings`);
 
-  console.log(`[boot-reembed-scripts] starting: ${missing.length} scripts missing embeddings`);
+    let embedded = 0;
+    let failed = 0;
 
-  let embedded = 0;
-  let failed = 0;
-
-  for (const row of missing) {
-    try {
-      await embedScript({
-        ...row,
-        scopeId: row.scopeId ?? null,
-        isScratch: row.isScratch === 1,
-        typeChecked: row.typeChecked === 1,
-        createdByAgentId: row.createdByAgentId ?? null,
-      });
-      embedded++;
-    } catch (err) {
-      failed++;
-      console.error(
-        `[boot-reembed-scripts] failed to embed "${row.name}":`,
-        (err as Error).message,
-      );
+    for (const row of missing) {
+      try {
+        await embedScript({
+          ...row,
+          scopeId: row.scopeId ?? null,
+          isScratch: row.isScratch === 1,
+          typeChecked: row.typeChecked === 1,
+          createdByAgentId: row.createdByAgentId ?? null,
+        });
+        embedded++;
+      } catch (err) {
+        failed++;
+        console.error(
+          `[boot-reembed-scripts] failed to embed "${row.name}":`,
+          (err as Error).message,
+        );
+      }
     }
+
+    console.log(`[boot-reembed-scripts] complete: embedded=${embedded} failed=${failed}`);
   }
 
-  console.log(`[boot-reembed-scripts] complete: embedded=${embedded} failed=${failed}`);
+  // Fix any rows that were embedded at the wrong dimension (e.g. 1536d rows
+  // from before the 512d pin was applied). This is idempotent and safe to
+  // re-run — rows already at the correct dimension are skipped.
+  await reembedMismatchedScripts();
 }

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, getDb, initDb } from "../be/db";
+import { serializeEmbedding } from "../be/embedding";
 import type { EmbeddingProvider } from "../be/memory/types";
 import { runBootReembedScripts } from "../be/scripts/boot-reembed";
 import { upsertScriptByName } from "../be/scripts/db";
@@ -132,6 +133,39 @@ describe("boot-reembed-scripts", () => {
     provider.reset();
     await runBootReembedScripts();
     expect(provider.calls).toHaveLength(0);
+  });
+
+  test("fixes mismatched-dimension rows on boot", async () => {
+    const result = await upsertScriptByName({
+      name: "wrong-dim",
+      scope: "global",
+      source: source("wrong-dim"),
+      description: "Has stale 1536d embedding",
+      intent: "Dimension drift test",
+      signatureJson,
+    });
+    expect(embeddingCount(result.script.id)).toBe(1);
+
+    // Corrupt the embedding to 3 floats (wrong dimension)
+    const wrongEmb = serializeEmbedding(new Float32Array([0.9, 0.8, 0.7]));
+    getDb()
+      .prepare("UPDATE script_embeddings SET embedding = ? WHERE scriptId = ?")
+      .run(wrongEmb, result.script.id);
+
+    provider.reset();
+    await runBootReembedScripts();
+
+    // Should have re-embedded the mismatched row
+    expect(provider.calls).toHaveLength(1);
+    const afterLen = (
+      getDb()
+        .prepare<{ len: number }, [string]>(
+          "SELECT length(embedding) as len FROM script_embeddings WHERE scriptId = ?",
+        )
+        .get(result.script.id) as { len: number }
+    ).len;
+    // FakeEmbeddingProvider.dimensions = 5, Float32 = 4 bytes → 20 bytes
+    expect(afterLen).toBe(provider.dimensions * 4);
   });
 
   test("backfills only scripts missing embeddings, not those that already have them", async () => {
