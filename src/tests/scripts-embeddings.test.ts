@@ -1,10 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, getDb, initDb } from "../be/db";
+import { serializeEmbedding } from "../be/embedding";
 import type { EmbeddingProvider } from "../be/memory/types";
 import { getScript, upsertScriptByName } from "../be/scripts/db";
 import {
   reembedAllScripts,
+  reembedMismatchedScripts,
   searchScripts,
   setScriptEmbeddingProviderForTests,
 } from "../be/scripts/embeddings";
@@ -365,6 +367,66 @@ describe("script embeddings", () => {
     provider.reset();
     await reembedAllScripts();
     expect(provider.calls).toHaveLength(2);
+  });
+
+  test("searchScripts skips rows with mismatched embedding dimensions — no throw", async () => {
+    // Insert a correctly-embedded script
+    await upsertFixture({
+      name: "good-dim",
+      description: "Linear issue parser",
+    });
+    // Insert a second script then corrupt its embedding with a different-length vector
+    const bad = await upsertFixture({
+      name: "bad-dim",
+      description: "Slack message digest",
+    });
+    // Overwrite with a 3-float (wrong-dim) embedding to simulate pre-512d drift
+    const wrongEmb = serializeEmbedding(new Float32Array([0.1, 0.2, 0.3]));
+    getDb()
+      .prepare("UPDATE script_embeddings SET embedding = ? WHERE scriptId = ?")
+      .run(wrongEmb, bad.script.id);
+
+    // Should not throw, and should return the correctly-sized result
+    const results = await searchScripts({ query: "issue triage", scopeId: "agent-1", limit: 5 });
+    const names = results.map((r) => r.script.name);
+    expect(names).toContain("good-dim");
+    expect(names).not.toContain("bad-dim");
+  });
+
+  test("reembedMismatchedScripts re-embeds stale-dimension rows", async () => {
+    const result = await upsertFixture({
+      name: "stale-dim-script",
+      description: "Memory recall helper",
+    });
+    // Corrupt embedding to wrong dimension (3 floats = 12 bytes)
+    const wrongEmb = serializeEmbedding(new Float32Array([0.1, 0.2, 0.3]));
+    getDb()
+      .prepare("UPDATE script_embeddings SET embedding = ? WHERE scriptId = ?")
+      .run(wrongEmb, result.script.id);
+
+    const beforeLength = (
+      getDb()
+        .prepare<{ len: number }, [string]>(
+          "SELECT length(embedding) as len FROM script_embeddings WHERE scriptId = ?",
+        )
+        .get(result.script.id) as { len: number }
+    ).len;
+    expect(beforeLength).toBe(12);
+
+    provider.reset();
+    await reembedMismatchedScripts();
+    expect(provider.calls).toHaveLength(1);
+
+    const afterLength = (
+      getDb()
+        .prepare<{ len: number }, [string]>(
+          "SELECT length(embedding) as len FROM script_embeddings WHERE scriptId = ?",
+        )
+        .get(result.script.id) as { len: number }
+    ).len;
+    // FakeEmbeddingProvider returns [0.1, 0.2, 0.3, 0.4, 0.5] — 5 floats = 20 bytes
+    // which matches provider.dimensions (5)
+    expect(afterLength).toBe(provider.dimensions * 4);
   });
 
   test("delete cascades script_embeddings", async () => {

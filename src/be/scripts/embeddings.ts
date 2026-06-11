@@ -204,20 +204,27 @@ export async function searchScripts(args: {
   const candidates = candidateRows(args.scope, args.scopeId);
   if (candidates.length === 0) return lexicalFallback(args);
 
-  return candidates
-    .map((row) => {
-      const script = rowToScript(row);
-      const semanticScore = cosineSimilarity(queryEmbedding, deserializeEmbedding(row.embedding));
-      const bonus = nameMatchBonus(script, args.query);
-      return {
-        script,
-        score: 0.7 * semanticScore + 0.3 * bonus,
-        semanticScore,
-        nameMatchBonus: bonus,
-      };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, args.limit ?? 10);
+  const results: ScriptSearchResult[] = [];
+  for (const row of candidates) {
+    const script = rowToScript(row);
+    const storedEmbedding = deserializeEmbedding(row.embedding);
+    if (storedEmbedding.length !== queryEmbedding.length) {
+      console.warn(
+        `[script-search] skipping "${script.name}" (${row.scope}): stored dim=${storedEmbedding.length} != query dim=${queryEmbedding.length}. Needs re-embed.`,
+      );
+      continue;
+    }
+    const semanticScore = cosineSimilarity(queryEmbedding, storedEmbedding);
+    const bonus = nameMatchBonus(script, args.query);
+    results.push({
+      script,
+      score: 0.7 * semanticScore + 0.3 * bonus,
+      semanticScore,
+      nameMatchBonus: bonus,
+    });
+  }
+
+  return results.sort((a, b) => b.score - a.score).slice(0, args.limit ?? 10);
 }
 
 export async function reembedAllScripts(): Promise<void> {
@@ -230,4 +237,59 @@ export async function reembedAllScripts(): Promise<void> {
   for (const row of rows) {
     await embedScript(rowToScript(row));
   }
+}
+
+type MismatchedEmbeddingRow = {
+  scriptId: string;
+  embeddedText: string;
+};
+
+/**
+ * Re-embed any script_embeddings rows whose stored vector has the wrong
+ * dimension (i.e., was embedded before the 512d pin was applied). Uses the
+ * embeddedText already on the row so we don't need to re-derive it.
+ * Idempotent: rows already at the correct dimension are skipped.
+ */
+export async function reembedMismatchedScripts(): Promise<void> {
+  const provider = embeddingProvider();
+  const expectedBytes = provider.dimensions * 4; // Float32 = 4 bytes per element
+
+  const stale = getDb()
+    .prepare<MismatchedEmbeddingRow, [number]>(
+      "SELECT scriptId, embeddedText FROM script_embeddings WHERE length(embedding) != ?",
+    )
+    .all(expectedBytes);
+
+  if (stale.length === 0) return;
+
+  console.log(
+    `[scripts-reembed] ${stale.length} rows have wrong embedding dimension (expected ${provider.dimensions}d); re-embedding…`,
+  );
+
+  let updated = 0;
+  let failed = 0;
+
+  for (const row of stale) {
+    try {
+      const embedding = await provider.embed(row.embeddedText);
+      if (!embedding) {
+        failed++;
+        continue;
+      }
+      getDb()
+        .prepare(
+          "UPDATE script_embeddings SET embedding = ?, embeddingModel = ?, embeddedAt = ? WHERE scriptId = ?",
+        )
+        .run(serializeEmbedding(embedding), provider.name, new Date().toISOString(), row.scriptId);
+      updated++;
+    } catch (err) {
+      failed++;
+      console.error(
+        `[scripts-reembed] failed for scriptId=${row.scriptId}:`,
+        (err as Error).message,
+      );
+    }
+  }
+
+  console.log(`[scripts-reembed] done: updated=${updated} failed=${failed}`);
 }
