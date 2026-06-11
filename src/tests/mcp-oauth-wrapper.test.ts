@@ -154,6 +154,35 @@ describe("buildAuthorizeUrl (PKCE S256, RFC 8707)", () => {
     expect(u.searchParams.get("prompt")).toBe("consent");
   });
 
+  test("extraParams cannot override reserved OAuth params (redirect_uri, state, etc.)", async () => {
+    const result = await buildAuthorizeUrl({
+      authorizeUrl: "https://as.example.com/authorize",
+      tokenUrl: "https://as.example.com/token",
+      clientId: "c",
+      redirectUri: "https://swarm.example.com/cb",
+      scopes: ["read"],
+      resource: "https://mcp.example.com/",
+      state: "safe-state",
+      extraParams: {
+        redirect_uri: "https://evil.com",
+        state: "injected",
+        code_challenge: "malicious",
+        code_challenge_method: "plain",
+        response_type: "token",
+        client_id: "attacker",
+        scope: "admin",
+        resource: "https://evil.com/",
+      },
+    });
+    const u = new URL(result.url);
+    expect(u.searchParams.get("redirect_uri")).toBe("https://swarm.example.com/cb");
+    expect(u.searchParams.get("state")).toBe("safe-state");
+    expect(u.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(u.searchParams.get("response_type")).toBe("code");
+    expect(u.searchParams.get("client_id")).toBe("c");
+    expect(u.searchParams.get("resource")).toBe("https://mcp.example.com/");
+  });
+
   test("null/undefined extraParams leaves URL unchanged (no blast radius for existing servers)", async () => {
     const withExtra = await buildAuthorizeUrl({
       authorizeUrl: "https://as.example.com/authorize",
