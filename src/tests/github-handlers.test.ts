@@ -376,9 +376,7 @@ describe("handleComment — dora-rule-intake path", () => {
 
   function getTaskType(taskId: string): string | null {
     const row = getDb()
-      .prepare<{ taskType: string | null }, string>(
-        "SELECT taskType FROM agent_tasks WHERE id = ?",
-      )
+      .prepare<{ taskType: string | null }, string>("SELECT taskType FROM agent_tasks WHERE id = ?")
       .get(taskId);
     return row?.taskType ?? null;
   }
@@ -392,7 +390,10 @@ describe("handleComment — dora-rule-intake path", () => {
 
   test("pull_request_review_comment with dora intent → dora-rule-intake task", async () => {
     const result = await handleComment(
-      makePrReviewCommentEvent("reviewer", `@${GITHUB_BOT_NAME} /dora-rule-intake avoid N+1 queries`),
+      makePrReviewCommentEvent(
+        "reviewer",
+        `@${GITHUB_BOT_NAME} /dora-rule-intake avoid N+1 queries`,
+      ),
       "pull_request_review_comment",
     );
     expect(result.created).toBe(true);
@@ -402,7 +403,10 @@ describe("handleComment — dora-rule-intake path", () => {
 
   test("issue_comment on PR with dora intent → dora-rule-intake task", async () => {
     const result = await handleComment(
-      makeIssueCommentOnPrEvent("contributor", `@${GITHUB_BOT_NAME} dora rule: no raw SQL in controllers`),
+      makeIssueCommentOnPrEvent(
+        "contributor",
+        `@${GITHUB_BOT_NAME} dora rule: no raw SQL in controllers`,
+      ),
       "issue_comment",
     );
     expect(result.created).toBe(true);
@@ -429,7 +433,11 @@ describe("handleComment — dora-rule-intake path", () => {
         html_url: `https://github.com/test/repo/issues/10#issuecomment-${id}`,
         user: { login: "user3" },
       },
-      issue: { number: 10, title: "A plain issue", html_url: "https://github.com/test/repo/issues/10" },
+      issue: {
+        number: 10,
+        title: "A plain issue",
+        html_url: "https://github.com/test/repo/issues/10",
+      },
       repository: BASE_REPO,
       sender: { login: "user3" },
     };
