@@ -23,6 +23,7 @@ import {
   handleIssue,
   handlePullRequest,
   handlePullRequestReview,
+  isDoraRuleIntentComment,
 } from "../github/handlers";
 import { GITHUB_BOT_NAME } from "../github/mentions";
 import type {
@@ -289,6 +290,152 @@ describe("unknown github sender", () => {
     const meta = getKv(UNMAPPED_NAMESPACE, "trunc-ghost:meta");
     const metaValue = meta?.value as { sampleContext: string };
     expect(metaValue.sampleContext.length).toBeLessThanOrEqual(100);
+  });
+});
+
+// ── Dora rule-intake intent detection ──
+
+describe("isDoraRuleIntentComment (unit)", () => {
+  test("detects /dora-rule-intake slash command", () => {
+    expect(isDoraRuleIntentComment(`@${GITHUB_BOT_NAME} /dora-rule-intake this is a rule`)).toBe(
+      true,
+    );
+  });
+
+  test("detects 'dora rule' natural language (space separated)", () => {
+    expect(isDoraRuleIntentComment("add this as a dora rule please")).toBe(true);
+  });
+
+  test("detects 'dora-rule' hyphenated variant", () => {
+    expect(isDoraRuleIntentComment("dora-rule: avoid N+1 queries")).toBe(true);
+  });
+
+  test("is case-insensitive", () => {
+    expect(isDoraRuleIntentComment("/DORA-RULE-INTAKE")).toBe(true);
+    expect(isDoraRuleIntentComment("Dora Rule: check this")).toBe(true);
+  });
+
+  test("does NOT match generic bot-mention without dora keyword", () => {
+    expect(isDoraRuleIntentComment(`@${GITHUB_BOT_NAME} please review this PR`)).toBe(false);
+  });
+
+  test("does NOT match partial word 'adorable'", () => {
+    expect(isDoraRuleIntentComment("this is adorable code")).toBe(false);
+  });
+});
+
+describe("handleComment — dora-rule-intake path", () => {
+  // Use an incrementing comment ID to avoid deduplication cache hits across tests.
+  let nextCommentId = 9000;
+
+  function makePrReviewCommentEvent(senderLogin: string, body: string): CommentEvent {
+    const id = nextCommentId++;
+    return {
+      action: "created",
+      comment: {
+        id,
+        node_id: `PRRC_${id}`,
+        body,
+        html_url: `https://github.com/test/repo/pull/42#discussion_r${id}`,
+        user: { login: senderLogin },
+      },
+      pull_request: {
+        number: 42,
+        title: "Add new feature",
+        html_url: "https://github.com/test/repo/pull/42",
+      },
+      repository: BASE_REPO,
+      sender: { login: senderLogin },
+    };
+  }
+
+  function makeIssueCommentOnPrEvent(senderLogin: string, body: string): CommentEvent {
+    const id = nextCommentId++;
+    return {
+      action: "created",
+      comment: {
+        id,
+        node_id: `IC_${id}`,
+        body,
+        html_url: `https://github.com/test/repo/pull/43#issuecomment-${id}`,
+        user: { login: senderLogin },
+      },
+      issue: {
+        number: 43,
+        title: "PR as issue",
+        html_url: "https://github.com/test/repo/pull/43",
+        pull_request: {
+          url: "https://api.github.com/repos/test/repo/pulls/43",
+          html_url: "https://github.com/test/repo/pull/43",
+        },
+      },
+      repository: BASE_REPO,
+      sender: { login: senderLogin },
+    };
+  }
+
+  function getTaskType(taskId: string): string | null {
+    const row = getDb()
+      .prepare<{ taskType: string | null }, string>(
+        "SELECT taskType FROM agent_tasks WHERE id = ?",
+      )
+      .get(taskId);
+    return row?.taskType ?? null;
+  }
+
+  function getTaskTags(taskId: string): string[] {
+    const row = getDb()
+      .prepare<{ tags: string | null }, string>("SELECT tags FROM agent_tasks WHERE id = ?")
+      .get(taskId);
+    return row?.tags ? JSON.parse(row.tags) : [];
+  }
+
+  test("pull_request_review_comment with dora intent → dora-rule-intake task", async () => {
+    const result = await handleComment(
+      makePrReviewCommentEvent("reviewer", `@${GITHUB_BOT_NAME} /dora-rule-intake avoid N+1 queries`),
+      "pull_request_review_comment",
+    );
+    expect(result.created).toBe(true);
+    expect(getTaskType(result.taskId!)).toBe("dora-rule-intake");
+    expect(getTaskTags(result.taskId!)).toContain("dora-rule-intake");
+  });
+
+  test("issue_comment on PR with dora intent → dora-rule-intake task", async () => {
+    const result = await handleComment(
+      makeIssueCommentOnPrEvent("contributor", `@${GITHUB_BOT_NAME} dora rule: no raw SQL in controllers`),
+      "issue_comment",
+    );
+    expect(result.created).toBe(true);
+    expect(getTaskType(result.taskId!)).toBe("dora-rule-intake");
+  });
+
+  test("pull_request_review_comment WITHOUT dora intent → generic github-comment", async () => {
+    const result = await handleComment(
+      makePrReviewCommentEvent("reviewer2", `@${GITHUB_BOT_NAME} can you review this PR?`),
+      "pull_request_review_comment",
+    );
+    expect(result.created).toBe(true);
+    expect(getTaskType(result.taskId!)).toBe("github-comment");
+  });
+
+  test("issue_comment on plain issue with dora phrase → generic github-comment (not PR-backed)", async () => {
+    // Plain issue comment — no pull_request sub-field on issue, no top-level pull_request
+    const id = nextCommentId++;
+    const plainIssueEvent: CommentEvent = {
+      action: "created",
+      comment: {
+        id,
+        body: `@${GITHUB_BOT_NAME} dora rule: test this`,
+        html_url: `https://github.com/test/repo/issues/10#issuecomment-${id}`,
+        user: { login: "user3" },
+      },
+      issue: { number: 10, title: "A plain issue", html_url: "https://github.com/test/repo/issues/10" },
+      repository: BASE_REPO,
+      sender: { login: "user3" },
+    };
+    const result = await handleComment(plainIssueEvent, "issue_comment");
+    expect(result.created).toBe(true);
+    expect(getTaskType(result.taskId!)).toBe("github-comment");
   });
 });
 
