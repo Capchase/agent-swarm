@@ -21,7 +21,13 @@ import {
   type ExecutorResult,
 } from "../workflows/executors/base";
 import { ExecutorRegistry } from "../workflows/executors/registry";
-import { SwarmScriptExecutor } from "../workflows/executors/swarm-script";
+import {
+  SWARM_SCRIPT_DEFAULT_TIMEOUT_MS,
+  SWARM_SCRIPT_MAX_TIMEOUT_MS,
+  SWARM_SCRIPT_MIN_TIMEOUT_MS,
+  SwarmScriptConfigSchema,
+  SwarmScriptExecutor,
+} from "../workflows/executors/swarm-script";
 import { interpolate } from "../workflows/template";
 
 const TEST_DB_PATH = "./test-workflow-swarm-script.sqlite";
@@ -141,6 +147,38 @@ beforeEach(() => {
 });
 
 describe("SwarmScriptExecutor", () => {
+  test("config schema validates timeoutMs bounds and applies the runtime default", () => {
+    expect(SwarmScriptConfigSchema.parse({ scriptName: "quick" }).timeoutMs).toBe(
+      SWARM_SCRIPT_DEFAULT_TIMEOUT_MS,
+    );
+
+    expect(
+      SwarmScriptConfigSchema.safeParse({
+        scriptName: "quick",
+        timeoutMs: SWARM_SCRIPT_MIN_TIMEOUT_MS - 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      SwarmScriptConfigSchema.safeParse({
+        scriptName: "quick",
+        timeoutMs: SWARM_SCRIPT_MAX_TIMEOUT_MS + 1,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      SwarmScriptConfigSchema.parse({
+        scriptName: "quick",
+        timeoutMs: SWARM_SCRIPT_MIN_TIMEOUT_MS,
+      }).timeoutMs,
+    ).toBe(SWARM_SCRIPT_MIN_TIMEOUT_MS);
+    expect(
+      SwarmScriptConfigSchema.parse({
+        scriptName: "quick",
+        timeoutMs: SWARM_SCRIPT_MAX_TIMEOUT_MS,
+      }).timeoutMs,
+    ).toBe(SWARM_SCRIPT_MAX_TIMEOUT_MS);
+  });
+
   test("A workflow with one swarm-script node resolves by name + runs + returns result", async () => {
     await saveScript(
       "add-one",
