@@ -340,6 +340,30 @@ Comment:
   category: "event",
 });
 
+registerTemplate({
+  eventType: "github.comment.dora_rule_intake",
+  header: "[Dora Rule Intake] PR #{{pr_number}} — {{repo_full_name}}",
+  defaultBody: `From: {{sender_login}}
+PR: {{pr_url}}
+Comment: {{comment_url}}
+
+Proposed rule:
+{{rule_body}}
+
+---
+Run /dora-rule-intake to process this rule submission.
+{{@template[common.delegation_instruction]}}`,
+  variables: [
+    { name: "sender_login", description: "Commenter GitHub login" },
+    { name: "repo_full_name", description: "Repository full name (owner/repo)" },
+    { name: "pr_number", description: "Pull request number" },
+    { name: "pr_url", description: "Pull request HTML URL" },
+    { name: "comment_url", description: "Comment HTML URL" },
+    { name: "rule_body", description: "Comment body (proposed rule text)" },
+  ],
+  category: "event",
+});
+
 // ============================================================================
 // Pull Request Review events
 // ============================================================================

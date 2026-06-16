@@ -42,7 +42,13 @@ export interface CommentEvent extends GitHubWebhookEvent {
     html_url: string;
     user: { login: string };
   };
-  issue?: { number: number; title: string; html_url: string };
+  issue?: {
+    number: number;
+    title: string;
+    html_url: string;
+    // Present when the issue_comment event targets a pull request (GitHub includes this sub-field).
+    pull_request?: { url: string; html_url: string };
+  };
   pull_request?: { number: number; title: string; html_url: string };
 }
 

@@ -122,6 +122,17 @@ function getCommandSuggestions(taskType: string, targetType?: string): string {
   }
 }
 
+/**
+ * Returns true when the comment body signals a Dora rule-intake submission:
+ *   - explicit `/dora-rule-intake` slash command, OR
+ *   - natural-language "dora rule" / "dora-rule" phrase.
+ *
+ * The bot-mention check runs before this — only mention-bearing comments reach here.
+ */
+export function isDoraRuleIntentComment(body: string): boolean {
+  return /\/dora-rule-intake/i.test(body) || /\bdora[- ]rule\b/i.test(body);
+}
+
 function isDuplicate(eventKey: string): boolean {
   const now = Date.now();
 
@@ -870,6 +881,71 @@ export async function handleComment(
   const targetTitle = target?.title ?? "Unknown";
   const targetUrl = target?.html_url ?? comment.html_url;
 
+  // A comment is PR-backed when the event carries a top-level pull_request (always
+  // true for pull_request_review_comment) OR when issue.pull_request is present
+  // (GitHub sets this sub-field for issue_comment events on PRs).
+  const isPrBacked = !!pull_request || !!issue?.pull_request;
+
+  // ── Dora rule-intake fast path ───────────────────────────────────────────
+  // Route to a dedicated dora-rule-intake task when the comment signals a rule
+  // submission AND it targets a PR (not a plain issue).
+  if (isPrBacked && isDoraRuleIntentComment(comment.body)) {
+    const prNumber = pull_request?.number ?? issue?.number ?? 0;
+    const prUrl = pull_request?.html_url ?? issue?.pull_request?.html_url ?? targetUrl;
+
+    const doraResult = resolveTemplate(
+      "github.comment.dora_rule_intake",
+      {
+        sender_login: sender.login,
+        repo_full_name: repository.full_name,
+        pr_number: prNumber,
+        pr_url: prUrl,
+        comment_url: comment.html_url,
+        rule_body: comment.body,
+      },
+      { agentId: lead?.id, repoId: repository.full_name },
+    );
+
+    if (!doraResult.skipped) {
+      const doraTask = createTaskWithSiblingAwareness(doraResult.text, {
+        agentId: lead?.id ?? "",
+        source: "github",
+        vcsProvider: "github",
+        taskType: "dora-rule-intake",
+        tags: ["dora-rule-intake"],
+        vcsRepo: repository.full_name,
+        vcsEventType: eventType,
+        vcsNumber: prNumber,
+        vcsCommentId: comment.id,
+        vcsAuthor: sender.login,
+        requestedByUserId,
+        vcsUrl: prUrl,
+        vcsInstallationId: installation?.id,
+        vcsNodeId: comment.node_id,
+        contextKey: prNumber
+          ? buildGithubContextKey(repository.full_name, "pr", prNumber)
+          : undefined,
+      });
+
+      if (lead) {
+        console.log(
+          `[GitHub] Created dora-rule-intake task ${doraTask.id} for PR #${prNumber} comment -> ${lead.name}`,
+        );
+      } else {
+        console.log(
+          `[GitHub] Created unassigned dora-rule-intake task ${doraTask.id} for PR #${prNumber} comment`,
+        );
+      }
+
+      if (installation?.id) {
+        addReaction(repository.full_name, comment.id, "eyes", installation.id);
+      }
+
+      return { created: true, taskId: doraTask.id };
+    }
+  }
+
+  // ── Generic github-comment path ───────────────────────────────────────────
   // Check if there's an existing task for this PR/Issue
   const existingTask = targetNumber ? findTaskByVcs(repository.full_name, targetNumber) : null;
 
