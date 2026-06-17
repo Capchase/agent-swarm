@@ -21,6 +21,7 @@ import {
   getTaskStats,
   getTasksByStatus,
   getUnassignedPoolTasks,
+  hasAnyResumeChild,
   hasNonTerminalResumeChild,
   releaseStaleMentionProcessing,
   releaseStaleProcessingInbox,
@@ -306,8 +307,9 @@ function escalateTakeoverTimeouts(findings: HeartbeatFindings): void {
       continue;
     }
 
-    // Lead already routed — a resume child exists for the original.
-    if (hasNonTerminalResumeChild(original.id)) {
+    // Lead already routed — a resume child exists for the original (terminal or not).
+    // Use hasAnyResumeChild so a completed Lead-routed resume doesn't look like "not routed yet".
+    if (hasAnyResumeChild(original.id)) {
       completeTask(decision.id, "routed_by_lead");
       console.log(
         `[Heartbeat] Takeover-decision ${decision.id.slice(0, 8)} closed — Lead already routed original ${original.id.slice(0, 8)}`,

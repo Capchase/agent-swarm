@@ -1457,6 +1457,23 @@ export function hasNonTerminalTakeoverDecisionChild(parentId: string): boolean {
   return row !== undefined && row !== null;
 }
 
+/**
+ * Returns true if `parentId` has at least one child task with `taskType = 'resume'`,
+ * regardless of terminal status. Used by `escalateTakeoverTimeouts` to detect a
+ * Lead-routed replacement even after that replacement has completed.
+ */
+export function hasAnyResumeChild(parentId: string): boolean {
+  const row = getDb()
+    .prepare(
+      `SELECT 1 FROM agent_tasks
+       WHERE parentTaskId = ?
+         AND taskType = 'resume'
+       LIMIT 1`,
+    )
+    .get(parentId);
+  return row !== undefined && row !== null;
+}
+
 export function getOpenTakeoverDecisionTasks(): AgentTask[] {
   const rows = getDb()
     .prepare(

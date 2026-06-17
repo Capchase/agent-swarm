@@ -150,7 +150,7 @@ Original task ID: {{original_task_id}}
 Trigger: {{reason}}
 Task: "{{task_desc}}"
 
-Resume generation: {{generation_next}} of {{max_generations}} (max). You MUST attach the tag \`resume-generation:{{generation_next}}\` and set \`parentTaskId: {{original_task_id}}\` when dispatching the resume. Do NOT inherit the original task's \`model\`.{{artifacts_block}}
+Resume generation: {{generation_next}} of {{max_generations}} (max). You MUST set \`taskType: "resume"\`, attach the tag \`resume-generation:{{generation_next}}\`, and set \`parentTaskId: {{original_task_id}}\` when dispatching via \`send-task\`. Do NOT inherit the original task's \`model\`.{{artifacts_block}}
 
 ## Your job
 

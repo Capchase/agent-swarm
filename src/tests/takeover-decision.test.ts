@@ -17,6 +17,7 @@ import {
   getChildTasks,
   getDb,
   getTaskById,
+  hasAnyResumeChild,
   hasNonTerminalResumeChild,
   initDb,
   startTask,
@@ -234,6 +235,57 @@ describe("Heartbeat — Lead-routed takeover-decision (DES-523)", () => {
     expect(children.length).toBe(1); // still exactly one resume
   });
 
+  test("T3b: Lead-routed child completed before timeout → decision closed, no second pool resume", async () => {
+    setTakeoverViaLeadForTests(true);
+
+    const lead = createAgent({ name: "lead", isLead: true, status: "idle" });
+    const worker = createAgent({ name: "coder-4b", isLead: false, status: "busy" });
+    const parent = createTaskExtended("Auth refactor (completed resume)", { agentId: worker.id });
+    startTask(parent.id);
+
+    getDb().run("UPDATE agent_tasks SET status = 'superseded' WHERE id = ?", [parent.id]);
+
+    // Lead routed a resume task — it has since completed successfully.
+    const resume = createTaskExtended("Resume interrupted auth refactor", {
+      parentTaskId: parent.id,
+      taskType: "resume",
+      tags: ["auto-resume", "reason:crash_recovery", `${RESUME_GENERATION_TAG_PREFIX}1`],
+    });
+    startTask(resume.id);
+    getDb().run("UPDATE agent_tasks SET status = 'completed' WHERE id = ?", [resume.id]);
+
+    // Decision task is past the timeout.
+    const decision = createTaskExtended("Takeover decision", {
+      agentId: lead.id,
+      taskType: "takeover-decision",
+      parentTaskId: parent.id,
+    });
+    startTask(decision.id);
+    const expiredTime = new Date(
+      Date.now() - (LEAD_ESCALATION_TIMEOUT_MIN + 1) * 60 * 1000,
+    ).toISOString();
+    getDb().run("UPDATE agent_tasks SET createdAt = ?, lastUpdatedAt = ? WHERE id = ?", [
+      expiredTime,
+      expiredTime,
+      decision.id,
+    ]);
+
+    const findings = await codeLevelTriage();
+
+    // Decision task was completed (routed_by_lead), NOT a second pool resume.
+    const updatedDecision = getTaskById(decision.id);
+    expect(updatedDecision?.status).toBe("completed");
+
+    // hasAnyResumeChild returns true even though the resume has completed.
+    expect(hasAnyResumeChild(parent.id)).toBe(true);
+    expect(hasNonTerminalResumeChild(parent.id)).toBe(false); // confirms the gap this fix addresses
+
+    // No new resume was created — still exactly one resume child.
+    const resumeChildren = getChildTasks(parent.id).filter((c) => c.taskType === "resume");
+    expect(resumeChildren.length).toBe(1);
+    expect(findings.autoResumedTasks.find((r) => r.taskId === parent.id)).toBeUndefined();
+  });
+
   // --------------------------------------------------------------------------
   // Test 4: Generation-cap propagation
   // --------------------------------------------------------------------------
@@ -286,6 +338,7 @@ describe("Heartbeat — Lead-routed takeover-decision (DES-523)", () => {
     });
 
     expect(result.skipped).toBe(false);
+    expect(result.text).toContain(`taskType: "resume"`); // send-task shape the timeout handler expects
     expect(result.text).toContain("resume-generation:2");
     expect(result.text).toContain("parentTaskId: test-id-1234");
     expect(result.text).toContain("crash_recovery");
