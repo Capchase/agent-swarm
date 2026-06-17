@@ -12,7 +12,27 @@
  * Complements slack-assistant-comention.test.ts (pure helper-function unit tests).
  * Regression for task 4ae1f3b5 — "<@U0831BS93V1> Are you here?" spawned an unwanted task.
  */
-import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+
+// ---------------------------------------------------------------------------
+// Snapshot real modules BEFORE mocking.
+//
+// Bun mutates live module-namespace bindings when mock.module() runs, so a
+// plain `await import()` captured before the call still returns the mock after
+// mock.module() executes.  Spreading the namespace into a plain object copies
+// the function references at snapshot-time, freezing the real exports.
+//
+// These snapshots are used in afterAll() to restore the global module registry
+// so that subsequent test files in the same bun process get the real modules.
+// ---------------------------------------------------------------------------
+const _realSiblingAwareness = { ...(await import("../tasks/sibling-awareness")) };
+const _realDb = { ...(await import("../be/db")) };
+const _realEnrich = { ...(await import("../slack/enrich")) };
+const _realEventDedup = { ...(await import("../slack/event-dedup")) };
+const _realThreadBuffer = { ...(await import("../slack/thread-buffer")) };
+const _realResolver = { ...(await import("../prompts/resolver")) };
+const _realContextKey = { ...(await import("../tasks/context-key")) };
+const _realWatcher = { ...(await import("../slack/watcher")) };
 
 // ---------------------------------------------------------------------------
 // Module mocks — Bun hoists these before all imports.
@@ -268,4 +288,22 @@ describe("registerMessageHandler — assistant_thread co-mention guard (producti
 
     expect(createTaskMock).not.toHaveBeenCalled();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Restore the real module implementations after all tests in this file.
+//
+// mock.module() overrides persist for the entire bun process; without this
+// cleanup every subsequent test file that imports ../be/db, ../prompts/resolver,
+// etc. would receive the stub implementations above instead of the real ones.
+// ---------------------------------------------------------------------------
+afterAll(() => {
+  mock.module("../tasks/sibling-awareness", () => _realSiblingAwareness);
+  mock.module("../be/db", () => _realDb);
+  mock.module("../slack/enrich", () => _realEnrich);
+  mock.module("../slack/event-dedup", () => _realEventDedup);
+  mock.module("../slack/thread-buffer", () => _realThreadBuffer);
+  mock.module("../prompts/resolver", () => _realResolver);
+  mock.module("../tasks/context-key", () => _realContextKey);
+  mock.module("../slack/watcher", () => _realWatcher);
 });
