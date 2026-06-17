@@ -8,12 +8,15 @@
 -- Forward-only: do NOT edit 097 (already applied in production).
 --
 -- SQLite cannot add a CHECK constraint to an existing column via ALTER TABLE,
--- so we rebuild the table (the established pattern — see migration 053).
+-- so we rebuild the table following the established pattern (migration 053):
+-- create agents_new, copy, DROP agents, rename agents_new → agents. This
+-- avoids the "rename parent table → child FK clauses get rewritten to the
+-- tmp name → DROP tmp → dangling FK" trap that the reverse pattern (rename
+-- agents → tmp) falls into with modern SQLite (legacy_alter_table=OFF).
 -- Column list derived from: 001 + 027 + 048 + 053 + 054 + 055 + 082 + 097.
 
-ALTER TABLE agents RENAME TO agents_role_class_check_tmp;
-
-CREATE TABLE agents (
+-- 1. Create new table with the role_class CHECK constraint.
+CREATE TABLE agents_new (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     isLead INTEGER NOT NULL DEFAULT 0,
@@ -44,7 +47,8 @@ CREATE TABLE agents (
     updated_by TEXT REFERENCES users(id)
 );
 
-INSERT INTO agents (
+-- 2. Copy existing data.
+INSERT INTO agents_new (
     id, name, isLead, status, description, role, role_class, capabilities,
     maxTasks, emptyPollCount, claudeMd, soulMd, identityMd, setupScript, toolsMd,
     lastActivityAt, createdAt, lastUpdatedAt, heartbeatMd, provider,
@@ -55,6 +59,10 @@ SELECT
     maxTasks, emptyPollCount, claudeMd, soulMd, identityMd, setupScript, toolsMd,
     lastActivityAt, createdAt, lastUpdatedAt, heartbeatMd, provider,
     credentialMissing, harness_provider, cred_status, created_by, updated_by
-FROM agents_role_class_check_tmp;
+FROM agents;
 
-DROP TABLE agents_role_class_check_tmp;
+-- 3. Drop old table + rename. Foreign keys referencing agents.id in child
+--    tables (agent_skills, mcp_servers, etc.) survive the rename because
+--    agents_new has no children — no FK clause rewriting occurs.
+DROP TABLE agents;
+ALTER TABLE agents_new RENAME TO agents;
