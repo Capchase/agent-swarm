@@ -10,6 +10,7 @@ import {
 import { repointTrackerSyncBySwarmId } from "../be/db-queries/tracker";
 import { resolveTemplate } from "../prompts/resolver";
 import type { AgentTask, ResumeReason, TaskAttachment } from "../types";
+import { REQUIRES_HARNESS_TAG_PREFIX, REQUIRES_ROLE_TAG_PREFIX } from "./role-routing-policy";
 // Side-effect import: registers task lifecycle templates in the in-memory registry.
 import "../tools/templates";
 
@@ -236,6 +237,22 @@ export function createResumeFollowUp(args: {
     `reason:${args.reason}`,
     `${RESUME_GENERATION_TAG_PREFIX}${getNextResumeGeneration(parent)}`,
   ];
+
+  // Role-class-aware resume routing. When the resume task falls to the pool
+  // (no live preferred agent), tag it with the original assignee's roleClass
+  // and harness so the claim gate (poll / task-action) keeps it on a
+  // matching agent. Without this, a crash-recovery resume of a Claude coder
+  // task could be self-claimed by a reviewer/PM (real incident: PR #29249),
+  // and session resume is harness-bound so a cross-harness claim dies on init.
+  // Only tag when there IS a signal — an unknown/missing class stays untagged
+  // so the gate fails open (a wedged pool is worse than a misroute).
+  const parentAssignee = parent.agentId ? getAgentById(parent.agentId) : null;
+  if (parentAssignee?.roleClass && parentAssignee.roleClass !== "unknown") {
+    tags.push(`${REQUIRES_ROLE_TAG_PREFIX}${parentAssignee.roleClass}`);
+  }
+  if (parentAssignee?.harnessProvider) {
+    tags.push(`${REQUIRES_HARNESS_TAG_PREFIX}${parentAssignee.harnessProvider}`);
+  }
 
   // Identity-shaped fields (dir, VCS provider/repo/number/url/etc.,
   // outputSchema, slack channel/thread/user, agentmail, mention, contextKey,

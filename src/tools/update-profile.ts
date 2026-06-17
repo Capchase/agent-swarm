@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { getAgentById, updateAgentName, updateAgentProfile } from "@/be/db";
 import { createToolRegistrar } from "@/tools/utils";
-import { type Agent, AgentSchema } from "@/types";
+import { type Agent, AgentSchema, RoleClassSchema } from "@/types";
 
 export const registerUpdateProfileTool = (server: McpServer) => {
   createToolRegistrar(server)(
@@ -28,6 +28,9 @@ export const registerUpdateProfileTool = (server: McpServer) => {
           .max(100)
           .optional()
           .describe("Agent role (free-form, e.g., 'frontend dev', 'code reviewer')."),
+        roleClass: RoleClassSchema.optional().describe(
+          "Structured role-class used for role-class-aware task routing (coder, reviewer, researcher, pm, ops, content, qa, ux, lead, unknown). Controls which pool tasks the agent is allowed to auto-claim.",
+        ),
         capabilities: z
           .array(z.string())
           .optional()
@@ -90,6 +93,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         name,
         description,
         role,
+        roleClass,
         capabilities,
         claudeMd,
         soulMd,
@@ -164,6 +168,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         name === undefined &&
         description === undefined &&
         role === undefined &&
+        roleClass === undefined &&
         capabilities === undefined &&
         claudeMd === undefined &&
         soulMd === undefined &&
@@ -183,7 +188,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
             yourAgentId: requestInfo.agentId,
             success: false,
             message:
-              "At least one field (name, description, role, capabilities, claudeMd, soulMd, identityMd, setupScript, toolsMd, or heartbeatMd) must be provided.",
+              "At least one field (name, description, role, roleClass, capabilities, claudeMd, soulMd, identityMd, setupScript, toolsMd, or heartbeatMd) must be provided.",
           },
         };
       }
@@ -212,6 +217,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
           {
             description,
             role,
+            roleClass,
             capabilities,
             claudeMd,
             soulMd,
@@ -284,6 +290,7 @@ export const registerUpdateProfileTool = (server: McpServer) => {
         if (name !== undefined) updatedFields.push("name");
         if (description !== undefined) updatedFields.push("description");
         if (role !== undefined) updatedFields.push("role");
+        if (roleClass !== undefined) updatedFields.push("roleClass");
         if (capabilities !== undefined) updatedFields.push("capabilities");
         if (claudeMd !== undefined) updatedFields.push("claudeMd");
         if (soulMd !== undefined) updatedFields.push("soulMd");

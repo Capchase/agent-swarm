@@ -7,7 +7,7 @@ import {
   generateDefaultSoulMd,
 } from "@/prompts/defaults";
 import { createToolRegistrar } from "@/tools/utils";
-import { AgentSchema } from "@/types";
+import { AgentSchema, RoleClassSchema } from "@/types";
 
 export const registerJoinSwarmTool = (server: McpServer) => {
   createToolRegistrar(server)(
@@ -35,6 +35,9 @@ export const registerJoinSwarmTool = (server: McpServer) => {
           .array(z.string())
           .optional()
           .describe("List of capabilities (e.g., ['typescript', 'react', 'testing'])."),
+        roleClass: RoleClassSchema.optional().describe(
+          "Structured role-class used for role-class-aware task routing (coder, reviewer, researcher, pm, ops, content, qa, ux, lead, unknown). Coders won't be auto-routed review tasks and reviewers won't be auto-routed coding tasks.",
+        ),
       }),
       outputSchema: z.object({
         yourAgentId: z.string().uuid().optional(),
@@ -43,7 +46,11 @@ export const registerJoinSwarmTool = (server: McpServer) => {
         agent: AgentSchema.optional(),
       }),
     },
-    async ({ lead, name, requestedId, description, role, capabilities }, requestInfo, _meta) => {
+    async (
+      { lead, name, requestedId, description, role, capabilities, roleClass },
+      requestInfo,
+      _meta,
+    ) => {
       // Check if agent ID is set
       if (!requestInfo.agentId && !requestedId) {
         return {
@@ -116,6 +123,7 @@ export const registerJoinSwarmTool = (server: McpServer) => {
           const updatedAgent = updateAgentProfile(agent.id, {
             description,
             role,
+            roleClass,
             capabilities,
             claudeMd: defaultClaudeMd,
             soulMd: defaultSoulMd,

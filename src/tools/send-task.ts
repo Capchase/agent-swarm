@@ -11,6 +11,7 @@ import {
   getTaskById,
   hasCapacity,
 } from "@/be/db";
+import { requiredRoleClassForTask } from "@/tasks/role-routing-policy";
 import { findDuplicateTask } from "@/tools/task-dedup";
 import { ownerCtx, type ToolCtx } from "@/tools/task-tool-ctx";
 import { createToolRegistrar } from "@/tools/utils";
@@ -309,6 +310,21 @@ export async function sendTaskHandler(
         success: false,
         message: `Agent "${agent.name}" is at capacity (${activeCount}/${agent.maxTasks ?? 1} tasks). Use offerMode: true to offer the task instead, or wait for a task to complete.`,
       };
+    }
+
+    // Role-class advisory. Explicit assigns/offers are an intentional Lead
+    // override (e.g. a coder reviews when the reviewer pool is exhausted), so we
+    // ALLOW but log a warning — unlike pool-claim / auto-resume, which hard-gate.
+    const requiredClass = requiredRoleClassForTask({ taskType, tags: finalTags ?? [] });
+    if (
+      requiredClass &&
+      agent.roleClass &&
+      agent.roleClass !== "unknown" &&
+      agent.roleClass !== requiredClass
+    ) {
+      console.warn(
+        `[send-task] Cross-role direct assign: task (requires '${requiredClass}') → agent "${agent.name}" (roleClass '${agent.roleClass}'). Allowed as an explicit override.`,
+      );
     }
 
     if (offerMode) {
