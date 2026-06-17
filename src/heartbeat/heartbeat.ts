@@ -79,7 +79,7 @@ export const RESUME_BUDGET_EXHAUSTED_REASON = "resume_budget_exhausted";
  * to enable; the existing pool fallback remains active when disabled or on
  * any failure/timeout in the Lead route.
  */
-export const TAKEOVER_VIA_LEAD = process.env.HEARTBEAT_TAKEOVER_VIA_LEAD === "true";
+export let TAKEOVER_VIA_LEAD = process.env.HEARTBEAT_TAKEOVER_VIA_LEAD === "true";
 
 /**
  * How long (minutes) to wait for the Lead to route a takeover-decision task
@@ -133,6 +133,11 @@ let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let checklistInterval: ReturnType<typeof setInterval> | null = null;
 let isSweeping = false;
 let beforeHeartbeatSupersedeForTests: ((task: AgentTask) => void) | null = null;
+
+/** Override TAKEOVER_VIA_LEAD in tests; pass null to restore the env-derived default. */
+export function setTakeoverViaLeadForTests(val: boolean | null): void {
+  TAKEOVER_VIA_LEAD = val ?? process.env.HEARTBEAT_TAKEOVER_VIA_LEAD === "true";
+}
 
 /** Tasks auto-failed during the reboot sweep, consumed by boot triage */
 let rebootAffectedTasks: Array<{ original: AgentTask; retryTaskId: string | null }> = [];

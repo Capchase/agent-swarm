@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Lead-routed takeover-decision mechanism for crash recovery (DES-523)** — when `HEARTBEAT_TAKEOVER_VIA_LEAD=true`, crashed-worker tasks are escalated to a Lead-owned `takeover-decision` task instead of going straight to the role-blind pool. The Lead consults the `takeover-routing` skill and direct-assigns the resume to a role/harness-appropriate worker. A configurable timeout (`HEARTBEAT_LEAD_ESCALATION_TIMEOUT_MIN`, default 30 min) falls open to the existing pool path, preserving the fail-open invariant. The hot poll/claim path is untouched; the new path is opt-in and off by default.
+
 ## [1.100.0] - 2026-06-17
 
 ### Added

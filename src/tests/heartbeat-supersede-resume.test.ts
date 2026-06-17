@@ -31,6 +31,7 @@ import {
   MAX_RESUME_GENERATIONS,
   RESUME_BUDGET_EXHAUSTED_REASON,
   setBeforeHeartbeatSupersedeForTests,
+  setTakeoverViaLeadForTests,
 } from "../heartbeat/heartbeat";
 import { RESUME_GENERATION_TAG_PREFIX } from "../tasks/worker-follow-up";
 
@@ -60,6 +61,8 @@ describe("Heartbeat — supersede + resume (DES-523)", () => {
 
   beforeEach(() => {
     setBeforeHeartbeatSupersedeForTests(null);
+    // Ensure the TAKEOVER_VIA_LEAD path is off — these tests exercise the direct pool-resume path.
+    setTakeoverViaLeadForTests(false);
     getDb().run("DELETE FROM tracker_sync");
     getDb().run("DELETE FROM agent_tasks");
     getDb().run("DELETE FROM agents");

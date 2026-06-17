@@ -167,6 +167,21 @@ The heartbeat system automatically detects and recovers stalled tasks — tasks 
 
 Stalled task detection uses the heartbeat's code-level triage: if a task has been `in_progress` for longer than expected without progress updates and its assigned worker is offline, the heartbeat can reassign or fail the task as appropriate.
 
+### Crash Recovery — Lead-Routed Takeover (opt-in)
+
+By default, crash-recovery resumes go into the unassigned pool (role-blind). When `HEARTBEAT_TAKEOVER_VIA_LEAD=true` is set, the heartbeat instead creates a Lead-owned `takeover-decision` task. The Lead reads the `takeover-routing` policy and directly assigns the resume to a role/harness-appropriate worker — preventing misroutes like a reviewer picking up a coding task.
+
+**Fail-open guarantee:** if the Lead does not route within `HEARTBEAT_LEAD_ESCALATION_TIMEOUT_MIN` minutes (default: 30), the heartbeat automatically falls back to the unassigned pool. Work is never lost.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEARTBEAT_TAKEOVER_VIA_LEAD` | `false` | Set to `true` to enable Lead-routed crash recovery |
+| `HEARTBEAT_LEAD_ESCALATION_TIMEOUT_MIN` | `30` | Minutes before the fail-open pool fallback fires |
+
+**Generation budget:** crash-recovered tasks carry a `resume-generation:N` tag. The budget cap (`HEARTBEAT_MAX_RESUME_GENERATIONS`, default: 3) is checked _before_ escalation — a budget-exhausted task is failed immediately, never escalated. The Lead-dispatched resume must carry `resume-generation:N+1` to keep the budget accurate; the timeout path always computes generation server-side as a backstop.
+
 ## Related
 
 - [Scheduled Tasks](/docs/concepts/scheduling) — Automate recurring task creation
