@@ -22,14 +22,7 @@ export const REQUIRES_ROLE_TAG_PREFIX = "requires-role:";
 export const REQUIRES_HARNESS_TAG_PREFIX = "requires-harness:";
 
 /** Task types that are coding work — only `coder` agents may claim from pool. */
-const CODING_TASK_TYPES = new Set([
-  "feature",
-  "bug",
-  "fix",
-  "chore",
-  "refactor",
-  "implement",
-]);
+const CODING_TASK_TYPES = new Set(["feature", "bug", "fix", "chore", "refactor", "implement"]);
 
 /** Task types that are review work — only `reviewer` agents may claim from pool. */
 const REVIEW_TASK_TYPES = new Set(["review"]);
