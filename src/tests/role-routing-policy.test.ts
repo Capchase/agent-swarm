@@ -117,6 +117,28 @@ describe("isClaimAllowed — FAIL OPEN safety invariant", () => {
   });
 });
 
+describe("isClaimAllowed — harness-only pin (no role tag)", () => {
+  test("harness pin alone blocks a wrong-harness worker even when roleClass is null", () => {
+    // Task has only requires-harness, no requires-role tag, unmapped taskType.
+    // Before the fix this returned allowed:true because the harness check was
+    // inside the role-class branch that was skipped via early-return.
+    const t = task("resume", [`${REQUIRES_HARNESS_TAG_PREFIX}claude`]);
+    const r = isClaimAllowed({ roleClass: null, harnessProvider: "codex" }, t);
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toContain("harness");
+  });
+
+  test("harness pin alone allows a matching-harness worker even when roleClass is null", () => {
+    const t = task("resume", [`${REQUIRES_HARNESS_TAG_PREFIX}claude`]);
+    expect(isClaimAllowed({ roleClass: null, harnessProvider: "claude" }, t).allowed).toBe(true);
+  });
+
+  test("harness pin alone fails open when agent harness is unknown", () => {
+    const t = task("resume", [`${REQUIRES_HARNESS_TAG_PREFIX}claude`]);
+    expect(isClaimAllowed({ roleClass: null, harnessProvider: null }, t).allowed).toBe(true);
+  });
+});
+
 describe("isClaimAllowed — harness gate (resume tasks)", () => {
   test("matching role but wrong harness is denied (session is harness-bound)", () => {
     const t = task("resume", [

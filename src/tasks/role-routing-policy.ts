@@ -96,6 +96,19 @@ export interface ClaimGateResult {
  * they are an intentional Lead override and only log a warning.
  */
 export function isClaimAllowed(agent: ClaimGateAgent, task: TaskLike): ClaimGateResult {
+  // Harness gate — enforced INDEPENDENTLY of the role-class gate, because a
+  // task may carry only a requires-harness pin (no role tag, unmapped taskType)
+  // and still need to be rejected for a wrong-harness worker. Session resume is
+  // harness-bound, so this must fire even when requiredClass is null.
+  // Fails open when either side is unknown.
+  const requiredHarness = requiredHarnessForTask(task.tags);
+  if (requiredHarness && agent.harnessProvider && agent.harnessProvider !== requiredHarness) {
+    return {
+      allowed: false,
+      reason: `Task requires harness '${requiredHarness}' but agent runs '${agent.harnessProvider}'.`,
+    };
+  }
+
   const requiredClass = requiredRoleClassForTask(task);
   // No requirement (unmapped taskType, no tag) → fail open.
   if (!requiredClass) return { allowed: true };
@@ -108,16 +121,6 @@ export function isClaimAllowed(agent: ClaimGateAgent, task: TaskLike): ClaimGate
     return {
       allowed: false,
       reason: `Task requires roleClass '${requiredClass}' but agent is '${agentClass}'.`,
-    };
-  }
-
-  // Harness gate — only meaningful for resume tasks that pinned a harness
-  // (session resume is harness-bound). Fail open if either side is unknown.
-  const requiredHarness = requiredHarnessForTask(task.tags);
-  if (requiredHarness && agent.harnessProvider && agent.harnessProvider !== requiredHarness) {
-    return {
-      allowed: false,
-      reason: `Task requires harness '${requiredHarness}' but agent runs '${agent.harnessProvider}'.`,
     };
   }
 
