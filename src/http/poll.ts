@@ -314,6 +314,18 @@ export async function handlePoll(
           // from the start (no reassociation needed).
           if (hasCapacity(myAgentId)) {
             const unassignedIds = getUnassignedTaskIds(5);
+            // Role/harness pre-filter: collect only tasks this worker may claim.
+            // The budget gate must run against a task the worker can actually
+            // take — a budget_refused on a role-incompatible task would block
+            // the whole poll even when claimable tasks are waiting further down.
+            const claimableIds = unassignedIds.filter((id) => {
+              const candidate = getTaskById(id);
+              if (!candidate) return true; // fail open: unknown → try to claim
+              return isClaimAllowed(
+                { roleClass: agent.roleClass, harnessProvider: agent.harnessProvider },
+                candidate,
+              ).allowed;
+            });
             // Budget admission gate (Phase 3). Pool path is workers-only —
             // per-agent budgets matter most here, but we still check global.
             // Only run the gate when there's at least one candidate task; an
@@ -322,8 +334,8 @@ export async function handlePoll(
             // would have claimed). That id is stable for the duration of the
             // refusal, and the dedup is per-(task,date) so subsequent same-day
             // refusals on the same lead-candidate are suppressed.
-            if (unassignedIds.length > 0) {
-              const candidateId = unassignedIds[0]!;
+            if (claimableIds.length > 0) {
+              const candidateId = claimableIds[0]!;
               const candidateTask = getTaskById(candidateId);
               const admission = canClaim(myAgentId, new Date(), candidateTask?.requestedByUserId);
               if (!admission.allowed) {
@@ -370,18 +382,8 @@ export async function handlePoll(
                 };
               }
             }
-            for (const candidateId of unassignedIds) {
-              // Role-class gate: never auto-claim a task whose required role-class
-              // (or pinned harness, for resumes) is incompatible with this worker.
-              // Fails open on ambiguity — leave the candidate for a matching agent.
-              const candidate = getTaskById(candidateId);
-              if (candidate) {
-                const gate = isClaimAllowed(
-                  { roleClass: agent.roleClass, harnessProvider: agent.harnessProvider },
-                  candidate,
-                );
-                if (!gate.allowed) continue;
-              }
+            for (const candidateId of claimableIds) {
+              // Role/harness already checked in the pre-filter above.
               const claimed = claimTask(candidateId, myAgentId);
               if (claimed) {
                 telemetry.taskEvent("claimed", {
