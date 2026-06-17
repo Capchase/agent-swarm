@@ -120,6 +120,15 @@ afterAll(() => {
 
 const BOT_USER_ID = "U_BOT_PROD_TEST";
 const DEVIN_USER_ID = "U0831BS93V1"; // the other agent from the original regression
+let slackDeliverySequence = 0;
+
+function nextSlackDelivery(eventIdPrefix: string): { eventId: string; ts: string } {
+  slackDeliverySequence += 1;
+  return {
+    eventId: `${eventIdPrefix}_${slackDeliverySequence}`,
+    ts: `2000000001.${String(slackDeliverySequence).padStart(6, "0")}`,
+  };
+}
 
 // Mock Slack WebClient — auth.test() returns our bot's user ID so the
 // module-level cachedBotUserId gets populated on the first handler invocation.
@@ -250,16 +259,17 @@ describe("registerMessageHandler — assistant_thread co-mention guard (producti
 
   test("does NOT spawn a task when assistant_thread message @-mentions another agent", async () => {
     expect(capturedHandler).not.toBeNull();
+    const delivery = nextSlackDelivery("evt_prod_hdlr_comention");
 
     await capturedHandler!({
       event: {
         channel: "D_HANDLER_PROD_TEST",
-        ts: "2000000001.000001",
+        ts: delivery.ts,
         text: `<@${DEVIN_USER_ID}> Are you here?`,
         user: "U_HUMAN_HDLR_001",
         assistant_thread: { channel_id: "D_HANDLER_PROD_TEST" },
       },
-      body: { event_id: "evt_prod_hdlr_comention_001" },
+      body: { event_id: delivery.eventId },
       client: mockClient,
       say: mock(async () => {}),
     });
@@ -269,16 +279,17 @@ describe("registerMessageHandler — assistant_thread co-mention guard (producti
 
   test("DOES spawn a task for assistant_thread plain message with no @-mentions (baseline)", async () => {
     expect(capturedHandler).not.toBeNull();
+    const delivery = nextSlackDelivery("evt_prod_hdlr_plain");
 
     await capturedHandler!({
       event: {
         channel: "D_HANDLER_PROD_TEST",
-        ts: "2000000001.000002",
+        ts: delivery.ts,
         text: "What is the current status of all agents?",
         user: "U_HUMAN_HDLR_001",
         assistant_thread: { channel_id: "D_HANDLER_PROD_TEST" },
       },
-      body: { event_id: "evt_prod_hdlr_plain_001" },
+      body: { event_id: delivery.eventId },
       client: mockClient,
       say: mock(async () => {}),
     });
@@ -288,16 +299,17 @@ describe("registerMessageHandler — assistant_thread co-mention guard (producti
 
   test("does NOT spawn a task when assistant_thread message @-mentions a human (not our bot)", async () => {
     expect(capturedHandler).not.toBeNull();
+    const delivery = nextSlackDelivery("evt_prod_hdlr_comention");
 
     await capturedHandler!({
       event: {
         channel: "D_HANDLER_PROD_TEST",
-        ts: "2000000001.000003",
+        ts: delivery.ts,
         text: "<@U037TJB7VHQ> what do you think?",
         user: "U_HUMAN_HDLR_001",
         assistant_thread: { channel_id: "D_HANDLER_PROD_TEST" },
       },
-      body: { event_id: "evt_prod_hdlr_comention_002" },
+      body: { event_id: delivery.eventId },
       client: mockClient,
       say: mock(async () => {}),
     });
