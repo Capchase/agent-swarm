@@ -61,6 +61,7 @@ import type {
   PromptTemplateHistory,
   ProviderName,
   RepoGuidelines,
+  RoleClass,
   ScheduledTask,
   ScheduledTaskSummary,
   ScriptRun,
@@ -605,6 +606,8 @@ type AgentRow = {
   harness_provider: string | null;
   /** Migration 055: worker-self-reported credential snapshot (JSON of AgentCredStatus). NULL = unreported. */
   cred_status: string | null;
+  /** Migration 097: structured role-class for role-class-aware task routing. NULL = no signal (fail open). */
+  role_class: string | null;
 };
 
 /**
@@ -622,6 +625,7 @@ function rowToAgent(row: AgentRow, slim = false): Agent {
     status: row.status,
     description: row.description ?? undefined,
     role: row.role ?? undefined,
+    roleClass: (row.role_class as RoleClass | null) ?? null,
     capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
     maxTasks: row.maxTasks ?? 1,
     emptyPollCount: row.emptyPollCount ?? 0,
@@ -651,9 +655,9 @@ export const agentQueries = {
   insert: () =>
     getDb().prepare<
       AgentRow,
-      [string, string, number, AgentStatus, number, string | null, string | null]
+      [string, string, number, AgentStatus, number, string | null, string | null, string | null]
     >(
-      "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
+      "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, role_class, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
     ),
 
   getById: () => getDb().prepare<AgentRow, [string]>("SELECT * FROM agents WHERE id = ?"),
@@ -710,6 +714,7 @@ export function createAgent(
       maxTasks,
       agent.provider ?? null,
       agent.harnessProvider ?? null,
+      agent.roleClass ?? null,
     );
   if (!row) throw new Error("Failed to create agent");
   try {
@@ -3550,6 +3555,7 @@ export function updateAgentProfile(
   updates: {
     description?: string;
     role?: string;
+    roleClass?: RoleClass;
     capabilities?: string[];
     claudeMd?: string;
     soulMd?: string;
@@ -3611,6 +3617,7 @@ export function updateAgentProfile(
           string | null,
           string | null,
           string | null,
+          string | null,
           string,
           string,
         ]
@@ -3618,6 +3625,7 @@ export function updateAgentProfile(
         `UPDATE agents SET
           description = COALESCE(?, description),
           role = COALESCE(?, role),
+          role_class = COALESCE(?, role_class),
           capabilities = COALESCE(?, capabilities),
           claudeMd = COALESCE(?, claudeMd),
           soulMd = COALESCE(?, soulMd),
@@ -3631,6 +3639,7 @@ export function updateAgentProfile(
       .get(
         updates.description ?? null,
         updates.role ?? null,
+        updates.roleClass ?? null,
         updates.capabilities ? JSON.stringify(updates.capabilities) : null,
         updates.claudeMd ?? null,
         updates.soulMd ?? null,

@@ -460,6 +460,28 @@ export type TaskTemplate = z.infer<typeof TaskTemplateSchema>;
 
 export const AgentStatusSchema = z.enum(["idle", "busy", "offline", "waiting_for_credentials"]);
 
+/**
+ * Structured agent role-class. Unlike the free-form `role` string (often empty)
+ * and the empty `capabilities` array, this is a closed enum the runner uses to
+ * keep reviewer agents off coding tasks and coders off review tasks
+ * (role-class-aware task routing). `unknown` (and a null column) are treated as
+ * "no signal" and FAIL OPEN at the claim gate — a wedged pool is worse than an
+ * occasional misroute.
+ */
+export const RoleClassSchema = z.enum([
+  "coder",
+  "reviewer",
+  "researcher",
+  "pm",
+  "ops",
+  "content",
+  "qa",
+  "ux",
+  "lead",
+  "unknown",
+]);
+export type RoleClass = z.infer<typeof RoleClassSchema>;
+
 export const AgentSchema = z.object({
   id: z.uuid(),
   name: z.string().min(1),
@@ -470,6 +492,10 @@ export const AgentSchema = z.object({
   description: z.string().optional(),
   role: z.string().max(100).optional(), // Free-form, e.g., "frontend dev"
   capabilities: z.array(z.string()).default([]), // e.g., ["typescript", "react"]
+
+  // Structured role-class for role-class-aware task routing. Null/`unknown`
+  // means "no signal" → claim gate fails open. See RoleClassSchema.
+  roleClass: RoleClassSchema.nullable().optional(),
 
   // Personal CLAUDE.md content (max 64KB)
   claudeMd: z.string().max(65536).optional(),
