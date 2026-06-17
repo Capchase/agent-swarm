@@ -25,6 +25,7 @@ import {
   releaseTask,
   updateTaskClaudeSessionId,
 } from "@/be/db";
+import { isClaimAllowed } from "@/tasks/role-routing-policy";
 import { assertOwnsTask, ownerCtx, type ToolCtx } from "@/tools/task-tool-ctx";
 import { createToolRegistrar } from "@/tools/utils";
 import { AgentTaskSchema, BudgetRefusalCauseSchema } from "@/types";
@@ -277,6 +278,22 @@ export async function taskActionHandler(
           return {
             success: false,
             message: `Task "${taskId}" has unmet dependencies: ${blockedBy.join(", ")}. Cannot claim until dependencies are completed.`,
+          };
+        }
+        // Role-class gate: keep reviewers off coding tasks and coders off review
+        // tasks (and honor harness pins on resumes). Fails open on ambiguity.
+        const claimingAgent = getAgentById(agentId);
+        const claimGate = isClaimAllowed(
+          {
+            roleClass: claimingAgent?.roleClass ?? null,
+            harnessProvider: claimingAgent?.harnessProvider ?? null,
+          },
+          existingTask,
+        );
+        if (!claimGate.allowed) {
+          return {
+            success: false,
+            message: `Cannot claim task "${taskId}": ${claimGate.reason}`,
           };
         }
         // Atomic claim — only one agent can win this race

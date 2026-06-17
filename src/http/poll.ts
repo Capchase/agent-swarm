@@ -25,6 +25,7 @@ import {
   upsertChannelActivityCursor,
 } from "../be/db";
 import { fetchChannelActivity } from "../slack/channel-activity";
+import { isClaimAllowed } from "../tasks/role-routing-policy";
 import { telemetry } from "../telemetry";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
@@ -370,6 +371,17 @@ export async function handlePoll(
               }
             }
             for (const candidateId of unassignedIds) {
+              // Role-class gate: never auto-claim a task whose required role-class
+              // (or pinned harness, for resumes) is incompatible with this worker.
+              // Fails open on ambiguity — leave the candidate for a matching agent.
+              const candidate = getTaskById(candidateId);
+              if (candidate) {
+                const gate = isClaimAllowed(
+                  { roleClass: agent.roleClass, harnessProvider: agent.harnessProvider },
+                  candidate,
+                );
+                if (!gate.allowed) continue;
+              }
               const claimed = claimTask(candidateId, myAgentId);
               if (claimed) {
                 telemetry.taskEvent("claimed", {
