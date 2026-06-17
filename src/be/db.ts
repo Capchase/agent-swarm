@@ -101,7 +101,7 @@ import type {
   WorkflowSummary,
   WorkflowVersion,
 } from "../types";
-import { FollowUpConfigSchema, isTerminalTaskStatus } from "../types";
+import { FollowUpConfigSchema, isTerminalTaskStatus, RoleClassSchema } from "../types";
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
@@ -625,7 +625,7 @@ function rowToAgent(row: AgentRow, slim = false): Agent {
     status: row.status,
     description: row.description ?? undefined,
     role: row.role ?? undefined,
-    roleClass: (row.role_class as RoleClass | null) ?? null,
+    roleClass: row.role_class ? (RoleClassSchema.safeParse(row.role_class).data ?? null) : null,
     capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
     maxTasks: row.maxTasks ?? 1,
     emptyPollCount: row.emptyPollCount ?? 0,
