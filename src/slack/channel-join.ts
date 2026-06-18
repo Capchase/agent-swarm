@@ -9,18 +9,26 @@ function slackCode(error: unknown): string | undefined {
 }
 
 /**
- * Returns true if the channel has any external (non-host-org) members.
- * Uses Slack's documented flags: is_ext_shared (accepted Connect) and
- * is_pending_ext_shared (invite sent, not yet accepted). These two booleans
- * are the authoritative org-boundary signal per Slack's API docs.
+ * Returns true only when conversations.info positively reports external members.
+ * Returns false (allow join) on any lookup failure — we only block on a confirmed signal.
  */
 async function isExternalChannel(client: WebClient, channelId: string): Promise<boolean> {
-  const resp = await client.conversations.info({ channel: channelId });
-  const ch = (resp.channel ?? {}) as {
-    is_ext_shared?: boolean;
-    is_pending_ext_shared?: boolean;
-  };
-  return ch.is_ext_shared === true || ch.is_pending_ext_shared === true;
+  try {
+    const resp = await client.conversations.info({ channel: channelId });
+    const ch = (resp.channel ?? {}) as {
+      is_ext_shared?: boolean;
+      is_pending_ext_shared?: boolean;
+    };
+    return ch.is_ext_shared === true || ch.is_pending_ext_shared === true;
+  } catch (infoError) {
+    // Lookup failed (channel_not_found, missing_scope, transient error, etc.).
+    // Fall back to allowing the join — only block on a positive external signal.
+    console.warn(
+      `[withAutoJoin] conversations.info failed for ${channelId}; falling back to join attempt.`,
+      infoError,
+    );
+    return false;
+  }
 }
 
 /**

@@ -15,12 +15,20 @@ type ChannelShape = {
   is_pending_ext_shared?: boolean;
 };
 
-function makeClient(opts: { channel?: ChannelShape; joinResult?: () => unknown }): {
+function makeClient(opts: {
+  channel?: ChannelShape;
+  joinResult?: () => unknown;
+  infoResult?: () => unknown;
+}): {
   client: WebClient;
   infoFn: ReturnType<typeof mock>;
   joinFn: ReturnType<typeof mock>;
 } {
-  const infoFn = mock(() => Promise.resolve({ channel: opts.channel ?? { is_ext_shared: false } }));
+  const infoFn = mock(
+    opts.infoResult
+      ? opts.infoResult
+      : () => Promise.resolve({ channel: opts.channel ?? { is_ext_shared: false } }),
+  );
   const joinFn = mock(opts.joinResult ? opts.joinResult : () => Promise.resolve({}));
   const client = {
     conversations: { info: infoFn, join: joinFn },
@@ -162,5 +170,46 @@ describe("withAutoJoin", () => {
     const result = await withAutoJoin(client, "CGRID", fn);
     expect(result).toBe("joined-ok");
     expect(joinFn).toHaveBeenCalledTimes(1);
+  });
+
+  // --- conversations.info failure fallback regression tests ---
+
+  test("info rejects (transient error): falls back to join, fn retries and succeeds", async () => {
+    // conversations.info throws a transient error; we must NOT propagate it.
+    // The join should proceed and fn should be retried.
+    const { client, infoFn, joinFn } = makeClient({
+      infoResult: () => Promise.reject(new Error("network_error")),
+    });
+    let callCount = 0;
+    const fn = mock(async () => {
+      callCount++;
+      if (callCount === 1) throw makePlatformError("not_in_channel");
+      return "fallback-ok";
+    });
+
+    const result = await withAutoJoin(client, "CFAIL", fn);
+    expect(result).toBe("fallback-ok");
+    expect(infoFn).toHaveBeenCalledTimes(1);
+    expect(joinFn).toHaveBeenCalledTimes(1);
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  test("info rejects then join returns method_not_supported: private-channel message preserved", async () => {
+    // conversations.info throws; we fall back to join. Join then tells us it's a
+    // private channel — the existing /invite UX must still be surfaced.
+    const { client, infoFn, joinFn } = makeClient({
+      infoResult: () => Promise.reject(makePlatformError("missing_scope")),
+      joinResult: () => {
+        throw makePlatformError("method_not_supported_for_channel_type");
+      },
+    });
+    const fn = mock(() => {
+      throw makePlatformError("not_in_channel");
+    });
+
+    await expect(withAutoJoin(client, "CPRIV2", fn)).rejects.toThrow("invite the bot");
+    expect(infoFn).toHaveBeenCalledTimes(1);
+    expect(joinFn).toHaveBeenCalledTimes(1);
+    expect(fn).toHaveBeenCalledTimes(1);
   });
 });
