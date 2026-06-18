@@ -207,6 +207,48 @@ describe("inline review comment surfacing", () => {
     expect(text).not.toContain("Inline review comments");
   });
 
+  test("pagination: two-page review comment response surfaces all comments from both pages", async () => {
+    const page1 = [SAMPLE_INLINE_COMMENTS[0]];
+    const page2 = [SAMPLE_INLINE_COMMENTS[1]];
+    const nextUrl =
+      "https://api.github.com/repos/test/repo/pulls/99/reviews/9001/comments?per_page=100&page=2";
+
+    const fetchSpy = spyOn(globalThis, "fetch")
+      .mockImplementationOnce(
+        async () =>
+          new Response(JSON.stringify(page1), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              Link: `<${nextUrl}>; rel="next", <${nextUrl}>; rel="last"`,
+            },
+          }),
+      )
+      .mockImplementationOnce(
+        async () =>
+          new Response(JSON.stringify(page2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      );
+
+    const event = makeReviewEvent({
+      state: "changes_requested",
+      body: "Multi-page review",
+      installationId: 123,
+    });
+    const result = await handlePullRequestReview(event);
+    fetchSpy.mockRestore();
+
+    expect(result.created).toBe(true);
+    const text = getLastTaskText();
+    expect(text).toBeDefined();
+    // Both pages of inline comments must appear in the task
+    expect(text).toContain("src/domain_tables.go:77"); // page 1 comment
+    expect(text).toContain("config/table-renderers.json:7"); // page 2 comment
+    expect(text).toContain("Inline review comments (2)");
+  });
+
   test("no-double-spawn: review-attached inline comment via pull_request_review_comment event does not create a second task", async () => {
     // Step 1: submitted review creates exactly ONE bundle task
     const fetchSpy = mockFetchWithComments(SAMPLE_INLINE_COMMENTS);

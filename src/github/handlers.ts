@@ -946,6 +946,12 @@ interface ReviewInlineComment {
   diff_hunk: string;
 }
 
+function parseNextPageLink(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+  return match ? (match[1] ?? null) : null;
+}
+
 async function fetchReviewComments(
   repo: string,
   prNumber: number,
@@ -956,26 +962,31 @@ async function fetchReviewComments(
   if (!token) {
     return [];
   }
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  const allComments: ReviewInlineComment[] = [];
+  let url: string | null =
+    `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments?per_page=100`;
   try {
-    const response = await fetch(
-      `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments`,
-      {
-        headers: {
-          Accept: "application/vnd.github+json",
-          Authorization: `Bearer ${token}`,
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-      },
-    );
-    if (!response.ok) {
-      console.error(`[GitHub] Failed to fetch review inline comments: ${response.status}`);
-      return [];
+    while (url) {
+      const response = await fetch(url, { headers });
+      if (!response.ok) {
+        console.error(`[GitHub] Failed to fetch review inline comments: ${response.status}`);
+        return allComments;
+      }
+      const page = (await response.json()) as ReviewInlineComment[];
+      if (Array.isArray(page)) {
+        allComments.push(...page);
+      }
+      url = parseNextPageLink(response.headers.get("link"));
     }
-    const data = (await response.json()) as ReviewInlineComment[];
-    return Array.isArray(data) ? data : [];
+    return allComments;
   } catch (error) {
     console.error("[GitHub] Error fetching review inline comments:", error);
-    return [];
+    return allComments;
   }
 }
 
