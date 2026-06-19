@@ -90,6 +90,7 @@ describe("script SDK allowlist", () => {
 describe("mcp-bridge allowlist gate", () => {
   const TEST_DB_PATH = "./test-sdk-allowlist-bridge.sqlite";
   const API_KEY = "test-mcp-bridge-key-1234567890";
+  let prevApiKey: string | undefined;
 
   async function removeDbFiles(path: string): Promise<void> {
     for (const suffix of ["", "-wal", "-shm"]) {
@@ -104,12 +105,18 @@ describe("mcp-bridge allowlist gate", () => {
   beforeAll(async () => {
     await removeDbFiles(TEST_DB_PATH);
     initDb(TEST_DB_PATH);
+    prevApiKey = process.env.AGENT_SWARM_API_KEY;
     process.env.AGENT_SWARM_API_KEY = API_KEY;
   });
 
   afterAll(async () => {
     closeDb();
     await removeDbFiles(TEST_DB_PATH);
+    if (prevApiKey === undefined) {
+      delete process.env.AGENT_SWARM_API_KEY;
+    } else {
+      process.env.AGENT_SWARM_API_KEY = prevApiKey;
+    }
   });
 
   async function postBridge(
