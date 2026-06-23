@@ -220,6 +220,9 @@ export const AgentTaskSchema = z.object({
   // See src/tasks/context-key.ts. Nullable: legacy rows stay NULL.
   contextKey: z.string().optional(),
 
+  // Capability-based routing (optional — pool auto-claim requires agent to have ALL listed caps)
+  requiredCapabilities: z.array(z.string()).optional(),
+
   // Structured output schema (optional — JSON Schema that task output must conform to)
   outputSchema: z.record(z.string(), z.unknown()).optional(),
 
