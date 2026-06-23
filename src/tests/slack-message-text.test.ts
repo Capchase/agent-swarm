@@ -19,19 +19,19 @@ describe("extractSlackMessageText", () => {
     test("uses fallback when text is empty", () => {
       const msg = {
         text: "",
-        attachments: [{ fallback: "Triggered: [P3] A Bull job process-inscribe-webhook failed" }],
+        attachments: [{ fallback: "Triggered: [P3] A Bull job email-dispatch-worker failed" }],
       };
       expect(extractSlackMessageText(msg)).toBe(
-        "Triggered: [P3] A Bull job process-inscribe-webhook failed",
+        "Triggered: [P3] A Bull job email-dispatch-worker failed",
       );
     });
 
     test("uses attachment text when fallback is absent", () => {
       const msg = {
         text: "",
-        attachments: [{ text: "Job failed in queue document_fraud_check" }],
+        attachments: [{ text: "Job failed in queue email_dispatch_queue" }],
       };
-      expect(extractSlackMessageText(msg)).toBe("Job failed in queue document_fraud_check");
+      expect(extractSlackMessageText(msg)).toBe("Job failed in queue email_dispatch_queue");
     });
 
     test("uses attachment title as tertiary fallback", () => {
@@ -171,12 +171,12 @@ describe("extractSlackMessageText", () => {
   describe("all layers combined — Datadog/alert-app shapes", () => {
     test("Datadog-style: fallback text + section fields + actions button URL all captured", () => {
       const msg = {
-        text: "Triggered: [P2] Orchestrator | [production] API failure with 500",
+        text: "Triggered: [P2] PaymentsService | [production] API failure with 500",
         blocks: [
           {
             type: "section",
             fields: [
-              { type: "mrkdwn", text: "*PoC:* @Lorenzo" },
+              { type: "mrkdwn", text: "*PoC:* @oncall" },
               { type: "mrkdwn", text: "*Error rate:* 1.0/0.0" },
               { type: "mrkdwn", text: "*Tags:* env:production, http.status_code:500" },
             ],
@@ -187,15 +187,15 @@ describe("extractSlackMessageText", () => {
               {
                 type: "button",
                 text: { type: "plain_text", text: "Check traces" },
-                url: "https://app.datadoghq.com/apm/traces?query=service:orchestrator",
+                url: "https://app.datadoghq.com/apm/traces?query=service:payments-service",
               },
             ],
           },
         ],
       };
       const result = extractSlackMessageText(msg);
-      expect(result).toContain("Triggered: [P2] Orchestrator");
-      expect(result).toContain("*PoC:* @Lorenzo");
+      expect(result).toContain("Triggered: [P2] PaymentsService");
+      expect(result).toContain("*PoC:* @oncall");
       expect(result).toContain("*Error rate:* 1.0/0.0");
       expect(result).toContain("*Tags:* env:production");
       expect(result).toContain("https://app.datadoghq.com/apm/traces");
@@ -221,14 +221,14 @@ describe("extractSlackMessageText", () => {
             type: "context",
             elements: [
               { type: "mrkdwn", text: "Environment: *production*" },
-              { type: "plain_text", text: "Service: orchestrator" },
+              { type: "plain_text", text: "Service: payments-service" },
             ],
           },
         ],
       };
       const result = extractSlackMessageText(msg);
       expect(result).toContain("Environment: *production*");
-      expect(result).toContain("Service: orchestrator");
+      expect(result).toContain("Service: payments-service");
     });
 
     test("header block text is captured", () => {
@@ -279,14 +279,14 @@ describe("extractSlackMessageText", () => {
           {
             fields: [
               { title: "Priority", value: "P2" },
-              { title: "Service", value: "orchestrator" },
+              { title: "Service", value: "payments-service" },
             ],
           },
         ],
       };
       const result = extractSlackMessageText(msg);
       expect(result).toContain("Priority: P2");
-      expect(result).toContain("Service: orchestrator");
+      expect(result).toContain("Service: payments-service");
     });
 
     test("attachment title_link emitted as mrkdwn link", () => {
@@ -331,9 +331,9 @@ describe("extractSlackMessageText", () => {
     test("attachment field with only value emits value", () => {
       const msg = {
         text: "",
-        attachments: [{ fields: [{ value: "Lorenzo" }] }],
+        attachments: [{ fields: [{ value: "jane.doe" }] }],
       };
-      expect(extractSlackMessageText(msg)).toBe("Lorenzo");
+      expect(extractSlackMessageText(msg)).toBe("jane.doe");
     });
   });
 
