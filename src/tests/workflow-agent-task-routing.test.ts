@@ -17,7 +17,6 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
   closeDb,
-  createAgent,
   createTaskExtended,
   createWorkflow,
   createWorkflowRun,
@@ -25,9 +24,9 @@ import {
   getUnassignedTaskIds,
   initDb,
 } from "../be/db";
+import type { ExecutorMeta } from "../types";
 import { AgentTaskExecutor } from "../workflows/executors/agent-task";
 import type { ExecutorDependencies } from "../workflows/executors/base";
-import type { ExecutorMeta } from "../types";
 
 const TEST_DB_PATH = "./test-capability-routing.sqlite";
 
@@ -92,19 +91,6 @@ function makeTask(requiredCapabilities?: string[]) {
     source: "workflow",
     requiredCapabilities: requiredCapabilities?.length ? requiredCapabilities : undefined,
   });
-}
-
-function makeAgent(capabilities: string[]) {
-  const id = crypto.randomUUID();
-  createAgent({
-    id,
-    name: `test-agent-${id.slice(0, 8)}`,
-    isLead: false,
-    status: "idle",
-    capabilities,
-    maxTasks: 1,
-  });
-  return id;
 }
 
 // ─── getUnassignedTaskIds — capability filter ─────────────────────────────────

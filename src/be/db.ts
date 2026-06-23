@@ -3242,9 +3242,7 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
       options?.scheduleId ?? null,
       options?.workflowRunId ?? null,
       options?.workflowRunStepId ?? null,
-      options?.requiredCapabilities?.length
-        ? JSON.stringify(options.requiredCapabilities)
-        : null,
+      options?.requiredCapabilities?.length ? JSON.stringify(options.requiredCapabilities) : null,
       options?.outputSchema ? JSON.stringify(options.outputSchema) : null,
       options?.followUpConfig ? JSON.stringify(options.followUpConfig) : null,
       options?.requestedByUserId ?? null,
