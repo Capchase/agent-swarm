@@ -1045,6 +1045,7 @@ type AgentTaskRow = {
   scheduleId: string | null;
   workflowRunId: string | null;
   workflowRunStepId: string | null;
+  requiredCapabilities: string | null;
   outputSchema: string | null;
   followUpConfig: string | null;
   contextKey: string | null;
@@ -1136,6 +1137,9 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     scheduleId: row.scheduleId ?? undefined,
     workflowRunId: row.workflowRunId ?? undefined,
     workflowRunStepId: row.workflowRunStepId ?? undefined,
+    requiredCapabilities: row.requiredCapabilities
+      ? JSON.parse(row.requiredCapabilities)
+      : undefined,
     outputSchema: row.outputSchema ? JSON.parse(row.outputSchema) : undefined,
     followUpConfig,
     contextKey: row.contextKey ?? undefined,
@@ -2978,6 +2982,17 @@ export interface CreateTaskOptions {
    * ("Per-task outputSchema support"). Callers reading `task.output` for
    * a schema'd task should be defensive about JSON parsing.
    */
+  /**
+   * Capability-based pool routing (optional).
+   *
+   * When set, the pool auto-claim path in `/api/poll` restricts this task to
+   * agents whose own `capabilities` array contains ALL listed values.  NULL /
+   * undefined / empty array = no requirement → claimable by anyone (fail-open,
+   * backward-compatible default).  Use in workflow `agent-task` nodes to route
+   * plan steps to researchers and implement steps to coders without pinning
+   * specific agent IDs.
+   */
+  requiredCapabilities?: string[];
   outputSchema?: Record<string, unknown>;
   /**
    * When a `parentTaskId` is set, the child inherits the parent's `outputSchema`
@@ -3187,8 +3202,8 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
         vcsInstallationId, vcsNodeId,
         agentmailInboxId, agentmailMessageId, agentmailThreadId,
         mentionMessageId, mentionChannelId, dir, parentTaskId, model, modelTier, scheduleId,
-        workflowRunId, workflowRunStepId, outputSchema, followUpConfig, requestedByUserId, contextKey, swarmVersion, createdAt, lastUpdatedAt, created_by, updated_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        workflowRunId, workflowRunStepId, requiredCapabilities, outputSchema, followUpConfig, requestedByUserId, contextKey, swarmVersion, createdAt, lastUpdatedAt, created_by, updated_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -3227,6 +3242,7 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
       options?.scheduleId ?? null,
       options?.workflowRunId ?? null,
       options?.workflowRunStepId ?? null,
+      options?.requiredCapabilities?.length ? JSON.stringify(options.requiredCapabilities) : null,
       options?.outputSchema ? JSON.stringify(options.outputSchema) : null,
       options?.followUpConfig ? JSON.stringify(options.followUpConfig) : null,
       options?.requestedByUserId ?? null,
@@ -3535,13 +3551,56 @@ export function getUnassignedTasksCount(): number {
 }
 
 /** Get unassigned task IDs, ordered by priority (highest first) then creation time */
-export function getUnassignedTaskIds(limit = 10): string[] {
-  const rows = getDb()
-    .prepare<{ id: string }, [number]>(
-      "SELECT id FROM agent_tasks WHERE status = 'unassigned' ORDER BY priority DESC, createdAt ASC, rowid ASC LIMIT ?",
+/**
+ * Return IDs of unassigned tasks eligible for the given agent to claim.
+ *
+ * When `agentCapabilities` is provided the query additionally filters out any
+ * task whose `requiredCapabilities` array is non-empty and contains a value
+ * that is NOT in the agent's capability set.  Tasks with no requirement (NULL
+ * or empty `requiredCapabilities`) are always included — this is the fail-open
+ * default so existing tasks and agents with no capability profile are
+ * unaffected.
+ *
+ * The capability check uses a correlated NOT EXISTS + LIKE pattern:
+ *   for each required capability `rc`, verify `agentCapsJson LIKE %"rc"%`.
+ * The `"rc"` quoting ensures exact element matching against the stored JSON
+ * array (no substring false-positives between e.g. "coder" and "code").
+ */
+export function getUnassignedTaskIds(limit = 10, agentCapabilities?: string[]): string[] {
+  const db = getDb();
+
+  if (!agentCapabilities || agentCapabilities.length === 0) {
+    // Agent has no declared capabilities: can only claim tasks with no requirement.
+    return db
+      .prepare<{ id: string }, [number]>(
+        `SELECT id FROM agent_tasks
+         WHERE status = 'unassigned'
+           AND (requiredCapabilities IS NULL OR requiredCapabilities = '[]')
+         ORDER BY priority DESC, createdAt ASC, rowid ASC LIMIT ?`,
+      )
+      .all(limit)
+      .map((r) => r.id);
+  }
+
+  // Agent has capabilities: include tasks with no requirement OR tasks where
+  // every required capability appears in the agent's capability JSON string.
+  const capsJson = JSON.stringify(agentCapabilities);
+  return db
+    .prepare<{ id: string }, [string, number]>(
+      `SELECT id FROM agent_tasks
+       WHERE status = 'unassigned'
+         AND (
+           requiredCapabilities IS NULL
+           OR requiredCapabilities = '[]'
+           OR NOT EXISTS (
+             SELECT 1 FROM json_each(agent_tasks.requiredCapabilities) AS rc
+             WHERE ? NOT LIKE '%"' || rc.value || '"%'
+           )
+         )
+       ORDER BY priority DESC, createdAt ASC, rowid ASC LIMIT ?`,
     )
-    .all(limit);
-  return rows.map((r) => r.id);
+    .all(capsJson, limit)
+    .map((r) => r.id);
 }
 
 // ============================================================================

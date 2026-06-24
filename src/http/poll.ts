@@ -312,7 +312,7 @@ export async function handlePoll(
           // This ensures session logs are correctly associated with the real task ID
           // from the start (no reassociation needed).
           if (hasCapacity(myAgentId)) {
-            const unassignedIds = getUnassignedTaskIds(5);
+            const unassignedIds = getUnassignedTaskIds(5, agent.capabilities);
             // Budget admission gate (Phase 3). Pool path is workers-only —
             // per-agent budgets matter most here, but we still check global.
             // Only run the gate when there's at least one candidate task; an

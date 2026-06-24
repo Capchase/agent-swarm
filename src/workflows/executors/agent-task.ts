@@ -21,6 +21,13 @@ const AgentTaskConfigSchema = z.object({
   modelTier: ModelTierSchema.optional(),
   parentTaskId: z.string().uuid().optional(),
   requestedByUserId: z.string().optional(),
+  /**
+   * Capability-based pool routing. When set, only agents whose own `capabilities`
+   * array contains ALL listed values can auto-claim this task from the pool.
+   * Use this to route plan tasks to researchers and implement tasks to coders
+   * without pinning a specific `agentId`.  Empty / omitted = no requirement.
+   */
+  requiredCapabilities: z.array(z.string()).optional(),
   outputSchema: z.record(z.string(), z.unknown()).optional(),
   followUpConfig: FollowUpConfigSchema.optional(),
 });
@@ -99,6 +106,7 @@ export class AgentTaskExecutor extends BaseExecutor<
         ...splitLegacyModelAlias({ model: config.model, modelTier: config.modelTier }),
         parentTaskId: config.parentTaskId,
         requestedByUserId: config.requestedByUserId ?? meta.requestedByUserId,
+        requiredCapabilities: config.requiredCapabilities,
         outputSchema: config.outputSchema,
         followUpConfig: config.followUpConfig,
         contextKey: workflowContextKey({ workflowRunId: meta.runId }),
