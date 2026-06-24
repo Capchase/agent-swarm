@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { getAgentById, getTaskById, recordInlineScriptRun, upsertKv } from "../be/db";
+import { resolveHttpAuditUserId } from "../be/audit-user";
+import { getAgentById, recordInlineScriptRun, upsertKv } from "../be/db";
 import { createEvent } from "../be/events";
 import {
   deleteScript,
@@ -305,11 +306,7 @@ export async function handleScripts(
       return true;
     }
 
-    const sourceTaskIdHeader = req.headers["x-source-task-id"];
-    const sourceTaskId = Array.isArray(sourceTaskIdHeader)
-      ? sourceTaskIdHeader[0]
-      : sourceTaskIdHeader;
-    const createdBy = sourceTaskId ? (getTaskById(sourceTaskId)?.requestedByUserId ?? null) : null;
+    const createdBy = resolveHttpAuditUserId(req, agent.id);
 
     const existingAgentScript =
       parsed.body.scope === "global"

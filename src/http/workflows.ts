@@ -1,9 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
+import { resolveHttpAuditUserId } from "../be/audit-user";
 import {
   createWorkflow,
   deleteWorkflow,
-  getTaskById,
   getWorkflow,
   getWorkflowRun,
   getWorkflowRunStepsByRunId,
@@ -430,6 +430,7 @@ export async function handleWorkflows(
       dir: parsed.body.dir,
       vcsRepo: parsed.body.vcsRepo,
       createdByAgentId: myAgentId ?? undefined,
+      createdBy: resolveHttpAuditUserId(req, myAgentId) ?? undefined,
     });
     json(res, workflow, 201);
     return true;
@@ -484,11 +485,7 @@ export async function handleWorkflows(
       // Snapshot failure should not block the update
     }
 
-    const sourceTaskId0 = req.headers["x-source-task-id"];
-    const updatedBy0 =
-      typeof sourceTaskId0 === "string"
-        ? (getTaskById(sourceTaskId0)?.requestedByUserId ?? undefined)
-        : undefined;
+    const updatedBy0 = resolveHttpAuditUserId(req, myAgentId) ?? undefined;
     const workflow = updateWorkflow(id, {
       definition: patchResult.definition,
       updatedBy: updatedBy0,
@@ -532,18 +529,14 @@ export async function handleWorkflows(
       // Snapshot failure should not block the update
     }
 
-    const sourceTaskId1 = req.headers["x-source-task-id"];
-    const updatedBy1 =
-      typeof sourceTaskId1 === "string"
-        ? (getTaskById(sourceTaskId1)?.requestedByUserId ?? undefined)
-        : undefined;
+    const updatedBy1 = resolveHttpAuditUserId(req, myAgentId);
     const updateArgs: Parameters<typeof updateWorkflow>[1] = {
       definition: patchResult.definition,
     };
     if (parsed.body.triggerSchema !== undefined) {
       updateArgs.triggerSchema = parsed.body.triggerSchema;
     }
-    if (updatedBy1 !== undefined) {
+    if (updatedBy1 !== null) {
       updateArgs.updatedBy = updatedBy1;
     }
     const workflow = updateWorkflow(id, updateArgs);
@@ -586,11 +579,7 @@ export async function handleWorkflows(
       // Snapshot failure should not block the update — log and continue
     }
 
-    const sourceTaskId2 = req.headers["x-source-task-id"];
-    const updatedBy2 =
-      typeof sourceTaskId2 === "string"
-        ? (getTaskById(sourceTaskId2)?.requestedByUserId ?? undefined)
-        : undefined;
+    const updatedBy2 = resolveHttpAuditUserId(req, myAgentId) ?? undefined;
     const workflow = updateWorkflow(id, {
       name: body.name,
       description: body.description,

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CronExpressionParser } from "cron-parser";
 import { z } from "zod";
+import { resolveHttpAuditUserId } from "../be/audit-user";
 import {
   createScheduledTask,
   deleteScheduledTask,
@@ -9,7 +10,6 @@ import {
   getScheduledTaskById,
   getScheduledTaskByName,
   getScheduledTasks,
-  getTaskById,
   updateScheduledTask,
 } from "../be/db";
 import { mergeScheduleTiming, validateRecurringTiming } from "../be/schedules/validate";
@@ -158,7 +158,7 @@ export async function handleSchedules(
   res: ServerResponse,
   pathSegments: string[],
   queryParams: URLSearchParams,
-  _myAgentId: string | undefined,
+  myAgentId: string | undefined,
 ): Promise<boolean> {
   if (listSchedules.match(req.method, pathSegments)) {
     const parsed = await listSchedules.parse(req, res, pathSegments, queryParams);
@@ -274,6 +274,7 @@ export async function handleSchedules(
         timezone: body.timezone,
         ...splitLegacyModelAlias({ model: body.model, modelTier: body.modelTier }),
         scheduleType: body.scheduleType,
+        createdBy: resolveHttpAuditUserId(req, myAgentId) ?? undefined,
       });
 
       json(res, schedule, 201);
@@ -478,12 +479,8 @@ export async function handleSchedules(
       }
     }
 
-    const sourceTaskIdHdr = req.headers["x-source-task-id"];
-    const updatedBy =
-      typeof sourceTaskIdHdr === "string"
-        ? (getTaskById(sourceTaskIdHdr)?.requestedByUserId ?? undefined)
-        : undefined;
-    if (updatedBy !== undefined) body.updatedBy = updatedBy;
+    const updatedBy = resolveHttpAuditUserId(req, myAgentId);
+    if (updatedBy !== null) body.updatedBy = updatedBy;
     const schedule = updateScheduledTask(parsed.params.id, body);
     json(res, schedule);
     return true;
