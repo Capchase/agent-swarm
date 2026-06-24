@@ -299,7 +299,14 @@ const updateTaskVcsRoute = route({
 
 interface MultipartCreateTaskRequest {
   body: CreateTaskBody;
-  files: File[];
+  files: UserUploadFile[];
+}
+
+interface UserUploadFile {
+  name: string;
+  type: string;
+  size: number;
+  arrayBuffer(): Promise<ArrayBuffer>;
 }
 
 interface UploadedTaskFile {
@@ -345,6 +352,17 @@ function sanitizeUploadFileName(name: string): string {
   return ascii || "attachment";
 }
 
+function isUserUploadFile(value: unknown): value is UserUploadFile {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "arrayBuffer" in value &&
+    typeof (value as { arrayBuffer?: unknown }).arrayBuffer === "function" &&
+    "size" in value &&
+    typeof (value as { size?: unknown }).size === "number"
+  );
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
@@ -387,7 +405,10 @@ async function parseMultipartCreateTask(req: IncomingMessage): Promise<Multipart
     throw new Error("Multipart task creation payload must be valid JSON");
   }
 
-  const files = form.getAll("files").filter((value): value is File => value instanceof File);
+  const files: UserUploadFile[] = [];
+  for (const value of form.getAll("files")) {
+    if (isUserUploadFile(value)) files.push(value);
+  }
   if (files.length > MAX_USER_UPLOAD_FILES) {
     throw new Error(`Too many attachments (max ${MAX_USER_UPLOAD_FILES})`);
   }
@@ -455,7 +476,7 @@ function agentFsArgs(target: AgentFsTarget): string[] {
   ];
 }
 
-async function uploadFilesToAgentFs(files: File[]): Promise<UploadedTaskFile[]> {
+async function uploadFilesToAgentFs(files: UserUploadFile[]): Promise<UploadedTaskFile[]> {
   if (files.length === 0) return [];
 
   const target = await resolveAgentFsTarget();
