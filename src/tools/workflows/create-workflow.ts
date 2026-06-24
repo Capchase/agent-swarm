@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { createWorkflow } from "@/be/db";
+import { createWorkflow, getTaskById } from "@/be/db";
 import { createToolRegistrar } from "@/tools/utils";
 import {
   CooldownConfigSchema,
@@ -106,6 +106,10 @@ export const registerCreateWorkflowTool = (server: McpServer) => {
           };
         }
 
+        const createdBy = requestInfo.sourceTaskId
+          ? (getTaskById(requestInfo.sourceTaskId)?.requestedByUserId ?? undefined)
+          : undefined;
+
         const workflow = createWorkflow({
           name,
           description,
@@ -117,6 +121,7 @@ export const registerCreateWorkflowTool = (server: McpServer) => {
           vcsRepo,
           triggerSchema,
           createdByAgentId: requestInfo.agentId,
+          createdBy,
         });
         return {
           content: [
