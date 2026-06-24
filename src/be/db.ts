@@ -10817,6 +10817,21 @@ export function listTaskTemplates(opts?: {
 // ============================================================================
 
 /**
+ * Walk the parentTaskId chain upward from `taskId` to find the root task.
+ * Returns `taskId` itself when it has no parent (it is already the root).
+ * Bounded to 20 hops to guard against cycles; real sessions are shallow.
+ */
+export function getRootTaskId(taskId: string): string {
+  let id = taskId;
+  for (let depth = 0; depth < 20; depth++) {
+    const task = getTaskById(id);
+    if (!task?.parentTaskId) return id;
+    id = task.parentTaskId;
+  }
+  return id;
+}
+
+/**
  * Walk the parent→child chain rooted at `rootTaskId` via recursive CTE.
  * Returns the chain ordered by `createdAt` (so the root is first; siblings
  * appear in creation order; grand-children after their parents).

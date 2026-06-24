@@ -510,6 +510,12 @@ export async function handleAgentSessionEvent(event: Record<string, unknown>): P
       );
       if (sessionId) {
         taskSessionMap.set(existingTask.id, sessionId);
+        upsertKv({
+          namespace: "linear:session",
+          key: existingTask.id,
+          value: sessionId,
+          valueType: "string",
+        });
         const refuseMsg = [
           `This issue is already being worked on — task \`${existing.swarmId}\` is currently \`${existingTask.status}\`.`,
           "",
@@ -599,6 +605,8 @@ export async function handleAgentSessionEvent(event: Record<string, unknown>): P
   // Track the AgentSession so outbound sync can post activities to it
   if (sessionId) {
     taskSessionMap.set(task.id, sessionId);
+    // Persist to KV so child tasks and process-restarts can resolve the session
+    upsertKv({ namespace: "linear:session", key: task.id, value: sessionId, valueType: "string" });
 
     // Acknowledge the AgentSession (pending → active)
     const ackMsg = existing
@@ -608,11 +616,11 @@ export async function handleAgentSessionEvent(event: Record<string, unknown>): P
       console.error("[Linear Sync] Failed to acknowledge AgentSession:", err);
     });
 
-    // Set externalUrls so users can click through to the swarm dashboard
+    // Set externalUrls so users can click through to the full session view
     const dashboardUrl = process.env.SWARM_DASHBOARD_URL || process.env.APP_URL;
     if (dashboardUrl) {
       updateAgentSessionExternalUrls(sessionId, [
-        { label: "View in Agent Swarm", url: `${dashboardUrl}/tasks/${task.id}` },
+        { label: "View in Agent Swarm", url: `${dashboardUrl}/sessions/${task.id}` },
       ]).catch((err) => {
         console.error("[Linear Sync] Failed to set externalUrls on AgentSession:", err);
       });
@@ -851,6 +859,9 @@ export async function handleAgentSessionPrompted(event: Record<string, unknown>)
   // Track session and acknowledge
   if (sessionId) {
     taskSessionMap.set(task.id, sessionId);
+    // Persist to KV so child tasks and process-restarts can resolve the session
+    upsertKv({ namespace: "linear:session", key: task.id, value: sessionId, valueType: "string" });
+
     acknowledgeAgentSession(
       sessionId,
       `Follow-up task created (${task.id}). Processing your message...`,
@@ -858,11 +869,11 @@ export async function handleAgentSessionPrompted(event: Record<string, unknown>)
       console.error("[Linear Sync] Failed to acknowledge prompted AgentSession:", err);
     });
 
-    // Set externalUrls for the follow-up task
+    // Set externalUrls for the follow-up task — point at the full session view
     const dashboardUrl = process.env.SWARM_DASHBOARD_URL || process.env.APP_URL;
     if (dashboardUrl) {
       updateAgentSessionExternalUrls(sessionId, [
-        { label: "View in Agent Swarm", url: `${dashboardUrl}/tasks/${task.id}` },
+        { label: "View in Agent Swarm", url: `${dashboardUrl}/sessions/${task.id}` },
       ]).catch((err) => {
         console.error("[Linear Sync] Failed to set externalUrls on prompted AgentSession:", err);
       });
