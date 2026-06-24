@@ -5413,6 +5413,8 @@ type ScheduledTaskRow = {
   scheduleType: string;
   createdAt: string;
   lastUpdatedAt: string;
+  created_by: string | null;
+  updated_by: string | null;
 };
 
 // ── List-endpoint slimming helpers ──────────────────────────────────────────
@@ -5455,6 +5457,8 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
     scheduleType: row.scheduleType as "recurring" | "one_time",
     createdAt: normalizeDateRequired(row.createdAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
+    createdBy: row.created_by ?? undefined,
+    updatedBy: row.updated_by ?? undefined,
   };
 }
 
@@ -5613,6 +5617,7 @@ export interface UpdateScheduledTaskData {
   modelTier?: ModelTier | null;
   scheduleType?: "recurring" | "one_time";
   lastUpdatedAt?: string;
+  updatedBy?: string;
 }
 
 export function updateScheduledTask(
@@ -5697,6 +5702,10 @@ export function updateScheduledTask(
   if (data.scheduleType !== undefined) {
     updates.push("scheduleType = ?");
     params.push(data.scheduleType);
+  }
+  if (data.updatedBy !== undefined) {
+    updates.push("updated_by = ?");
+    params.push(data.updatedBy);
   }
 
   if (updates.length === 0) {
@@ -6727,6 +6736,8 @@ type WorkflowRow = {
   createdByAgentId: string | null;
   createdAt: string;
   lastUpdatedAt: string;
+  created_by: string | null;
+  updated_by: string | null;
 };
 
 function rowToWorkflow(row: WorkflowRow): Workflow {
@@ -6747,6 +6758,8 @@ function rowToWorkflow(row: WorkflowRow): Workflow {
     createdByAgentId: row.createdByAgentId ?? undefined,
     createdAt: normalizeDateRequired(row.createdAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
+    createdBy: row.created_by ?? undefined,
+    updatedBy: row.updated_by ?? undefined,
   };
 }
 
@@ -6875,6 +6888,7 @@ export function updateWorkflow(
     triggerSchema?: Record<string, unknown> | null;
     dir?: string | null;
     vcsRepo?: string | null;
+    updatedBy?: string;
   },
 ): Workflow | null {
   const updates: string[] = [];
@@ -6918,6 +6932,10 @@ export function updateWorkflow(
   if (data.vcsRepo !== undefined) {
     updates.push("vcs_repo = ?");
     params.push(data.vcsRepo ?? null);
+  }
+  if (data.updatedBy !== undefined) {
+    updates.push("updated_by = ?");
+    params.push(data.updatedBy);
   }
   if (updates.length === 0) return getWorkflow(id);
   updates.push("lastUpdatedAt = ?");

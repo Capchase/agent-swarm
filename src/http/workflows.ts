@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   createWorkflow,
   deleteWorkflow,
+  getTaskById,
   getWorkflow,
   getWorkflowRun,
   getWorkflowRunStepsByRunId,
@@ -483,7 +484,15 @@ export async function handleWorkflows(
       // Snapshot failure should not block the update
     }
 
-    const workflow = updateWorkflow(id, { definition: patchResult.definition });
+    const sourceTaskId0 = req.headers["x-source-task-id"];
+    const updatedBy0 =
+      typeof sourceTaskId0 === "string"
+        ? (getTaskById(sourceTaskId0)?.requestedByUserId ?? undefined)
+        : undefined;
+    const workflow = updateWorkflow(id, {
+      definition: patchResult.definition,
+      updatedBy: updatedBy0,
+    });
     if (!workflow) {
       res.writeHead(404);
       res.end();
@@ -523,11 +532,19 @@ export async function handleWorkflows(
       // Snapshot failure should not block the update
     }
 
+    const sourceTaskId1 = req.headers["x-source-task-id"];
+    const updatedBy1 =
+      typeof sourceTaskId1 === "string"
+        ? (getTaskById(sourceTaskId1)?.requestedByUserId ?? undefined)
+        : undefined;
     const updateArgs: Parameters<typeof updateWorkflow>[1] = {
       definition: patchResult.definition,
     };
     if (parsed.body.triggerSchema !== undefined) {
       updateArgs.triggerSchema = parsed.body.triggerSchema;
+    }
+    if (updatedBy1 !== undefined) {
+      updateArgs.updatedBy = updatedBy1;
     }
     const workflow = updateWorkflow(id, updateArgs);
     if (!workflow) {
@@ -569,6 +586,11 @@ export async function handleWorkflows(
       // Snapshot failure should not block the update — log and continue
     }
 
+    const sourceTaskId2 = req.headers["x-source-task-id"];
+    const updatedBy2 =
+      typeof sourceTaskId2 === "string"
+        ? (getTaskById(sourceTaskId2)?.requestedByUserId ?? undefined)
+        : undefined;
     const workflow = updateWorkflow(id, {
       name: body.name,
       description: body.description,
@@ -580,6 +602,7 @@ export async function handleWorkflows(
       dir: body.dir === null ? null : body.dir,
       vcsRepo: body.vcsRepo === null ? null : body.vcsRepo,
       enabled: body.enabled,
+      updatedBy: updatedBy2,
     });
     if (!workflow) {
       res.writeHead(404);

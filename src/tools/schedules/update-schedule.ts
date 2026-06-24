@@ -5,6 +5,7 @@ import {
   getAgentById,
   getScheduledTaskById,
   getScheduledTaskByName,
+  getTaskById,
   updateScheduledTask,
 } from "@/be/db";
 import { mergeScheduleTiming, validateRecurringTiming } from "@/be/schedules/validate";
@@ -285,7 +286,10 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
           }
         }
 
-        const updated = updateScheduledTask(schedule.id, updateData);
+        const updatedBy = requestInfo.sourceTaskId
+          ? (getTaskById(requestInfo.sourceTaskId)?.requestedByUserId ?? undefined)
+          : undefined;
+        const updated = updateScheduledTask(schedule.id, { ...updateData, updatedBy });
 
         if (!updated) {
           return {

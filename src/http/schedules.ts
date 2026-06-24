@@ -9,6 +9,7 @@ import {
   getScheduledTaskById,
   getScheduledTaskByName,
   getScheduledTasks,
+  getTaskById,
   updateScheduledTask,
 } from "../be/db";
 import { mergeScheduleTiming, validateRecurringTiming } from "../be/schedules/validate";
@@ -477,6 +478,12 @@ export async function handleSchedules(
       }
     }
 
+    const sourceTaskIdHdr = req.headers["x-source-task-id"];
+    const updatedBy =
+      typeof sourceTaskIdHdr === "string"
+        ? (getTaskById(sourceTaskIdHdr)?.requestedByUserId ?? undefined)
+        : undefined;
+    if (updatedBy !== undefined) body.updatedBy = updatedBy;
     const schedule = updateScheduledTask(parsed.params.id, body);
     json(res, schedule);
     return true;
