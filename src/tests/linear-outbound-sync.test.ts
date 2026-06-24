@@ -504,6 +504,80 @@ describe("Linear Outbound Sync", () => {
     expect(args[0]).toBe("kv-session-id");
   });
 
+  test("root task progress resolves session from KV after restart (not in-memory map)", async () => {
+    // Simulate process restart: session is in KV but taskSessionMap was cleared
+    const rootTask = createTaskExtended("Root task progress kv restart", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-ROOT-KV-PROGRESS",
+      syncDirection: "bidirectional",
+    });
+    upsertKv({
+      namespace: "linear:session",
+      key: rootTask.id,
+      value: "root-kv-session-progress",
+      valueType: "string",
+    });
+    // Do NOT populate taskSessionMap — simulates process restart
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionAction.mockClear();
+    mockCreateComment.mockClear();
+
+    workflowEventBus.emit("task.progress", {
+      taskId: rootTask.id,
+      progress: "Root task progress after restart",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Must use AgentSession path, not the issue-comment fallback
+    expect(mockPostAgentSessionAction).toHaveBeenCalledTimes(1);
+    expect(mockCreateComment).not.toHaveBeenCalled();
+    const args = mockPostAgentSessionAction.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("root-kv-session-progress");
+  });
+
+  test("root task completion resolves session from KV after restart (not issue comment)", async () => {
+    // Simulate process restart: session is in KV but taskSessionMap was cleared
+    const rootTask = createTaskExtended("Root task completion kv restart", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-ROOT-KV-COMPLETE",
+      syncDirection: "bidirectional",
+    });
+    upsertKv({
+      namespace: "linear:session",
+      key: rootTask.id,
+      value: "root-kv-session-complete",
+      valueType: "string",
+    });
+    // Do NOT populate taskSessionMap — simulates process restart
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockEndAgentSession.mockClear();
+    mockCreateComment.mockClear();
+
+    workflowEventBus.emit("task.completed", {
+      taskId: rootTask.id,
+      output: "Root task done after restart!",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Must call endAgentSession (AgentSession path), not createComment (issue fallback)
+    expect(mockEndAgentSession).toHaveBeenCalledTimes(1);
+    expect(mockCreateComment).not.toHaveBeenCalled();
+    const args = mockEndAgentSession.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("root-kv-session-complete");
+    expect(args[1] as string).toContain("Root task done after restart!");
+    expect(args[2]).toBe("response");
+  });
+
   test("non-Linear tasks (no ancestor tracked) are still no-ops", async () => {
     // Task with no Linear session in its ancestry — drain setup events first
     const orphanTask = createTaskExtended("Orphan task no linear");

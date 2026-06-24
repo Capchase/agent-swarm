@@ -39,7 +39,13 @@ function resolveLinearContext(taskId: string): LinearContext {
   const directSession = taskSessionMap.get(taskId);
   const directSync = getTrackerSync("linear", "task", taskId);
   if (directSession !== undefined || directSync !== null) {
-    return { sessionId: directSession, sync: directSync, rootTaskId: taskId, isRoot: true };
+    // After a process restart taskSessionMap is empty; fall back to the persisted KV entry
+    let sessionId = directSession;
+    if (sessionId === undefined) {
+      const kvEntry = getKv("linear:session", taskId);
+      sessionId = typeof kvEntry?.value === "string" ? kvEntry.value : undefined;
+    }
+    return { sessionId, sync: directSync, rootTaskId: taskId, isRoot: true };
   }
 
   // Walk to root and check there
