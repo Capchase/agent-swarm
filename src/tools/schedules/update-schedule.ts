@@ -1,11 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CronExpressionParser } from "cron-parser";
 import * as z from "zod";
+import { resolveTaskAuditUserId } from "@/be/audit-user";
 import {
   getAgentById,
   getScheduledTaskById,
   getScheduledTaskByName,
-  getTaskById,
   updateScheduledTask,
 } from "@/be/db";
 import { mergeScheduleTiming, validateRecurringTiming } from "@/be/schedules/validate";
@@ -286,9 +286,8 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
           }
         }
 
-        const updatedBy = requestInfo.sourceTaskId
-          ? (getTaskById(requestInfo.sourceTaskId)?.requestedByUserId ?? undefined)
-          : undefined;
+        const updatedBy =
+          resolveTaskAuditUserId(requestInfo.sourceTaskId, requestInfo.agentId) ?? undefined;
         const updated = updateScheduledTask(schedule.id, { ...updateData, updatedBy });
 
         if (!updated) {

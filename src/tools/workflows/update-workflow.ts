@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getTaskById, getWorkflow, updateWorkflow } from "@/be/db";
+import { resolveTaskAuditUserId } from "@/be/audit-user";
+import { getWorkflow, updateWorkflow } from "@/be/db";
 import { createToolRegistrar } from "@/tools/utils";
 import {
   CooldownConfigSchema,
@@ -116,9 +117,8 @@ export const registerUpdateWorkflowTool = (server: McpServer) => {
         // Create version snapshot before applying update
         const version = snapshotWorkflow(id, requestInfo.agentId);
 
-        const updatedBy = requestInfo.sourceTaskId
-          ? (getTaskById(requestInfo.sourceTaskId)?.requestedByUserId ?? undefined)
-          : undefined;
+        const updatedBy =
+          resolveTaskAuditUserId(requestInfo.sourceTaskId, requestInfo.agentId) ?? undefined;
         const workflow = updateWorkflow(id, {
           name,
           description,

@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CronExpressionParser } from "cron-parser";
 import * as z from "zod";
-import { createScheduledTask, getAgentById, getScheduledTaskByName, getTaskById } from "@/be/db";
+import { resolveTaskAuditUserId } from "@/be/audit-user";
+import { createScheduledTask, getAgentById, getScheduledTaskByName } from "@/be/db";
 import { calculateNextRun } from "@/scheduler";
 import { createToolRegistrar } from "@/tools/utils";
 import { ModelTierSchema, splitLegacyModelAlias } from "../../model-tiers";
@@ -285,9 +286,8 @@ export const registerCreateScheduleTool = (server: McpServer) => {
           nextRunAt = calculateNextRun(tempSchedule, new Date());
         }
 
-        const createdBy = requestInfo.sourceTaskId
-          ? (getTaskById(requestInfo.sourceTaskId)?.requestedByUserId ?? undefined)
-          : undefined;
+        const createdBy =
+          resolveTaskAuditUserId(requestInfo.sourceTaskId, requestInfo.agentId) ?? undefined;
 
         const schedule = createScheduledTask({
           name,
