@@ -638,7 +638,7 @@ export function registerMessageHandler(app: App): void {
       });
 
       await say({
-        text: ":satellite: _Your request has been queued and will be picked up by an agent shortly._",
+        text: ":satellite: _Your request has been queued. An agent will pick it up when one is available._",
         thread_ts: threadTs,
       });
       return;
