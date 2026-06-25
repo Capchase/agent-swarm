@@ -157,7 +157,7 @@ Agents can read Slack threads using `slack-read`:
 - By task ID (reads the thread associated with a task)
 - By channel ID (leads only, for channel history)
 
-`slack-read` and the worker thread-context helpers also extract text from attachment-only and Block Kit-only messages, so alert threads from tools like Datadog, PagerDuty, and GitHub can be delegated without manually copying the root message text first.
+`slack-read` and the worker thread-context helpers extract all message layers together: top-level `text`, legacy `attachments`, and Block Kit `blocks`. That means alert threads from tools like Datadog, PagerDuty, and GitHub keep both the short summary and the richer body content (fields, context, action URLs) instead of silently dropping everything outside the root `text`.
 
 ### Posting Messages
 

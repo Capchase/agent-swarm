@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.101.1] - 2026-06-25
+
+### Changed
+- **Worker-image harness pins refreshed** (#809) — `Dockerfile.worker` now ships Claude Code `2.1.187`, Codex `0.142.0`, OpenCode `1.17.9`, and pi `0.80.2`, plus the corresponding `pi-ai` `0.80` API migration updates.
+
+### Fixed
+- **Published CLI package now works cleanly through `npx`** (#804) — the npm package now ships a built `dist/cli.js` entrypoint with a Node shebang, so `npx @desplega.ai/agent-swarm ...` runs the same commands without requiring Bun to execute the published bin.
+- **Slack message extraction now keeps all text layers instead of truncating at the first summary** (#807) — `extractSlackMessageText()` now combines top-level text, legacy attachment bodies/fields/actions, and Block Kit content with exact-match dedup, so alert-style Slack threads preserve the real diagnostic payload for agents.
+
 ## [1.101.0] - 2026-06-22
 
 ### Added

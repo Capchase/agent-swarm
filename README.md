@@ -147,6 +147,7 @@ The fastest way is the onboarding wizard — it collects credentials, picks pres
 
 ```bash
 bunx @desplega.ai/agent-swarm onboard
+npx @desplega.ai/agent-swarm onboard
 ```
 
 Prefer manual setup? Clone and run with Docker Compose:
@@ -165,7 +166,7 @@ The API runs on port `3013`, with interactive docs at `http://localhost:3013/doc
 <summary><strong>Other setups</strong></summary>
 
 - **Local API + Docker workers** — run the API on your host, workers in Docker. See [Getting Started](https://docs.agent-swarm.dev/docs/getting-started).
-- **Claude Code as the lead agent** — `bunx @desplega.ai/agent-swarm connect`, then tell Claude Code to register as the lead.
+- **Claude Code as the lead agent** — `bunx @desplega.ai/agent-swarm connect` (or `npx @desplega.ai/agent-swarm connect`), then tell Claude Code to register as the lead.
 
 </details>
 
@@ -221,6 +222,7 @@ Opens at `http://localhost:5274`.
 
 ```bash
 bunx @desplega.ai/agent-swarm <command>
+npx @desplega.ai/agent-swarm <command>
 ```
 
 | Command | Description |
