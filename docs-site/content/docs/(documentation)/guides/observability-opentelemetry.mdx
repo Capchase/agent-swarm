@@ -368,8 +368,8 @@ Two cumulative counters are emitted by the API server each time a session-cost r
 
 | Metric | Unit | Description |
 |--------|------|-------------|
-| `agentswarm.session.cost.usd` | `{usd}` | USD cost per finalized session-cost record. Not emitted for zero-cost sessions. |
-| `agentswarm.session.tokens` | `{token}` | Token count per finalized session-cost record, split by `token_type`. Not emitted for zero-count classes. |
+| `agentswarm.cost.usd` | `{usd}` | USD cost per finalized cost record. Not emitted for zero-cost sessions. |
+| `agentswarm.tokens` | `{token}` | Token count per finalized cost record, split by `token_type`. Not emitted for zero-count classes. |
 
 Both counters share the same set of low-cardinality attributes:
 
@@ -380,7 +380,7 @@ Both counters share the same set of low-cardinality attributes:
 | `cost_source` | `harness`, `pricing-table`, `unpriced` | How the cost figure was derived. `harness` = adapter-reported; `pricing-table` = recomputed from seeded pricing rows; `unpriced` = provider/model pair has no pricing data. |
 | `is_error` | `true`, `false` | Whether the session ended with an error. |
 
-`agentswarm.session.tokens` additionally carries:
+`agentswarm.tokens` additionally carries:
 
 | Attribute | Values | Description |
 |-----------|--------|-------------|
@@ -400,13 +400,13 @@ Omit it for backends (SigNoz, Prometheus) that prefer cumulative temporality (th
 
 | Panel | Metric query |
 |-------|-------------|
-| Total cost by harness | `sum(agentswarm.session.cost.usd)`, group by `harness` |
-| Cost by model | `sum(agentswarm.session.cost.usd)`, group by `model` |
-| Cost by pricing source | `sum(agentswarm.session.cost.usd)`, group by `cost_source` |
-| Input tokens by harness | `sum(agentswarm.session.tokens)` where `token_type = 'input'`, group by `harness` |
-| Output tokens by model | `sum(agentswarm.session.tokens)` where `token_type = 'output'`, group by `model` |
-| Cache efficiency | `sum(agentswarm.session.tokens)` where `token_type = 'cacheRead'` ÷ `token_type = 'input'` |
-| Error session cost | `sum(agentswarm.session.cost.usd)` where `is_error = true` |
+| Total cost by harness | `sum(agentswarm.cost.usd)`, group by `harness` |
+| Cost by model | `sum(agentswarm.cost.usd)`, group by `model` |
+| Cost by pricing source | `sum(agentswarm.cost.usd)`, group by `cost_source` |
+| Input tokens by harness | `sum(agentswarm.tokens)` where `token_type = 'input'`, group by `harness` |
+| Output tokens by model | `sum(agentswarm.tokens)` where `token_type = 'output'`, group by `model` |
+| Cache efficiency | `sum(agentswarm.tokens)` where `token_type = 'cacheRead'` ÷ `token_type = 'input'` |
+| Error session cost | `sum(agentswarm.cost.usd)` where `is_error = true` |
 
 ### Trace-derived Metrics
 
@@ -528,7 +528,7 @@ after the tool result returned). Adapter-emitted explicit `tool_end` spans
 
 ### Sessions with Cost Data
 
-Use the `agentswarm.session.cost.usd` OTLP metric counter for cost aggregations and dashboards. For per-span cost attribution in trace queries, filter on the `agentswarm.cost.total_usd` span attribute on `worker.session` spans:
+Use the `agentswarm.cost.usd` OTLP metric counter for cost aggregations and dashboards. For per-span cost attribution in trace queries, filter on the `agentswarm.cost.total_usd` span attribute on `worker.session` spans:
 
 ```text
 service.name = 'agent-swarm'
@@ -549,10 +549,10 @@ Start with these panels:
 
 | Panel | Signal |
 |-------|--------|
-| Cost by harness | `sum(agentswarm.session.cost.usd)` metric, grouped by `harness` |
-| Cost by model | `sum(agentswarm.session.cost.usd)` metric, grouped by `model` |
-| Token usage by type | `sum(agentswarm.session.tokens)` metric, grouped by `token_type` |
-| Cache efficiency | `sum(agentswarm.session.tokens)` where `token_type=cacheRead` ÷ `input` |
+| Cost by harness | `sum(agentswarm.cost.usd)` metric, grouped by `harness` |
+| Cost by model | `sum(agentswarm.cost.usd)` metric, grouped by `model` |
+| Token usage by type | `sum(agentswarm.tokens)` metric, grouped by `token_type` |
+| Cache efficiency | `sum(agentswarm.tokens)` where `token_type=cacheRead` ÷ `input` |
 | API request rate by route | Trace count over `agentswarm.component = 'api'`, grouped by span `name` |
 | API p95 latency by route | `p95(durationNano)` over `agentswarm.component = 'api'`, grouped by span `name` |
 | Worker sessions by harness | Trace count over `worker.session`, grouped by `agentswarm.harness_provider` |
