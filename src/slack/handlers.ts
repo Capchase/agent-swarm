@@ -638,7 +638,7 @@ export function registerMessageHandler(app: App): void {
       });
 
       await say({
-        text: ":satellite: _No agents are online right now. Your request has been queued and will be processed when agents come back up._",
+        text: ":satellite: _Your request has been queued and will be picked up by an agent shortly._",
         thread_ts: threadTs,
       });
       return;
