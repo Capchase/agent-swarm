@@ -1,6 +1,13 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { countSessions, getRootTaskChain, getTaskById, listRecentSessions } from "../be/db";
+import {
+  countSessions,
+  getRootTaskChain,
+  getTaskAttachments,
+  getTaskById,
+  listRecentSessions,
+} from "../be/db";
+import type { AgentTask, TaskAttachment } from "../types";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -54,6 +61,12 @@ const getSession = route({
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
+type SessionTaskWithAttachments = AgentTask & { attachments: TaskAttachment[] };
+
+function withAttachments(task: AgentTask): SessionTaskWithAttachments {
+  return { ...task, attachments: getTaskAttachments(task.id) };
+}
+
 export async function handleSessions(
   req: IncomingMessage,
   res: ServerResponse,
@@ -106,7 +119,7 @@ export async function handleSessions(
       return true;
     }
     const chain = getRootTaskChain(parsed.params.rootTaskId);
-    json(res, { root, chain });
+    json(res, { root: withAttachments(root), chain: chain.map(withAttachments) });
     return true;
   }
 

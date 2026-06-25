@@ -1,4 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ensure } from "@desplega.ai/business-use";
 import { z } from "zod";
 import {
@@ -15,6 +18,7 @@ import {
   getTaskById,
   getTasksCount,
   getUserById,
+  insertTaskAttachment,
   pauseTask,
   resumeTask,
   supersedeTask,
@@ -34,12 +38,38 @@ import {
   isTerminalTaskStatus,
   ProviderNameSchema,
   ResumeReasonSchema,
+  type TaskAttachment,
 } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
 // ─── Route Definitions ───────────────────────────────────────────────────────
+
+const createTaskBodySchema = z.object({
+  task: z.string().min(1),
+  agentId: z.string().optional(),
+  taskType: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  priority: z.number().int().optional(),
+  dependsOn: z.array(z.string()).optional(),
+  offeredTo: z.string().optional(),
+  dir: z.string().optional(),
+  parentTaskId: z.string().optional(),
+  source: AgentTaskSourceSchema.optional(),
+  outputSchema: z.record(z.string(), z.unknown()).optional(),
+  contextKey: z.string().optional(),
+  requestedByUserId: z.string().optional(),
+  model: z.string().optional(),
+  modelTier: ModelTierSchema.optional(),
+});
+
+type CreateTaskBody = z.infer<typeof createTaskBodySchema>;
+
+const USER_UPLOAD_ATTACHMENT_MARKER = "\n\n---\nUser-uploaded attachments:\n";
+const MAX_USER_UPLOAD_FILES = 5;
+const MAX_USER_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_MULTIPART_CREATE_TASK_BYTES = MAX_USER_UPLOAD_FILES * MAX_USER_UPLOAD_BYTES + 1024 * 1024;
 
 const listTasks = route({
   method: "get",
@@ -77,26 +107,11 @@ const createTask = route({
   pattern: ["api", "tasks"],
   summary: "Create a new task",
   tags: ["Tasks"],
-  body: z.object({
-    task: z.string().min(1),
-    agentId: z.string().optional(),
-    taskType: z.string().optional(),
-    tags: z.array(z.string()).optional(),
-    priority: z.number().int().optional(),
-    dependsOn: z.array(z.string()).optional(),
-    offeredTo: z.string().optional(),
-    dir: z.string().optional(),
-    parentTaskId: z.string().optional(),
-    source: AgentTaskSourceSchema.optional(),
-    outputSchema: z.record(z.string(), z.unknown()).optional(),
-    contextKey: z.string().optional(),
-    requestedByUserId: z.string().optional(),
-    model: z.string().optional(),
-    modelTier: ModelTierSchema.optional(),
-  }),
+  body: createTaskBodySchema,
   responses: {
     201: { description: "Task created" },
     400: { description: "Validation error" },
+    413: { description: "Multipart request body too large" },
   },
 });
 
@@ -282,6 +297,328 @@ const updateTaskVcsRoute = route({
   auth: { apiKey: true },
 });
 
+// ─── User Upload Helpers ─────────────────────────────────────────────────────
+
+interface MultipartCreateTaskRequest {
+  body: CreateTaskBody;
+  files: UserUploadFile[];
+}
+
+interface UserUploadFile {
+  name: string;
+  type: string;
+  size: number;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+interface UploadedTaskFile {
+  name: string;
+  path: string;
+  orgId?: string;
+  driveId?: string;
+  mimeType?: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+interface AgentFsTarget {
+  orgId?: string;
+  driveId?: string;
+}
+
+interface AgentFsDriveListEntry {
+  orgId?: string;
+  drives?: Array<{ id?: string; isDefault?: boolean }>;
+}
+
+let agentFsTargetCache: AgentFsTarget | null = null;
+
+function getHeader(req: IncomingMessage, name: string): string {
+  const value = req.headers[name.toLowerCase()];
+  return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
+}
+
+function isMultipartRequest(req: IncomingMessage): boolean {
+  return getHeader(req, "content-type").toLowerCase().includes("multipart/form-data");
+}
+
+function sanitizeUploadFileName(name: string): string {
+  const base = name.split(/[\\/]/).pop()?.trim() || "attachment";
+  const ascii = base
+    .normalize("NFKD")
+    .replace(/[^\w.() -]+/g, "_")
+    .replace(/\s+/g, "-")
+    .replace(/_+/g, "_")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+  return ascii || "attachment";
+}
+
+function isUserUploadFile(value: unknown): value is UserUploadFile {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "arrayBuffer" in value &&
+    typeof (value as { arrayBuffer?: unknown }).arrayBuffer === "function" &&
+    "size" in value &&
+    typeof (value as { size?: unknown }).size === "number"
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(1)} MB`;
+}
+
+class MultipartRequestTooLargeError extends Error {}
+
+function multipartRequestTooLargeError(): MultipartRequestTooLargeError {
+  return new MultipartRequestTooLargeError(
+    `Multipart task creation request is too large (max ${formatBytes(
+      MAX_MULTIPART_CREATE_TASK_BYTES,
+    )})`,
+  );
+}
+
+function sha256Hex(bytes: ArrayBuffer): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(new Uint8Array(bytes));
+  return hasher.digest("hex");
+}
+
+async function readRequestBuffer(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const declaredLength = Number(getHeader(req, "content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw multipartRequestTooLargeError();
+  }
+
+  return await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+    };
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const onData = (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.length;
+      if (totalBytes > maxBytes) {
+        req.pause();
+        settle(() => reject(multipartRequestTooLargeError()));
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      settle(() => resolve(Buffer.concat(chunks, totalBytes)));
+    };
+    const onError = (error: Error) => {
+      settle(() => reject(error));
+    };
+
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+  });
+}
+
+async function parseMultipartCreateTask(req: IncomingMessage): Promise<MultipartCreateTaskRequest> {
+  const body = await readRequestBuffer(req, MAX_MULTIPART_CREATE_TASK_BYTES);
+  const request = new Request("http://localhost/api/tasks", {
+    method: "POST",
+    headers: { "content-type": getHeader(req, "content-type") },
+    body,
+  });
+  const form = await request.formData();
+  const rawPayload = form.get("payload");
+  if (typeof rawPayload !== "string") {
+    throw new Error("Multipart task creation requires a JSON 'payload' field");
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawPayload);
+  } catch {
+    throw new Error("Multipart task creation payload must be valid JSON");
+  }
+
+  const files: UserUploadFile[] = [];
+  for (const value of form.getAll("files")) {
+    if (isUserUploadFile(value)) files.push(value);
+  }
+  if (files.length > MAX_USER_UPLOAD_FILES) {
+    throw new Error(`Too many attachments (max ${MAX_USER_UPLOAD_FILES})`);
+  }
+  for (const file of files) {
+    if (file.size > MAX_USER_UPLOAD_BYTES) {
+      throw new Error(
+        `Attachment '${file.name || "attachment"}' is too large (max ${formatBytes(
+          MAX_USER_UPLOAD_BYTES,
+        )})`,
+      );
+    }
+  }
+
+  return { body: createTaskBodySchema.parse(payload), files };
+}
+
+/** Exported for upload-limit regression tests; production callers use handleTasks. */
+export const taskUploadTestHooks: {
+  maxMultipartCreateTaskBytes: number;
+  parseMultipartCreateTask: (req: IncomingMessage) => Promise<unknown>;
+} = {
+  maxMultipartCreateTaskBytes: MAX_MULTIPART_CREATE_TASK_BYTES,
+  parseMultipartCreateTask,
+};
+
+async function runAgentFsJson(args: string[]): Promise<unknown> {
+  const binary = process.env.AGENT_FS_BINARY || "agent-fs";
+  const proc = Bun.spawn([binary, "--json", ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) {
+    const message = (stderr || stdout || "unknown error").trim().slice(0, 500);
+    throw new Error(`agent-fs failed: ${message}`);
+  }
+  const trimmed = stdout.trim();
+  return trimmed ? JSON.parse(trimmed) : null;
+}
+
+async function resolveAgentFsTarget(): Promise<AgentFsTarget> {
+  if (agentFsTargetCache) return agentFsTargetCache;
+
+  const requestedOrgId = process.env.AGENT_FS_SHARED_ORG_ID || process.env.AGENT_FS_DEFAULT_ORG_ID;
+  const requestedDriveId = process.env.AGENT_FS_DEFAULT_DRIVE_ID;
+  if (requestedOrgId && requestedDriveId) {
+    agentFsTargetCache = { orgId: requestedOrgId, driveId: requestedDriveId };
+    return agentFsTargetCache;
+  }
+
+  const raw = await runAgentFsJson(["drive", "list"]);
+  const entries = Array.isArray(raw) ? (raw as AgentFsDriveListEntry[]) : [];
+  const matchedOrgEntry = requestedOrgId
+    ? entries.find((entry) => entry.orgId === requestedOrgId)
+    : undefined;
+  const orgEntry = matchedOrgEntry ?? entries[0];
+  const defaultDrive = orgEntry?.drives?.find((drive) => drive.isDefault) ?? orgEntry?.drives?.[0];
+
+  agentFsTargetCache = {
+    orgId: matchedOrgEntry?.orgId ?? orgEntry?.orgId ?? requestedOrgId,
+    driveId: requestedDriveId || defaultDrive?.id,
+  };
+  return agentFsTargetCache;
+}
+
+function agentFsArgs(target: AgentFsTarget): string[] {
+  return [
+    ...(target.orgId ? ["--org", target.orgId] : []),
+    ...(target.driveId ? ["--drive", target.driveId] : []),
+  ];
+}
+
+async function uploadFilesToAgentFs(files: UserUploadFile[]): Promise<UploadedTaskFile[]> {
+  if (files.length === 0) return [];
+
+  const target = await resolveAgentFsTarget();
+  const batchId = crypto.randomUUID();
+  const tempDir = await mkdtemp(join(tmpdir(), "swarm-task-upload-"));
+  const uploaded: UploadedTaskFile[] = [];
+
+  try {
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index]!;
+      const safeName = sanitizeUploadFileName(file.name);
+      const bytes = await file.arrayBuffer();
+      const sha256 = sha256Hex(bytes);
+      const path = `misc/user-uploads/${batchId}/${String(index + 1).padStart(2, "0")}-${safeName}`;
+      const tmpPath = join(tempDir, `${index}-${safeName}`);
+      await Bun.write(tmpPath, bytes);
+      await runAgentFsJson([
+        ...agentFsArgs(target),
+        "write",
+        path,
+        "--file",
+        tmpPath,
+        "-m",
+        `User upload for task composer: ${safeName}`,
+      ]);
+      uploaded.push({
+        name: safeName,
+        path,
+        orgId: target.orgId,
+        driveId: target.driveId,
+        mimeType: file.type || undefined,
+        sizeBytes: file.size,
+        sha256,
+      });
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+
+  return uploaded;
+}
+
+function buildAgentFsLiveUrl(file: UploadedTaskFile): string | null {
+  if (!file.orgId || !file.driveId) return null;
+  const host = (process.env.AGENT_FS_LIVE_URL || "https://live.agent-fs.dev").replace(/\/+$/, "");
+  return `${host}/file/~/${file.orgId}/${file.driveId}/${file.path}`;
+}
+
+function appendUserUploadAttachmentBlock(taskText: string, files: UploadedTaskFile[]): string {
+  if (files.length === 0) return taskText;
+  const lines = files.map((file) => {
+    const meta = [file.mimeType, formatBytes(file.sizeBytes)].filter(Boolean).join(", ");
+    const liveUrl = buildAgentFsLiveUrl(file);
+    return `- ${file.name}${meta ? ` (${meta})` : ""}: agent-fs:${file.path}${
+      liveUrl ? ` (${liveUrl})` : ""
+    }`;
+  });
+  return `${taskText.trimEnd()}${USER_UPLOAD_ATTACHMENT_MARKER}${lines.join(
+    "\n",
+  )}\n\nThe user uploaded these files with this message. Use \`agent-fs download <path> --out <local-file>\` to inspect binary files, or \`agent-fs cat <path>\` for text files.`;
+}
+
+function insertUploadedTaskAttachments(
+  taskId: string,
+  files: UploadedTaskFile[],
+): TaskAttachment[] {
+  return files.map((file) =>
+    insertTaskAttachment({
+      taskId,
+      agentId: null,
+      name: file.name,
+      kind: "agent-fs",
+      path: file.path,
+      orgId: file.orgId,
+      driveId: file.driveId,
+      mimeType: file.mimeType,
+      sizeBytes: file.sizeBytes,
+      sha256: file.sha256,
+      intent: "user-upload",
+      description: "Uploaded by the user from the sessions composer",
+    }),
+  );
+}
+
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 export async function handleTasks(
@@ -354,15 +691,50 @@ export async function handleTasks(
   }
 
   if (createTask.match(req.method, pathSegments)) {
-    const parsed = await createTask.parse(req, res, pathSegments, queryParams);
-    if (!parsed) return true;
+    let body: CreateTaskBody;
+    let uploadedFiles: UploadedTaskFile[] = [];
+
+    if (isMultipartRequest(req)) {
+      let parsedMultipart: MultipartCreateTaskRequest;
+      try {
+        parsedMultipart = await parseMultipartCreateTask(req);
+      } catch (error) {
+        const message =
+          error instanceof z.ZodError
+            ? `Validation error: ${error.issues
+                .map((e) => `${e.path.join(".")}: ${e.message}`)
+                .join(", ")}`
+            : error instanceof Error
+              ? error.message
+              : "Invalid multipart task creation request";
+        jsonError(res, message, error instanceof MultipartRequestTooLargeError ? 413 : 400);
+        return true;
+      }
+
+      body = parsedMultipart.body;
+      try {
+        uploadedFiles = await uploadFilesToAgentFs(parsedMultipart.files);
+      } catch (error) {
+        console.error("[HTTP] Failed to upload task attachments:", error);
+        jsonError(
+          res,
+          error instanceof Error ? error.message : "Failed to upload task attachments",
+          500,
+        );
+        return true;
+      }
+    } else {
+      const parsed = await createTask.parse(req, res, pathSegments, queryParams);
+      if (!parsed) return true;
+      body = parsed.body;
+    }
 
     // Tolerant `requestedByUserId`: prevent the deleted-user race from
     // becoming a 500 — if the referenced user doesn't exist, log and drop
     // the field rather than letting the FK fail at INSERT.
     const auth = getRequestAuth(req);
     let requestedByUserId =
-      auth?.kind === "user" ? auth.userId : parsed.body.requestedByUserId || undefined;
+      auth?.kind === "user" ? auth.userId : body.requestedByUserId || undefined;
     if (requestedByUserId && !getUserById(requestedByUserId)) {
       console.warn(
         `[tasks] requestedByUserId ${requestedByUserId} does not exist — coercing to NULL`,
@@ -376,32 +748,34 @@ export async function handleTasks(
     // Without this, UI composer follow-ups land unassigned and never get
     // picked up. Mirrors Slack's pattern (slack/actions.ts uses lead?.id when
     // there's no working agent).
-    let defaultAgentId = parsed.body.agentId || undefined;
+    let defaultAgentId = body.agentId || undefined;
     if (!defaultAgentId) {
       const lead = getLeadAgent();
       if (lead) defaultAgentId = lead.id;
     }
 
     try {
-      const task = createTaskWithSiblingAwareness(parsed.body.task, {
+      const taskText = appendUserUploadAttachmentBlock(body.task, uploadedFiles);
+      const task = createTaskWithSiblingAwareness(taskText, {
         agentId: defaultAgentId,
         creatorAgentId: myAgentId || undefined,
-        taskType: parsed.body.taskType || undefined,
-        tags: parsed.body.tags || undefined,
-        priority: parsed.body.priority || 50,
-        dependsOn: parsed.body.dependsOn || undefined,
-        offeredTo: parsed.body.offeredTo || undefined,
-        dir: parsed.body.dir || undefined,
-        parentTaskId: parsed.body.parentTaskId || undefined,
-        source: parsed.body.source || "api",
-        outputSchema: parsed.body.outputSchema || undefined,
-        contextKey: parsed.body.contextKey || undefined,
+        taskType: body.taskType || undefined,
+        tags: body.tags || undefined,
+        priority: body.priority || 50,
+        dependsOn: body.dependsOn || undefined,
+        offeredTo: body.offeredTo || undefined,
+        dir: body.dir || undefined,
+        parentTaskId: body.parentTaskId || undefined,
+        source: body.source || "api",
+        outputSchema: body.outputSchema || undefined,
+        contextKey: body.contextKey || undefined,
         requestedByUserId,
         ...splitLegacyModelAlias({
-          model: parsed.body.model,
-          modelTier: parsed.body.modelTier,
+          model: body.model,
+          modelTier: body.modelTier,
         }),
       });
+      const attachments = insertUploadedTaskAttachments(task.id, uploadedFiles);
 
       ensure({
         id: "created",
@@ -410,7 +784,7 @@ export async function handleTasks(
         data: {
           taskId: task.id,
           agentId: task.agentId,
-          source: parsed.body.source || "api",
+          source: body.source || "api",
           status: task.status,
           task: task.task.slice(0, 200),
           priority: task.priority,
@@ -419,7 +793,7 @@ export async function handleTasks(
         },
       });
 
-      json(res, task, 201);
+      json(res, { ...task, attachments }, 201);
     } catch (error) {
       console.error("[HTTP] Failed to create task:", error);
       jsonError(res, "Failed to create task", 500);
