@@ -263,12 +263,12 @@ export interface SessionCostMetric {
 function ensureInstruments(): void {
   if (costCounter) return;
   const meter = metrics.getMeter(METER_NAME);
-  costCounter = meter.createCounter("agentswarm.session.cost.usd", {
-    description: "USD cost per finalized session-cost record",
+  costCounter = meter.createCounter("agentswarm.cost.usd", {
+    description: "USD cost per finalized cost record",
     unit: "{usd}",
   });
-  tokenCounter = meter.createCounter("agentswarm.session.tokens", {
-    description: "Tokens per finalized session-cost record",
+  tokenCounter = meter.createCounter("agentswarm.tokens", {
+    description: "Tokens per finalized cost record",
     unit: "{token}",
   });
 }
