@@ -52,19 +52,17 @@ describe("otel.ts recordSessionCost — no-op when OTEL_EXPORTER_OTLP_ENDPOINT i
 
 const recordSessionCostSpy = mock((_m: SessionCostMetric) => {});
 
+// `mock.module` is process-global and is never auto-restored, so it leaks into
+// every test file that runs after this one in the same `bun test` process.
+// Spread the real module and override ONLY `recordSessionCost`: that keeps the
+// genuine NOOP-based `withSpan`/`startSpan` (whose spans expose the full
+// SwarmSpan surface, incl. `setAttributes`) so the leaked mock can't break
+// unrelated MCP-tool tests via `span.setAttributes` in createToolRegistrar.
+const actualOtel = await import("../otel");
 // Mock ../otel BEFORE importing handleSessionData so the module picks up our spy.
 mock.module("../otel", () => ({
+  ...actualOtel,
   recordSessionCost: recordSessionCostSpy,
-  isOtelEnabled: () => false,
-  isPollTracingEnabled: () => false,
-  initOtel: async () => {},
-  withSpan: async (_n: string, fn: (s: unknown) => unknown) => fn({}),
-  startSpan: () => ({}),
-  withSpanContext: (_s: unknown, fn: () => unknown) => fn(),
-  withRemoteContext: async (_c: unknown, fn: () => unknown) => fn(),
-  injectTraceContext: (h: Record<string, string>) => h,
-  shutdownOtel: async () => {},
-  _resetOtelForTests: () => {},
 }));
 
 const { handleSessionData } = await import("../http/session-data");
