@@ -13,6 +13,7 @@
     "performance-resource-sizing",
     "cost-and-context-computation",
     "scripts-runtime",
+    "scripts-credential-broker",
     "script-workflow-runs",
     "claude-bridge-experimental",
     "worker-credential-recovery",

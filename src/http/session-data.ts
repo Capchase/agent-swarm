@@ -15,6 +15,7 @@ import {
 } from "../be/db";
 import { normalizeModelKey } from "../be/pricing-normalize";
 import { recordSessionCost } from "../otel";
+import { incrementServerSessionsProcessed } from "../server-runtime-counters";
 import type { SessionCost, SessionCostSource } from "../types";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
@@ -306,6 +307,7 @@ export async function handleSessionData(
           thinking: parsed.body.thinkingTokens ?? 0,
         },
       });
+      incrementServerSessionsProcessed();
       json(res, { success: true, cost }, 201);
     } catch (error) {
       console.error("[HTTP] Failed to create session cost:", error);

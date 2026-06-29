@@ -3,12 +3,14 @@ import pkg from "../package.json";
 import { initDb } from "./be/db";
 import { startPricingRefreshLoop } from "./be/pricing-refresh";
 import { seedPricingFromModelsDev } from "./be/seed-pricing";
+import { registerGithubTaskReactions } from "./github/task-reactions";
 import { registerCancelTaskTool } from "./tools/cancel-task";
 import { registerContextDiffTool } from "./tools/context-diff";
 import { registerContextHistoryTool } from "./tools/context-history";
 import { registerCreateChannelTool } from "./tools/create-channel";
 import { registerCreateMetricTool } from "./tools/create-metric";
 import { registerCreatePageTool } from "./tools/create-page";
+import { registerCredentialBindingsTool } from "./tools/credential-bindings";
 import { registerDbQueryTool } from "./tools/db-query";
 import { registerDeleteChannelTool } from "./tools/delete-channel";
 import { registerGetMetricsTool } from "./tools/get-metrics";
@@ -41,6 +43,7 @@ import {
 } from "./tools/mcp-servers";
 // Memory capability
 import { registerMemoryDeleteTool } from "./tools/memory-delete";
+import { registerMemoryEditTool } from "./tools/memory-edit";
 import { registerMemoryGetTool } from "./tools/memory-get";
 import { registerMemoryRateTool } from "./tools/memory-rate";
 import { registerMemorySearchTool } from "./tools/memory-search";
@@ -76,6 +79,7 @@ import {
   registerRunScheduleNowTool,
   registerUpdateScheduleTool,
 } from "./tools/schedules";
+import { registerScriptConnectionsTool } from "./tools/script-connections";
 import { registerScriptDeleteTool } from "./tools/script-delete";
 import { registerScriptQueryTypesTool } from "./tools/script-query-types";
 import { registerScriptRunTool } from "./tools/script-run";
@@ -175,6 +179,10 @@ export function createServer() {
   seedPricingFromModelsDev();
   startPricingRefreshLoop();
 
+  // Subscribe API-side integrations to task-lifecycle events. Idempotent.
+  // (Inverts the old be/db → github/task-reactions import; see cycle-break #4.)
+  registerGithubTaskReactions();
+
   const server = new McpServer(
     {
       name: pkg.name,
@@ -213,6 +221,7 @@ export function createServer() {
   registerGetConfigTool(server);
   registerListConfigTool(server);
   registerDeleteConfigTool(server);
+  registerCredentialBindingsTool(server);
 
   // Repo management tools - always registered (repo config is fundamental)
   registerGetReposTool(server);
@@ -227,6 +236,7 @@ export function createServer() {
 
   // Reusable script catalog tools - always registered (HTTP MCP only in v1).
   registerScriptSearchTool(server);
+  registerScriptConnectionsTool(server);
   registerScriptRunTool(server);
   registerScriptUpsertTool(server);
   registerScriptDeleteTool(server);
@@ -298,6 +308,7 @@ export function createServer() {
   if (hasCapability("memory")) {
     registerMemorySearchTool(server);
     registerMemoryGetTool(server);
+    registerMemoryEditTool(server);
     registerMemoryDeleteTool(server);
     registerMemoryRateTool(server);
     registerInjectLearningTool(server);

@@ -66,11 +66,16 @@ export const DEFERRED_TOOLS = new Set([
   "list-services",
   "update-service-status",
 
-  // Config (4)
+  // Config (5)
   "set-config",
   "get-config",
   "list-config",
   "delete-config",
+  "credential-bindings",
+  "script-connections",
+
+  // Memory (1)
+  "memory-edit",
 
   // Repos (2)
   "get-repos",

@@ -49,6 +49,10 @@ The `fetch` available in the runtime IS the one Bun provides — same shape as
 Node 18+'s undici fetch. Prefer `ctx.stdlib.fetch` / `ctx.stdlib.fetchJson` for
 built-in retries; bare `fetch` works too.
 
+For external APIs that need secrets, use the
+[scripts credential broker](/docs/guides/scripts-credential-broker) instead of
+putting raw tokens in source or args.
+
 ### Console + logger
 
 `console.log` / `.warn` / `.error` / `.info` / `.debug` are global. They also

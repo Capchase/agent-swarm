@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { buildScriptCredentialBindings } from "../../be/script-credential-broker";
 import { getScript, getScriptVersion } from "../../be/scripts/db";
 import { DEFAULT_SCRIPT_RESOURCES } from "../../scripts-runtime/executors/types";
 import { runScript } from "../../scripts-runtime/loader";
@@ -72,6 +73,7 @@ export class SwarmScriptExecutor extends BaseExecutor<
       args: config.args,
       fsMode: "none",
       agentId: agentId ?? "workflow",
+      egressSecrets: buildScriptCredentialBindings({ agentId: agentId ?? undefined }),
       timeoutMs: config.timeoutMs,
     });
 

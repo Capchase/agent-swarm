@@ -1,8 +1,6 @@
 import { Database } from "bun:sqlite";
 import { parseProviderMeta } from "@/utils/provider-metadata.ts";
 import pkg from "../../package.json";
-import { addEyesReactionOnTaskStart } from "../github/task-reactions";
-import { type ModelTier, parseModelTier } from "../model-tiers";
 import { configureDbResolver } from "../prompts/resolver";
 import { telemetry } from "../telemetry";
 import type {
@@ -101,7 +99,12 @@ import type {
   WorkflowSummary,
   WorkflowVersion,
 } from "../types";
-import { FollowUpConfigSchema, isTerminalTaskStatus } from "../types";
+import {
+  FollowUpConfigSchema,
+  isTerminalTaskStatus,
+  type ModelTier,
+  parseModelTier,
+} from "../types";
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
@@ -111,11 +114,17 @@ import { normalizeDate, normalizeDateRequired } from "./date-utils";
 import { runMigrations } from "./migrations/runner";
 import { seedDefaultTemplates } from "./seed-prompt-templates";
 import { isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
+import { emitTaskStarted } from "./task-lifecycle-events";
 
 let db: Database | null = null;
 let sqliteVecAvailable = false;
 
 type TaskTelemetryProps = Parameters<typeof telemetry.taskEvent>[1];
+type TaskTelemetryContext = {
+  provider?: ProviderName;
+  harnessVariant?: string;
+  harnessVersion?: string;
+};
 
 function emitTaskLifecycleTelemetryAfterCommit(
   event: string,
@@ -126,6 +135,17 @@ function emitTaskLifecycleTelemetryAfterCommit(
     if (verify && !verify(getTaskById(props.taskId))) return;
     telemetry.taskEvent(event, props);
   });
+}
+
+function taskContextForTelemetry(task: AgentTask): TaskTelemetryContext {
+  const harnessVersion = task.harnessVariantMeta?.version;
+  const context: TaskTelemetryContext = {};
+  if (task.provider) context.provider = task.provider;
+  if (task.harnessVariant) context.harnessVariant = task.harnessVariant;
+  if (typeof harnessVersion === "string" || typeof harnessVersion === "number") {
+    context.harnessVersion = String(harnessVersion);
+  }
+  return context;
 }
 
 export function isSqliteVecAvailable(): boolean {
@@ -1375,9 +1395,9 @@ export function startTask(taskId: string): AgentTask | null {
     } catch {}
   }
   const result = row ? rowToAgentTask(row) : null;
-  // Fire-and-forget: add eyes reaction for GitHub-sourced tasks
+  // Fire-and-forget: notify lifecycle subscribers (e.g. GitHub eyes reaction)
   if (result && oldTask.status !== "in_progress") {
-    addEyesReactionOnTaskStart(result).catch(() => {});
+    emitTaskStarted(result);
   }
   return result;
 }
@@ -2153,6 +2173,8 @@ export function completeTask(id: string, output?: string): AgentTask | null {
       "completed",
       {
         taskId: id,
+        source: oldTask.source,
+        ...taskContextForTelemetry(oldTask),
         agentId: row.agentId ?? undefined,
         durationMs: row.createdAt ? Date.now() - new Date(row.createdAt).getTime() : undefined,
       },
@@ -2203,6 +2225,8 @@ export function failTask(id: string, reason: string): AgentTask | null {
       "failed",
       {
         taskId: id,
+        source: oldTask.source,
+        ...taskContextForTelemetry(oldTask),
         agentId: row.agentId ?? undefined,
         durationMs: row.createdAt ? Date.now() - new Date(row.createdAt).getTime() : undefined,
       },
@@ -2337,6 +2361,21 @@ export function supersedeTask(
     .get(finishedAt, id);
 
   if (row && oldTask) {
+    emitTaskLifecycleTelemetryAfterCommit(
+      "superseded",
+      {
+        taskId: id,
+        source: oldTask.source,
+        ...taskContextForTelemetry(oldTask),
+        agentId: row.agentId ?? undefined,
+        reason: args.reason,
+        durationMs: oldTask.createdAt
+          ? Date.now() - new Date(oldTask.createdAt).getTime()
+          : undefined,
+      },
+      (task) => task?.status === "superseded",
+    );
+
     try {
       createLogEntry({
         eventType: "task_superseded",
@@ -3255,7 +3294,7 @@ export function createTaskExtended(task: string, options?: CreateTaskOptions): A
     {
       taskId: row.id,
       source: row.source,
-      tags: options?.tags ?? [],
+      ...taskContextForTelemetry(rowToAgentTask(row)),
       hasParent: !!row.parentTaskId,
       priority: row.priority,
     },
@@ -3305,9 +3344,9 @@ export function claimTask(taskId: string, agentId: string): AgentTask | null {
   }
 
   const result = row ? rowToAgentTask(row) : null;
-  // Fire-and-forget: add eyes reaction for GitHub-sourced tasks
+  // Fire-and-forget: notify lifecycle subscribers (e.g. GitHub eyes reaction)
   if (result) {
-    addEyesReactionOnTaskStart(result).catch(() => {});
+    emitTaskStarted(result);
   }
   return result;
 }
@@ -6183,6 +6222,7 @@ type SwarmRepoRow = {
   clonePath: string;
   defaultBranch: string;
   autoClone: number; // SQLite boolean
+  hooks: string | null;
   guidelines: string | null;
   createdAt: string;
   lastUpdatedAt: string;
@@ -6196,6 +6236,7 @@ function rowToSwarmRepo(row: SwarmRepoRow): SwarmRepo {
     clonePath: row.clonePath,
     defaultBranch: row.defaultBranch,
     autoClone: row.autoClone === 1,
+    hooks: row.hooks ? JSON.parse(row.hooks) : { enabled: false },
     guidelines: row.guidelines ? JSON.parse(row.guidelines) : null,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
@@ -6251,20 +6292,22 @@ export function createSwarmRepo(data: {
   clonePath?: string;
   defaultBranch?: string;
   autoClone?: boolean;
+  hooks?: { enabled: boolean };
   guidelines?: RepoGuidelines | null;
 }): SwarmRepo {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const clonePath = data.clonePath || `/workspace/repos/${data.name}`;
+  const clonePath = data.clonePath || `/workspace/personal/repos/${data.name}`;
+  const hooksJson = JSON.stringify(data.hooks ?? { enabled: true });
   const guidelinesJson = data.guidelines ? JSON.stringify(data.guidelines) : null;
 
   const row = getDb()
     .prepare<
       SwarmRepoRow,
-      [string, string, string, string, string, number, string | null, string, string]
+      [string, string, string, string, string, number, string | null, string | null, string, string]
     >(
-      `INSERT INTO swarm_repos (id, url, name, clonePath, defaultBranch, autoClone, guidelines, createdAt, lastUpdatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      `INSERT INTO swarm_repos (id, url, name, clonePath, defaultBranch, autoClone, hooks, guidelines, createdAt, lastUpdatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     )
     .get(
       id,
@@ -6273,6 +6316,7 @@ export function createSwarmRepo(data: {
       clonePath,
       data.defaultBranch ?? "main",
       data.autoClone !== false ? 1 : 0,
+      hooksJson,
       guidelinesJson,
       now,
       now,
@@ -6290,6 +6334,7 @@ export function updateSwarmRepo(
     clonePath: string;
     defaultBranch: string;
     autoClone: boolean;
+    hooks: { enabled: boolean } | null;
     guidelines: RepoGuidelines | null;
   }>,
 ): SwarmRepo | null {
@@ -6306,6 +6351,10 @@ export function updateSwarmRepo(
   if (updates.autoClone !== undefined) {
     setClauses.push("autoClone = ?");
     params.push(updates.autoClone ? 1 : 0);
+  }
+  if (updates.hooks !== undefined) {
+    setClauses.push("hooks = ?");
+    params.push(updates.hooks ? JSON.stringify(updates.hooks) : null);
   }
   if (updates.guidelines !== undefined) {
     setClauses.push("guidelines = ?");
@@ -7037,6 +7086,22 @@ export function getWorkflowRun(id: string): WorkflowRun | null {
   return row ? rowToWorkflowRun(row) : null;
 }
 
+function emitWorkflowTerminalTelemetry(run: WorkflowRun): void {
+  if (run.status !== "completed" && run.status !== "failed") return;
+
+  queueMicrotask(() => {
+    const latest = getWorkflowRun(run.id);
+    if (!latest || latest.status !== run.status) return;
+    const steps = getWorkflowRunStepsByRunId(run.id);
+    telemetry.workflow(run.status, {
+      workflowId: run.workflowId,
+      durationMs: run.startedAt ? Date.now() - new Date(run.startedAt).getTime() : undefined,
+      stepsCompleted: steps.filter((step) => step.status === "completed").length,
+      stepsFailed: steps.filter((step) => step.status === "failed").length,
+    });
+  });
+}
+
 export function updateWorkflowRun(
   id: string,
   data: {
@@ -7073,7 +7138,12 @@ export function updateWorkflowRun(
       `UPDATE workflow_runs SET ${updates.join(", ")} WHERE id = ? RETURNING *`,
     )
     .get(...params);
-  return row ? rowToWorkflowRun(row) : null;
+  if (!row) return null;
+  const run = rowToWorkflowRun(row);
+  if (data.status === "completed" || data.status === "failed") {
+    emitWorkflowTerminalTelemetry(run);
+  }
+  return run;
 }
 
 export function listWorkflowRuns(workflowId: string): WorkflowRun[] {

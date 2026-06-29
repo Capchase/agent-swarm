@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.103.0] - 2026-06-27
+
+### Added
+- **Workers can now opt into per-repo git-hook bootstrap** (#828) — repo records accept `hooks: { enabled: true }`, the worker image bundles `install-repo-hooks.sh`, and runners invoke it after clone/refresh so repository-local hooks can be installed automatically.
+- **Telemetry now covers deeper runtime lifecycle signals** (#826) — workers and schedulers emit session-cost, compaction, workflow, schedule, and provider-session completion/failure events in addition to the existing task lifecycle baseline.
+- **A Code Health Reports community template now ships with the repo** (#823) — operators get a seeded community-report template out of the box instead of having to author the first version from scratch.
+
+### Fixed
+- **Runner startup no longer risks a `runningTask` TDZ during `session_init`** (#827) — provider sessions can initialize without tripping an internal runner crash during early event handling.
+- **Provider stderr now persists in streamed session logs** (#824) — raw stderr events are buffered and flushed alongside normal provider log lines so debugging data is retained in task/session logs.
+- **Codex edit bursts no longer trip false-positive loop detection as easily** (#821) — low-cardinality `Edit`/`Write`/`Delete` file-change batches now require a higher repeat threshold before the hook blocks the session.
+- **Auto-cloned repos now hard-sync clean default branches before task execution** (#825) — worker checkouts recover more reliably from stale local branch state when reusing clean auto-cloned repositories.
+
+## [1.102.0] - 2026-06-26
+
+### Added
+- **Scripts, workflows, and schedules now record canonical user audit attribution** (#810) — create and update flows now populate `created_by` / `updated_by` when a trusted human requester exists, covering MCP and HTTP paths while leaving pure automation writes nullable.
+- **A new `taste-minimalist-skill` now ships in the default page-design seed set** (#816) — page-generation templates now include a reusable minimalist taste baseline plus the bundled license artifact for seeded skills.
+
+### Changed
+- **GitHub Pages docs now ship a first-class landing page and landing-site styling** (#814, #815) — the synced README site now has branded layout/CSS, icons, and a Pages publishing flow that matches the main landing experience more closely.
+
+### Fixed
+- **Audit-user resolution for script/workflow/schedule writes is now server-trusted instead of header-spoofable** (#810) — `X-Source-Task-Id` only contributes a requester when the named task belongs to the calling agent, and authenticated HTTP users take precedence for audit stamping.
+
 ## [1.101.1] - 2026-06-25
 
 ### Changed

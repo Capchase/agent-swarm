@@ -2,7 +2,6 @@ import { existsSync, statSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { ensure, initialize } from "@desplega.ai/business-use";
 import type { TemplateResponse } from "../../templates/schema.ts";
-import { resolveTaskModelSelection } from "../model-tiers.ts";
 import {
   type Attributes,
   initOtel,
@@ -34,7 +33,7 @@ import {
   type ProviderSessionConfig,
 } from "../providers/index.ts";
 import { initTelemetry, telemetry } from "../telemetry.ts";
-import type { ProviderName, RepoGuidelines } from "../types.ts";
+import { type ProviderName, type RepoGuidelines, resolveTaskModelSelection } from "../types.ts";
 import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
@@ -52,9 +51,9 @@ import { resolveHarnessProvider } from "../utils/harness-provider.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
+import { interpolate } from "../utils/template.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { validateJsonSchema } from "../workflows/json-schema-validator.ts";
-import { interpolate } from "../workflows/template.ts";
 import { buildContextPreamble, buildResumeContextPreamble } from "./context-preamble.ts";
 import { awaitCredentials, BootMaxWaitExceededError, EX_CONFIG } from "./credential-wait.ts";
 import {
@@ -131,6 +130,7 @@ async function fetchRepoConfig(
   name: string;
   clonePath: string;
   defaultBranch: string;
+  hooks?: { enabled: boolean } | null;
   guidelines?: RepoGuidelines | null;
 } | null> {
   try {
@@ -145,6 +145,7 @@ async function fetchRepoConfig(
         name: string;
         clonePath: string;
         defaultBranch: string;
+        hooks?: { enabled: boolean } | null;
         guidelines?: RepoGuidelines | null;
       }>;
     };
@@ -170,7 +171,8 @@ export type SwarmAutostash = { ref: string; message: string };
 
 async function listSwarmAutostashes(clonePath: string, role: string): Promise<SwarmAutostash[]> {
   try {
-    const result = await Bun.$`cd ${clonePath} && git stash list --format=%gd%x09%s`.quiet();
+    const result =
+      await Bun.$`env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX git -C ${clonePath} stash list --format=%gd%x09%s`.quiet();
     return result
       .text()
       .split("\n")
@@ -194,7 +196,8 @@ async function refreshExistingRepoForTask(
   role: string,
 ): Promise<string | null> {
   const { name, clonePath, defaultBranch } = repoConfig;
-  const statusResult = await Bun.$`cd ${clonePath} && git status --porcelain`.quiet();
+  const statusResult =
+    await Bun.$`env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX git -C ${clonePath} status --porcelain`.quiet();
   const statusOutput = statusResult.text().trim();
   let stashMessage: string | null = null;
 
@@ -202,7 +205,7 @@ async function refreshExistingRepoForTask(
     stashMessage = `swarm-autostash ${defaultBranch} ${new Date().toISOString()}`;
     try {
       console.log(`[${role}] Auto-stashing pending work in ${name}: ${stashMessage}`);
-      await Bun.$`cd ${clonePath} && git stash push --include-untracked -m ${stashMessage}`.quiet();
+      await Bun.$`env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX git -C ${clonePath} stash push --include-untracked -m ${stashMessage}`.quiet();
       console.log(`[${role}] Auto-stashed pending work in ${name}`);
     } catch (err) {
       const errorMsg = scrubSecrets((err as Error).message);
@@ -215,15 +218,15 @@ async function refreshExistingRepoForTask(
     console.log(`[${role}] Refreshing ${name} from origin/${defaultBranch}...`);
     const fetchSpec = `${defaultBranch}:refs/remotes/origin/${defaultBranch}`;
     const remoteRef = `refs/remotes/origin/${defaultBranch}`;
-    await Bun.$`cd ${clonePath} && git fetch origin ${fetchSpec}`.quiet();
-    await Bun.$`cd ${clonePath} && git merge --no-edit --no-stat ${remoteRef}`.quiet();
+    await Bun.$`env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX git -C ${clonePath} fetch origin ${fetchSpec}`.quiet();
+    await Bun.$`env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX git -C ${clonePath} merge --no-edit --no-stat ${remoteRef}`.quiet();
     console.log(`[${role}] Refreshed ${name}`);
     return null;
   } catch (err) {
     const errorMsg = scrubSecrets((err as Error).message);
     console.warn(`[${role}] Could not refresh ${name}: ${errorMsg}`);
     try {
-      await Bun.$`cd ${clonePath} && git merge --abort`.quiet();
+      await Bun.$`env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX git -C ${clonePath} merge --abort`.quiet();
     } catch {
       // No merge in progress, or abort failed. The original refresh warning is
       // the actionable signal; repo setup remains best-effort.
@@ -235,12 +238,40 @@ async function refreshExistingRepoForTask(
   }
 }
 
+function getInstallRepoHooksScriptPath(): string {
+  const imagePath = "/usr/local/bin/install-repo-hooks.sh";
+  if (existsSync(imagePath)) return imagePath;
+  return `${process.cwd()}/scripts/install-repo-hooks.sh`;
+}
+
+async function installRepoHooksForTask(
+  repoConfig: { name: string; clonePath: string; hooks?: { enabled: boolean } | null },
+  role: string,
+): Promise<void> {
+  if (repoConfig.hooks?.enabled !== true) return;
+
+  try {
+    const scriptPath = getInstallRepoHooksScriptPath();
+    await Bun.$`bash ${scriptPath} ${repoConfig.clonePath} ${repoConfig.name}`;
+    console.log(`[${role}] Installed git hooks for ${repoConfig.name}`);
+  } catch (err) {
+    const errorMsg = scrubSecrets((err as Error).message);
+    console.warn(`[${role}] Could not install git hooks for ${repoConfig.name}: ${errorMsg}`);
+  }
+}
+
 /**
  * Ensure a repo is cloned and up-to-date for a task.
  * Returns { clonePath, claudeMd, warning }.
  */
 export async function ensureRepoForTask(
-  repoConfig: { url: string; name: string; clonePath: string; defaultBranch: string },
+  repoConfig: {
+    url: string;
+    name: string;
+    clonePath: string;
+    defaultBranch: string;
+    hooks?: { enabled: boolean } | null;
+  },
   role: string,
 ): Promise<{
   clonePath: string;
@@ -274,6 +305,8 @@ export async function ensureRepoForTask(
       console.log(`[${role}] Repo ${name} already cloned at ${clonePath}`);
       warning = await refreshExistingRepoForTask({ name, clonePath, defaultBranch }, role);
     }
+
+    await installRepoHooksForTask(repoConfig, role);
 
     const claudeMd = await readClaudeMd(clonePath, role);
     const autoStashes = await listSwarmAutostashes(clonePath, role);
@@ -1484,7 +1517,11 @@ function setupShutdownHandlers(
     }
 
     if (apiConfig) {
-      telemetry.session("ended", { agentId: apiConfig.agentId });
+      telemetry.session("ended", {
+        agentId: apiConfig.agentId,
+        durationMs: state ? Date.now() - state.startedAt : undefined,
+        tasksProcessed: state?.tasksProcessed ?? 0,
+      });
       await closeAgent(apiConfig, role);
     }
     await savePm2State(role);
@@ -1554,12 +1591,18 @@ interface RunningTask {
   hasLocalEnvironment: boolean;
   /** Harness variant captured on session_init (e.g. "bridge" or "stock") */
   harnessVariant?: string;
+  /** Harness metadata captured on session_init (currently includes provider package version) */
+  harnessVariantMeta?: Record<string, unknown>;
+  /** Resolved model used for the provider session, when configured */
+  model?: string;
 }
 
 /** Runner state for tracking concurrent tasks */
 interface RunnerState {
   activeTasks: Map<string, RunningTask>;
   maxConcurrent: number;
+  startedAt: number;
+  tasksProcessed: number;
   /**
    * Effective harness provider for this worker boot session — resolved
    * from `swarm_config` (overlay) > `process.env.HARNESS_PROVIDER` > "claude".
@@ -2542,6 +2585,19 @@ function providerEventAttributes(event: ProviderEvent): Attributes {
   }
 }
 
+function normalizeSessionErrorCategory(category: string | undefined): string {
+  switch (category) {
+    case "rate_limit":
+    case "api_error":
+    case "context_overflow":
+    case "timeout":
+    case "provider_error":
+      return category;
+    default:
+      return "unknown";
+  }
+}
+
 /**
  * Entry shape for the `activeToolSpans` map maintained by `runWithSession`.
  * Exported for unit tests that exercise `implicitCloseActiveToolSpans`.
@@ -2799,6 +2855,9 @@ async function spawnProviderProcess(
   const eventFlushTimer = setInterval(flushEvents, EVENT_FLUSH_INTERVAL_MS);
   const sessionStartTime = Date.now();
   let providerSessionId = session.sessionId;
+  let pendingHarnessVariant: string | undefined;
+  let pendingHarnessVariantMeta: Record<string, unknown> | undefined;
+  let runningTaskForSessionInit: RunningTask | undefined;
   const activeToolSpans = new Map<
     string,
     {
@@ -2823,12 +2882,37 @@ async function spawnProviderProcess(
   // snapshots carry a real `cumulativeOutputTokens` (was 0 until completion).
   let cumulativeProgressOutputTokens = 0;
 
+  function bufferSessionLogLine(content: string) {
+    if (!shouldStream) return;
+    logBuffer.lines.push(content);
+    const shouldFlush =
+      logBuffer.lines.length >= LOG_BUFFER_SIZE ||
+      Date.now() - logBuffer.lastFlush >= LOG_FLUSH_INTERVAL_MS;
+    if (shouldFlush) {
+      flushLogBuffer(logBuffer, {
+        apiUrl: opts.apiUrl,
+        apiKey: opts.apiKey,
+        agentId: opts.agentId,
+        sessionId: opts.runnerSessionId,
+        iteration: opts.iteration,
+        taskId: effectiveTaskId,
+        cli: adapter.name,
+      }).catch(() => {});
+    }
+  }
+
   session.onEvent((event) =>
     withSpanContext(sessionSpan, () => {
       sessionSpan.addEvent(`provider.${event.type}`, providerEventAttributes(event));
       switch (event.type) {
         case "session_init":
           providerSessionId = event.sessionId;
+          pendingHarnessVariant = event.harnessVariant;
+          pendingHarnessVariantMeta = event.harnessVariantMeta;
+          if (runningTaskForSessionInit) {
+            runningTaskForSessionInit.harnessVariant = event.harnessVariant;
+            runningTaskForSessionInit.harnessVariantMeta = event.harnessVariantMeta;
+          }
           sessionSpan.setAttributes({
             "agentswarm.provider.session_id": providerSessionId,
             "agentswarm.provider.name": event.provider,
@@ -3074,6 +3158,11 @@ async function spawnProviderProcess(
         }
         case "compaction": {
           // Always record compaction events (no throttle)
+          telemetry.compaction("triggered", {
+            compactTrigger: event.compactTrigger,
+            preCompactTokens: event.preCompactTokens,
+            contextTotalTokens: event.contextTotalTokens,
+          });
           fetch(`${opts.apiUrl}/api/tasks/${realTaskId}/context`, {
             method: "POST",
             headers: {
@@ -3093,26 +3182,17 @@ async function spawnProviderProcess(
         }
         case "raw_log":
           prettyPrintLine(event.content, opts.role);
-          if (shouldStream) {
-            logBuffer.lines.push(event.content);
-            const shouldFlush =
-              logBuffer.lines.length >= LOG_BUFFER_SIZE ||
-              Date.now() - logBuffer.lastFlush >= LOG_FLUSH_INTERVAL_MS;
-            if (shouldFlush) {
-              flushLogBuffer(logBuffer, {
-                apiUrl: opts.apiUrl,
-                apiKey: opts.apiKey,
-                agentId: opts.agentId,
-                sessionId: opts.runnerSessionId,
-                iteration: opts.iteration,
-                taskId: effectiveTaskId,
-                cli: adapter.name,
-              }).catch(() => {});
-            }
-          }
+          bufferSessionLogLine(event.content);
           break;
         case "raw_stderr":
           prettyPrintStderr(event.content, opts.role);
+          bufferSessionLogLine(
+            JSON.stringify({
+              type: "stderr",
+              content: event.content,
+              timestamp: new Date().toISOString(),
+            }),
+          );
           break;
 
         case "progress": {
@@ -3201,6 +3281,21 @@ async function spawnProviderProcess(
             "gen_ai.usage.input_tokens": result.cost.inputTokens ?? 0,
             "gen_ai.usage.output_tokens": result.cost.outputTokens ?? 0,
             "agentswarm.cost.total_usd": result.cost.totalCostUsd ?? 0,
+          });
+          telemetry.session("cost", {
+            agentId: opts.agentId,
+            model: result.cost.model,
+            provider: result.cost.provider ?? opts.harnessProvider,
+            inputTokens: result.cost.inputTokens ?? 0,
+            outputTokens: result.cost.outputTokens ?? 0,
+            cacheReadTokens: result.cost.cacheReadTokens,
+            cacheWriteTokens: result.cost.cacheWriteTokens,
+            reasoningOutputTokens: result.cost.reasoningOutputTokens,
+            thinkingTokens: result.cost.thinkingTokens,
+            totalCostUsd: result.cost.totalCostUsd,
+            durationMs: result.cost.durationMs,
+            numTurns: result.cost.numTurns,
+            isError: result.cost.isError,
           });
           try {
             await saveCostData(
@@ -3303,7 +3398,15 @@ async function spawnProviderProcess(
     // swap that mutates the global RunnerState (review finding 2).
     harnessProvider: opts.harnessProvider,
     hasLocalEnvironment: adapter.traits.hasLocalEnvironment,
+    model: model || undefined,
   };
+  runningTaskForSessionInit = runningTask;
+  if (pendingHarnessVariant !== undefined) {
+    runningTask.harnessVariant = pendingHarnessVariant;
+  }
+  if (pendingHarnessVariantMeta !== undefined) {
+    runningTask.harnessVariantMeta = pendingHarnessVariantMeta;
+  }
 
   // Non-blocking completion tracking
   promise
@@ -3333,6 +3436,10 @@ async function checkCompletedProcesses(
     credentialInfo?: RunningTask["credentialInfo"];
     harnessProvider: ProviderName;
     hasLocalEnvironment: boolean;
+    harnessVariant?: string;
+    harnessVariantMeta?: Record<string, unknown>;
+    model?: string;
+    durationMs: number;
   }> = [];
 
   for (const [taskId, task] of state.activeTasks) {
@@ -3350,6 +3457,10 @@ async function checkCompletedProcesses(
         credentialInfo: task.credentialInfo,
         harnessProvider: task.harnessProvider,
         hasLocalEnvironment: task.hasLocalEnvironment,
+        harnessVariant: task.harnessVariant,
+        harnessVariantMeta: task.harnessVariantMeta,
+        model: task.model,
+        durationMs: Date.now() - task.startTime.getTime(),
       });
     }
   }
@@ -3362,6 +3473,10 @@ async function checkCompletedProcesses(
     workingDir,
     credentialInfo,
     harnessProvider,
+    harnessVariant,
+    harnessVariantMeta,
+    model,
+    durationMs,
   } of completedTasks) {
     state.activeTasks.delete(taskId);
     vcsDetectedTasks.delete(taskId);
@@ -3481,6 +3596,33 @@ async function checkCompletedProcesses(
         harnessProvider,
         bridgeFailureDiagnostics,
       );
+
+      telemetry.taskEvent("session_completed", {
+        taskId,
+        agentId: apiConfig.agentId,
+        provider: result.cost?.provider ?? harnessProvider,
+        model: result.cost?.model ?? model,
+        harnessVariant,
+        harnessVersion:
+          typeof harnessVariantMeta?.version === "string" ||
+          typeof harnessVariantMeta?.version === "number"
+            ? String(harnessVariantMeta.version)
+            : undefined,
+        exitCode: result.exitCode,
+        isError: result.exitCode !== 0,
+        durationMs,
+      });
+      if (result.exitCode !== 0 || result.isError) {
+        telemetry.session("failure", {
+          agentId: apiConfig.agentId,
+          errorCategory: normalizeSessionErrorCategory(result.errorCategory),
+          provider: result.cost?.provider ?? harnessProvider,
+          model: result.cost?.model ?? model,
+          durationMs: result.cost?.durationMs ?? durationMs,
+          wasRateLimited: result.rateLimitResetAt != null,
+        });
+      }
+      state.tasksProcessed += 1;
 
       if (result.exitCode === 0 && credentialInfo) {
         reportKeyClearRateLimit(
@@ -3660,6 +3802,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // Failures (network, API down, malformed value) fall back to env then "claude"
   // so a swarm_config outage cannot wedge boot.
   let bootProvider: ProviderName;
+  let bootModel = process.env.MODEL_OVERRIDE || "";
   // Codex credits-exhausted cooldown is sourced solely from the global swarm_config
   // (key `CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS`). Initialize to the default constant
   // for the case where it is unset, then apply the swarm_config value below; on a
@@ -3669,6 +3812,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   try {
     const bootEnv = await fetchResolvedEnv(apiUrl, apiKey, agentId);
     bootProvider = bootEnv.resolvedProvider;
+    bootModel = (bootEnv.env.MODEL_OVERRIDE as string | undefined) || bootModel;
     bootCooldownMs = resolveCodexCreditsExhaustedCooldownMs(
       bootEnv.env.CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS,
     );
@@ -3733,7 +3877,12 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       },
     );
   }
-  telemetry.session("started", { agentId });
+  telemetry.session("started", {
+    agentId,
+    harnessProvider: bootProvider,
+    model: bootModel || undefined,
+    role,
+  });
 
   let capabilities = config.capabilities;
 
@@ -3878,6 +4027,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   const state: RunnerState = {
     activeTasks: new Map(),
     maxConcurrent,
+    startedAt: Date.now(),
+    tasksProcessed: 0,
     harnessProvider: bootProvider,
     codexCreditsExhaustedCooldownMs: bootCooldownMs,
   };
@@ -4506,7 +4657,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           const effectiveConfig = repoConfig ?? {
             url: task.vcsRepo,
             name: task.vcsRepo.split("/").pop() || task.vcsRepo,
-            clonePath: `/workspace/repos/${task.vcsRepo.split("/").pop() || task.vcsRepo}`,
+            clonePath: `/workspace/personal/repos/${task.vcsRepo.split("/").pop() || task.vcsRepo}`,
             defaultBranch: "main",
           };
           const repoContext = await ensureRepoForTask(effectiveConfig, role);
@@ -4897,7 +5048,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           const effectiveConfig = repoConfig ?? {
             url: taskVcsRepo,
             name: taskVcsRepo.split("/").pop() || taskVcsRepo,
-            clonePath: `/workspace/repos/${taskVcsRepo.split("/").pop() || taskVcsRepo}`,
+            clonePath: `/workspace/personal/repos/${taskVcsRepo.split("/").pop() || taskVcsRepo}`,
             defaultBranch: "main",
           };
           const repoResult = await ensureRepoForTask(effectiveConfig, role);
