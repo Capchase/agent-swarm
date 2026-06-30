@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { handleReleaseContentTrigger, shouldFireReleaseContent } from "./release-content";
 import {
   handleAgentSessionEvent,
   handleAgentSessionPrompted,
@@ -55,6 +56,19 @@ async function processWebhookEvent(
   // Handle Issue events
   if (type === "Issue") {
     if (action === "update") {
+      // Release-content gate: fire before the standard tracker-sync update so
+      // it runs regardless of whether the issue is in tracker_sync.
+      if (shouldFireReleaseContent(event)) {
+        const data = event.data as Record<string, unknown> | undefined;
+        handleReleaseContentTrigger({
+          source: "linear-webhook",
+          linearTicketId: String(data?.id ?? ""),
+          linearTicketIdentifier: data?.identifier ? String(data.identifier) : undefined,
+          linearTicketTitle: data?.title ? String(data.title) : undefined,
+          linearTicketUrl: data?.url ? String(data.url) : undefined,
+          deliveryId,
+        });
+      }
       await handleIssueUpdate(event, deliveryId);
     } else if (action === "remove") {
       await handleIssueDelete(event);

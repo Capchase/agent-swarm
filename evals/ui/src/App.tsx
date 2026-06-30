@@ -1,4 +1,10 @@
 import { type ReactNode, useEffect, useState } from "react";
+import {
+  clearStoredApiKey,
+  getStoredApiKey,
+  setStoredApiKey,
+  setUnauthorizedHandler,
+} from "./api.ts";
 import { navigate, useHashRoute } from "./hooks.ts";
 import AnalyticsPage from "./pages/AnalyticsPage.tsx";
 import ConfigsPage from "./pages/ConfigsPage.tsx";
@@ -26,8 +32,64 @@ function ThemeToggle(): ReactNode {
   );
 }
 
+function LoginScreen({
+  error,
+  onUnlock,
+}: {
+  error: string | null;
+  onUnlock: (key: string) => void;
+}): ReactNode {
+  const [key, setKey] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmed = key.trim();
+    if (!trimmed) {
+      setLocalError("Paste the evals API key.");
+      return;
+    }
+    onUnlock(trimmed);
+  };
+  const displayedError = localError ?? error;
+  return (
+    <main className="auth-shell">
+      <form className="auth-panel" onSubmit={submit}>
+        <div className="auth-brand">
+          <img src="/logo.png" width={28} height={28} alt="swarm logo" />
+          <h1>
+            swarm <span className="accent">evals</span>
+          </h1>
+        </div>
+        <label htmlFor="evals-api-key">Master key</label>
+        <input
+          id="evals-api-key"
+          type="password"
+          autoComplete="current-password"
+          value={key}
+          onChange={(event) => {
+            setKey(event.target.value);
+            setLocalError(null);
+          }}
+        />
+        {displayedError ? <p className="auth-error">{displayedError}</p> : null}
+        <button type="submit">Log in</button>
+      </form>
+    </main>
+  );
+}
+
 export default function App(): ReactNode {
   const { parts } = useHashRoute();
+  const [apiKey, setApiKey] = useState(() => getStoredApiKey());
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setApiKey(null);
+      setAuthError("Invalid key — please log in again.");
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
 
   // Legacy redirect: #/runs/:id/cells/:scenarioId/:configId → first attempt of the cell
   // (attempt ids are deterministic `${runId}_${scenarioId}_${configId}_${index}`).
@@ -42,6 +104,19 @@ export default function App(): ReactNode {
       );
     }
   }, [legacyCell]);
+
+  if (!apiKey) {
+    return (
+      <LoginScreen
+        error={authError}
+        onUnlock={(key) => {
+          setStoredApiKey(key);
+          setApiKey(key);
+          setAuthError(null);
+        }}
+      />
+    );
+  }
 
   let page: ReactNode;
   if (parts[0] === "scenarios") {
@@ -89,6 +164,17 @@ export default function App(): ReactNode {
             Configs
           </a>
         </nav>
+        <button
+          type="button"
+          className="logout-button"
+          onClick={() => {
+            clearStoredApiKey();
+            setApiKey(null);
+            setAuthError(null);
+          }}
+        >
+          Log out
+        </button>
         <ThemeToggle />
       </header>
       <main className="app-main">{page}</main>

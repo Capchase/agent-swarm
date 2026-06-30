@@ -1,5 +1,6 @@
 import type { App } from "@slack/bolt";
 import { getAllAgents, getAllTasks } from "../be/db";
+import { handleReleaseContentTrigger } from "../linear/release-content";
 
 export function registerCommandHandler(app: App): void {
   app.command("/agent-swarm-status", async ({ ack, respond }) => {
@@ -97,6 +98,29 @@ export function registerCommandHandler(app: App): void {
     await respond({
       response_type: "ephemeral",
       blocks,
+    });
+  });
+
+  app.command("/release-content", async ({ ack, respond, command }) => {
+    await ack();
+
+    const linearTicketId = command.text?.trim();
+    if (!linearTicketId) {
+      await respond({
+        response_type: "ephemeral",
+        text: "Usage: `/release-content <linear-ticket-id>`\nExample: `/release-content TRI-7032`",
+      });
+      return;
+    }
+
+    handleReleaseContentTrigger({
+      source: "slack",
+      linearTicketId,
+    });
+
+    await respond({
+      response_type: "ephemeral",
+      text: `:pencil: Release content draft triggered for \`${linearTicketId}\`. Processing...`,
     });
   });
 }
