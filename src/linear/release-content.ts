@@ -25,8 +25,6 @@ export function handleReleaseContentTrigger(meta: ReleaseContentTriggerMeta): vo
   const parts = [
     `[ReleaseContent] Trigger — source=${meta.source}`,
     `ticket=${id}`,
-    meta.linearTicketTitle ? `title="${meta.linearTicketTitle}"` : null,
-    meta.linearTicketUrl ? `url=${meta.linearTicketUrl}` : null,
     meta.deliveryId ? `delivery=${meta.deliveryId}` : null,
   ]
     .filter(Boolean)
