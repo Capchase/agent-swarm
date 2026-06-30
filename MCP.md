@@ -793,7 +793,7 @@ Create a new scheduled task. For recurring: provide cronExpression or intervalMs
 
 **Update Scheduled Task**
 
-Update an existing scheduled task. Only the creator or lead agent can update schedules.
+Update an existing scheduled task. Any registered agent can update schedules.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -806,7 +806,7 @@ Update an existing scheduled task. Only the creator or lead agent can update sch
 
 **Delete Scheduled Task**
 
-Delete a scheduled task permanently. Only the creator or lead agent can delete schedules.
+Delete a scheduled task permanently. Any registered agent can delete schedules.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

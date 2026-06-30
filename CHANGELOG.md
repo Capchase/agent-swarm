@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.105.0] - 2026-06-30
+
+### Added
+- **Agent Swarm now emits OTLP session cost and token metrics for every harness** (#817) — finalized session-cost records export cumulative `agentswarm.cost.usd` and `agentswarm.tokens` counters alongside the existing traces.
+- **A DORA metrics community template now ships with the repo** (#848) — teams can seed a weekly DORA report playbook and schedule without building the reporting workflow from scratch.
+
+### Changed
+- **Schedule mutation gates are now relaxed for registered agents** (#847) — `update-schedule` and `delete-schedule` no longer require creator-or-lead ownership when a registered agent needs to manage an existing schedule.
+
+### Fixed
+- **Heartbeat reboot sweeps no longer cancel pre-boot stale sessions** (#846) — the concurrency-safe guard stops false crash-recovery cleanups during startup races.
+- **Page exports now render full server-side PDFs** (#840) — page PDF generation keeps the complete document instead of truncating exported output.
+- **Authed iframe launches now wait for the page session to be ready** (#839) — the UI avoids racing iframe startup before the backing page is available.
+- **Script connection audit writes now avoid agent IDs in user audit foreign keys** (#841) — credential-binding and script-connection mutations persist canonical user attribution cleanly.
+
 ## [1.104.0] - 2026-06-29
 
 ### Added

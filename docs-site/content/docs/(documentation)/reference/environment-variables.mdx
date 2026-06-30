@@ -363,11 +363,11 @@ When a session is spawned, the runner splits the credential value by commas and 
 
 ## OpenTelemetry
 
-OpenTelemetry traces are disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. See [Observability with OpenTelemetry](/docs/guides/observability-opentelemetry) for SigNoz setup, emitted spans, and query examples.
+OpenTelemetry traces and OTLP metrics are disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. See [Observability with OpenTelemetry](/docs/guides/observability-opentelemetry) for SigNoz setup, emitted spans, metric counters, and query examples.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | OTLP HTTP traces endpoint. For SigNoz Cloud, use your region's base ingest URL (e.g. `https://ingest.eu2.signoz.cloud`) — the SDK appends `/v1/traces`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Base OTLP HTTP endpoint shared by traces and metrics. For SigNoz Cloud, use your region's ingest URL (e.g. `https://ingest.eu2.signoz.cloud`) and let the SDK append `/v1/traces` and `/v1/metrics`. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | none | OTLP exporter headers, for example `signoz-ingestion-key=<key>`. Treated as sensitive by the secret scrubber |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | SDK default | Export protocol. Use `http/protobuf` for SigNoz Cloud |
 | `OTEL_SERVICE_NAME` | `agent-swarm-api` or `agent-swarm-worker` outside local compose | OpenTelemetry `service.name`. Set to `agent-swarm` everywhere to keep one service and split by `agentswarm.service.role` |
