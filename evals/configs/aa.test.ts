@@ -33,10 +33,10 @@ describe("AA mapping completeness (v7.6 item D, frozen)", () => {
     expect(mapped.size + unmatched.size).toBe(configs.length);
   });
 
-  test("frozen counts: 54 matched, 12 unmatched, 30 distinct AA rows", () => {
-    expect(Object.keys(CONFIG_AA_ROWS).length).toBe(54);
-    expect(Object.keys(AA_UNMATCHED_CONFIG_IDS).length).toBe(12);
-    // 30: Haiku, Sonnet 4.6 (max), Opus 4.8 (max), Opus 4.7 (max), Fable 5,
+  test("frozen counts: 59 matched, 21 unmatched, 32 distinct AA rows", () => {
+    expect(Object.keys(CONFIG_AA_ROWS).length).toBe(59);
+    expect(Object.keys(AA_UNMATCHED_CONFIG_IDS).length).toBe(21);
+    // 32: Haiku, Sonnet 4.6 (max), Opus 4.8 (max), Opus 4.7 (max), Fable 5,
     // DS Flash (High), DS Pro (High), Gemini 3.5 Flash, Gemini 3.1 Pro Preview
     // (v7.7 item 1), Qwen3 Coder Next, gpt-oss-120b (high),
     // Gemini 3.1 Flash-Lite, GPT-5.4 mini (medium), GPT-5.5 (medium), the
@@ -47,8 +47,9 @@ describe("AA mapping completeness (v7.6 item D, frozen)", () => {
     // Gemini 3.1 Flash-Lite gained its pi twin without adding a row), plus the
     // round-10 leaderboard additions: NVIDIA Nemotron 3 Super, MiniMax-M2.7,
     // Qwen3.6 Plus (Gemini 3.5 Flash was already a row via the gemini-flash
-    // spec-pin; grok-build-0.1 / owl-alpha have no rows).
-    expect(new Set(Object.values(CONFIG_AA_ROWS).map((m) => m.sourceRow)).size).toBe(30);
+    // spec-pin; grok-build-0.1 / owl-alpha have no rows), plus round-11 rows:
+    // Qwen3.5 397B A17B and Mistral Large 3.
+    expect(new Set(Object.values(CONFIG_AA_ROWS).map((m) => m.sourceRow)).size).toBe(32);
   });
 
   test("every sourceRow exists in the TSV", () => {

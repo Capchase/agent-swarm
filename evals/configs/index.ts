@@ -53,6 +53,12 @@ export const configs: HarnessConfig[] = [
     model: "claude-opus-4-8",
   },
   {
+    id: "claude-sonnet-4.6",
+    label: "Claude Code / sonnet 4.6",
+    provider: "claude",
+    model: "claude-sonnet-4-6",
+  },
+  {
     id: "claude-fable",
     label: "Claude Code / fable 5",
     provider: "claude",
@@ -269,6 +275,44 @@ export const configs: HarnessConfig[] = [
     provider: "pi",
     model: "openrouter/qwen/qwen3.6-plus",
   },
+  // Round-11 June 2026 catalog refresh. Every slug is present in both
+  // models.dev and OpenRouter and supports tool calls; paid slugs only.
+  {
+    id: "pi-glm-5.2",
+    label: "pi-mono / GLM 5.2 (OpenRouter)",
+    provider: "pi",
+    model: "openrouter/z-ai/glm-5.2",
+  },
+  {
+    id: "pi-kimi-k2.7-code",
+    label: "pi-mono / Kimi K2.7 Code (OpenRouter)",
+    provider: "pi",
+    model: "openrouter/moonshotai/kimi-k2.7-code",
+  },
+  {
+    id: "pi-grok-4.20",
+    label: "pi-mono / Grok 4.20 (OpenRouter)",
+    provider: "pi",
+    model: "openrouter/x-ai/grok-4.20",
+  },
+  {
+    id: "pi-qwen3.5-397b",
+    label: "pi-mono / Qwen3.5 397B A17B (OpenRouter)",
+    provider: "pi",
+    model: "openrouter/qwen/qwen3.5-397b-a17b",
+  },
+  {
+    id: "pi-mistral-large-2512",
+    label: "pi-mono / Mistral Large 2512 (OpenRouter)",
+    provider: "pi",
+    model: "openrouter/mistralai/mistral-large-2512",
+  },
+  {
+    id: "pi-llama-4-maverick",
+    label: "pi-mono / Llama 4 Maverick (OpenRouter)",
+    provider: "pi",
+    model: "openrouter/meta-llama/llama-4-maverick",
+  },
   {
     id: "opencode-gemini-flash",
     label: "opencode / Gemini 3 flash (OpenRouter)",
@@ -439,6 +483,43 @@ export const configs: HarnessConfig[] = [
     provider: "opencode",
     model: "openrouter/qwen/qwen3.6-plus",
   },
+  // Round-11 June 2026 catalog refresh — opencode twins of the pi entries above.
+  {
+    id: "opencode-glm-5.2",
+    label: "opencode / GLM 5.2 (OpenRouter)",
+    provider: "opencode",
+    model: "openrouter/z-ai/glm-5.2",
+  },
+  {
+    id: "opencode-kimi-k2.7-code",
+    label: "opencode / Kimi K2.7 Code (OpenRouter)",
+    provider: "opencode",
+    model: "openrouter/moonshotai/kimi-k2.7-code",
+  },
+  {
+    id: "opencode-grok-4.20",
+    label: "opencode / Grok 4.20 (OpenRouter)",
+    provider: "opencode",
+    model: "openrouter/x-ai/grok-4.20",
+  },
+  {
+    id: "opencode-qwen3.5-397b",
+    label: "opencode / Qwen3.5 397B A17B (OpenRouter)",
+    provider: "opencode",
+    model: "openrouter/qwen/qwen3.5-397b-a17b",
+  },
+  {
+    id: "opencode-mistral-large-2512",
+    label: "opencode / Mistral Large 2512 (OpenRouter)",
+    provider: "opencode",
+    model: "openrouter/mistralai/mistral-large-2512",
+  },
+  {
+    id: "opencode-llama-4-maverick",
+    label: "opencode / Llama 4 Maverick (OpenRouter)",
+    provider: "opencode",
+    model: "openrouter/meta-llama/llama-4-maverick",
+  },
   {
     id: "codex-5.4-mini",
     label: "Codex / gpt-5.4-mini",
@@ -456,6 +537,12 @@ export const configs: HarnessConfig[] = [
     label: "Codex / gpt-5.5",
     provider: "codex",
     model: "gpt-5.5",
+  },
+  {
+    id: "codex-5.5-pro",
+    label: "Codex / gpt-5.5-pro",
+    provider: "codex",
+    model: "gpt-5.5-pro",
   },
 ];
 

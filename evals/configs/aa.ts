@@ -131,6 +131,11 @@ export const CONFIG_AA_ROWS: Record<string, { sourceRow: string; matchedVariant:
         "(max) — the only reasoning Sonnet 4.6 row; we run with thinking on. Claude Code's " +
         "default thinking budget may sit below AA's max effort.",
     },
+    "claude-sonnet-4.6": {
+      sourceRow: "Claude Sonnet 4.6 (max)",
+      matchedVariant:
+        "(max) — pinned concrete Sonnet 4.6; same reasoning row as the moving sonnet alias.",
+    },
     // [II 61] — spec-pinned; the alias `opus` resolves to claude-opus-4-8 today.
     "claude-opus": {
       sourceRow: "Claude Opus 4.8 (max)",
@@ -337,6 +342,27 @@ export const CONFIG_AA_ROWS: Record<string, { sourceRow: string; matchedVariant:
     "opencode-nemotron-3-super": { sourceRow: "NVIDIA Nemotron 3 Super", matchedVariant: null },
     "opencode-minimax-m2.7": { sourceRow: "MiniMax-M2.7", matchedVariant: null },
     "opencode-qwen3.6-plus": { sourceRow: "Qwen3.6 Plus", matchedVariant: null },
+    // Round-11 June 2026 refresh rows present in the 2026-06-12 AA snapshot.
+    "pi-qwen3.5-397b": {
+      sourceRow: "Qwen3.5 397B A17B",
+      matchedVariant:
+        "Reasoning row — plain OpenRouter API usage with no effort param gets the default " +
+        '(reasoning) serving config; "(variant 2)" [II 40] is the lower-II non-reasoning twin.',
+    },
+    "opencode-qwen3.5-397b": {
+      sourceRow: "Qwen3.5 397B A17B",
+      matchedVariant:
+        "Reasoning row — plain OpenRouter API usage with no effort param gets the default " +
+        '(reasoning) serving config; "(variant 2)" [II 40] is the lower-II non-reasoning twin.',
+    },
+    "pi-mistral-large-2512": {
+      sourceRow: "Mistral Large 3",
+      matchedVariant: "Mistral Large 2512 is the catalog slug for the Large 3 generation.",
+    },
+    "opencode-mistral-large-2512": {
+      sourceRow: "Mistral Large 3",
+      matchedVariant: "Mistral Large 2512 is the catalog slug for the Large 3 generation.",
+    },
     // [II 38] — effort matching; "(xhigh)" [49] and bare "GPT-5.4 mini" [23] rejected.
     "codex-5.4-mini": {
       sourceRow: "GPT-5.4 mini (medium)",
@@ -375,6 +401,16 @@ export const AA_UNMATCHED_CONFIG_IDS: Record<string, string> = {
     "no Grok Build row in the 2026-06-12 snapshot — only Grok 4.3 effort rows",
   "pi-owl-alpha": "no Owl Alpha row — AA does not benchmark the OpenRouter stealth model",
   "opencode-owl-alpha": "no Owl Alpha row — AA does not benchmark the OpenRouter stealth model",
+  // Round-11 June 2026 refresh.
+  "pi-glm-5.2": "no GLM-5.2 row in the 2026-06-12 snapshot",
+  "opencode-glm-5.2": "no GLM-5.2 row in the 2026-06-12 snapshot",
+  "pi-kimi-k2.7-code": "no Kimi K2.7 Code row in the 2026-06-12 snapshot",
+  "opencode-kimi-k2.7-code": "no Kimi K2.7 Code row in the 2026-06-12 snapshot",
+  "pi-grok-4.20": "no Grok 4.20 row in the 2026-06-12 snapshot",
+  "opencode-grok-4.20": "no Grok 4.20 row in the 2026-06-12 snapshot",
+  "pi-llama-4-maverick": "no Llama 4 Maverick row in the 2026-06-12 snapshot",
+  "opencode-llama-4-maverick": "no Llama 4 Maverick row in the 2026-06-12 snapshot",
+  "codex-5.5-pro": "no GPT-5.5 Pro row in the 2026-06-12 snapshot",
 };
 
 /** Joined blocks, built eagerly so a mapping → missing-row typo fails at import. */
