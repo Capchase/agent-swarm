@@ -203,7 +203,10 @@ describe("getValidCodexOAuth — concurrent pool refresh", () => {
       } satisfies CodexOAuthCredentials,
     };
 
-    globalThis.fetch = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    globalThis.fetch = async (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => {
       const urlStr = typeof url === "string" ? url : url.toString();
       const method = (init?.method ?? "GET").toUpperCase();
 

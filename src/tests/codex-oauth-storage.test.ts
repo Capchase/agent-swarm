@@ -22,7 +22,8 @@ const mockCreds: CodexOAuthCredentials = {
 
 /** Immediately grants/releases the refresh lock — for tests exercising refresh mechanics, not the lock itself. */
 function mockLockResponse(method: string): Response | null {
-  if (method === "POST") return new Response(JSON.stringify({ owner: "test-owner" }), { status: 200 });
+  if (method === "POST")
+    return new Response(JSON.stringify({ owner: "test-owner" }), { status: 200 });
   if (method === "DELETE") return new Response(null, { status: 204 });
   return null;
 }
