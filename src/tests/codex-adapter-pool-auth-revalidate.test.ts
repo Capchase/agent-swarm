@@ -19,6 +19,16 @@
  * `codex-oauth-refresh-lock.test.ts` uses — so "the pool path now refreshes
  * through the lock" is proven at the adapter boundary, not only via direct
  * calls to `getValidCodexOAuth()`.
+ *
+ * Review finding #2 (PR #881, near-expiry): an already-expired slot is only
+ * half the race. A slot that is still valid — or valid but within the refresh
+ * skew — used to be handed to the spawned Codex CLI WITH its refresh token, so
+ * two tasks sharing the slot could both refresh locally (outside the lock)
+ * once the token expired mid-session and replay the same refresh token. The
+ * near-expiry cases below prove (a) the skew routes a near-expiry slot through
+ * the lock exactly once and (b) the pool auth.json handed to every spawned CLI
+ * carries an empty refresh token, so no CLI can rotate the family outside the
+ * lock regardless of when its access token expires.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
@@ -191,9 +201,13 @@ describe("resolveCodexAuthMode — pool path revalidates through the lock", () =
     expect(store.creds.refresh).toBe("rt_gen1");
 
     // auth.json on disk was rewritten with the freshly-rotated token, not
-    // left holding the stale one the runner originally materialized.
-    const written = JSON.parse(readCurrent() ?? "{}") as { tokens: { access_token: string } };
+    // left holding the stale one the runner originally materialized — and the
+    // refresh token was stripped so the spawned CLI can't rotate outside the lock.
+    const written = JSON.parse(readCurrent() ?? "{}") as {
+      tokens: { access_token: string; refresh_token: string };
+    };
     expect(written.tokens.access_token).toBe("at_gen1");
+    expect(written.tokens.refresh_token).toBe("");
   });
 
   it("performs exactly ONE exchange when two concurrent adapter resolutions race the same materialized slot", async () => {
@@ -243,6 +257,121 @@ describe("resolveCodexAuthMode — pool path revalidates through the lock", () =
     expect(modeA).toBe("chatgpt");
     expect(modeB).toBe("chatgpt");
     expect(store.creds.access).toBe("at_gen1");
+  });
+
+  it("strips the refresh token from the pool auth.json handed to the spawned CLI even when the token is still valid (no exchange)", async () => {
+    // A pool slot whose access token is comfortably valid (1h out, well past
+    // the near-expiry skew) — `getValidCodexOAuth` returns it untouched, no
+    // `/oauth/token` exchange happens. This is exactly the case the reviewer
+    // flagged: the fast path returns the stored creds and rewrites auth.json.
+    // The guarantee is that the spawned CLI still never receives a rotatable
+    // refresh token, so it can't refresh outside the lock if the token later
+    // expires during the (up-to-1h) session.
+    const store = {
+      creds: {
+        access: "at_valid",
+        refresh: "rt_valid",
+        expires: Date.now() + 60 * 60 * 1000, // 1h out — not expiring soon
+        accountId: "acc-test",
+      } satisfies CodexOAuthCredentials,
+    };
+    installMockTransport(store);
+
+    setFetchForTesting(async () => {
+      throw new Error("no /oauth/token exchange should happen for a still-valid token");
+    });
+
+    const runnerMaterialized = JSON.stringify({
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: store.creds.access,
+        access_token: store.creds.access,
+        // The runner also strips this in production; seed the un-stripped
+        // shape here so the assertion proves the ADAPTER does the stripping.
+        refresh_token: store.creds.refresh,
+        account_id: store.creds.accountId,
+      },
+      last_refresh: new Date(store.creds.expires).toISOString(),
+    });
+    const { fs, homedir, readCurrent } = fakeAuthJsonFs(runnerMaterialized);
+
+    const authMode = await resolveCodexAuthMode(baseConfig(0), () => {}, { homedir, fs });
+
+    expect(authMode).toBe("chatgpt");
+    // Config store keeps the real refresh token — it's still the sole,
+    // lock-guarded refresher's source of truth.
+    expect(store.creds.refresh).toBe("rt_valid");
+    // The on-disk auth.json the CLI reads has NO usable refresh token.
+    const written = JSON.parse(readCurrent() ?? "{}") as {
+      tokens: { access_token: string; refresh_token: string };
+    };
+    expect(written.tokens.access_token).toBe("at_valid");
+    expect(written.tokens.refresh_token).toBe("");
+  });
+
+  it("performs exactly ONE exchange for two concurrent adapter resolutions racing a NEAR-EXPIRY (still valid) slot, and strips the refresh token from both auth.json files", async () => {
+    // Valid but within the near-expiry skew: the fast path used to return this
+    // unchanged, letting two spawned CLIs both refresh it locally moments
+    // later. The skew now routes it through the lock (exactly one exchange)
+    // and the refresh token is stripped from what each CLI receives.
+    const store = {
+      creds: {
+        access: "at_stale",
+        refresh: "rt_gen0",
+        expires: Date.now() + 30 * 1000, // 30s out — inside REFRESH_SKEW_MS
+        accountId: "acc-test",
+      } satisfies CodexOAuthCredentials,
+    };
+    installMockTransport(store);
+
+    let exchangeCount = 0;
+    setFetchForTesting(async () => {
+      exchangeCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return new Response(
+        JSON.stringify({ access_token: "at_gen1", refresh_token: "rt_gen1", expires_in: 3600 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    const runnerMaterialized = JSON.stringify({
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: store.creds.access,
+        access_token: store.creds.access,
+        refresh_token: store.creds.refresh,
+        account_id: store.creds.accountId,
+      },
+      last_refresh: new Date(store.creds.expires).toISOString(),
+    });
+
+    const fsA = fakeAuthJsonFs(runnerMaterialized);
+    const fsB = fakeAuthJsonFs(runnerMaterialized);
+
+    const [modeA, modeB] = await Promise.all([
+      resolveCodexAuthMode(baseConfig(0), () => {}, { homedir: fsA.homedir, fs: fsA.fs }),
+      resolveCodexAuthMode(baseConfig(0), () => {}, { homedir: fsB.homedir, fs: fsB.fs }),
+    ]);
+
+    // The near-expiry slot was refreshed exactly once through the lock — the
+    // loser adopted the winner's rotated token instead of re-exchanging.
+    expect(exchangeCount).toBe(1);
+    expect(modeA).toBe("chatgpt");
+    expect(modeB).toBe("chatgpt");
+    expect(store.creds.access).toBe("at_gen1");
+    expect(store.creds.refresh).toBe("rt_gen1");
+
+    // Neither spawned CLI can rotate the family outside the lock: both
+    // auth.json files carry the fresh access token and an empty refresh token.
+    for (const readCurrent of [fsA.readCurrent, fsB.readCurrent]) {
+      const written = JSON.parse(readCurrent() ?? "{}") as {
+        tokens: { access_token: string; refresh_token: string };
+      };
+      expect(written.tokens.access_token).toBe("at_gen1");
+      expect(written.tokens.refresh_token).toBe("");
+    }
   });
 
   it("does not touch a non-pool (codexSlot undefined) auth.json that is already chatgpt mode", async () => {
