@@ -26,8 +26,27 @@ const REFRESH_LOCK_TTL_MS = 2 * 60 * 1000;
 const REFRESH_LOCK_WAIT_MS = 30 * 1000;
 const REFRESH_LOCK_POLL_MS = 250;
 
+/**
+ * How far ahead of actual expiry a token is treated as needing refresh —
+ * matches the default `bufferMs` in `isTokenExpiringSoon`
+ * (`src/be/db-queries/oauth.ts`), the tracker-OAuth path's equivalent skew.
+ *
+ * Without this, a token that is still technically valid but seconds from
+ * expiry sails through the fast path (`Date.now() < creds.expires`) with no
+ * lock at all — two pool callers can both read it as "valid", proceed to use
+ * it, and race an independent refresh moments later. Treating near-expiry
+ * the same as already-expired routes both callers through the same
+ * lock-and-re-read critical section below, so only one of them refreshes.
+ */
+const REFRESH_SKEW_MS = 5 * 60 * 1000;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True once `expires` is within `REFRESH_SKEW_MS` of now (or already past). */
+function isExpiringSoon(expires: number): boolean {
+  return Date.now() >= expires - REFRESH_SKEW_MS;
 }
 
 /**
@@ -257,6 +276,11 @@ export async function persistCodexOAuth(
  * tracker-OAuth path uses (`src/oauth/ensure-token.ts`), re-reading the
  * stored credentials after acquiring the lock so a caller that lost the race
  * picks up the winner's freshly-rotated tokens instead of re-exchanging.
+ *
+ * A token that is still valid but within `REFRESH_SKEW_MS` of expiry is
+ * treated the same as an already-expired one — it also goes through the
+ * lock-and-re-read path below — so two callers can't both observe it as
+ * "valid" and independently refresh it moments apart.
  */
 export async function getValidCodexOAuth(
   apiUrl: string,
@@ -265,7 +289,7 @@ export async function getValidCodexOAuth(
 ): Promise<CodexOAuthCredentials | null> {
   let creds = await loadCodexOAuth(apiUrl, apiKey, slot);
   if (!creds) return null;
-  if (Date.now() < creds.expires) return creds;
+  if (!isExpiringSoon(creds.expires)) return creds;
 
   const waitStartedAt = Date.now();
   for (;;) {
@@ -273,7 +297,7 @@ export async function getValidCodexOAuth(
     // refreshed since our last read, above or on a prior loop iteration.
     creds = await loadCodexOAuth(apiUrl, apiKey, slot);
     if (!creds) return null;
-    if (Date.now() < creds.expires) return creds;
+    if (!isExpiringSoon(creds.expires)) return creds;
 
     const owner = await acquireCodexRefreshLock(apiUrl, apiKey, slot);
     if (!owner) {
@@ -290,9 +314,9 @@ export async function getValidCodexOAuth(
       // rotated the refresh token between our last read and lock acquisition.
       const lockedCreds = await loadCodexOAuth(apiUrl, apiKey, slot);
       if (!lockedCreds) return null;
-      if (Date.now() < lockedCreds.expires) return lockedCreds;
+      if (!isExpiringSoon(lockedCreds.expires)) return lockedCreds;
 
-      console.log("[codex-oauth] Token expired, refreshing...");
+      console.log("[codex-oauth] Token expired or expiring soon, refreshing...");
       const result = await refreshAccessToken(lockedCreds.refresh);
       if (result.type !== "success") {
         console.error("[codex-oauth] Token refresh failed");

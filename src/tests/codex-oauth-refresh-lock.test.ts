@@ -162,6 +162,59 @@ describe("getValidCodexOAuth — concurrent pool refresh", () => {
     expect(store.creds.refresh).toBe("rt_gen1");
   });
 
+  it("performs exactly ONE /oauth/token exchange when two callers race the same near-expiry (but not yet expired) slot", async () => {
+    const store = {
+      creds: {
+        access: "at_stale",
+        refresh: "rt_gen0",
+        // Still technically valid, but inside the refresh-skew window — must
+        // be treated the same as expired, not fast-pathed past the lock.
+        expires: Date.now() + 30 * 1000,
+        accountId: "acc-test",
+      } satisfies CodexOAuthCredentials,
+    };
+    installMockTransport(store);
+
+    let exchangeCount = 0;
+    const seenRefreshTokens: string[] = [];
+    setFetchForTesting(async (_url: string | URL | Request, init?: RequestInit) => {
+      exchangeCount += 1;
+      const params = new URLSearchParams((init?.body as string) ?? "");
+      seenRefreshTokens.push(params.get("refresh_token") ?? "");
+      // Widen the race window so both callers are guaranteed to be past
+      // their initial (pre-lock) read before either finishes exchanging.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return new Response(
+        JSON.stringify({
+          access_token: "at_gen1",
+          refresh_token: "rt_gen1",
+          expires_in: 3600,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    const [first, second] = await Promise.all([
+      getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY, 0),
+      getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY, 0),
+    ]);
+
+    // The core claim: only one caller ever exchanged rt_gen0 with OpenAI,
+    // even though the token was still technically valid (not yet expired)
+    // when both callers made their first read.
+    expect(exchangeCount).toBe(1);
+    expect(seenRefreshTokens).toEqual(["rt_gen0"]);
+
+    // Both callers must observe the SAME rotated credentials.
+    expect(first?.access).toBe("at_gen1");
+    expect(second?.access).toBe("at_gen1");
+    expect(first?.refresh).toBe("rt_gen1");
+    expect(second?.refresh).toBe("rt_gen1");
+
+    expect(store.creds.access).toBe("at_gen1");
+    expect(store.creds.refresh).toBe("rt_gen1");
+  });
+
   it("does not re-exchange when a third caller arrives after the race is already resolved", async () => {
     const store = {
       creds: {
