@@ -111,6 +111,45 @@ describe("resolveHarnessProvider", () => {
   test("trims whitespace before validating", () => {
     expect(resolveHarnessProvider({ HARNESS_PROVIDER: "  codex  " }, {})).toBe("codex");
   });
+
+  test("prefers 'pi' when unset and only an OpenRouter key is present (fallbackEnv)", () => {
+    expect(resolveHarnessProvider({}, { OPENROUTER_API_KEY: "sk-or-v1-xxx" })).toBe("pi");
+  });
+
+  test("prefers 'pi' when unset and only an OpenRouter key is present (resolvedEnv)", () => {
+    expect(resolveHarnessProvider({ OPENROUTER_API_KEY: "sk-or-v1-xxx" }, {})).toBe("pi");
+  });
+
+  test("prefers 'pi' when invalid and only an OpenRouter key is present", () => {
+    expect(
+      resolveHarnessProvider(
+        { HARNESS_PROVIDER: "not-a-provider" },
+        { OPENROUTER_API_KEY: "sk-or-v1-xxx" },
+      ),
+    ).toBe("pi");
+  });
+
+  test("keeps 'claude' when both an OpenRouter key and an Anthropic API key are present", () => {
+    expect(
+      resolveHarnessProvider(
+        {},
+        { OPENROUTER_API_KEY: "sk-or-v1-xxx", ANTHROPIC_API_KEY: "sk-ant-xxx" },
+      ),
+    ).toBe("claude");
+  });
+
+  test("keeps 'claude' when both an OpenRouter key and a Claude Code OAuth token are present", () => {
+    expect(
+      resolveHarnessProvider(
+        {},
+        { OPENROUTER_API_KEY: "sk-or-v1-xxx", CLAUDE_CODE_OAUTH_TOKEN: "token-xxx" },
+      ),
+    ).toBe("claude");
+  });
+
+  test("keeps 'claude' when no credentials are present at all", () => {
+    expect(resolveHarnessProvider({}, {})).toBe("claude");
+  });
 });
 
 // ─── validateConfigValue ─────────────────────────────────────────────────────
