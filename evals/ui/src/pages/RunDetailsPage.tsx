@@ -47,6 +47,7 @@ import {
 } from "../components/StatusBadge.tsx";
 import { InfoTip, Tooltip } from "../components/Tooltip.tsx";
 import { type ConfigLookup, navigate, useConfigs, usePoll } from "../hooks.ts";
+import { explainCheck, observedText } from "../lib/check-descriptions.ts";
 import {
   memberLabel,
   type NormalizedSandboxInfo,
@@ -682,6 +683,22 @@ export default function RunDetailsPage(props: {
                         }
                       : null
                   }
+                  outcome={
+                    attempt
+                      ? {
+                          status: attempt.status,
+                          score: attempt.score,
+                          judgments: judgments.map((j) => ({
+                            kind: j.kind,
+                            name: j.name,
+                            pass: j.pass,
+                            score: j.score,
+                            reasoning: j.reasoning,
+                            dimension: j.dimension,
+                          })),
+                        }
+                      : null
+                  }
                   focusTask={focusTask !== null && focusTask.attemptId === selId ? focusTask : null}
                 />
               ) : (
@@ -1005,7 +1022,7 @@ function AttemptSummary(props: {
         <TaskRows tasks={props.tasks} members={props.members} onOpenTask={props.onOpenTask} />
       ) : attempt.taskIds.length > 0 ? (
         <div className="rd-tasks">
-          <span className="meta-label">Tasks</span>
+          <span className="meta-label">Run Tasks · {attempt.taskIds.length}</span>
           {attempt.taskIds.map((taskId) => {
             const flag = taskFlags.get(taskId);
             return (
@@ -1115,7 +1132,14 @@ function TaskRows(props: {
   // refs (taskRefLabel resolves by position in props.tasks) never shift.
   return (
     <div className="rd-taskrows">
-      <span className="rd-taskrows-label">Tasks</span>
+      <span className="rd-taskrows-label">
+        Run Tasks · {runTasks.length}
+        {seedTasks.length > 0 ? (
+          <Tooltip text="Seeded history rows are scenario reference data loaded before the attempt; they are not tasks created by this run.">
+            <span className="rd-taskrows-source"> + {seedTasks.length} seeded</span>
+          </Tooltip>
+        ) : null}
+      </span>
       {runTasks.map((t) => (
         <TaskRow
           key={t.id}
@@ -1139,7 +1163,7 @@ function TaskRows(props: {
             }
             onClick={() => setShowSeed((v) => !v)}
           >
-            {showSeed ? "▾" : "▸"} Seeded history ({seedTasks.length})
+            {showSeed ? "▾" : "▸"} Scenario Seeded History ({seedTasks.length})
           </button>
           {showSeed
             ? seedTasks.map((t) => (
@@ -1823,7 +1847,16 @@ const JUDGMENT_COLUMNS: Column<JudgmentJson>[] = [
     header: "Name",
     sortValue: (j) => j.name,
     titleText: (j) => j.name,
-    render: (j) => <span className="rd-judgment-name">{j.name}</span>,
+    render: (j) => {
+      const explanation = explainCheck(j.name);
+      return (
+        <Tooltip text={`${j.name}\n${explanation.verifies}`}>
+          <span className="rd-judgment-name">
+            {j.kind === "deterministic" ? explanation.title : humanizeKey(j.name)}
+          </span>
+        </Tooltip>
+      );
+    },
   },
   {
     // v8.0 OutcomeSpec v2: the weighted dimension this judgment feeds. Gate rows
@@ -2047,9 +2080,28 @@ function JudgmentDetail(props: { judgment: JudgmentJson }): ReactNode {
   const isLlmKind = j.kind !== "deterministic";
   const hasTrace = j.steps !== null;
   const [showRaw, setShowRaw] = useState(false);
+  const explanation = explainCheck(j.name);
   return (
     <div className="rd-judgment-detail">
-      {j.reasoning ? <div className="rd-judgment-reason">{j.reasoning}</div> : null}
+      {j.kind === "deterministic" ? (
+        <div className="rd-judgment-explain">
+          <div>
+            <span className="meta-label">Verifies</span>
+            <div>{explanation.verifies}</div>
+          </div>
+          <div>
+            <span className="meta-label">Observed</span>
+            <div>{observedText(j.reasoning, j.pass, j.score)}</div>
+          </div>
+          <div>
+            <span className="meta-label">Raw check</span>
+            <code>{j.name}</code>
+          </div>
+        </div>
+      ) : null}
+      {j.kind !== "deterministic" && j.reasoning ? (
+        <div className="rd-judgment-reason">{j.reasoning}</div>
+      ) : null}
       {hasTrace ? (
         <>
           <div className="rd-judgment-trace">
