@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.106.0] - 2026-07-01
+
+### Added
+- **Saved scripts can now be exposed as external HTTP APIs** (#862) — swarm scripts can be published at `POST /api/x/script/<id>` with optional bearer auth, request-shape validation, usage tracking, and MCP management via `script-apis`.
+- **Evals now cover orchestration substrate scenarios plus a gated UI flow** (#863, #853) — the eval harness gained broader orchestration coverage while the evals UI added a login gate for controlled access.
+
+### Changed
+- **Claude Managed Agents now default to `claude-sonnet-5`** (#861) — managed-agent setup, model registries, pricing metadata, and runtime selectors were updated for the new default.
+- **The evals stack is easier to ship as a standalone service with refreshed June model configs** (#852, #860) — deployment and scenario config updates keep the eval environment aligned with the current model set.
+- **Worker-image harness pins refreshed** (#868) — the weekly Docker worker bump updates Claude Code, Codex, OpenCode, and pi-family versions bundled into the worker image.
+- **Environment-variable reference coverage expanded** — the docs now include missing heartbeat, workflow, script-runtime, provider, Jira, Composio, Pages, and UI dev-server settings plus corrected memory-rater variable names.
+
+### Fixed
+- **Codex loop detection now handles nested MCP args and low-cardinality ping-pong patterns correctly** (#856) — legitimate edit/test and `script-upsert`/`script-run` cycles no longer trip false-positive loop kills as early.
+- **Evals infra reliability issues were tightened up across TLS, health checks, and registry cache refreshes** (#854, #855, #864) — Turso TLS bootstrap, Docker healthcheck quoting, and registry cache revalidation all fail less often.
+- **Worker and setup-script privilege boundaries were hardened** (#865, #866) — per-agent setup scripts now run after privilege drop, accepted setupScript updates are syntax-validated and audited, and the worker image no longer grants blanket passwordless sudo.
+- **MCP, register-service, and harness-provider security guardrails were tightened** (#869, #870, #872) — owner MCP sessions are bound to the initializing `X-Agent-ID`, PM2 service configs are validated before persistence, and harness fallback now considers available credentials instead of defaulting unconditionally to Claude.
+- **Evals runs, artifacts, checks, and transcripts are more reliable and easier to inspect** (#871, #873, #876) — startup reconciles orphaned eval runs, log artifacts load through the authenticated UI helper, check descriptions are clearer, and transcripts surface final attempt outcomes plus provider-specific tool inputs.
+
 ## [1.105.0] - 2026-06-30
 
 ### Added
