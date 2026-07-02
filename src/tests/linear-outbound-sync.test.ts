@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, initDb } from "../be/db";
+import { closeDb, createTaskExtended, initDb, upsertKv } from "../be/db";
 import { createTrackerSync, getTrackerSync, updateTrackerSync } from "../be/db-queries/tracker";
 import { initLinearOutboundSync, teardownLinearOutboundSync } from "../linear/outbound";
 import { taskSessionMap } from "../linear/sync";
@@ -305,5 +305,294 @@ describe("Linear Outbound Sync", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     expect(mockCreateComment).not.toHaveBeenCalled();
+  });
+
+  // ── Child-task forwarding tests ────────────────────────────────────────────
+  // These tests create real tasks (for parentTaskId resolution) and use a
+  // drain+clear pattern: set up root task + session, wait for any async
+  // task.created events from createTaskExtended to drain, clear mocks, then
+  // create/emit the child event and assert.
+
+  test("child task created posts sub-task action to Linear session", async () => {
+    // Set up root task and session BEFORE child, drain root's task.created event
+    const rootTask = createTaskExtended("Root task from Linear issue", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-CHILD-CREATED",
+      syncDirection: "bidirectional",
+    });
+    taskSessionMap.set(rootTask.id, "linear-session-child-created");
+
+    // Drain async task.created from root, then reset mocks
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionAction.mockClear();
+
+    // Create child task — createTaskExtended fires task.created asynchronously
+    const childTask = createTaskExtended("Child sub-task", { parentTaskId: rootTask.id });
+
+    // Wait for the async task.created event to fire and be handled
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockPostAgentSessionAction).toHaveBeenCalledTimes(1);
+    const args = mockPostAgentSessionAction.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("linear-session-child-created");
+    expect(args[1]).toBe("Sub-task started");
+    expect(args[2] as string).toContain(childTask.id);
+  });
+
+  test("child task progress posts action to Linear session", async () => {
+    const rootTask = createTaskExtended("Root task linear", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-CHILD-PROGRESS",
+      syncDirection: "bidirectional",
+    });
+    taskSessionMap.set(rootTask.id, "linear-session-child-progress");
+
+    const childTask = createTaskExtended("Child sub-task progress", { parentTaskId: rootTask.id });
+
+    // Drain setup events, reset mocks, then emit the specific lifecycle event
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionAction.mockClear();
+
+    workflowEventBus.emit("task.progress", {
+      taskId: childTask.id,
+      progress: "Working on sub-task...",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockPostAgentSessionAction).toHaveBeenCalledTimes(1);
+    const args = mockPostAgentSessionAction.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("linear-session-child-progress");
+    expect(args[2] as string).toBe("Working on sub-task...");
+  });
+
+  test("child task completed posts thought (not endAgentSession) to Linear", async () => {
+    const rootTask = createTaskExtended("Root task linear complete", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-CHILD-COMPLETE",
+      syncDirection: "bidirectional",
+    });
+    taskSessionMap.set(rootTask.id, "linear-session-child-complete");
+
+    const childTask = createTaskExtended("Child sub-task complete", { parentTaskId: rootTask.id });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionThought.mockClear();
+    mockEndAgentSession.mockClear();
+
+    workflowEventBus.emit("task.completed", {
+      taskId: childTask.id,
+      output: "Sub-task done!",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Must post a thought, NOT end the session
+    expect(mockPostAgentSessionThought).toHaveBeenCalledTimes(1);
+    expect(mockEndAgentSession).not.toHaveBeenCalled();
+
+    const args = mockPostAgentSessionThought.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("linear-session-child-complete");
+    expect(args[1] as string).toContain(childTask.id);
+    expect(args[1] as string).toContain("Sub-task done!");
+  });
+
+  test("child task failed posts thought (not endAgentSession) to Linear", async () => {
+    const rootTask = createTaskExtended("Root task linear fail", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-CHILD-FAIL",
+      syncDirection: "bidirectional",
+    });
+    taskSessionMap.set(rootTask.id, "linear-session-child-fail");
+
+    const childTask = createTaskExtended("Child sub-task fail", { parentTaskId: rootTask.id });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionThought.mockClear();
+    mockEndAgentSession.mockClear();
+
+    workflowEventBus.emit("task.failed", {
+      taskId: childTask.id,
+      failureReason: "Build error!",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockPostAgentSessionThought).toHaveBeenCalledTimes(1);
+    expect(mockEndAgentSession).not.toHaveBeenCalled();
+
+    const args = mockPostAgentSessionThought.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("linear-session-child-fail");
+    expect(args[1] as string).toContain(childTask.id);
+    expect(args[1] as string).toContain("Build error!");
+  });
+
+  test("child task cancelled posts thought to Linear", async () => {
+    const rootTask = createTaskExtended("Root task linear cancel", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-CHILD-CANCEL",
+      syncDirection: "bidirectional",
+    });
+    taskSessionMap.set(rootTask.id, "linear-session-child-cancel");
+
+    const childTask = createTaskExtended("Child sub-task cancel", { parentTaskId: rootTask.id });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionThought.mockClear();
+    mockEndAgentSession.mockClear();
+
+    workflowEventBus.emit("task.cancelled", { taskId: childTask.id });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockPostAgentSessionThought).toHaveBeenCalledTimes(1);
+    expect(mockEndAgentSession).not.toHaveBeenCalled();
+
+    const args = mockPostAgentSessionThought.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("linear-session-child-cancel");
+    expect(args[1] as string).toContain(childTask.id);
+  });
+
+  test("session resolved from KV when not in in-memory map (process restart simulation)", async () => {
+    // Simulate process restart: session ID is in KV but not in taskSessionMap
+    const rootTask = createTaskExtended("Root task kv session", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-KV-SESSION",
+      syncDirection: "bidirectional",
+    });
+    // Persist session ID to KV (as sync.ts does) but do NOT set taskSessionMap
+    upsertKv({
+      namespace: "linear:session",
+      key: rootTask.id,
+      value: "kv-session-id",
+      valueType: "string",
+    });
+
+    const childTask = createTaskExtended("Child after restart", { parentTaskId: rootTask.id });
+
+    // Drain setup events, reset mocks
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionAction.mockClear();
+
+    workflowEventBus.emit("task.progress", {
+      taskId: childTask.id,
+      progress: "progress after restart",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockPostAgentSessionAction).toHaveBeenCalledTimes(1);
+    const args = mockPostAgentSessionAction.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("kv-session-id");
+  });
+
+  test("root task progress resolves session from KV after restart (not in-memory map)", async () => {
+    // Simulate process restart: session is in KV but taskSessionMap was cleared
+    const rootTask = createTaskExtended("Root task progress kv restart", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-ROOT-KV-PROGRESS",
+      syncDirection: "bidirectional",
+    });
+    upsertKv({
+      namespace: "linear:session",
+      key: rootTask.id,
+      value: "root-kv-session-progress",
+      valueType: "string",
+    });
+    // Do NOT populate taskSessionMap — simulates process restart
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionAction.mockClear();
+    mockCreateComment.mockClear();
+
+    workflowEventBus.emit("task.progress", {
+      taskId: rootTask.id,
+      progress: "Root task progress after restart",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Must use AgentSession path, not the issue-comment fallback
+    expect(mockPostAgentSessionAction).toHaveBeenCalledTimes(1);
+    expect(mockCreateComment).not.toHaveBeenCalled();
+    const args = mockPostAgentSessionAction.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("root-kv-session-progress");
+  });
+
+  test("root task completion resolves session from KV after restart (not issue comment)", async () => {
+    // Simulate process restart: session is in KV but taskSessionMap was cleared
+    const rootTask = createTaskExtended("Root task completion kv restart", { source: "linear" });
+    createTrackerSync({
+      provider: "linear",
+      entityType: "task",
+      swarmId: rootTask.id,
+      externalId: "LIN-ROOT-KV-COMPLETE",
+      syncDirection: "bidirectional",
+    });
+    upsertKv({
+      namespace: "linear:session",
+      key: rootTask.id,
+      value: "root-kv-session-complete",
+      valueType: "string",
+    });
+    // Do NOT populate taskSessionMap — simulates process restart
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockEndAgentSession.mockClear();
+    mockCreateComment.mockClear();
+
+    workflowEventBus.emit("task.completed", {
+      taskId: rootTask.id,
+      output: "Root task done after restart!",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Must call endAgentSession (AgentSession path), not createComment (issue fallback)
+    expect(mockEndAgentSession).toHaveBeenCalledTimes(1);
+    expect(mockCreateComment).not.toHaveBeenCalled();
+    const args = mockEndAgentSession.mock.calls[0] as unknown[];
+    expect(args[0]).toBe("root-kv-session-complete");
+    expect(args[1] as string).toContain("Root task done after restart!");
+    expect(args[2]).toBe("response");
+  });
+
+  test("non-Linear tasks (no ancestor tracked) are still no-ops", async () => {
+    // Task with no Linear session in its ancestry — drain setup events first
+    const orphanTask = createTaskExtended("Orphan task no linear");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockPostAgentSessionAction.mockClear();
+    mockPostAgentSessionThought.mockClear();
+
+    workflowEventBus.emit("task.created", {
+      taskId: orphanTask.id,
+      source: "mcp",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(mockPostAgentSessionAction).not.toHaveBeenCalled();
+    expect(mockPostAgentSessionThought).not.toHaveBeenCalled();
   });
 });
