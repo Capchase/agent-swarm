@@ -430,6 +430,69 @@ describe("collectProfilePayloads (baseline integration)", () => {
     expect(payloads[0]?.body.claudeMd).toBe("modified claude md");
   });
 
+  test("session_sync skips unchanged setupScript when baseline matches extracted content", async () => {
+    const setupContent = "export X=1";
+    const baselines: IdentityBaselines = { setupScript: contentSha256(setupContent) };
+
+    const files = reader({
+      [SETUP_SCRIPT_PATH]: `#!/bin/bash\necho prelude\n${MARKER_START}\n${setupContent}\n${MARKER_END}`,
+      [IDENTITY_BASELINES_PATH]: JSON.stringify(baselines),
+    });
+
+    const payloads = await collectProfilePayloads(["setup"], "session_sync", files);
+    expect(payloads).toEqual([]);
+  });
+
+  test("session_sync syncs modified setupScript when baseline differs", async () => {
+    const baselines: IdentityBaselines = { setupScript: contentSha256("export X=1") };
+
+    const files = reader({
+      [SETUP_SCRIPT_PATH]: `${MARKER_START}\nexport X=2\n${MARKER_END}`,
+      [IDENTITY_BASELINES_PATH]: JSON.stringify(baselines),
+    });
+
+    const payloads = await collectProfilePayloads(["setup"], "session_sync", files);
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.body).toEqual({
+      setupScript: "export X=2",
+      changeSource: "session_sync",
+    });
+  });
+
+  test("self_edit syncs setupScript even when baseline matches", async () => {
+    const setupContent = "export X=1";
+
+    const files = reader({
+      [SETUP_SCRIPT_PATH]: `${MARKER_START}\n${setupContent}\n${MARKER_END}`,
+      [IDENTITY_BASELINES_PATH]: JSON.stringify({
+        setupScript: contentSha256(setupContent),
+      }),
+    });
+
+    const payloads = await collectProfilePayloads(["setup"], "self_edit", files);
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.body).toEqual({
+      setupScript: setupContent,
+      changeSource: "self_edit",
+    });
+  });
+
+  test("session_sync preserves setupScript sync when baseline entry is missing", async () => {
+    const files = reader({
+      [SETUP_SCRIPT_PATH]: `${MARKER_START}\nexport X=1\n${MARKER_END}`,
+      [IDENTITY_BASELINES_PATH]: JSON.stringify({
+        toolsMd: contentSha256("tools"),
+      }),
+    });
+
+    const payloads = await collectProfilePayloads(["setup"], "session_sync", files);
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.body).toEqual({
+      setupScript: "export X=1",
+      changeSource: "session_sync",
+    });
+  });
+
   test("session_sync proceeds normally when baselines file is missing", async () => {
     const files = reader({
       [TOOLS_MD_PATH]: "tools content",

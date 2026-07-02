@@ -58,7 +58,9 @@ import { buildContextPreamble, buildResumeContextPreamble } from "./context-prea
 import { awaitCredentials, BootMaxWaitExceededError, EX_CONFIG } from "./credential-wait.ts";
 import {
   contentSha256,
+  extractSetupScriptContent,
   resolveClaudeMdPath,
+  SETUP_SCRIPT_PATH,
   syncProfileFilesToServer,
   writeIdentityBaselines,
 } from "./profile-sync.ts";
@@ -4429,8 +4431,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   // Only create if it doesn't exist — the entrypoint already composed/prepended it at container start
   if (agentSetupScript) {
     try {
-      if (!(await Bun.file("/workspace/start-up.sh").exists())) {
-        await Bun.write("/workspace/start-up.sh", `#!/bin/bash\n${agentSetupScript}\n`);
+      if (!(await Bun.file(SETUP_SCRIPT_PATH).exists())) {
+        await Bun.write(SETUP_SCRIPT_PATH, `#!/bin/bash\n${agentSetupScript}\n`);
         console.log(`[${role}] Wrote start-up.sh to workspace`);
       }
     } catch (err) {
@@ -4479,8 +4481,13 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     if (agentToolsMd) baselines.toolsMd = contentSha256(agentToolsMd);
     if (agentHeartbeatMd) baselines.heartbeatMd = contentSha256(agentHeartbeatMd);
     if (agentClaudeMd) baselines.claudeMd = contentSha256(agentClaudeMd);
+    const setupFile = Bun.file(SETUP_SCRIPT_PATH);
+    if (await setupFile.exists()) {
+      const setupContent = extractSetupScriptContent(await setupFile.text());
+      if (setupContent !== null) baselines.setupScript = contentSha256(setupContent);
+    }
     await writeIdentityBaselines(baselines);
-    console.log(`[${role}] Recorded identity file baselines for session-end sync`);
+    console.log(`[${role}] Recorded profile file baselines for session-end sync`);
   } catch {
     // Non-fatal — worst case, session-end sync proceeds as before (blind overwrite)
   }

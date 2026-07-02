@@ -36,11 +36,11 @@ export const HEARTBEAT_MD_PATH = "/workspace/HEARTBEAT.md";
 export const SETUP_SCRIPT_PATH = "/workspace/start-up.sh";
 
 // ──────────────────────────────────────────────────────────────────────────
-// Identity-file baseline hashes — prevents session-end sync from clobbering
+// Profile-file baseline hashes — prevents session-end sync from clobbering
 // DB-side edits made by Lead (via update-profile) during a running session.
 //
 // Flow:
-//   1. Runner writes DB content → /workspace/*.md at session start.
+//   1. Runner writes DB content → /workspace files at session start.
 //   2. Runner records SHA-256 hashes of the written content (the "baselines").
 //   3. At session end, sync compares current file hash against its baseline.
 //      - Hash matches → file untouched by the agent → skip sync (preserves
@@ -258,8 +258,8 @@ async function readFileIfExists(path: string): Promise<string | undefined> {
  * the field-selection / guard logic can be unit-tested without touching the FS.
  *
  * When `changeSource` is `"session_sync"`, loads baseline hashes written at
- * session start and skips identity fields whose content hasn't changed — this
- * prevents blind-overwriting DB-side edits made by Lead during the session.
+ * session start and skips fields whose content hasn't changed — this prevents
+ * blind-overwriting DB-side edits made by Lead during the session.
  * On-edit syncs (`"self_edit"`) bypass baselines entirely since the agent
  * explicitly changed the file and the new content should propagate.
  */
@@ -304,7 +304,11 @@ export async function collectProfilePayloads(
     if (raw !== undefined) {
       const content = extractSetupScriptContent(raw);
       if (content !== null) {
-        payloads.push({ label: "setup", body: { setupScript: content, changeSource } });
+        if (baselines?.setupScript && contentSha256(content) === baselines.setupScript) {
+          // setupScript unchanged during session — skip to preserve Lead's DB edits
+        } else {
+          payloads.push({ label: "setup", body: { setupScript: content, changeSource } });
+        }
       }
     }
   }

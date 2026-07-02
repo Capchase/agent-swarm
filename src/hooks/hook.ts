@@ -9,7 +9,11 @@ import {
   postRatings,
   type RetrievalRow,
 } from "../be/memory/raters/llm";
-import { contentSha256, readIdentityBaselines } from "../commands/profile-sync";
+import {
+  contentSha256,
+  extractSetupScriptContent,
+  readIdentityBaselines,
+} from "../commands/profile-sync";
 import type { Agent } from "../types";
 import { getApiKey } from "../utils/api-key";
 import { getMcpBaseUrl } from "../utils/constants";
@@ -677,27 +681,19 @@ export async function handleHook(): Promise<void> {
   ): Promise<void> => {
     if (!mcpConfig) return;
 
+    const baselines = changeSource === "session_sync" ? await readIdentityBaselines() : null;
+
     const file = Bun.file(SETUP_SCRIPT_PATH);
     if (!(await file.exists())) return;
 
     const raw = await file.text();
-    if (!raw.trim()) return;
+    const content = extractSetupScriptContent(raw);
+    if (content === null) return;
 
-    const markerStart = "# === Agent-managed setup (from DB) ===";
-    const markerEnd = "# === End agent-managed setup ===";
-    const startIdx = raw.indexOf(markerStart);
-    const endIdx = raw.indexOf(markerEnd);
-
-    let content: string;
-    if (startIdx !== -1 && endIdx !== -1) {
-      // Markers present — extract ONLY the content between them.
-      content = raw.substring(startIdx + markerStart.length, endIdx).trim();
-    } else {
-      // No markers — agent created/replaced the entire file. Store as-is minus shebang.
-      content = raw.replace(/^#!\/bin\/bash\n/, "").trim();
+    if (baselines?.setupScript && contentSha256(content) === baselines.setupScript) {
+      // Unchanged during session — skip to preserve Lead's DB edits
+      return;
     }
-
-    if (!content || content.length > 65536) return;
 
     try {
       await fetch(`${getBaseUrl()}/api/agents/${agentId}/profile`, {
