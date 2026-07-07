@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import {
   assignUnassignedTaskPending,
   backfillSupersedeTaskResumeTaskId,
@@ -37,7 +38,7 @@ import {
   getNextResumeGeneration,
   getResumeGeneration,
 } from "../tasks/worker-follow-up";
-import type { AgentTask } from "../types";
+import type { ActiveSession, AgentTask } from "../types";
 import { getExecutorRegistry } from "../workflows";
 import { recoverIncompleteRuns } from "../workflows/recovery";
 // Side-effect import: registers heartbeat event templates in the in-memory registry
@@ -161,6 +162,7 @@ let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let checklistInterval: ReturnType<typeof setInterval> | null = null;
 let isSweeping = false;
 let beforeHeartbeatSupersedeForTests: ((task: AgentTask) => void) | null = null;
+let sessionProcessLivenessProbeForTests: ((sessionIds: readonly string[]) => boolean) | null = null;
 
 /** Tasks auto-failed during the reboot sweep, consumed by boot triage */
 let rebootAffectedTasks: Array<{ original: AgentTask; retryTaskId: string | null }> = [];
@@ -169,6 +171,12 @@ export function setBeforeHeartbeatSupersedeForTests(
   hook: ((task: AgentTask) => void) | null,
 ): void {
   beforeHeartbeatSupersedeForTests = hook;
+}
+
+export function setSessionProcessLivenessProbeForTests(
+  probe: ((sessionIds: readonly string[]) => boolean) | null,
+): void {
+  sessionProcessLivenessProbeForTests = probe;
 }
 
 // ============================================================================
@@ -262,6 +270,9 @@ function detectAndRemediateStalledTasks(findings: HeartbeatFindings): void {
     if (!session) {
       // Case A: No active session — worker is dead
       if (taskAgeMs >= STALL_THRESHOLD_NO_SESSION_MIN * 60 * 1000) {
+        if (deferRemediationForLiveProcess(findings, task, null, taskAgeMs, "no active session")) {
+          continue;
+        }
         remediateCrashedWorkerTask(findings, task, {
           supersedeReason:
             "Auto-superseded by heartbeat: worker session not found (no active session for task)",
@@ -278,6 +289,11 @@ function detectAndRemediateStalledTasks(findings: HeartbeatFindings): void {
       if (isStaleHeartbeat) {
         // Case B: Session exists but heartbeat is stale — worker likely crashed
         if (taskAgeMs >= STALL_THRESHOLD_STALE_HEARTBEAT_MIN * 60 * 1000) {
+          if (
+            deferRemediationForLiveProcess(findings, task, session, taskAgeMs, "stale heartbeat")
+          ) {
+            continue;
+          }
           remediateCrashedWorkerTask(findings, task, {
             supersedeReason:
               "Auto-superseded by heartbeat: worker session heartbeat is stale (likely crashed)",
@@ -295,6 +311,57 @@ function detectAndRemediateStalledTasks(findings: HeartbeatFindings): void {
       }
     }
   }
+}
+
+function deferRemediationForLiveProcess(
+  findings: HeartbeatFindings,
+  task: AgentTask,
+  session: ActiveSession | null,
+  taskAgeMs: number,
+  shortLabel: string,
+): boolean {
+  const sessionIds = collectSessionProcessProbeIds(task, session);
+  if (sessionIds.length === 0) return false;
+  if (!hasLiveSessionProcess(sessionIds)) return false;
+
+  if (taskAgeMs >= STALL_THRESHOLD_MINUTES * 60 * 1000) {
+    findings.stalledTasks.push(task);
+  }
+  console.warn(
+    `[Heartbeat] Deferring crash recovery for task ${task.id.slice(0, 8)} — live process still matches session ID (${shortLabel})`,
+  );
+  return true;
+}
+
+function collectSessionProcessProbeIds(task: AgentTask, session: ActiveSession | null): string[] {
+  return [...new Set([task.claudeSessionId, session?.providerSessionId, session?.runnerSessionId])]
+    .filter((id): id is string => Boolean(id?.trim()))
+    .map((id) => id.trim());
+}
+
+function hasLiveSessionProcess(sessionIds: readonly string[]): boolean {
+  if (sessionProcessLivenessProbeForTests) {
+    return sessionProcessLivenessProbeForTests(sessionIds);
+  }
+
+  const result = spawnSync("ps", ["-eo", "pid=,ppid=,stat=,args="], {
+    encoding: "utf8",
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
+    return false;
+  }
+
+  for (const line of result.stdout.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!match) continue;
+    const [, pid, , stat, args] = match;
+    if (!pid || pid === String(process.pid)) continue;
+    if (stat?.includes("Z")) continue;
+    if (sessionIds.some((id) => args?.includes(id))) return true;
+  }
+
+  return false;
 }
 
 /**

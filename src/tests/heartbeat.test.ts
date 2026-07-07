@@ -18,6 +18,7 @@ import {
   MAX_EMPTY_POLLS,
   resetOrphanedInProgressTasksForAgent,
   startTask,
+  updateActiveSessionProviderSessionId,
   updateAgentStatus,
   updateTaskClaudeSessionId,
 } from "../be/db";
@@ -28,6 +29,7 @@ import {
   preflightGate,
   runHeartbeatSweep,
   runRebootSweep,
+  setSessionProcessLivenessProbeForTests,
   startHeartbeat,
   stopHeartbeat,
 } from "../heartbeat/heartbeat";
@@ -61,6 +63,7 @@ describe("Heartbeat Triage", () => {
     getDb().run("DELETE FROM agent_tasks");
     getDb().run("DELETE FROM agents");
     getDb().run("DELETE FROM active_sessions");
+    setSessionProcessLivenessProbeForTests(null);
   });
 
   // ==========================================================================
@@ -330,6 +333,75 @@ describe("Heartbeat Triage", () => {
 
       const session = getActiveSessionForTask(task.id);
       expect(session).toBeNull();
+    });
+
+    test("does not auto-supersede when task session process is still alive", async () => {
+      const agent = createAgent({ name: "silent-worker", isLead: false, status: "busy" });
+      const task = createTaskExtended("Silent long-running task", { agentId: agent.id });
+      startTask(task.id);
+      updateTaskClaudeSessionId(task.id, "live-provider-session");
+
+      // Make task stale enough for the no-active-session crash-recovery path.
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [oldTime, task.id]);
+
+      setSessionProcessLivenessProbeForTests((sessionIds) =>
+        sessionIds.includes("live-provider-session"),
+      );
+
+      const findings = await codeLevelTriage();
+
+      expect(findings.autoResumedTasks.length).toBe(0);
+      expect(findings.autoFailedTasks.length).toBe(0);
+      expect(findings.stalledTasks.length).toBe(0);
+
+      const updated = getTaskById(task.id);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.finishedAt).toBeUndefined();
+    });
+
+    test("does not auto-supersede stale heartbeat when provider process is still alive", async () => {
+      const agent = createAgent({
+        name: "silent-worker-with-session",
+        isLead: false,
+        status: "busy",
+      });
+      const task = createTaskExtended("Silent task with stale heartbeat", { agentId: agent.id });
+      startTask(task.id);
+
+      insertActiveSession({
+        agentId: agent.id,
+        taskId: task.id,
+        triggerType: "task_assigned",
+        runnerSessionId: "live-runner-session",
+      });
+      updateTaskClaudeSessionId(task.id, "live-provider-session");
+      updateActiveSessionProviderSessionId(task.id, "live-provider-session");
+
+      // Make both task and session heartbeat stale enough for crash recovery.
+      const oldTime = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+      getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [oldTime, task.id]);
+      getDb().run("UPDATE active_sessions SET lastHeartbeatAt = ? WHERE taskId = ?", [
+        oldTime,
+        task.id,
+      ]);
+
+      setSessionProcessLivenessProbeForTests(
+        (sessionIds) =>
+          sessionIds.includes("live-provider-session") &&
+          sessionIds.includes("live-runner-session"),
+      );
+
+      const findings = await codeLevelTriage();
+
+      expect(findings.autoResumedTasks.length).toBe(0);
+      expect(findings.autoFailedTasks.length).toBe(0);
+      expect(findings.stalledTasks.length).toBe(0);
+
+      const updated = getTaskById(task.id);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.finishedAt).toBeUndefined();
+      expect(getActiveSessionForTask(task.id)).not.toBeNull();
     });
 
     test("escalates stalled task with fresh session heartbeat (ambiguous)", async () => {
