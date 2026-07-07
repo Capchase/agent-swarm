@@ -263,6 +263,18 @@ RUN mkdir -p /home/worker/.claude/commands /home/worker/.claude/agents \
 # a dep) sidesteps it. Drop this workaround once HF republishes a clean
 # xetchunk-wasm and chonkie / agent-fs pull it in.
 USER root
+#
+# @notionhq/notion-mcp-server is baked in here (rather than spawned via `npx -y`
+# from the MCP server record) because `npx -y` takes ~60s to resolve/link inside
+# this container even with a warm npx cache — that's npx's own overhead, not a
+# download — which blows past Claude Code's 30s MCP handshake timeout and
+# silently drops the Notion tools for the whole session. A direct `node <cli.mjs>`
+# spawn reaches `initialize` in ~0.4s. The resulting stable path,
+# /opt/global-deps/node_modules/@notionhq/notion-mcp-server/bin/cli.mjs, is
+# present identically in every worker container built from this image — the
+# notion-ro / notion-rw MCP server records (swarm-scoped, owned by Lead) should
+# be repointed to `command:"node", args:["/opt/global-deps/node_modules/@notionhq/notion-mcp-server/bin/cli.mjs"]`
+# once this image ships.
 RUN mkdir -p /opt/global-deps && cat > /opt/global-deps/package.json <<'EOF'
 {
   "name": "global-deps",
@@ -274,7 +286,8 @@ RUN mkdir -p /opt/global-deps && cat > /opt/global-deps/package.json <<'EOF'
     "@desplega.ai/localtunnel": "2.2.0",
     "@desplega.ai/qa-use": "2.19.0",
     "@desplega.ai/claude-bridge": "0.2.2",
-    "@desplega.ai/agent-fs": "0.10.0"
+    "@desplega.ai/agent-fs": "0.10.0",
+    "@notionhq/notion-mcp-server": "2.4.1"
   },
   "overrides": {
     "@huggingface/hub": "2.11.0",

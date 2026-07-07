@@ -2780,6 +2780,17 @@ async function spawnProviderProcess(
     }
   }
 
+  // Safety net: Claude Code's MCP startup handshake defaults to a 30s timeout
+  // (MCP_TIMEOUT unset). npx-based stdio MCP servers (e.g. the Notion MCP
+  // server) can take 60s+ to resolve/link inside the worker container even
+  // with a warm npx cache — that's npx's own overhead, not a download — so
+  // they blow past the default and silently drop their tools for the whole
+  // session. Bump the default here; an explicit MCP_TIMEOUT from swarm_config
+  // or the container env still wins.
+  if (!freshEnv.MCP_TIMEOUT) {
+    freshEnv.MCP_TIMEOUT = "120000";
+  }
+
   // Propagate agent-fs config to process.env so getBasePrompt() can read them
   // (fetchResolvedEnv returns a new object, doesn't update process.env)
   if (freshEnv.AGENT_FS_SHARED_ORG_ID) {
