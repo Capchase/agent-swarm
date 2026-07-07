@@ -2,7 +2,7 @@
 
 > **Maintained doc — current logic only (no history).** This runbook is the canonical reference for the heartbeat sweep, the stalled-task classifier, and the crash-recovery routing heuristic. Keep the diagrams + pseudocode in sync with the code: when you change any of this logic, update this file in the same PR (enforced by the CLAUDE.md rule). It documents *current* behavior — do not turn it into a changelog.
 
-Owner code: `src/heartbeat/heartbeat.ts`, `src/tasks/worker-follow-up.ts`, plus the assignment/claim path in `src/http/poll.ts` + `src/be/db.ts`.
+Owner code: `src/heartbeat/heartbeat.ts`, `src/tasks/worker-follow-up.ts`, plus the assignment/claim path in `src/http/poll.ts` + `src/be/db.ts`. The worker-side heartbeat freshness signal that feeds §2's classifier also depends on `src/hooks/hook.ts` (`PreToolUse`/`PostToolUse`) and `src/hooks/heartbeat-pinger.ts`.
 
 ---
 
@@ -37,7 +37,7 @@ flowchart TD
 ```
 
 - Candidate set = `getStalledInProgressTasks(STALL_THRESHOLD_NO_SESSION_MIN)` → `status='in_progress' AND lastUpdatedAt > 5m`. Tasks in `pending`/`offered` are **not** seen by this sweep.
-- An **active_session** = one worker-*run* process for a task (`active_sessions`, `UNIQUE(taskId)`), created lazily *after* the provider process spawns, heartbeated by **tool activity** (throttled ~5s; no wall-clock ping between tool calls). "No active session" is AND-gated with `lastUpdatedAt > 5m`, so it means *"no live run **and** no task progress in 5 min."* It can false-positive on a long-but-quiet live worker; the resume-generation budget (`MAX_RESUME_GENERATIONS`) bounds the blast radius.
+- An **active_session** = one worker-*run* process for a task (`active_sessions`, `UNIQUE(taskId)`), created lazily *after* the provider process spawns, heartbeated by **tool activity** (`PostToolUse`, throttled ~5s) **plus a wall-clock pinger for long Bash calls**: `PreToolUse` spawns a detached `heartbeat-pinger.ts` subprocess (`src/hooks/heartbeat-pinger.ts`) that PUTs the same heartbeat endpoint on a short interval (default 60s) for the duration of the Bash call, and the matching `PostToolUse` kills it. This keeps `lastHeartbeatAt` fresh during a long *silent* command (`pnpm install`, `nx affected --target=test`, a CI-watch sleep loop) so it isn't misread as Case B below. The pinger self-expires after a safety-net max lifetime if its kill signal is ever missed. "No active session" is AND-gated with `lastUpdatedAt > 5m`, so it means *"no live run **and** no task progress in 5 min."* It can still false-positive on a long-but-quiet live worker outside a Bash call (or if the pinger itself fails to spawn); the resume-generation budget (`MAX_RESUME_GENERATIONS`) bounds the blast radius.
 - Thresholds (env-overridable): `STALL_THRESHOLD_NO_SESSION_MIN=5` (`HEARTBEAT_STALL_NO_SESSION_MIN`), `STALL_THRESHOLD_STALE_HEARTBEAT_MIN=15`, `STALL_THRESHOLD_MINUTES=30`, `STALE_CLEANUP_THRESHOLD_MINUTES=30`.
 
 ## 3. Protected resume routing heuristic (`remediateCrashedWorkerTask` / shutdown → `createResumeFollowUp` → reaper)

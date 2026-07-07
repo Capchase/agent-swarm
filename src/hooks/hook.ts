@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { unlink } from "node:fs/promises";
 import pkg from "../../package.json";
 import {
   buildRatingsFromLlm,
@@ -166,6 +167,55 @@ async function readTaskFile(): Promise<TaskFileData | null> {
     return (await file.json()) as TaskFileData;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Keeps `active_sessions.lastHeartbeatAt` fresh while a single Bash tool call
+ * blocks for minutes (see `src/hooks/heartbeat-pinger.ts` for the full
+ * rationale). `spawnHeartbeatPinger` is called from PreToolUse and its PID is
+ * recorded per `tool_use_id` so the matching PostToolUse call can kill it via
+ * `killHeartbeatPinger`.
+ */
+export function heartbeatPingerPidFile(toolUseId: string): string {
+  return `/tmp/.swarm-heartbeat-pinger-${toolUseId}.pid`;
+}
+
+export function spawnHeartbeatPinger(
+  taskId: string,
+  toolUseId: string,
+  projectDir: string,
+  deps: { spawn?: typeof Bun.spawn } = {},
+): void {
+  const spawnFn = deps.spawn ?? Bun.spawn;
+  try {
+    const proc = spawnFn(["bun", "run", `${import.meta.dir}/heartbeat-pinger.ts`, taskId], {
+      cwd: projectDir,
+      stdio: ["ignore", "ignore", "ignore"],
+      env: process.env,
+    });
+    proc.unref();
+    void Bun.write(heartbeatPingerPidFile(toolUseId), String(proc.pid)).catch(() => {});
+  } catch {
+    // Non-fatal — worst case the existing stale-heartbeat detection still applies.
+  }
+}
+
+export async function killHeartbeatPinger(toolUseId: string): Promise<void> {
+  const pidFile = heartbeatPingerPidFile(toolUseId);
+  try {
+    const file = Bun.file(pidFile);
+    if (!(await file.exists())) return;
+    const pid = Number((await file.text()).trim());
+    if (Number.isFinite(pid) && pid > 0) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // Already exited — fine.
+      }
+    }
+  } finally {
+    await unlink(pidFile).catch(() => {});
   }
 }
 
@@ -1103,10 +1153,28 @@ export async function handleHook(): Promise<void> {
           }
         }
       }
+
+      // Keep the active-session heartbeat fresh for the duration of a Bash call
+      // (workers only). PostToolUse only fires once the whole command finishes,
+      // so a long silent command (`pnpm install`, `nx affected --target=test`, a
+      // CI-watch sleep loop) would otherwise leave `lastHeartbeatAt` stale long
+      // enough for the heartbeat sweep to falsely supersede a healthy task. See
+      // `src/hooks/heartbeat-pinger.ts`. Killed by the matching PostToolUse call.
+      if (agentInfo && !agentInfo.isLead && msg.tool_name === "Bash" && msg.tool_use_id) {
+        const bashTaskFile = await readTaskFile();
+        if (bashTaskFile?.taskId) {
+          spawnHeartbeatPinger(bashTaskFile.taskId, msg.tool_use_id, projectDir);
+        }
+      }
       break;
     }
 
     case "PostToolUse":
+      // Stop the long-running-Bash heartbeat pinger spawned in PreToolUse, if any.
+      if (msg.tool_name === "Bash" && msg.tool_use_id) {
+        await killHeartbeatPinger(msg.tool_use_id);
+      }
+
       // Active session heartbeat (workers only, fire-and-forget)
       if (agentInfo && !agentInfo.isLead) {
         const heartbeatTaskFile = await readTaskFile();
