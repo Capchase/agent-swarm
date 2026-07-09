@@ -74,6 +74,44 @@ function isStaleByAge(expires: number, maxAgeMs: number): boolean {
   return Date.now() - issuedAt > maxAgeMs;
 }
 
+/**
+ * True when a refresh rejection is definitive rather than transient.
+ *
+ * `refreshAccessToken` only sets `status` when OpenAI actually answered the
+ * `/oauth/token` request (see `TokenResult` in `flow.ts`) — a network error
+ * or timeout resolves with no `status` at all. A 4xx means OpenAI looked at
+ * the `refresh_token` we sent and rejected it outright: revoked, already
+ * rotated, or (the 2026-07-08 incident) an empty string from a corrupted
+ * config-store entry. Retrying that exact request will fail identically on
+ * every future draw, so it's safe to bench on. A 5xx or missing status is
+ * OpenAI's/the network's problem, not the credential's — must stay
+ * retryable, not benched.
+ */
+export function isNonRetryableRefreshRejection(status?: number): boolean {
+  return status !== undefined && status >= 400 && status < 500;
+}
+
+/**
+ * Best-effort quarantine: remove a slot's credentials from the config store
+ * so the next `loadCodexOAuth`/`loadAllCodexOAuthSlots` call finds nothing
+ * for it instead of repeating the same doomed refresh. A delete failure is
+ * logged and swallowed — the caller has already decided the slot is
+ * unusable and must still surface its own (more useful) error.
+ */
+async function quarantineSlot(
+  apiUrl: string,
+  apiKey: string,
+  slot: number,
+  context: string,
+): Promise<void> {
+  await deleteCodexOAuth(apiUrl, apiKey, slot).catch((deleteErr) => {
+    console.error(
+      `[codex-oauth] Failed to quarantine slot ${slot} after ${context} (non-fatal):`,
+      deleteErr,
+    );
+  });
+}
+
 export type CodexOAuthRefreshFailureReason = "refresh_rejected" | "lock_timeout";
 
 /**
@@ -396,6 +434,15 @@ export async function getValidCodexOAuth(
       const result = await refreshAccessToken(lockedCreds.refresh);
       if (result.type !== "success") {
         console.error("[codex-oauth] Token refresh failed");
+        // A definitive 4xx (revoked, already rotated, empty/malformed
+        // refresh_token, ...) means this slot will fail the identical way on
+        // every future draw — quarantine it now instead of leaving it in the
+        // pool for the runner to keep re-drawing and instant-failing tasks
+        // against. A 5xx or network-level failure (no `status`) is
+        // transient/retryable and must NOT bench the slot.
+        if (isNonRetryableRefreshRejection(result.status)) {
+          await quarantineSlot(apiUrl, apiKey, slot, "refresh rejected");
+        }
         throw new CodexOAuthRefreshError(
           slot,
           "refresh_rejected",
@@ -428,12 +475,7 @@ export async function getValidCodexOAuth(
         // now-consumed old refresh token. Best-effort: a delete failure here
         // leaves the corrupted state, but we still surface the original
         // persist error so this call treats the slot as unusable.
-        await deleteCodexOAuth(apiUrl, apiKey, slot).catch((deleteErr) => {
-          console.error(
-            `[codex-oauth] Failed to quarantine slot ${slot} after persist failure (non-fatal):`,
-            deleteErr,
-          );
-        });
+        await quarantineSlot(apiUrl, apiKey, slot, "persist failure");
         throw persistErr;
       }
 
