@@ -673,4 +673,26 @@ describe("SwarmScriptExecutor", () => {
     expect(result.error).toContain("boom");
     expect(result.output?.exitCode).not.toBe(0);
   });
+
+  test("engine persists executedByAgentId on the failed workflow_run_steps row", async () => {
+    // The receipt's real guarantee is that it survives the failure checkpoint
+    // path (engine.ts persists `result.output` on failure for observability),
+    // not just direct-executor-call success paths. Run the engine end-to-end
+    // with a throwing script and read back the persisted failed step.
+    await saveScript("throws-receipt", `export default async () => { throw new Error("boom"); };`);
+    const wf = makeWorkflow({
+      nodes: [{ id: "script", type: "swarm-script", config: { scriptName: "throws-receipt" } }],
+    });
+
+    const runId = await startWorkflowExecution(wf, {}, registry);
+    const run = getWorkflowRun(runId);
+    const steps = getWorkflowRunStepsByRunId(runId);
+    const scriptStep = steps.find((step) => step.nodeId === "script");
+
+    expect(run?.status).toBe("failed");
+    expect(scriptStep?.status).toBe("failed");
+    // The workflow was created with createdByAgentId = agentId (see makeWorkflow),
+    // so the durably persisted failure output must carry that resolved receipt.
+    expect(scriptStep?.output).toMatchObject({ executedByAgentId: agentId });
+  });
 });
