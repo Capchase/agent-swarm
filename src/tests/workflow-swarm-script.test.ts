@@ -206,6 +206,59 @@ describe("SwarmScriptExecutor", () => {
     expect(result.output?.scriptName).toBe("add-one");
   });
 
+  test("output records executedByAgentId receipt from the workflow's createdByAgentId", async () => {
+    await saveScript("receipt", `export default async () => ({ ok: true });`);
+
+    const executor = new SwarmScriptExecutor(deps);
+    const wf = makeWorkflow({ nodes: [] });
+    const result = await executor.run({
+      config: { scriptName: "receipt" },
+      context: {},
+      meta: {
+        runId: crypto.randomUUID(),
+        stepId: crypto.randomUUID(),
+        nodeId: "script",
+        workflowId: wf.id,
+        dryRun: false,
+      },
+    });
+
+    expect(result.status).toBe("success");
+    // The workflow was created with createdByAgentId = agentId (see makeWorkflow),
+    // so the per-run receipt must reflect that resolved identity.
+    expect(result.output?.executedByAgentId).toBe(agentId);
+  });
+
+  test("output records executedByAgentId as the 'workflow' sentinel when no agent resolves", async () => {
+    // A global-scope script run for a workflow whose createdByAgentId cannot be
+    // resolved (missing workflow) and with no trigger.agentId falls back to the sentinel.
+    await upsertScriptByName({
+      name: "receipt-global",
+      scope: "global",
+      source: `export default async () => ({ ok: true });`,
+      description: "receipt-global test script",
+      intent: "workflow-swarm-script test fixture",
+      signatureJson,
+      agentId,
+      typeChecked: true,
+    });
+    const executor = new SwarmScriptExecutor(deps);
+    const result = await executor.run({
+      config: { scriptName: "receipt-global", scope: "global" },
+      context: {},
+      meta: {
+        runId: crypto.randomUUID(),
+        stepId: crypto.randomUUID(),
+        nodeId: "script",
+        workflowId: crypto.randomUUID(),
+        dryRun: false,
+      },
+    });
+
+    expect(result.status).toBe("success");
+    expect(result.output?.executedByAgentId).toBe("workflow");
+  });
+
   test("swarm-script executor includes API connection descriptors in ctx.api", async () => {
     await upsertScriptConnection({
       slug: "workflowVendor",
@@ -619,5 +672,27 @@ describe("SwarmScriptExecutor", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toContain("boom");
     expect(result.output?.exitCode).not.toBe(0);
+  });
+
+  test("engine persists executedByAgentId on the failed workflow_run_steps row", async () => {
+    // The receipt's real guarantee is that it survives the failure checkpoint
+    // path (engine.ts persists `result.output` on failure for observability),
+    // not just direct-executor-call success paths. Run the engine end-to-end
+    // with a throwing script and read back the persisted failed step.
+    await saveScript("throws-receipt", `export default async () => { throw new Error("boom"); };`);
+    const wf = makeWorkflow({
+      nodes: [{ id: "script", type: "swarm-script", config: { scriptName: "throws-receipt" } }],
+    });
+
+    const runId = await startWorkflowExecution(wf, {}, registry);
+    const run = getWorkflowRun(runId);
+    const steps = getWorkflowRunStepsByRunId(runId);
+    const scriptStep = steps.find((step) => step.nodeId === "script");
+
+    expect(run?.status).toBe("failed");
+    expect(scriptStep?.status).toBe("failed");
+    // The workflow was created with createdByAgentId = agentId (see makeWorkflow),
+    // so the durably persisted failure output must carry that resolved receipt.
+    expect(scriptStep?.output).toMatchObject({ executedByAgentId: agentId });
   });
 });

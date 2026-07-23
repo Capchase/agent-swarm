@@ -38,6 +38,14 @@ export const SwarmScriptOutputSchema = z.object({
   scriptName: z.string(),
   contentHash: z.string(),
   version: z.number(),
+  /**
+   * The agent identity the script actually executed as — a per-run receipt.
+   * Resolved from the workflow's `createdByAgentId` (or `trigger.agentId`),
+   * falling back to the `"workflow"` sentinel when no agent could be resolved.
+   * Unlike agent-task nodes, swarm-script nodes ignore node-level `config.agentId`,
+   * so this is the only runtime record of which identity a script node ran under.
+   */
+  executedByAgentId: z.string(),
 });
 
 type SwarmScriptConfig = z.infer<typeof SwarmScriptConfigSchema>;
@@ -66,6 +74,10 @@ export class SwarmScriptExecutor extends BaseExecutor<
 
     const workflow = this.deps.db.getWorkflow(meta.workflowId);
     const agentId = workflow?.createdByAgentId ?? agentIdFromContext(context);
+    // The identity the script runtime actually runs under. Swarm-script nodes
+    // resolve identity from the workflow (createdByAgentId) or the trigger, not
+    // from node-level config.agentId — so surface it as a per-run receipt below.
+    const executedByAgentId = agentId ?? "workflow";
     const resolved = resolveScriptSource(config, agentId);
 
     if (!resolved.ok) {
@@ -76,7 +88,7 @@ export class SwarmScriptExecutor extends BaseExecutor<
       source: resolved.source,
       args: config.args,
       fsMode: "none",
-      agentId: agentId ?? "workflow",
+      agentId: executedByAgentId,
       egressSecrets: await buildScriptCredentialBindings({ agentId: agentId ?? undefined }),
       apiConnections: getScriptApiConnectionDescriptors({ agentId: agentId ?? undefined }),
       mcpConnections: getScriptMcpConnectionDescriptors({ agentId: agentId ?? undefined }),
@@ -93,6 +105,7 @@ export class SwarmScriptExecutor extends BaseExecutor<
       scriptName: resolved.script.name,
       contentHash: resolved.contentHash,
       version: resolved.version,
+      executedByAgentId,
     };
 
     if (output.exitCode !== 0 || output.error) {
