@@ -425,11 +425,30 @@ if [ -n "$AGENT_FS_API_URL" ] && [ -n "$AGENT_ID" ]; then
     echo "[agent-fs] Registering with agent-fs at $AGENT_FS_API_URL..."
     AF_EMAIL="${AGENT_EMAIL:-${AGENT_ID}@swarm.local}"
 
-    AF_RESULT=$(curl -s -X POST "${AGENT_FS_API_URL}/auth/register" \
-      -H "Content-Type: application/json" \
-      -d "{\"email\": \"$AF_EMAIL\"}" 2>/dev/null) || true
+    # Retry a handful of times: a single dropped request here permanently
+    # strands the pod's agent-fs identity, since this block only runs once
+    # per container boot and nothing else retries it. Found 2026-07-23 when
+    # 5 freshly-provisioned pods (infra PR #4123) never got an AGENT_FS_API_KEY
+    # — their first-boot registration attempt silently failed (`|| true`) and
+    # the StatefulSet pods never restarted, so it never got a second try.
+    AF_API_KEY=""
+    AF_REG_RETRIES=0
+    AF_REG_MAX=5
+    while [ "$AF_REG_RETRIES" -lt "$AF_REG_MAX" ] && [ -z "$AF_API_KEY" ]; do
+      AF_RESULT=$(curl -s -X POST "${AGENT_FS_API_URL}/auth/register" \
+        -H "Content-Type: application/json" \
+        -d "{\"email\": \"$AF_EMAIL\"}" 2>/dev/null) || true
 
-    AF_API_KEY=$(echo "$AF_RESULT" | jq -r '.apiKey // empty')
+      AF_API_KEY=$(echo "$AF_RESULT" | jq -r '.apiKey // empty')
+
+      if [ -z "$AF_API_KEY" ]; then
+        AF_REG_RETRIES=$((AF_REG_RETRIES + 1))
+        if [ "$AF_REG_RETRIES" -lt "$AF_REG_MAX" ]; then
+          echo "[agent-fs] Registration attempt ${AF_REG_RETRIES}/${AF_REG_MAX} failed, retrying in 3s..."
+          sleep 3
+        fi
+      fi
+    done
 
     if [ -n "$AF_API_KEY" ]; then
       echo "[agent-fs] Registered successfully, storing API key..."
