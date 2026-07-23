@@ -206,6 +206,59 @@ describe("SwarmScriptExecutor", () => {
     expect(result.output?.scriptName).toBe("add-one");
   });
 
+  test("output records executedByAgentId receipt from the workflow's createdByAgentId", async () => {
+    await saveScript("receipt", `export default async () => ({ ok: true });`);
+
+    const executor = new SwarmScriptExecutor(deps);
+    const wf = makeWorkflow({ nodes: [] });
+    const result = await executor.run({
+      config: { scriptName: "receipt" },
+      context: {},
+      meta: {
+        runId: crypto.randomUUID(),
+        stepId: crypto.randomUUID(),
+        nodeId: "script",
+        workflowId: wf.id,
+        dryRun: false,
+      },
+    });
+
+    expect(result.status).toBe("success");
+    // The workflow was created with createdByAgentId = agentId (see makeWorkflow),
+    // so the per-run receipt must reflect that resolved identity.
+    expect(result.output?.executedByAgentId).toBe(agentId);
+  });
+
+  test("output records executedByAgentId as the 'workflow' sentinel when no agent resolves", async () => {
+    // A global-scope script run for a workflow whose createdByAgentId cannot be
+    // resolved (missing workflow) and with no trigger.agentId falls back to the sentinel.
+    await upsertScriptByName({
+      name: "receipt-global",
+      scope: "global",
+      source: `export default async () => ({ ok: true });`,
+      description: "receipt-global test script",
+      intent: "workflow-swarm-script test fixture",
+      signatureJson,
+      agentId,
+      typeChecked: true,
+    });
+    const executor = new SwarmScriptExecutor(deps);
+    const result = await executor.run({
+      config: { scriptName: "receipt-global", scope: "global" },
+      context: {},
+      meta: {
+        runId: crypto.randomUUID(),
+        stepId: crypto.randomUUID(),
+        nodeId: "script",
+        workflowId: crypto.randomUUID(),
+        dryRun: false,
+      },
+    });
+
+    expect(result.status).toBe("success");
+    expect(result.output?.executedByAgentId).toBe("workflow");
+  });
+
   test("swarm-script executor includes API connection descriptors in ctx.api", async () => {
     await upsertScriptConnection({
       slug: "workflowVendor",
