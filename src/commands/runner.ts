@@ -596,6 +596,16 @@ async function fetchResolvedEnv(
   return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
 }
 
+// This only runs once per container boot (see call site in runAgent), and
+// nothing else retries it afterward — a single transient failure (agent-fs
+// mid-restart, brief network blip) otherwise permanently strands the pod's
+// agent-fs identity until the next reboot. Found 2026-07-23: 3 of 5
+// freshly-provisioned agent pods (infra PR #4123) never got an
+// AGENT_FS_API_KEY because their one boot-time attempt silently failed and
+// was swallowed by the catch below with no retry.
+const AGENT_FS_CREDENTIALS_MAX_ATTEMPTS = 5;
+const AGENT_FS_CREDENTIALS_RETRY_DELAY_MS = 3_000;
+
 async function ensureAgentFsCredentials(
   apiUrl: string,
   apiKey: string,
@@ -603,38 +613,53 @@ async function ensureAgentFsCredentials(
 ): Promise<void> {
   if (!apiUrl || !apiKey || !agentId || agentId === "unknown") return;
 
-  try {
-    const response = await fetch(`${apiUrl}/api/fs/agent-credentials`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "X-Agent-ID": agentId,
-        "Content-Type": "application/json",
-      },
-      body: "{}",
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
+  for (let attempt = 1; attempt <= AGENT_FS_CREDENTIALS_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(`${apiUrl}/api/fs/agent-credentials`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "X-Agent-ID": agentId,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        console.warn(
+          scrubSecrets(
+            `[agent-fs] credential provisioning attempt ${attempt}/${AGENT_FS_CREDENTIALS_MAX_ATTEMPTS} failed: HTTP ${response.status}${text ? ` ${text}` : ""}`,
+          ),
+        );
+      } else {
+        const result = (await response.json().catch(() => ({}))) as {
+          enabled?: boolean;
+          created?: boolean;
+        };
+        if (result.enabled) {
+          console.log(
+            `[agent-fs] ${result.created ? "created" : "confirmed"} agent-scoped credentials`,
+          );
+        }
+        return;
+      }
+    } catch (error) {
       console.warn(
         scrubSecrets(
-          `[agent-fs] credential provisioning skipped: HTTP ${response.status}${text ? ` ${text}` : ""}`,
+          `[agent-fs] credential provisioning attempt ${attempt}/${AGENT_FS_CREDENTIALS_MAX_ATTEMPTS} failed: ${error}`,
         ),
       );
-      return;
     }
-    const result = (await response.json().catch(() => ({}))) as {
-      enabled?: boolean;
-      created?: boolean;
-    };
-    if (result.enabled) {
-      console.log(
-        `[agent-fs] ${result.created ? "created" : "confirmed"} agent-scoped credentials`,
-      );
+
+    if (attempt < AGENT_FS_CREDENTIALS_MAX_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, AGENT_FS_CREDENTIALS_RETRY_DELAY_MS));
     }
-  } catch (error) {
-    console.warn(scrubSecrets(`[agent-fs] credential provisioning skipped: ${error}`));
   }
+
+  console.warn(
+    `[agent-fs] credential provisioning skipped after ${AGENT_FS_CREDENTIALS_MAX_ATTEMPTS} attempts`,
+  );
 }
 
 /**
