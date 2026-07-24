@@ -312,6 +312,9 @@ const updateTaskTitleRoute = route({
     404: { description: "Task not found" },
   },
   auth: { apiKey: true },
+  rbac: {
+    ungated: "mirrors the pre-RBAC PATCH /api/tasks/{id}/vcs sibling route: bearer auth only",
+  },
 });
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
