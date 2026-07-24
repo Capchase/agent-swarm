@@ -1117,6 +1117,7 @@ type AgentTaskRow = {
   agentId: string | null;
   creatorAgentId: string | null;
   task: string;
+  title: string | null;
   status: AgentTaskStatus;
   source: AgentTaskSource;
   taskType: string | null;
@@ -1231,6 +1232,7 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     agentId: row.agentId,
     creatorAgentId: row.creatorAgentId ?? undefined,
     task: row.task,
+    title: row.title ?? undefined,
     status: row.status,
     source: row.source,
     taskType: row.taskType ?? undefined,
@@ -1315,6 +1317,7 @@ function rowToAgentTaskSummary(row: AgentTaskRow): AgentTaskSummary {
     agentId: t.agentId,
     creatorAgentId: t.creatorAgentId,
     task: previewText(t.task, TASK_PREVIEW_LENGTH),
+    title: t.title,
     status: t.status,
     source: t.source,
     taskType: t.taskType,
@@ -1678,6 +1681,22 @@ export function updateTaskClaudeSessionId(
       `UPDATE agent_tasks SET ${setClauses.join(", ")} WHERE id = ? RETURNING *`,
     )
     .get(...params);
+  return row ? rowToAgentTask(row) : null;
+}
+
+/**
+ * Sets or clears a task's display title (session rename). Trims the input and
+ * normalizes an empty string to NULL (clear). Deliberately does NOT touch
+ * `lastUpdatedAt` — a rename is not activity, and the sessions sidebar sorts
+ * on chain-wide max `lastUpdatedAt`, so bumping it here would reorder the list.
+ */
+export function updateTaskTitle(taskId: string, title: string | null): AgentTask | null {
+  const normalized = title === null ? null : title.trim() || null;
+  const row = getDb()
+    .prepare<AgentTaskRow, [string | null, string]>(
+      "UPDATE agent_tasks SET title = ? WHERE id = ? RETURNING *",
+    )
+    .get(normalized, taskId);
   return row ? rowToAgentTask(row) : null;
 }
 
@@ -12444,8 +12463,9 @@ export function listRecentSessions(
     params.push(...sources);
   }
   if (q && q.length > 0) {
-    conditions.push("lower(r.task) LIKE ?");
-    params.push(`%${q.toLowerCase()}%`);
+    conditions.push("(lower(r.task) LIKE ? OR lower(COALESCE(r.title, '')) LIKE ?)");
+    const like = `%${q.toLowerCase()}%`;
+    params.push(like, like);
   }
   if (requestedByUserId) {
     conditions.push("r.requestedByUserId = ?");
@@ -12538,8 +12558,9 @@ export function countSessions(
     params.push(...sources);
   }
   if (q && q.length > 0) {
-    conditions.push("lower(task) LIKE ?");
-    params.push(`%${q.toLowerCase()}%`);
+    conditions.push("(lower(task) LIKE ? OR lower(COALESCE(title, '')) LIKE ?)");
+    const like = `%${q.toLowerCase()}%`;
+    params.push(like, like);
   }
   if (requestedByUserId) {
     conditions.push("requestedByUserId = ?");
