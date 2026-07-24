@@ -8,6 +8,7 @@ import { telemetry } from "../telemetry";
 import type {
   ActiveSession,
   Agent,
+  AgentAvatar,
   AgentCredStatus,
   AgentLog,
   AgentLogEventType,
@@ -109,6 +110,7 @@ import type {
   WorkflowVersion,
 } from "../types";
 import {
+  AgentAvatarSchema,
   FollowUpConfigSchema,
   isTerminalTaskStatus,
   type ModelTier,
@@ -653,7 +655,22 @@ type AgentRow = {
   harness_provider: string | null;
   /** Migration 055: worker-self-reported credential snapshot (JSON of AgentCredStatus). NULL = unreported. */
   cred_status: string | null;
+  /** Migration 117: custom avatar (JSON of AgentAvatar). NULL = deterministic hash-derived fallback. */
+  avatar: string | null;
 };
+
+/** Safe-parse the `avatar` JSON column. Malformed/invalid content (e.g. a
+ * hand-edited row, or a future downgrade) falls back to `null` so rendering
+ * always has a deterministic path — never throws. */
+function parseAgentAvatar(raw: string | null): AgentAvatar | null {
+  if (!raw) return null;
+  try {
+    const parsed = AgentAvatarSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Map an agent row to the `Agent` shape. When `slim` is true the six identity
@@ -682,6 +699,7 @@ function rowToAgent(row: AgentRow, slim = false): Agent {
       ? (JSON.parse(row.credentialMissing) as string[])
       : null,
     credStatus: row.cred_status ? (JSON.parse(row.cred_status) as AgentCredStatus) : null,
+    avatar: parseAgentAvatar(row.avatar),
   };
   if (slim) return base;
   return {
@@ -4716,6 +4734,8 @@ export function updateAgentProfile(
     setupScript?: string;
     toolsMd?: string;
     heartbeatMd?: string;
+    /** `null` resets to the deterministic fallback; omit the key to leave untouched. */
+    avatar?: AgentAvatar | null;
   },
   meta?: VersionMeta,
 ): Agent | null {
@@ -4755,7 +4775,17 @@ export function updateAgentProfile(
       });
     }
 
-    // Proceed with existing UPDATE logic
+    // Proceed with existing UPDATE logic.
+    //
+    // `avatar` can't use the COALESCE(?, col) pattern the other fields use:
+    // COALESCE can never write NULL back (a bound NULL just falls through to
+    // the existing value), which would make "reset to default avatar"
+    // unimplementable. So it gets its own explicit-set CASE, gated by an
+    // `avatarProvided` flag distinguishing "key absent from updates" (leave
+    // untouched) from "key present with value null" (reset).
+    const avatarProvided = Object.hasOwn(updates, "avatar");
+    const avatarJson = updates.avatar ? JSON.stringify(updates.avatar) : null;
+
     const now = new Date().toISOString();
     const row = database
       .prepare<
@@ -4769,6 +4799,8 @@ export function updateAgentProfile(
           string | null,
           string | null,
           string | null,
+          string | null,
+          number,
           string | null,
           string,
           string,
@@ -4784,6 +4816,7 @@ export function updateAgentProfile(
           setupScript = COALESCE(?, setupScript),
           toolsMd = COALESCE(?, toolsMd),
           heartbeatMd = COALESCE(?, heartbeatMd),
+          avatar = CASE WHEN ? = 1 THEN ? ELSE avatar END,
           lastUpdatedAt = ?
          WHERE id = ? RETURNING *`,
       )
@@ -4797,6 +4830,8 @@ export function updateAgentProfile(
         updates.setupScript ?? null,
         updates.toolsMd ?? null,
         updates.heartbeatMd ?? null,
+        avatarProvided ? 1 : 0,
+        avatarJson,
         now,
         id,
       );
