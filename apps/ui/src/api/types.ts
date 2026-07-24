@@ -117,6 +117,7 @@ export interface AgentTask {
   agentId: string | null;
   creatorAgentId?: string;
   task: string;
+  title?: string;
   status: AgentTaskStatus;
   source: AgentTaskSource;
   taskType?: string;
