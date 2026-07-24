@@ -16280,6 +16280,59 @@
         }
       }
     },
+    "/api/tasks/{id}/title": {
+      "patch": {
+        "summary": "Set or clear a task's display title (session rename)",
+        "description": "Sets a human-facing display title override on a task. The sessions UI only reads this from root tasks (session list items), but titles on child tasks are harmless. Pass `title: null` (or an empty string) to clear the override and fall back to the task prompt.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 120
+                  }
+                },
+                "required": [
+                  "title"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Title updated"
+          },
+          "404": {
+            "description": "Task not found"
+          }
+        }
+      }
+    },
     "/api/task-templates": {
       "get": {
         "summary": "List task templates ('To start' bucket)",
