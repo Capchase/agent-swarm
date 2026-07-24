@@ -138,7 +138,7 @@ export function scheduleIntegrationsReload(delayMs = AUTO_RELOAD_DEBOUNCE_MS): v
       .catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
         console.error("[auto-reload] Failed:", message);
-        throw err;
+        return undefined;
       })
       .finally(() => {
         inFlightReload = null;
@@ -146,7 +146,7 @@ export function scheduleIntegrationsReload(delayMs = AUTO_RELOAD_DEBOUNCE_MS): v
           reloadRerunRequested = false;
           scheduleIntegrationsReload(delayMs);
         }
-      });
+      }) as Promise<ReloadConfigResult>;
   }, delayMs);
 }
 
