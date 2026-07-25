@@ -805,7 +805,7 @@ export const AgentSchema = z.object({
 
   // Custom avatar (icon + color). Null/missing = fall back to the
   // deterministic hash-derived icon and color (see apps/ui/src/lib/agent-icon.ts
-  // and agent-color.ts). Migration 117 adds the column.
+  // and agent-color.ts). Migration 119 adds the column.
   avatar: z
     .lazy(() => AgentAvatarSchema)
     .nullable()

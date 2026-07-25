@@ -1,6 +1,6 @@
 # QA: Customizable agent avatar (icon + color)
 
-Verified live against a scratch API server (`DATABASE_PATH=/tmp` fresh SQLite, migration 117 applied) and a `vite` dev server for `apps/ui` proxying to it — two agents registered (`Lead`, `Picateclas`), no seed data reused from any real deployment.
+Verified live against a scratch API server (`DATABASE_PATH=/tmp` fresh SQLite, migration 119 applied) and a `vite` dev server for `apps/ui` proxying to it — two agents registered (`Lead`, `Picateclas`), no seed data reused from any real deployment.
 
 ## Flow verified
 
@@ -15,6 +15,6 @@ Verified live against a scratch API server (`DATABASE_PATH=/tmp` fresh SQLite, m
 
 ## Also verified (not screenshotted, via direct DB script)
 
-- Fresh DB boot applies migration 117 cleanly.
-- Existing (pre-117) DB upgrades cleanly on next boot; pre-existing agent rows get `avatar: null` (deterministic fallback), not a migration failure.
+- Fresh DB boot applies migration 119 cleanly.
+- Existing (pre-119) DB upgrades cleanly on next boot; pre-existing agent rows get `avatar: null` (deterministic fallback), not a migration failure.
 - `updateAgentProfile` avatar set → unrelated-field update (role) does not clobber avatar → explicit `avatar: null` resets it. Covered by an automated test in `src/tests/list-endpoint-slimming.test.ts`.

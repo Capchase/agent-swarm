@@ -655,7 +655,7 @@ type AgentRow = {
   harness_provider: string | null;
   /** Migration 055: worker-self-reported credential snapshot (JSON of AgentCredStatus). NULL = unreported. */
   cred_status: string | null;
-  /** Migration 117: custom avatar (JSON of AgentAvatar). NULL = deterministic hash-derived fallback. */
+  /** Migration 119: custom avatar (JSON of AgentAvatar). NULL = deterministic hash-derived fallback. */
   avatar: string | null;
 };
 
