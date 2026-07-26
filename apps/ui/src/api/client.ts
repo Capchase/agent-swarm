@@ -1,5 +1,6 @@
 import { getConfig } from "@/lib/config";
 import type {
+  AgentAvatar,
   AgentMcpServersResponse,
   AgentSkillsResponse,
   AgentsResponse,
@@ -236,6 +237,8 @@ class ApiClient {
       toolsMd?: string;
       setupScript?: string;
       heartbeatMd?: string;
+      /** `null` resets to the deterministic fallback; omit to leave untouched. */
+      avatar?: AgentAvatar | null;
     },
   ): Promise<AgentWithTasks> {
     const url = `${this.getBaseUrl()}/api/agents/${id}/profile`;

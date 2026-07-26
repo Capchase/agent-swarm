@@ -725,6 +725,25 @@ export type TaskTemplate = z.infer<typeof TaskTemplateSchema>;
 
 export const AgentStatusSchema = z.enum(["idle", "busy", "offline", "waiting_for_credentials"]);
 
+// Discriminated union so future avatar types (emoji, image, ...) can be added
+// with zero migrations — just a new zod branch + a UI renderer branch. Server
+// validates shape only; the UI owns the curated icon catalog and deterministic
+// fallback, so an unrecognized/hand-set icon name can never break rendering.
+export const AgentAvatarSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("lucide"),
+    icon: z
+      .string()
+      .regex(/^[a-z0-9-]+$/)
+      .max(64),
+    color: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/)
+      .optional(),
+  }),
+]);
+export type AgentAvatar = z.infer<typeof AgentAvatarSchema>;
+
 export const AgentSchema = z.object({
   id: z.uuid(),
   name: z.string().min(1),
@@ -781,6 +800,14 @@ export const AgentSchema = z.object({
   // yet, or CRED_CHECK_DISABLE=1 was set). Migration 055 adds the column.
   credStatus: z
     .lazy(() => AgentCredStatusSchema)
+    .nullable()
+    .optional(),
+
+  // Custom avatar (icon + color). Null/missing = fall back to the
+  // deterministic hash-derived icon and color (see apps/ui/src/lib/agent-icon.ts
+  // and agent-color.ts). Migration 119 adds the column.
+  avatar: z
+    .lazy(() => AgentAvatarSchema)
     .nullable()
     .optional(),
 
