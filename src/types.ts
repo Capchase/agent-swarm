@@ -371,6 +371,7 @@ export const AgentTaskSchema = z.object({
   agentId: z.uuid().nullable(), // Nullable for unassigned tasks
   creatorAgentId: z.uuid().optional(), // Who created this task (optional for Slack/API)
   task: z.string().min(1),
+  title: z.string().optional(), // Human-facing display title override (e.g. session rename); falls back to `task` when unset
   status: AgentTaskStatusSchema,
   source: AgentTaskSourceSchema.default("mcp"),
 
@@ -1794,6 +1795,7 @@ export type AgentTaskSummary = Pick<
   | "agentId"
   | "creatorAgentId"
   | "task"
+  | "title"
   | "status"
   | "source"
   | "taskType"
