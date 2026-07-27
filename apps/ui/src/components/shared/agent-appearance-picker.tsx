@@ -10,7 +10,7 @@ import { RotateCcw } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { AgentAvatar } from "@/api/types";
 import { AVATAR_SUGGESTED_SWATCHES } from "@/lib/agent-color";
-import { AVATAR_ICON_CATALOG, DEFAULT_AVATAR_ICON_NAMES } from "@/lib/agent-icon";
+import { AVATAR_ICON_CATALOG, searchAvatarIcons } from "@/lib/agent-icon";
 import { cn } from "@/lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -19,12 +19,6 @@ import { ScrollArea } from "../ui/scroll-area";
 
 const DEFAULT_ICON_KEY = "bot";
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
-const MAX_SEARCH_RESULTS = 100;
-
-function normalizeIconName(value: string): string {
-  return value.toLowerCase().replace(/[\s-]+/g, "");
-}
-
 function IconTile({ icon }: { icon: string }) {
   const StaticIcon = AVATAR_ICON_CATALOG[icon];
   return StaticIcon ? <StaticIcon className="h-4 w-4" /> : null;
@@ -40,16 +34,7 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
   const [hexDraft, setHexDraft] = useState(avatar?.color ?? "");
   const [iconQuery, setIconQuery] = useState("");
   const hexValid = hexDraft === "" || HEX_RE.test(hexDraft);
-  const normalizedQuery = normalizeIconName(iconQuery);
-  const { iconResults, totalMatches } = useMemo(() => {
-    if (!normalizedQuery) {
-      return { iconResults: DEFAULT_AVATAR_ICON_NAMES, totalMatches: 0 };
-    }
-    const matches = Object.keys(AVATAR_ICON_CATALOG).filter((icon) =>
-      normalizeIconName(icon).includes(normalizedQuery),
-    );
-    return { iconResults: matches.slice(0, MAX_SEARCH_RESULTS), totalMatches: matches.length };
-  }, [normalizedQuery]);
+  const { iconResults, totalMatches } = useMemo(() => searchAvatarIcons(iconQuery), [iconQuery]);
 
   function pickIcon(icon: string) {
     onChange({ type: "lucide", icon, color: avatar?.color });
@@ -80,11 +65,11 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
             <Input
               value={iconQuery}
               onChange={(event) => setIconQuery(event.target.value)}
-              placeholder="Search 1,900+ icons"
+              placeholder="Search icons"
               aria-label="Search icons"
               className="mb-2 h-9"
             />
-            {normalizedQuery && (
+            {iconQuery && (
               <p className="mb-2 text-xs text-muted-foreground">
                 Showing {iconResults.length} of {totalMatches}
               </p>

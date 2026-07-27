@@ -872,6 +872,33 @@ export const AVATAR_ICON_CATALOG: Record<string, LucideIcon> = {
 
 /** The original familiar 64 choices shown until a search narrows the catalog. */
 export const DEFAULT_AVATAR_ICON_NAMES = Object.keys(AVATAR_ICON_CATALOG).slice(0, 64);
+export const MAX_AVATAR_ICON_SEARCH_RESULTS = 100;
+
+/**
+ * Filters the static picker catalog without coupling the search behavior to
+ * the popover. Spaces and hyphens are intentionally equivalent so people can
+ * discover names such as `tree-deciduous` by typing natural words.
+ */
+export function searchAvatarIcons(query: string): { iconResults: string[]; totalMatches: number } {
+  const normalizedQuery = query.toLowerCase().replace(/[\s-]+/g, "");
+  if (!normalizedQuery) {
+    return {
+      iconResults: DEFAULT_AVATAR_ICON_NAMES,
+      totalMatches: DEFAULT_AVATAR_ICON_NAMES.length,
+    };
+  }
+
+  const matches = Object.keys(AVATAR_ICON_CATALOG).filter((icon) =>
+    icon
+      .toLowerCase()
+      .replace(/[\s-]+/g, "")
+      .includes(normalizedQuery),
+  );
+  return {
+    iconResults: matches.slice(0, MAX_AVATAR_ICON_SEARCH_RESULTS),
+    totalMatches: matches.length,
+  };
+}
 
 /** Resolves an agent's rendered icon: stored catalog icon wins; unset/unknown
  * falls back to the existing deterministic derivation, so a stale or

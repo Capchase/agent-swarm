@@ -3,7 +3,9 @@ import { getAgentColorToken, resolveAgentColor } from "../../apps/ui/src/lib/age
 import {
   AVATAR_ICON_CATALOG,
   getAgentIcon,
+  MAX_AVATAR_ICON_SEARCH_RESULTS,
   resolveAgentIcon,
+  searchAvatarIcons,
   WORKER_ICONS,
 } from "../../apps/ui/src/lib/agent-icon";
 
@@ -64,6 +66,11 @@ describe("agent avatar resolution", () => {
       expect(first).toBe(second);
     });
 
+    test("keeps fixed seeds on their established fallback icons", () => {
+      expect(getAgentIcon({ agentId: "fixed-seed-alpha" })).toBe(AVATAR_ICON_CATALOG.snail);
+      expect(getAgentIcon({ agentId: "fixed-seed-beta" })).toBe(AVATAR_ICON_CATALOG.moon);
+    });
+
     test("different agentIds can resolve to different icons", () => {
       // Not a strict guarantee for every pair (hash collisions are possible),
       // but across a spread of ids we should see more than one icon.
@@ -76,6 +83,29 @@ describe("agent avatar resolution", () => {
     test("empty/missing seed falls back to Bot", () => {
       expect(getAgentIcon({})).toBe(AVATAR_ICON_CATALOG.bot);
       expect(getAgentIcon({ agentId: "", agentName: "" })).toBe(AVATAR_ICON_CATALOG.bot);
+    });
+  });
+
+  describe("avatar icon picker search", () => {
+    test("returns the familiar 64-icon shortlist for an empty query", () => {
+      const results = searchAvatarIcons("");
+      expect(results.iconResults).toHaveLength(64);
+      expect(results.totalMatches).toBe(64);
+    });
+
+    test("normalizes case, spaces, and hyphens", () => {
+      expect(searchAvatarIcons("TREE DECIDUOUS").iconResults).toContain("tree-deciduous");
+      expect(searchAvatarIcons("tree-deciduous").iconResults).toContain("tree-deciduous");
+    });
+
+    test("returns no choices for an unmatched query", () => {
+      expect(searchAvatarIcons("not-an-icon-at-all")).toEqual({ iconResults: [], totalMatches: 0 });
+    });
+
+    test("caps broad searches at 100 choices while retaining the match total", () => {
+      const results = searchAvatarIcons("a");
+      expect(results.totalMatches).toBeGreaterThan(MAX_AVATAR_ICON_SEARCH_RESULTS);
+      expect(results.iconResults).toHaveLength(MAX_AVATAR_ICON_SEARCH_RESULTS);
     });
   });
 
