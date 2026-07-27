@@ -7,6 +7,7 @@ import {
   createUser,
   createWorkflow,
   deleteWorkflow,
+  failTask,
   getTaskByWorkflowRunStepId,
   getWorkflowRun,
   getWorkflowRunStepsByRunId,
@@ -23,6 +24,7 @@ import {
 } from "../workflows/executors/base";
 import { ExecutorRegistry } from "../workflows/executors/registry";
 import { setupWorkflowResumeListener } from "../workflows/resume";
+import { startRetryPoller, stopRetryPoller } from "../workflows/retry-poller";
 import { interpolate } from "../workflows/template";
 
 const TEST_DB_PATH = "./test-workflow-async-v2.sqlite";
@@ -526,6 +528,153 @@ describe("Workflow Async v2 (Phase 4)", () => {
       // Workflow run should be completed
       const run = getWorkflowRun(runId)!;
       expect(run.status).toBe("completed");
+    });
+  });
+
+  describe("node.retry on agent-task failure (Defect D)", () => {
+    afterAll(() => {
+      stopRetryPoller();
+    });
+
+    test("a failed agent-task with node.retry is retried by the poller — new task, no false completion", async () => {
+      const workflow = makeWorkflow({
+        nodes: [
+          {
+            id: "task1",
+            type: "agent-task",
+            config: { template: "Retryable work" },
+            retry: { strategy: "static", maxRetries: 2, baseDelayMs: 10, maxDelayMs: 10 },
+          },
+        ],
+      });
+
+      const runId = await startWorkflowExecution(workflow, {}, registry);
+      const steps = getWorkflowRunStepsByRunId(runId);
+      const taskStep = steps.find((s) => s.nodeId === "task1")!;
+      const firstTask = getTaskByWorkflowRunStepId(taskStep.id)!;
+
+      // failTask() itself fires the "task.failed" bus event (see
+      // src/be/db.ts) — don't also emit manually, that would double-fire
+      // the listener and corrupt the retry count.
+      failTask(firstTask.id, "transient infra error");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Retry scheduled — step failed with a retry marker, run NOT terminal.
+      let updatedStep = getWorkflowRunStepsByRunId(runId).find((s) => s.nodeId === "task1")!;
+      expect(updatedStep.status).toBe("failed");
+      expect(updatedStep.nextRetryAt).toBeTruthy();
+      expect(getWorkflowRun(runId)!.status).not.toBe("failed");
+
+      // Let nextRetryAt pass, then run the poller.
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      startRetryPoller(registry, 10);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      stopRetryPoller();
+
+      // The step must be "waiting" on a freshly dispatched task — NOT
+      // falsely "completed" (that would mean the retry poller checkpointed
+      // an async agent-task dispatch as if it were a synchronous success).
+      updatedStep = getWorkflowRunStepsByRunId(runId).find((s) => s.nodeId === "task1")!;
+      expect(updatedStep.status).toBe("waiting");
+
+      const retryTask = getTaskByWorkflowRunStepId(taskStep.id)!;
+      expect(retryTask.id).not.toBe(firstTask.id);
+      expect(retryTask.status).not.toBe("failed");
+
+      // Complete the retried task — the run should finish normally.
+      // completeTask() self-emits "task.completed".
+      completeTask(retryTask.id, "recovered output");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(getWorkflowRun(runId)!.status).toBe("completed");
+    });
+
+    test("retries exhausted falls through to onNodeFailure (default 'fail')", async () => {
+      const workflow = makeWorkflow({
+        nodes: [
+          {
+            id: "task1",
+            type: "agent-task",
+            config: { template: "Always-failing work" },
+            retry: { strategy: "static", maxRetries: 1, baseDelayMs: 10, maxDelayMs: 10 },
+          },
+        ],
+      });
+
+      const runId = await startWorkflowExecution(workflow, {}, registry);
+      let steps = getWorkflowRunStepsByRunId(runId);
+      let taskStep = steps.find((s) => s.nodeId === "task1")!;
+      let task = getTaskByWorkflowRunStepId(taskStep.id)!;
+
+      // failTask() self-emits "task.failed" — see comment in the previous test.
+      failTask(task.id, "still broken");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(getWorkflowRun(runId)!.status).not.toBe("failed");
+
+      // Let the retry fire and re-dispatch.
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      startRetryPoller(registry, 10);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      stopRetryPoller();
+
+      steps = getWorkflowRunStepsByRunId(runId);
+      taskStep = steps.find((s) => s.nodeId === "task1")!;
+      task = getTaskByWorkflowRunStepId(taskStep.id)!;
+
+      // Fail the retried task too — maxRetries: 1 is now exhausted (this is
+      // the second failure), so onNodeFailure ("fail", the default) applies.
+      failTask(task.id, "still broken again");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(getWorkflowRun(runId)!.status).toBe("failed");
+    });
+  });
+
+  describe("onNodeFailure: 'continue' status honesty (Defect E)", () => {
+    test("a continue-mode node failure is recorded as failed, not completed, and the run reports completed_with_errors", async () => {
+      const workflow = makeWorkflow(
+        {
+          nodes: [
+            {
+              id: "task1",
+              type: "agent-task",
+              config: { template: "Will fail" },
+              next: "done",
+            },
+            {
+              id: "done",
+              type: "notify",
+              config: { channel: "swarm", template: "Coder outcome: {{task1.taskOutput}}" },
+            },
+          ],
+          onNodeFailure: "continue",
+        },
+        { name: `test-continue-status-${Date.now()}` },
+      );
+
+      const runId = await startWorkflowExecution(workflow, {}, registry);
+      const steps = getWorkflowRunStepsByRunId(runId);
+      const taskStep = steps.find((s) => s.nodeId === "task1")!;
+      const task = getTaskByWorkflowRunStepId(taskStep.id)!;
+
+      // failTask() self-emits "task.failed".
+      failTask(task.id, "session ended without output");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const updatedSteps = getWorkflowRunStepsByRunId(runId);
+      const failedStep = updatedSteps.find((s) => s.nodeId === "task1")!;
+      const doneStep = updatedSteps.find((s) => s.nodeId === "done")!;
+
+      // The crashed node must NOT be recorded as "completed" (Defect E) —
+      // it genuinely failed, even though "continue" routes past it.
+      expect(failedStep.status).toBe("failed");
+      expect(failedStep.error).toContain("session ended without output");
+      // Routing semantics unchanged — downstream node still ran.
+      expect(doneStep.status).toBe("completed");
+
+      // The run must not silently claim full success.
+      const finalRun = getWorkflowRun(runId)!;
+      expect(finalRun.status).toBe("completed_with_errors");
     });
   });
 });

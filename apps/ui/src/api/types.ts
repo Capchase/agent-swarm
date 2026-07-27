@@ -969,7 +969,13 @@ export interface Workflow {
   favorite?: boolean;
 }
 
-export type WorkflowRunStatus = "running" | "waiting" | "completed" | "failed" | "skipped";
+export type WorkflowRunStatus =
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "completed_with_errors";
 
 export interface WorkflowRun {
   id: string;

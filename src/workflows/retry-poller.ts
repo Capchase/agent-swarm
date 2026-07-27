@@ -6,9 +6,10 @@ import {
   updateWorkflowRunStep,
 } from "../be/db";
 import type { RetryPolicy } from "../types";
-import { checkpointStep, checkpointStepFailure } from "./checkpoint";
+import { checkpointStep, checkpointStepFailure, checkpointStepWaiting } from "./checkpoint";
 import { getSuccessors } from "./definition";
 import { interpolateNodeConfig, walkGraph } from "./engine";
+import type { AsyncExecutorResult } from "./executors/base";
 import type { ExecutorRegistry } from "./executors/registry";
 import { runStepValidation } from "./validation";
 
@@ -93,6 +94,14 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
                 step.retryCount,
                 retryPolicy,
               );
+            } else if ("async" in result && (result as AsyncExecutorResult).async) {
+              // Re-dispatched an async executor (e.g. agent-task): the
+              // executor returns `status: "success"` immediately but the
+              // real work (a freshly created agent task) hasn't finished —
+              // mirror engine.ts's executeStep handling instead of falsely
+              // checkpointing this retry as "completed" and walking
+              // successors before the new task even starts.
+              checkpointStepWaiting(run.id, step.id, ctx);
             } else {
               // Success! Re-run validation if configured before checkpointing.
               if (node.validation) {

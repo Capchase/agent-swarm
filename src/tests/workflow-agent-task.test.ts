@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
+  cancelTask,
   closeDb,
   createWorkflow,
   createWorkflowRun,
@@ -197,5 +198,88 @@ describe("AgentTaskExecutor — workspace scoping", () => {
     expect(task!.dir).toBeUndefined();
     expect(task!.vcsRepo).toBeUndefined();
     expect(task!.model).toBeUndefined();
+  });
+});
+
+describe("AgentTaskExecutor — retry idempotency (Defect D)", () => {
+  test("re-running execute() after the existing task is cancelled (terminal, not completed) creates a fresh task instead of waiting on the dead one forever", async () => {
+    const wf = createWorkflow({
+      name: "test-retry-terminal",
+      definition: { nodes: [], edges: [] },
+    });
+    const run = createWorkflowRun({ id: crypto.randomUUID(), workflowId: wf.id });
+    const step = createWorkflowRunStep({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      nodeId: "retry-node",
+      nodeType: "agent-task",
+    });
+    const meta: ExecutorMeta = {
+      runId: run.id,
+      stepId: step.id,
+      nodeId: "retry-node",
+      workflowId: wf.id,
+      dryRun: false,
+    };
+    const executor = new AgentTaskExecutor(mockDeps);
+    const config = { template: "Do the retryable thing" };
+
+    // First attempt: creates a task, returns the async "wait" marker.
+    const firstResult = await executor.run({ config, context: {}, meta });
+    expect(firstResult.status).toBe("success");
+    const firstTaskId = (firstResult as { correlationId?: string }).correlationId;
+    expect(firstTaskId).toBeDefined();
+
+    // Simulate the retry-poller re-invoking the SAME step after the first
+    // task reached a terminal (but not "completed") status.
+    const cancelled = cancelTask(firstTaskId!, "simulated failure for retry test");
+    expect(cancelled?.status).toBe("cancelled");
+
+    const retryResult = await executor.run({ config, context: {}, meta });
+    expect(retryResult.status).toBe("success");
+    const retryTaskId = (retryResult as { correlationId?: string }).correlationId;
+    expect(retryTaskId).toBeDefined();
+    // Must be a DIFFERENT task — reusing the dead cancelled one would mean
+    // the workflow waits forever on an event that will never fire again.
+    expect(retryTaskId).not.toBe(firstTaskId);
+
+    const newTask = getTaskById(retryTaskId!);
+    expect(newTask).toBeDefined();
+    expect(newTask!.status).not.toBe("cancelled");
+  });
+
+  test("re-running execute() while the existing task is still non-terminal (in-flight) returns the wait marker, no duplicate dispatch", async () => {
+    const wf = createWorkflow({
+      name: "test-retry-inflight",
+      definition: { nodes: [], edges: [] },
+    });
+    const run = createWorkflowRun({ id: crypto.randomUUID(), workflowId: wf.id });
+    const step = createWorkflowRunStep({
+      id: crypto.randomUUID(),
+      runId: run.id,
+      nodeId: "inflight-node",
+      nodeType: "agent-task",
+    });
+    const meta: ExecutorMeta = {
+      runId: run.id,
+      stepId: step.id,
+      nodeId: "inflight-node",
+      workflowId: wf.id,
+      dryRun: false,
+    };
+    const executor = new AgentTaskExecutor(mockDeps);
+    const config = { template: "Do the in-flight thing" };
+
+    const firstResult = await executor.run({ config, context: {}, meta });
+    const firstTaskId = (firstResult as { correlationId?: string }).correlationId;
+    expect(firstTaskId).toBeDefined();
+    // Freshly created tasks are non-terminal (e.g. "unassigned"/"pending") —
+    // don't mutate status, just re-invoke execute() for the same step.
+
+    const secondResult = await executor.run({ config, context: {}, meta });
+    expect(secondResult.status).toBe("success");
+    const secondTaskId = (secondResult as { correlationId?: string }).correlationId;
+    // Same task — no duplicate dispatch while the original is still alive.
+    expect(secondTaskId).toBe(firstTaskId);
   });
 });

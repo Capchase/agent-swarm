@@ -78,6 +78,43 @@ export function checkpointStepFailure(
 }
 
 /**
+ * Checkpoint a node that failed/was cancelled but the workflow's
+ * `onNodeFailure: "continue"` policy routes past it anyway.
+ *
+ * Unlike `checkpointStep`, this records the step as `status: "failed"` (with
+ * `error` set) instead of lying that it `completed` — the run's own status is
+ * corrected separately (see `finalizeOrWait` in resume.ts, which promotes a
+ * run containing any `"failed"` step to `"completed_with_errors"` instead of
+ * `"completed"`). The synthetic output is still merged into the run context
+ * so downstream `{{node.taskOutput...}}`-style interpolation keeps working —
+ * "continue" only changes routing semantics, not observability.
+ */
+export function checkpointStepContinuedAfterFailure(
+  runId: string,
+  stepId: string,
+  nodeId: string,
+  result: { output?: unknown; nextPort?: string },
+  error: string,
+  ctx: Record<string, unknown>,
+): void {
+  const txn = getDb().transaction(() => {
+    updateWorkflowRunStep(stepId, {
+      status: "failed",
+      error,
+      output: result.output,
+      nextPort: result.nextPort || undefined,
+      finishedAt: new Date().toISOString(),
+    });
+
+    ctx[nodeId] = result.output;
+    updateWorkflowRun(runId, {
+      context: ctx,
+    });
+  });
+  txn();
+}
+
+/**
  * Checkpoint a step entering waiting state (async executor).
  */
 export function checkpointStepWaiting(

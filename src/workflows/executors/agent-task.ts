@@ -4,6 +4,7 @@ import { withSiblingAwareness } from "../../tasks/sibling-awareness";
 import type { ExecutorMeta } from "../../types";
 import {
   FollowUpConfigSchema,
+  isTerminalTaskStatus,
   ModelTierSchema,
   ReasoningEffortSchema,
   splitLegacyModelAlias,
@@ -55,7 +56,17 @@ export class AgentTaskExecutor extends BaseExecutor<
   ): Promise<ExecutorResult<AgentTaskOutput>> {
     const { db } = this.deps;
 
-    // 1. Idempotency: check if a task was already created for this step
+    // 1. Idempotency: check if a task was already created for this step.
+    //
+    // A retry (node.retry configured, see resume.ts handleTaskFailure +
+    // retry-poller.ts) re-runs this SAME step id after its previous task
+    // already reached a terminal failure/cancellation — that terminal task
+    // will never emit another completion event, so it must NOT be treated
+    // as "still in flight." Only `completed` short-circuits with the stored
+    // output; a non-completed terminal status (failed/cancelled/superseded)
+    // falls through to create a fresh task exactly like the no-existing-task
+    // case. A genuinely non-terminal existing task (pending/in_progress/…)
+    // still returns the "keep waiting" marker to avoid double-dispatch.
     const existingTask = db.getTaskByWorkflowRunStepId(meta.stepId);
     if (existingTask) {
       if (existingTask.status === "completed") {
@@ -67,14 +78,18 @@ export class AgentTaskExecutor extends BaseExecutor<
           },
         };
       }
-      // Task exists but not yet completed — return async marker to keep waiting.
-      // The engine detects async results via `"async" in result`.
-      return {
-        status: "success",
-        async: true,
-        waitFor: "task.completed",
-        correlationId: existingTask.id,
-      } as unknown as ExecutorResult<AgentTaskOutput>;
+      if (!isTerminalTaskStatus(existingTask.status)) {
+        // Task exists but not yet completed — return async marker to keep waiting.
+        // The engine detects async results via `"async" in result`.
+        return {
+          status: "success",
+          async: true,
+          waitFor: "task.completed",
+          correlationId: existingTask.id,
+        } as unknown as ExecutorResult<AgentTaskOutput>;
+      }
+      // Terminal but not completed (failed/cancelled/superseded) — this is a
+      // retry. Fall through to create a fresh task below.
     }
 
     // 2. Inherit workflow-level dir/vcsRepo when node config doesn't specify them

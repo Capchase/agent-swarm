@@ -366,6 +366,7 @@ export default function WorkflowsPage() {
                 <SelectItem value="running">Running</SelectItem>
                 <SelectItem value="waiting">Waiting</SelectItem>
                 <SelectItem value="completed">Completed</SelectItem>
+                <SelectItem value="completed_with_errors">Completed (errors)</SelectItem>
                 <SelectItem value="failed">Failed</SelectItem>
                 <SelectItem value="skipped">Skipped</SelectItem>
               </SelectContent>

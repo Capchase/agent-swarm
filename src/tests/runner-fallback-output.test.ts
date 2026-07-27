@@ -468,7 +468,10 @@ describe("parseClaudeFallbackEnvelope", () => {
       is_error: true,
       result: "Not logged in · Please run /login",
     });
-    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 0, stdout: envelope, stderr: "" },
+      schema,
+    );
     expect(result.kind).toBe("schema-fail");
     expect((result as { failReason: string }).failReason).toContain("[envelope-error]");
     expect((result as { failReason: string }).failReason).toContain("Not logged in");
@@ -480,7 +483,10 @@ describe("parseClaudeFallbackEnvelope", () => {
       is_error: false,
       result: "here's my answer: not actually json",
     });
-    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 0, stdout: envelope, stderr: "" },
+      schema,
+    );
     expect(result.kind).toBe("schema-fail");
     expect((result as { failReason: string }).failReason).toContain("[payload-not-json]");
   });
@@ -491,7 +497,10 @@ describe("parseClaudeFallbackEnvelope", () => {
       is_error: false,
       result: JSON.stringify({ wrongField: "oops" }),
     });
-    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 0, stdout: envelope, stderr: "" },
+      schema,
+    );
     expect(result.kind).toBe("schema-fail");
     expect((result as { failReason: string }).failReason).toContain("[schema-invalid]");
   });
@@ -505,7 +514,10 @@ describe("parseClaudeFallbackEnvelope", () => {
       session_id: "sess-1",
       usage: {},
     });
-    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 0, stdout: envelope, stderr: "" },
+      schema,
+    );
     expect(result).toEqual({ kind: "extracted", output: JSON.stringify({ action: "merged" }) });
   });
 
@@ -515,7 +527,10 @@ describe("parseClaudeFallbackEnvelope", () => {
       is_error: false,
       result: { action: "merged" },
     });
-    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 0, stdout: envelope, stderr: "" },
+      schema,
+    );
     expect(result).toEqual({ kind: "extracted", output: JSON.stringify({ action: "merged" }) });
   });
 });

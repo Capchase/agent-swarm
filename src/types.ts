@@ -1966,6 +1966,12 @@ export const WorkflowRunStatusSchema = z.enum([
   "failed",
   "skipped",
   "cancelled",
+  // A run that walked through at least one "continue"-mode node failure
+  // (onNodeFailure: "continue") and still reached the end of its graph.
+  // Distinct from "completed" so health checks / dashboards don't read a
+  // silently-swallowed node failure as a clean success (see
+  // src/workflows/resume.ts finalizeOrWait).
+  "completed_with_errors",
 ]);
 export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusSchema>;
 

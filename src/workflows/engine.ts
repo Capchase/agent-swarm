@@ -222,6 +222,19 @@ export async function walkGraph(
     }
   }
 
+  // A "continue"-mode node failure (resume.ts handleTaskFailure) marks its
+  // step "failed" rather than "completed" (Defect E — status honesty) but
+  // still routes to its successors. The convergence gates below key off
+  // `completedNodeIds`, so without this a predecessor that failed-but-was-
+  // routed-past would never satisfy readiness and the walk would silently
+  // stall. Only reachable here for continue-mode failures — a hard "fail"
+  // marks the run failed and returns before ever calling walkGraph.
+  const routedPastFailedNodeIds = new Set(
+    allSteps.filter((s) => s.status === "failed").map((s) => s.nodeId),
+  );
+  const isPredecessorSatisfied = (nodeId: string): boolean =>
+    completedNodeIds.has(nodeId) || routedPastFailedNodeIds.has(nodeId);
+
   // Seed with start nodes whose predecessors are all completed (convergence gate).
   // For entry nodes (no predecessors), skip if already completed — these are
   // re-walk/recovery scenarios where memoization should apply.
@@ -238,7 +251,7 @@ export async function walkGraph(
     const activePreds = preds.filter((predId) => activeEdges.has(`${predId}→${n.id}`));
     // If no active edges yet (first walk), check ALL structural predecessors
     const predsToCheck = activePreds.length > 0 ? activePreds : preds;
-    return predsToCheck.every((p) => completedNodeIds.has(p));
+    return predsToCheck.every(isPredecessorSatisfied);
   });
 
   // Track nodes executed in THIS walk to prevent re-execution within the same
@@ -311,7 +324,7 @@ export async function walkGraph(
 
       const allPreds = getAllPredecessors(def, nodeId);
       const activePreds = allPreds.filter((predId) => activeEdges.has(`${predId}→${nodeId}`));
-      const allActivePredsCompleted = activePreds.every((p) => completedNodeIds.has(p));
+      const allActivePredsCompleted = activePreds.every(isPredecessorSatisfied);
 
       if (allActivePredsCompleted) {
         readyNext.push(node);
@@ -355,11 +368,13 @@ export async function walkGraph(
           finishedAt: new Date().toISOString(),
         });
       } else if (failedSteps.length > 0) {
-        // Partial failure — some branches succeeded, some failed.
-        // Mark as completed with error noting partial failure.
+        // Partial failure — some branches succeeded, some failed (this is the
+        // same "don't silently claim full success" concern as Defect E's fix
+        // to the async task-failure "continue" path in resume.ts — both
+        // report the same status for the same underlying situation).
         const failedNodeIds = failedSteps.map((s) => s.nodeId).join(", ");
         updateWorkflowRun(runId, {
-          status: "completed",
+          status: "completed_with_errors",
           error: `Partial failure: nodes [${failedNodeIds}] failed (mustPass validation), but other branches completed successfully`,
           context: ctx,
           finishedAt: new Date().toISOString(),

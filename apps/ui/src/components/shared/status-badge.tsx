@@ -97,6 +97,11 @@ const statusConfig: Record<string, StatusConfig> = {
     spinner: true,
   },
   waiting: { label: "WAITING", dot: "bg-status-pending", text: "text-status-pending-strong" },
+  completed_with_errors: {
+    label: "COMPLETED (ERRORS)",
+    dot: "bg-status-warning",
+    text: "text-status-warning-strong",
+  },
 
   // Workflow step statuses
   skipped: { label: "SKIPPED", dot: "bg-status-neutral", text: "text-status-neutral" },

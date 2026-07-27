@@ -568,8 +568,10 @@ describe("Workflow Engine v2 (Phase 3)", () => {
       const runId = await startWorkflowExecution(workflow, {}, registry);
 
       const run = getWorkflowRun(runId);
-      // Run should complete (not fail) because branchB succeeded
-      expect(run!.status).toBe("completed");
+      // Run should complete (not hard-fail) because branchB succeeded, but
+      // must not silently claim full success either (Defect E — see
+      // engine.ts's walkGraph partial-failure branch).
+      expect(run!.status).toBe("completed_with_errors");
       // Should note partial failure
       expect(run!.error).toContain("Partial failure");
       expect(run!.error).toContain("branchA");

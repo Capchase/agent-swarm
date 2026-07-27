@@ -8144,16 +8144,20 @@ export function listWorkflows(
     params.push(filters.lastRunStatus);
   }
   if (filters?.consecutiveErrorsMin !== undefined) {
+    // 'completed_with_errors' (a "continue"-mode run that swallowed a node
+    // failure — see resume.ts finalizeOrWait) counts toward this health
+    // signal the same as 'failed': a workflow silently limping through node
+    // failures run after run is exactly what this filter is meant to catch.
     query += ` AND (
       SELECT COUNT(*)
       FROM workflow_runs wr
       WHERE wr.workflowId = workflows.id
-        AND wr.status = 'failed'
+        AND wr.status IN ('failed', 'completed_with_errors')
         AND NOT EXISTS (
           SELECT 1
           FROM workflow_runs newer_non_failed
           WHERE newer_non_failed.workflowId = wr.workflowId
-            AND newer_non_failed.status != 'failed'
+            AND newer_non_failed.status NOT IN ('failed', 'completed_with_errors')
             AND newer_non_failed.startedAt > wr.startedAt
         )
     ) >= ?`;
@@ -8633,9 +8637,15 @@ export function getCompletedStepNodeIds(runId: string): string[] {
 }
 
 export function getTaskByWorkflowRunStepId(stepId: string): AgentTask | null {
+  // A workflow retry (agent-task node with `node.retry`) creates a fresh
+  // agent_tasks row for the same stepId after the previous attempt reached a
+  // terminal failure — there's no uniqueness constraint on workflowRunStepId.
+  // ORDER BY createdAt DESC ensures callers (notably AgentTaskExecutor's
+  // idempotency check) always see the most recent attempt, not an
+  // arbitrary/stale one.
   const row = getDb()
     .prepare<AgentTaskRow, [string]>(
-      "SELECT * FROM agent_tasks WHERE workflowRunStepId = ? LIMIT 1",
+      "SELECT * FROM agent_tasks WHERE workflowRunStepId = ? ORDER BY createdAt DESC LIMIT 1",
     )
     .get(stepId);
   return row ? rowToAgentTask(row) : null;

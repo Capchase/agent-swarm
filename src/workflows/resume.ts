@@ -13,7 +13,11 @@ import {
   updateWorkflowRun,
   updateWorkflowRunStep,
 } from "../be/db";
-import { checkpointStep } from "./checkpoint";
+import {
+  checkpointStep,
+  checkpointStepContinuedAfterFailure,
+  checkpointStepFailure,
+} from "./checkpoint";
 import { getSuccessors } from "./definition";
 import { findReadyNodes, walkGraph } from "./engine";
 import type { WorkflowEventBus } from "./event-bus";
@@ -163,18 +167,33 @@ export function finalizeOrWait(runId: string): void {
   if (hasWaiting) {
     updateWorkflowRun(runId, { status: "waiting" });
   } else {
-    // All steps done (completed or failed) — finalize the run
+    // All steps done (completed or failed) — finalize the run. A run that
+    // walked through a "continue"-mode node failure (see
+    // checkpointStepContinuedAfterFailure) contains a "failed" step even
+    // though the graph walk itself finished — report that as
+    // "completed_with_errors" rather than silently claiming "completed"
+    // (Defect E). A hard "fail"-mode failure never reaches this function —
+    // markRunFailed returns immediately — so this only ever fires for the
+    // continue path.
+    const hasFailedStep = steps.some((s) => s.status === "failed");
     updateWorkflowRun(runId, {
-      status: "completed",
+      status: hasFailedStep ? "completed_with_errors" : "completed",
       finishedAt: new Date().toISOString(),
     });
   }
 }
 
 /**
- * Handle task failure/cancellation — respects workflow's onNodeFailure config.
+ * Handle task failure/cancellation.
+ *
+ * Precedence: an explicit per-node `retry` policy (Defect D) is honored
+ * BEFORE the workflow's `onNodeFailure` decision — retry is strictly opt-in
+ * (a node without `retry` configured falls straight through to the existing
+ * behavior, unchanged) and only once retries are exhausted does
+ * `onNodeFailure` apply:
  * 'fail' (default): mark the entire run as failed.
- * 'continue': treat as completed with error output, let convergence proceed.
+ * 'continue': record the failure (Defect E — no longer marked "completed"),
+ * let convergence proceed.
  */
 async function handleTaskFailure(
   event: TaskEvent,
@@ -187,6 +206,31 @@ async function handleTaskFailure(
   const workflow = getWorkflow(run.workflowId);
   if (!workflow) return;
 
+  const step = getWorkflowRunStep(event.workflowRunStepId!);
+  if (!step) return;
+
+  const node = workflow.definition.nodes.find((n) => n.id === step.nodeId);
+  if (node?.retry) {
+    const { shouldRetry } = checkpointStepFailure(
+      run.id,
+      step.id,
+      reason,
+      step.retryCount,
+      node.retry,
+      { markRunFailed: false },
+    );
+    if (shouldRetry) {
+      // Leave the run non-terminal — checkpointStepFailure already marked
+      // the step "failed" with nextRetryAt set. The retry-poller will pick
+      // it up and re-dispatch a fresh task (AgentTaskExecutor's idempotency
+      // check treats this terminal-but-not-completed task as a prior
+      // attempt, not an in-flight one — see agent-task.ts).
+      updateWorkflowRun(run.id, { status: "running" });
+      return;
+    }
+    // Retries exhausted — fall through to the onNodeFailure decision below.
+  }
+
   const onFailure = workflow.definition.onNodeFailure ?? "fail";
 
   if (onFailure === "fail") {
@@ -194,16 +238,20 @@ async function handleTaskFailure(
     return;
   }
 
-  // "continue": treat as completed with error output
-  const step = getWorkflowRunStep(event.workflowRunStepId!);
-  if (!step) return;
-
+  // "continue": record the failure, then let convergence proceed.
   const ctx = (run.context ?? {}) as Record<string, unknown>;
   const stepOutput = {
     taskId: event.taskId,
     taskOutput: `[FAILED: ${reason}] This node failed or was cancelled.`,
   };
-  checkpointStep(run.id, step.id, step.nodeId, { output: stepOutput }, ctx);
+  checkpointStepContinuedAfterFailure(
+    run.id,
+    step.id,
+    step.nodeId,
+    { output: stepOutput },
+    reason,
+    ctx,
+  );
 
   updateWorkflowRun(run.id, { status: "running" });
 
