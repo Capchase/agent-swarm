@@ -24,6 +24,11 @@ function IconTile({ icon }: { icon: string }) {
   return StaticIcon ? <StaticIcon className="h-4 w-4" /> : null;
 }
 
+/** Human-readable label for a11y — "tree-deciduous" -> "tree deciduous". */
+function iconLabel(icon: string): string {
+  return icon.replace(/-/g, " ");
+}
+
 export interface AgentAppearancePickerProps {
   avatar: AgentAvatar | null | undefined;
   onChange: (avatar: AgentAvatar | null) => void;
@@ -34,7 +39,16 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
   const [hexDraft, setHexDraft] = useState(avatar?.color ?? "");
   const [iconQuery, setIconQuery] = useState("");
   const hexValid = hexDraft === "" || HEX_RE.test(hexDraft);
-  const { iconResults, totalMatches } = useMemo(() => searchAvatarIcons(iconQuery), [iconQuery]);
+  const { iconResults: rawIconResults, totalMatches } = useMemo(
+    () => searchAvatarIcons(iconQuery),
+    [iconQuery],
+  );
+  // Defensive: only render icons that actually resolve, so a stale/typo'd
+  // catalog key can never leave a blank, unlabeled, clickable tile.
+  const iconResults = useMemo(
+    () => rawIconResults.filter((icon) => icon in AVATAR_ICON_CATALOG),
+    [rawIconResults],
+  );
 
   function pickIcon(icon: string) {
     onChange({ type: "lucide", icon, color: avatar?.color });
@@ -81,6 +95,8 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
                     key={icon}
                     type="button"
                     title={icon}
+                    aria-label={iconLabel(icon)}
+                    aria-pressed={avatar?.icon === icon}
                     onClick={() => pickIcon(icon)}
                     className={cn(
                       "flex items-center justify-center rounded-md p-1.5 hover:bg-accent transition-colors",
