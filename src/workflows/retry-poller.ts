@@ -11,6 +11,7 @@ import { getSuccessors } from "./definition";
 import { interpolateNodeConfig, walkGraph } from "./engine";
 import type { AsyncExecutorResult } from "./executors/base";
 import type { ExecutorRegistry } from "./executors/registry";
+import { finalizeOrWait } from "./resume";
 import { runStepValidation } from "./validation";
 
 let pollerTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -167,12 +168,17 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
                   workflow.id,
                 );
               } else {
-                // No successors — check if run is complete
-                updateWorkflowRun(run.id, {
-                  status: "completed",
-                  context: ctx,
-                  finishedAt: new Date().toISOString(),
-                });
+                // No successors — finalize through the same status
+                // calculation used elsewhere (resume.ts's
+                // resumeFromTaskCompletion), instead of hardcoding
+                // "completed" directly. A sibling branch may already have
+                // failed under onNodeFailure: "continue" (Defect E), leaving
+                // a "failed" step in this same run; finalizeOrWait promotes
+                // that to "completed_with_errors" rather than letting this
+                // retried branch's own success silently overwrite that
+                // signal (review finding 2). checkpointStep() above already
+                // persisted ctx into the run's context field.
+                finalizeOrWait(run.id);
               }
             }
           } catch (err) {

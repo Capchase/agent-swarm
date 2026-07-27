@@ -13,7 +13,7 @@ import {
   getWorkflowRunStepsByRunId,
   initDb,
 } from "../be/db";
-import type { Workflow, WorkflowDefinition } from "../types";
+import type { ExecutorMeta, Workflow, WorkflowDefinition } from "../types";
 import { startWorkflowExecution } from "../workflows/engine";
 import { InProcessEventBus, workflowEventBus } from "../workflows/event-bus";
 import { AgentTaskExecutor } from "../workflows/executors/agent-task";
@@ -64,6 +64,38 @@ class NotifyStubExecutor extends BaseExecutor<
   }
 }
 
+// Fails on its first invocation per workflow run, then succeeds — used to
+// drive a synchronous node through engine.ts's retry-scheduling path and
+// then the retry-poller's re-execution/success path without needing a real
+// agent-task round trip (review finding 2 regression coverage).
+const flakyOnceAttempts = new Map<string, number>();
+
+class FlakyOnceExecutor extends BaseExecutor<
+  typeof FlakyOnceExecutor.schema,
+  typeof FlakyOnceExecutor.outSchema
+> {
+  static readonly schema = z.object({});
+  static readonly outSchema = z.object({ attempt: z.number() });
+
+  readonly type = "flaky-once";
+  readonly mode = "instant" as const;
+  readonly configSchema = FlakyOnceExecutor.schema;
+  readonly outputSchema = FlakyOnceExecutor.outSchema;
+
+  protected async execute(
+    _config: z.infer<typeof FlakyOnceExecutor.schema>,
+    _context: Readonly<Record<string, unknown>>,
+    meta: ExecutorMeta,
+  ): Promise<ExecutorResult<z.infer<typeof FlakyOnceExecutor.outSchema>>> {
+    const attempt = (flakyOnceAttempts.get(meta.runId) ?? 0) + 1;
+    flakyOnceAttempts.set(meta.runId, attempt);
+    if (attempt === 1) {
+      return { status: "failed", error: "transient flake" };
+    }
+    return { status: "success", output: { attempt } };
+  }
+}
+
 // ─── Mock Dependencies ───────────────────────────────────────
 
 import * as db from "../be/db";
@@ -79,6 +111,7 @@ function createTestRegistry(): ExecutorRegistry {
   registry.register(new EchoExecutor(mockDeps));
   registry.register(new NotifyStubExecutor(mockDeps));
   registry.register(new AgentTaskExecutor(mockDeps));
+  registry.register(new FlakyOnceExecutor(mockDeps));
   return registry;
 }
 
@@ -675,6 +708,80 @@ describe("Workflow Async v2 (Phase 4)", () => {
       // The run must not silently claim full success.
       const finalRun = getWorkflowRun(runId)!;
       expect(finalRun.status).toBe("completed_with_errors");
+    });
+  });
+
+  describe("retry-poller finalizes through finalizeOrWait, not a hardcoded status (review finding 2)", () => {
+    afterAll(() => {
+      stopRetryPoller();
+    });
+
+    test("a retried branch's success does not overwrite a sibling branch's continue-mode failure with 'completed'", async () => {
+      const workflow = makeWorkflow({
+        nodes: [
+          {
+            id: "start",
+            type: "echo",
+            config: { message: "go" },
+            next: ["branch-continue", "branch-flaky"],
+          },
+          // Leaf, no retry — will be failed directly via failTask() and
+          // routed past via onNodeFailure: "continue".
+          { id: "branch-continue", type: "agent-task", config: { template: "Branch A" } },
+          // Leaf, synchronous, retried once — fails on the initial walk,
+          // succeeds when the retry-poller re-runs it.
+          {
+            id: "branch-flaky",
+            type: "flaky-once",
+            config: {},
+            retry: { strategy: "static", maxRetries: 1, baseDelayMs: 10, maxDelayMs: 10 },
+          },
+        ],
+        onNodeFailure: "continue",
+      });
+
+      const runId = await startWorkflowExecution(workflow, {}, registry);
+
+      // branch-flaky failed synchronously on the initial walk (engine.ts's
+      // retry-scheduling path) — retryable, so the run isn't terminal.
+      let steps = getWorkflowRunStepsByRunId(runId);
+      const flakyStep = steps.find((s) => s.nodeId === "branch-flaky")!;
+      expect(flakyStep.status).toBe("failed");
+      expect(flakyStep.nextRetryAt).toBeTruthy();
+
+      // branch-continue is still an in-flight agent-task, untouched so far.
+      const continueStep = steps.find((s) => s.nodeId === "branch-continue")!;
+      expect(continueStep.status).toBe("waiting");
+
+      // Let nextRetryAt pass, then let the poller re-run branch-flaky. It
+      // succeeds on this second attempt and has no successors — this is
+      // exactly the retry-poller.ts code path finding 2 flagged.
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      startRetryPoller(registry, 10);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      stopRetryPoller();
+
+      steps = getWorkflowRunStepsByRunId(runId);
+      expect(steps.find((s) => s.nodeId === "branch-flaky")!.status).toBe("completed");
+
+      // branch-continue has NOT resolved yet — the run must still be
+      // waiting, not "completed". The old code hardcoded "completed" here
+      // unconditionally, which would have been a lie: a sibling branch is
+      // still outstanding.
+      expect(getWorkflowRun(runId)!.status).not.toBe("completed");
+
+      // Now fail branch-continue — onNodeFailure: "continue" routes past it
+      // (Defect E semantics), and finalizeOrWait finalizes the run.
+      const continueTask = getTaskByWorkflowRunStepId(continueStep.id)!;
+      failTask(continueTask.id, "branch A crashed");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      steps = getWorkflowRunStepsByRunId(runId);
+      expect(steps.find((s) => s.nodeId === "branch-continue")!.status).toBe("failed");
+
+      // Both branches are now terminal, one of them failed — the run must
+      // report completed_with_errors, never a plain "completed".
+      expect(getWorkflowRun(runId)!.status).toBe("completed_with_errors");
     });
   });
 });
