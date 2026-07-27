@@ -7,6 +7,7 @@ import {
   ensureTaskFinished,
   getBridgeFailureDiagnostics,
   handleStructuredOutputFallback,
+  parseClaudeFallbackEnvelope,
 } from "../commands/runner";
 
 // Configurable mock responses per test
@@ -422,6 +423,100 @@ describe("ensureTaskFinished", () => {
 
     expect(lastFinishBody).toBeTruthy();
     expect((lastFinishBody!.output as string).length).toBe(2000);
+  });
+});
+
+describe("parseClaudeFallbackEnvelope", () => {
+  const schema = {
+    type: "object",
+    required: ["action"],
+    properties: { action: { type: "string" } },
+  };
+
+  test("subprocess-failed: non-zero exit surfaces scrubbed stderr", () => {
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 1, stdout: "", stderr: "Not logged in · Please run /login" },
+      schema,
+    );
+    expect(result.kind).toBe("schema-fail");
+    expect((result as { failReason: string }).failReason).toContain("[subprocess-failed]");
+    expect((result as { failReason: string }).failReason).toContain("Not logged in");
+  });
+
+  test("subprocess-failed: scrubs a leaked secret in stderr", () => {
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 1, stdout: "", stderr: "auth failed with key sk-ant-abcdefghijklmnopqrstuvwxyz" },
+      schema,
+    );
+    const failReason = (result as { failReason: string }).failReason;
+    expect(failReason).not.toContain("sk-ant-abcdefghijklmnopqrstuvwxyz");
+  });
+
+  test("payload-not-json: stdout isn't JSON at all", () => {
+    const result = parseClaudeFallbackEnvelope(
+      { exitCode: 0, stdout: "not json output", stderr: "" },
+      schema,
+    );
+    expect(result.kind).toBe("schema-fail");
+    expect((result as { failReason: string }).failReason).toContain("[payload-not-json]");
+  });
+
+  test("envelope-error: is_error true is treated as failure, not success", () => {
+    const envelope = JSON.stringify({
+      type: "result",
+      subtype: "error",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+    });
+    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    expect(result.kind).toBe("schema-fail");
+    expect((result as { failReason: string }).failReason).toContain("[envelope-error]");
+    expect((result as { failReason: string }).failReason).toContain("Not logged in");
+  });
+
+  test("payload-not-json: envelope.result is a string that isn't JSON", () => {
+    const envelope = JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: "here's my answer: not actually json",
+    });
+    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    expect(result.kind).toBe("schema-fail");
+    expect((result as { failReason: string }).failReason).toContain("[payload-not-json]");
+  });
+
+  test("schema-invalid: unwrapped payload fails outputSchema validation", () => {
+    const envelope = JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: JSON.stringify({ wrongField: "oops" }),
+    });
+    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    expect(result.kind).toBe("schema-fail");
+    expect((result as { failReason: string }).failReason).toContain("[schema-invalid]");
+  });
+
+  test("extracted: unwraps a stringified result and validates successfully", () => {
+    const envelope = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: JSON.stringify({ action: "merged" }),
+      session_id: "sess-1",
+      usage: {},
+    });
+    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    expect(result).toEqual({ kind: "extracted", output: JSON.stringify({ action: "merged" }) });
+  });
+
+  test("extracted: unwraps an already-object result", () => {
+    const envelope = JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: { action: "merged" },
+    });
+    const result = parseClaudeFallbackEnvelope({ exitCode: 0, stdout: envelope, stderr: "" }, schema);
+    expect(result).toEqual({ kind: "extracted", output: JSON.stringify({ action: "merged" }) });
   });
 });
 

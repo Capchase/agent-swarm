@@ -956,10 +956,90 @@ export type FallbackResult =
   | { kind: "schema-fail"; failReason: string }
   | { kind: "fetch-error"; error: string };
 
+/**
+ * Parse the `claude --output-format json` result envelope
+ * (`{type,subtype,is_error,result,session_id,usage,...}`), unwrap `.result`,
+ * and validate it against the task's outputSchema.
+ *
+ * Pulled out as a pure function (no shell/network access) so the four
+ * failure branches — subprocess exit, envelope-reported error, non-JSON
+ * payload, schema mismatch — are unit-testable without spawning `claude`.
+ * Exported for tests.
+ */
+export function parseClaudeFallbackEnvelope(
+  outcome: { exitCode: number; stdout: string; stderr: string },
+  outputSchema: Record<string, unknown>,
+): FallbackResult {
+  if (outcome.exitCode !== 0) {
+    return {
+      kind: "schema-fail",
+      failReason: `Structured output extraction fallback failed [subprocess-failed]: claude exited ${outcome.exitCode}: ${scrubSecrets(outcome.stderr.slice(0, 500)) || "(no stderr)"}`,
+    };
+  }
+
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(outcome.stdout);
+  } catch {
+    return {
+      kind: "schema-fail",
+      failReason: `Structured output extraction fallback failed [payload-not-json]: claude stdout was not valid JSON: ${scrubSecrets(outcome.stdout.slice(0, 200))}`,
+    };
+  }
+
+  if (typeof envelope !== "object" || envelope === null) {
+    return {
+      kind: "schema-fail",
+      failReason:
+        "Structured output extraction fallback failed [payload-not-json]: claude stdout parsed to a non-object envelope",
+    };
+  }
+
+  const env = envelope as { is_error?: boolean; result?: unknown };
+  if (env.is_error) {
+    return {
+      kind: "schema-fail",
+      failReason: `Structured output extraction fallback failed [envelope-error]: ${scrubSecrets(String(env.result ?? "unknown error")).slice(0, 500)}`,
+    };
+  }
+
+  let payload: unknown = env.result;
+  if (typeof payload === "string") {
+    const rawResultString = payload;
+    try {
+      payload = JSON.parse(rawResultString);
+    } catch {
+      return {
+        kind: "schema-fail",
+        failReason: `Structured output extraction fallback failed [payload-not-json]: envelope result was not valid JSON: ${scrubSecrets(rawResultString.slice(0, 200))}`,
+      };
+    }
+  }
+
+  const validationErrors = validateJsonSchema(outputSchema, payload);
+  if (validationErrors.length > 0) {
+    return {
+      kind: "schema-fail",
+      failReason: `Structured output extraction fallback failed [schema-invalid]: ${validationErrors.join("; ")}`,
+    };
+  }
+
+  return { kind: "extracted", output: JSON.stringify(payload) };
+}
+
 export async function handleStructuredOutputFallback(
   config: ApiConfig,
   taskId: string,
   adapterType: string,
+  /**
+   * Auth env resolved at spawn time for this task's session (Defect A —
+   * credential-pool members are deliberately never written to
+   * `process.env`, see RELOADABLE_ENV_KEYS above, so this fallback
+   * subprocess needs its own explicit env overlay to authenticate).
+   * Undefined when the original spawn never happened (e.g. spawn-failure
+   * call sites) — falls back to bare `process.env`.
+   */
+  credentialEnv?: Record<string, string | undefined>,
 ): Promise<FallbackResult> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -1026,19 +1106,21 @@ ${JSON.stringify(taskData.outputSchema, null, 2)}
 Extract the structured data from the progress updates above. Return ONLY valid JSON matching the schema.`;
 
     const schemaJson = JSON.stringify(taskData.outputSchema);
-    const result =
+    const shellEnv = { ...process.env, ...credentialEnv } as Record<string, string | undefined>;
+    const proc =
       await Bun.$`claude -p ${extractionPrompt} --json-schema ${schemaJson} --output-format json --model sonnet`
-        .json()
-        .catch(() => null);
+        .env(shellEnv)
+        .nothrow()
+        .quiet();
 
-    if (result && typeof result === "object") {
-      return { kind: "extracted", output: JSON.stringify(result) };
-    }
-
-    return {
-      kind: "schema-fail",
-      failReason: "Structured output extraction fallback failed — could not produce valid JSON",
-    };
+    return parseClaudeFallbackEnvelope(
+      {
+        exitCode: proc.exitCode,
+        stdout: proc.stdout.toString("utf8"),
+        stderr: proc.stderr.toString("utf8"),
+      },
+      taskData.outputSchema,
+    );
   } catch (err) {
     console.warn(`[runner] Structured output fallback failed for task ${taskId}: ${err}`);
     return { kind: "fetch-error", error: String(err) };
@@ -1109,6 +1191,8 @@ export async function ensureTaskFinished(
    */
   provider?: ProviderName,
   failureDiagnostics?: string,
+  /** See `handleStructuredOutputFallback`'s `credentialEnv` param (Defect A). */
+  credentialEnv?: Record<string, string | undefined>,
 ): Promise<void> {
   const headers: Record<string, string> = {
     "X-Agent-ID": config.agentId,
@@ -1140,7 +1224,12 @@ export async function ensureTaskFinished(
   } else {
     // Try structured output fallback if the task has an outputSchema
     const adapterType = provider ?? process.env.HARNESS_PROVIDER ?? "claude";
-    const fallback = await handleStructuredOutputFallback(config, taskId, adapterType);
+    const fallback = await handleStructuredOutputFallback(
+      config,
+      taskId,
+      adapterType,
+      credentialEnv,
+    );
 
     console.log(`[${role}] Task ${taskId.slice(0, 8)} fallback result: ${fallback.kind}`);
 
@@ -1770,6 +1859,14 @@ interface RunningTask {
     keySuffix: string;
     keyIndex: number;
   };
+  /**
+   * Resolved auth env for this session's credential-pool pick (Defect A). Only
+   * carries the vars the structured-output fallback subprocess needs to
+   * authenticate as `claude` — CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY are
+   * deliberately never written to `process.env` (see RELOADABLE_ENV_KEYS), so
+   * this is the only way the fallback can pick up a valid credential.
+   */
+  credentialEnv?: Record<string, string | undefined>;
   /**
    * Harness provider this session was actually spawned/resumed on, snapshotted
    * at spawn time. The runner lets in-flight sessions finish on their original
@@ -3684,6 +3781,10 @@ async function spawnProviderProcess(
     promise,
     result: null,
     credentialInfo,
+    credentialEnv: {
+      CLAUDE_CODE_OAUTH_TOKEN: freshEnv.CLAUDE_CODE_OAUTH_TOKEN,
+      ANTHROPIC_API_KEY: freshEnv.ANTHROPIC_API_KEY,
+    },
     // Snapshot the provider + local-env trait of the adapter this session is
     // spawned on, so the session-end sync decision survives a live provider
     // swap that mutates the global RunnerState (review finding 2).
@@ -3725,6 +3826,7 @@ async function checkCompletedProcesses(
     cursorUpdates?: Array<{ channelId: string; ts: string }>;
     workingDir?: string;
     credentialInfo?: RunningTask["credentialInfo"];
+    credentialEnv?: RunningTask["credentialEnv"];
     harnessProvider: ProviderName;
     hasLocalEnvironment: boolean;
     harnessVariant?: string;
@@ -3746,6 +3848,7 @@ async function checkCompletedProcesses(
         cursorUpdates: task.cursorUpdates,
         workingDir: task.workingDir,
         credentialInfo: task.credentialInfo,
+        credentialEnv: task.credentialEnv,
         harnessProvider: task.harnessProvider,
         hasLocalEnvironment: task.hasLocalEnvironment,
         harnessVariant: task.harnessVariant,
@@ -3763,6 +3866,7 @@ async function checkCompletedProcesses(
     cursorUpdates,
     workingDir,
     credentialInfo,
+    credentialEnv,
     harnessProvider,
     harnessVariant,
     harnessVariantMeta,
@@ -3886,6 +3990,7 @@ async function checkCompletedProcesses(
         result.output,
         harnessProvider,
         bridgeFailureDiagnostics,
+        credentialEnv,
       );
 
       telemetry.taskEvent("session_completed", {
