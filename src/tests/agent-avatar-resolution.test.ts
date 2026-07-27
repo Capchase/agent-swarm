@@ -4,6 +4,7 @@ import {
   AVATAR_ICON_CATALOG,
   getAgentIcon,
   resolveAgentIcon,
+  WORKER_ICONS,
 } from "../../apps/ui/src/lib/agent-icon";
 
 /**
@@ -15,6 +16,40 @@ import {
  */
 describe("agent avatar resolution", () => {
   describe("getAgentIcon (deterministic fallback)", () => {
+    test("keeps the 30-entry worker pool and its established order", () => {
+      expect(WORKER_ICONS).toEqual([
+        AVATAR_ICON_CATALOG.bot,
+        AVATAR_ICON_CATALOG.cat,
+        AVATAR_ICON_CATALOG.dog,
+        AVATAR_ICON_CATALOG.bird,
+        AVATAR_ICON_CATALOG.fish,
+        AVATAR_ICON_CATALOG.bug,
+        AVATAR_ICON_CATALOG.snail,
+        AVATAR_ICON_CATALOG.turtle,
+        AVATAR_ICON_CATALOG.squirrel,
+        AVATAR_ICON_CATALOG.cherry,
+        AVATAR_ICON_CATALOG.apple,
+        AVATAR_ICON_CATALOG.carrot,
+        AVATAR_ICON_CATALOG.leaf,
+        AVATAR_ICON_CATALOG.sprout,
+        AVATAR_ICON_CATALOG["tree-deciduous"],
+        AVATAR_ICON_CATALOG.flower,
+        AVATAR_ICON_CATALOG.mountain,
+        AVATAR_ICON_CATALOG.sun,
+        AVATAR_ICON_CATALOG.moon,
+        AVATAR_ICON_CATALOG.cloud,
+        AVATAR_ICON_CATALOG.snowflake,
+        AVATAR_ICON_CATALOG.sparkles,
+        AVATAR_ICON_CATALOG.star,
+        AVATAR_ICON_CATALOG.rocket,
+        AVATAR_ICON_CATALOG.plane,
+        AVATAR_ICON_CATALOG.anchor,
+        AVATAR_ICON_CATALOG.compass,
+        AVATAR_ICON_CATALOG.telescope,
+        AVATAR_ICON_CATALOG.atom,
+        AVATAR_ICON_CATALOG.crown,
+      ]);
+    });
     test("lead always resolves to Crown, regardless of id", () => {
       expect(getAgentIcon({ agentId: "any-id", isLead: true })).toBe(AVATAR_ICON_CATALOG.crown);
       expect(getAgentIcon({ role: "lead", agentId: "any-id" })).toBe(AVATAR_ICON_CATALOG.crown);
