@@ -14,6 +14,15 @@ import type { ExecutorRegistry } from "./executors/registry";
 import { runStepValidation } from "./validation";
 
 let pollerTimeout: ReturnType<typeof setTimeout> | null = null;
+/**
+ * Set by stopRetryPoller() and checked before poll() reschedules itself.
+ * Needed because clearTimeout() only cancels a PENDING tick — a tick already
+ * in-flight (awaiting getRetryableSteps()/executor.run()) when
+ * stopRetryPoller() is called completes normally and would otherwise
+ * unconditionally reschedule via `pollerTimeout = setTimeout(poll, ...)`,
+ * silently resurrecting a poller callers believe is stopped.
+ */
+let stopped = false;
 
 /**
  * Start the retry poller.
@@ -23,6 +32,7 @@ let pollerTimeout: ReturnType<typeof setTimeout> | null = null;
  */
 export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000): void {
   if (pollerTimeout !== null) return; // Already running
+  stopped = false;
 
   async function poll(): Promise<void> {
     try {
@@ -179,8 +189,11 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
       console.error("[workflows] Retry poller error:", err);
     }
 
-    // Schedule next tick after completion
-    pollerTimeout = setTimeout(poll, intervalMs);
+    // Schedule next tick after completion — unless stopRetryPoller() was
+    // called while this tick was in-flight.
+    if (!stopped) {
+      pollerTimeout = setTimeout(poll, intervalMs);
+    }
   }
 
   // Start the first tick
@@ -191,6 +204,7 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
  * Stop the retry poller (for clean shutdown).
  */
 export function stopRetryPoller(): void {
+  stopped = true;
   if (pollerTimeout !== null) {
     clearTimeout(pollerTimeout);
     pollerTimeout = null;
