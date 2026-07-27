@@ -55,7 +55,7 @@ import {
 import { resolveHarnessProvider } from "../utils/harness-provider.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { resolveScriptsOnlyMode } from "../utils/scripts-only-mode.ts";
-import { scrubSecrets } from "../utils/secret-scrubber.ts";
+import { registerVolatileSecret, scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
 import { interpolate } from "../utils/template.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
@@ -3772,6 +3772,17 @@ async function spawnProviderProcess(
         keyIndex: primarySelection.index,
       }
     : undefined;
+
+  // Register the per-task credential with the secret scrubber the moment it's
+  // resolved, so any diagnostic egress (e.g. the structured-output fallback's
+  // scrubbed stderr) redacts it even though it deliberately never touches
+  // process.env and may not match a structural token regex (review finding 1).
+  if (freshEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+    registerVolatileSecret(freshEnv.CLAUDE_CODE_OAUTH_TOKEN, "CLAUDE_CODE_OAUTH_TOKEN");
+  }
+  if (freshEnv.ANTHROPIC_API_KEY) {
+    registerVolatileSecret(freshEnv.ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY");
+  }
 
   const runningTask: RunningTask = {
     taskId: effectiveTaskId,

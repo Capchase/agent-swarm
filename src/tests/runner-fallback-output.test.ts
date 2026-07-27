@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import {
   handleStructuredOutputFallback,
   parseClaudeFallbackEnvelope,
 } from "../commands/runner";
+import { clearVolatileSecretsForTesting, registerVolatileSecret } from "../utils/secret-scrubber";
 
 // Configurable mock responses per test
 let mockGetTask: Record<string, unknown> | null = null;
@@ -450,6 +451,34 @@ describe("parseClaudeFallbackEnvelope", () => {
     );
     const failReason = (result as { failReason: string }).failReason;
     expect(failReason).not.toContain("sk-ant-abcdefghijklmnopqrstuvwxyz");
+  });
+
+  // Review finding 1: a runtime-only credential (never seeded into
+  // process.env, and shaped so it matches none of the structural
+  // TOKEN_REGEXES) must still be scrubbed from a fallback failReason. This
+  // only holds because the runner registers the resolved per-task credential
+  // via registerVolatileSecret at RunningTask construction time — a
+  // realistically-shaped `sk-ant-…` token (see the test above) would pass
+  // even without that wiring, since the structural regex alone would catch
+  // it.
+  test("subprocess-failed: scrubs an opaque runtime-only credential registered via registerVolatileSecret", () => {
+    const opaqueCredential = "not-shaped-like-any-known-token-format-zzqxjw9284";
+    registerVolatileSecret(opaqueCredential, "CLAUDE_CODE_OAUTH_TOKEN");
+    try {
+      const result = parseClaudeFallbackEnvelope(
+        { exitCode: 1, stdout: "", stderr: `Not logged in · token=${opaqueCredential}` },
+        schema,
+      );
+      const failReason = (result as { failReason: string }).failReason;
+      expect(failReason).not.toContain(opaqueCredential);
+      expect(failReason).toContain("[REDACTED:CLAUDE_CODE_OAUTH_TOKEN]");
+    } finally {
+      clearVolatileSecretsForTesting();
+    }
+  });
+
+  afterEach(() => {
+    clearVolatileSecretsForTesting();
   });
 
   test("payload-not-json: stdout isn't JSON at all", () => {
