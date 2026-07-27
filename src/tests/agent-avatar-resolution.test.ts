@@ -87,9 +87,76 @@ describe("agent avatar resolution", () => {
   });
 
   describe("avatar icon picker search", () => {
-    test("returns the familiar 64-icon shortlist for an empty query", () => {
+    test("returns the exact familiar shortlist for an empty query, not just its length", () => {
+      // Explicit contents (not just `.toHaveLength(64)`) so this can't silently
+      // drift to a different 64 if AVATAR_ICON_CATALOG is ever reordered.
       const results = searchAvatarIcons("");
-      expect(results.iconResults).toHaveLength(64);
+      expect(results.iconResults).toEqual([
+        "bot",
+        "cat",
+        "dog",
+        "bird",
+        "fish",
+        "bug",
+        "snail",
+        "turtle",
+        "squirrel",
+        "rabbit",
+        "cherry",
+        "apple",
+        "carrot",
+        "leaf",
+        "sprout",
+        "tree-deciduous",
+        "flower",
+        "mountain",
+        "sun",
+        "moon",
+        "cloud",
+        "snowflake",
+        "sparkles",
+        "star",
+        "rocket",
+        "plane",
+        "anchor",
+        "compass",
+        "telescope",
+        "atom",
+        "crown",
+        "award",
+        "book",
+        "box",
+        "briefcase",
+        "camera",
+        "coffee",
+        "diamond",
+        "droplet",
+        "feather",
+        "flag",
+        "flame",
+        "gem",
+        "ghost",
+        "gift",
+        "globe",
+        "heart",
+        "key",
+        "lock",
+        "map",
+        "music",
+        "package",
+        "palette",
+        "pizza",
+        "puzzle",
+        "shield",
+        "skull",
+        "sword",
+        "target",
+        "trophy",
+        "umbrella",
+        "wand",
+        "zap",
+        "wrench",
+      ]);
       expect(results.totalMatches).toBe(64);
     });
 
@@ -106,6 +173,44 @@ describe("agent avatar resolution", () => {
       const results = searchAvatarIcons("a");
       expect(results.totalMatches).toBeGreaterThan(MAX_AVATAR_ICON_SEARCH_RESULTS);
       expect(results.iconResults).toHaveLength(MAX_AVATAR_ICON_SEARCH_RESULTS);
+    });
+
+    test("the catalog has no duplicate-glyph deprecated-alias pairs", () => {
+      // Every icon component in the catalog should be unique — a deprecated
+      // lucide alias re-exports the SAME component as its canonical name, so
+      // two catalog keys pointing at the same component is exactly that bug.
+      const seen = new Map<unknown, string>();
+      const dupes: Array<{ key: string; dupOf: string }> = [];
+      for (const [key, icon] of Object.entries(AVATAR_ICON_CATALOG)) {
+        const existing = seen.get(icon);
+        if (existing) dupes.push({ key, dupOf: existing });
+        else seen.set(icon, key);
+      }
+      expect(dupes).toEqual([]);
+    });
+
+    test("covers previously-unreachable d-z avatar-worthy searches", () => {
+      // Round-3 fix: the catalog used to be an alphabetical head-slice
+      // (a/b/c only), so none of these ever returned a result.
+      for (const query of [
+        "wrench",
+        "gamepad",
+        "sword",
+        "rocket",
+        "crown",
+        "heart",
+        "star",
+        "zap",
+      ]) {
+        expect(searchAvatarIcons(query).totalMatches).toBeGreaterThan(0);
+      }
+      for (const query of ["ghost", "cat", "dog", "pizza", "music"]) {
+        expect(searchAvatarIcons(query).totalMatches).toBeGreaterThan(0);
+      }
+      // Spot-check letters that were entirely absent before this round.
+      for (const query of ["guitar", "octagon", "volleyball", "wheat"]) {
+        expect(searchAvatarIcons(query).totalMatches).toBeGreaterThan(0);
+      }
     });
   });
 
