@@ -17747,7 +17747,8 @@
                 "completed",
                 "failed",
                 "skipped",
-                "cancelled"
+                "cancelled",
+                "completed_with_errors"
               ]
             },
             "required": false,
@@ -19304,7 +19305,8 @@
                 "completed",
                 "failed",
                 "skipped",
-                "cancelled"
+                "cancelled",
+                "completed_with_errors"
               ]
             },
             "required": false,
