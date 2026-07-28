@@ -104,9 +104,12 @@ describe("agent avatar resolution", () => {
   });
 
   describe("searchAvatarIcons (full lucide library, not just the curated catalog)", () => {
-    test("the generated icon-name catalog has four-digit coverage of the real library, not a hand-curated subset", () => {
-      expect(LUCIDE_ICON_NAMES.length).toBeGreaterThanOrEqual(1000);
-      expect(LUCIDE_ICON_NAMES.length).toBeLessThan(10000);
+    test("the generated icon-name catalog matches the exact count for the pinned lucide-react version", () => {
+      // lucide-react is pinned to an exact version (apps/ui/package.json) specifically
+      // so this count is stable; a 1,000-9,999 range would let an accidental drop to
+      // 1,001 pass silently. Bumping the pin intentionally? Regenerate via
+      // `bun run refresh:lucide-icon-names` (apps/ui) and update this count.
+      expect(LUCIDE_ICON_NAMES.length).toBe(1688);
     });
 
     test.each(PREVIOUSLY_MISSING_ICON_NAMES)("%s is a searchable icon name", (name) => {
@@ -117,6 +120,11 @@ describe("agent avatar resolution", () => {
     test("search is space/hyphen-insensitive", () => {
       expect(searchAvatarIcons("tree deciduous").names).toContain("tree-deciduous");
       expect(searchAvatarIcons("treedeciduous").names).toContain("tree-deciduous");
+    });
+
+    test("search is case-insensitive", () => {
+      expect(searchAvatarIcons("SCAN-EYE").names).toContain("scan-eye");
+      expect(searchAvatarIcons("Hand Coins").names).toContain("hand-coins");
     });
 
     test("an empty query returns the curated default shortlist, not the full library", () => {
