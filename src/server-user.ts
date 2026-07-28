@@ -23,6 +23,11 @@ import {
 import { getTasksHandler, getTasksInputSchema, getTasksOutputSchema } from "./tools/get-tasks";
 import { sendTaskHandler, sendTaskOutputSchema } from "./tools/send-task";
 import {
+  steerTaskHandler,
+  steerTaskOutputSchema,
+  steerTaskUserInputSchema,
+} from "./tools/steer-task";
+import {
   taskActionHandler,
   taskActionInputSchema,
   taskActionOutputSchema,
@@ -30,6 +35,7 @@ import {
 import { userCtx } from "./tools/task-tool-ctx";
 import { createToolRegistrar } from "./tools/utils";
 import { ModelTierSchema, type User } from "./types";
+import { isSteeringEnabled } from "./utils/steering-enabled";
 
 type UserToolAdmissionConfig = {
   annotations?: ToolAnnotations;
@@ -160,6 +166,22 @@ export function createUserServer(user: User): McpServer {
     if (denied) return denied;
     return cancelTaskHandler(userCtx(user, info.sessionId), args);
   });
+
+  if (isSteeringEnabled()) {
+    const steerTaskConfig = {
+      title: "Steer Task",
+      description: "Send a message to a task that is already running.",
+      annotations: { destructiveHint: true },
+      rbac: permission("task.steer.own"),
+      inputSchema: steerTaskUserInputSchema,
+      outputSchema: steerTaskOutputSchema,
+    };
+    registerTool("steer-task", steerTaskConfig, async (args, info, _meta) => {
+      const denied = await maybeDenyUserToolAdmission(user, "steer-task", steerTaskConfig);
+      if (denied) return denied;
+      return steerTaskHandler(userCtx(user, info.sessionId), args);
+    });
+  }
 
   const taskActionConfig = {
     title: "Task Pool Action",

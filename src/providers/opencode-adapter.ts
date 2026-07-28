@@ -35,6 +35,8 @@ import type {
   ProviderSession,
   ProviderSessionConfig,
   ProviderTraits,
+  SteerDelivery,
+  SteerDeliveryResult,
 } from "./types";
 
 /**
@@ -258,6 +260,7 @@ export class OpencodeSession implements ProviderSession {
   // biome-ignore lint/correctness/noUnusedPrivateClassMembers: reserved for future error-propagation paths; symmetric with completionResolve.
   private completionReject!: (err: Error) => void;
   private completionPromise: Promise<ProviderResult>;
+  private client: Awaited<ReturnType<typeof createOpencode>>["client"];
   private server: { url: string; close(): void };
   private aborted = false;
   private completed = false;
@@ -289,6 +292,7 @@ export class OpencodeSession implements ProviderSession {
 
   constructor(
     sessionId: string,
+    client: Awaited<ReturnType<typeof createOpencode>>["client"],
     server: { url: string; close(): void },
     model: string,
     agentId: string,
@@ -300,6 +304,7 @@ export class OpencodeSession implements ProviderSession {
     appliedReasoningEffort: ReasoningEffort | null = null,
   ) {
     this._sessionId = sessionId;
+    this.client = client;
     this.server = server;
     this.model = model;
     this.agentId = agentId;
@@ -628,6 +633,31 @@ export class OpencodeSession implements ProviderSession {
       failureReason: "aborted",
     });
   }
+
+  async deliverSteering({ mode, text }: SteerDelivery): Promise<SteerDeliveryResult> {
+    if (this.completed || this.aborted) {
+      // `finish()` has closed the local server and `handleOpencodeEvent()`
+      // ignores further events — a promptAsync now would start a turn nobody
+      // observes while falsely reporting `delivered`. Fail closed so the
+      // server promotes the message to a follow-up task (same as pi).
+      return { delivered: false, reason: "opencode session already completed" };
+    }
+    try {
+      // Always queue. `steer` used to abort first and re-prompt, but E2E showed
+      // the re-prompt fails once the session has been aborted, so the message
+      // was lost to the undeliverable path. `steerModes` advertises queue only,
+      // so a "steer" request has already been degraded upstream — this branch
+      // exists for a caller that reaches us anyway, and reports queue honestly.
+      void mode;
+      await this.client.session.promptAsync({
+        path: { id: this._sessionId },
+        body: { parts: [{ type: "text", text }] },
+      });
+      return { delivered: true, mode: "queue" };
+    } catch (err) {
+      return { delivered: false, reason: String(err) };
+    }
+  }
 }
 
 export class OpencodeAdapter implements ProviderAdapter {
@@ -636,6 +666,7 @@ export class OpencodeAdapter implements ProviderAdapter {
   readonly traits: ProviderTraits = {
     hasMcp: true,
     hasLocalEnvironment: true,
+    steerModes: ["queue"],
   };
 
   validateCredentials(env: Record<string, string | undefined> = {}): string {
@@ -862,6 +893,7 @@ export class OpencodeAdapter implements ProviderAdapter {
 
     session = new OpencodeSession(
       sessionId,
+      client,
       server,
       config.model,
       config.agentId,

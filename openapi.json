@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.122.0",
+    "version": "1.122.1",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -43,8 +43,7 @@
         "parameters": [
           {
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "type": "string"
             },
             "required": false,
             "name": "agentId",
@@ -5003,8 +5002,7 @@
                 "type": "object",
                 "properties": {
                   "agentId": {
-                    "type": "string",
-                    "format": "uuid"
+                    "type": "string"
                   },
                   "content": {
                     "type": "string",
@@ -5285,7 +5283,6 @@
                   },
                   "agentId": {
                     "type": "string",
-                    "format": "uuid",
                     "description": "Filter to a single agent. Omit for all."
                   },
                   "scope": {
@@ -9709,8 +9706,7 @@
                     "type": "integer"
                   },
                   "targetAgentId": {
-                    "type": "string",
-                    "format": "uuid"
+                    "type": "string"
                   },
                   "enabled": {
                     "type": "boolean"
@@ -10070,8 +10066,7 @@
                     "type": [
                       "string",
                       "null"
-                    ],
-                    "format": "uuid"
+                    ]
                   },
                   "enabled": {
                     "type": "boolean"
@@ -10223,8 +10218,7 @@
                     "type": [
                       "string",
                       "null"
-                    ],
-                    "format": "uuid"
+                    ]
                   },
                   "enabled": {
                     "type": "boolean"
@@ -12552,8 +12546,7 @@
                     "type": "string"
                   },
                   "agentId": {
-                    "type": "string",
-                    "format": "uuid"
+                    "type": "string"
                   },
                   "tags": {
                     "type": "array",
@@ -14987,8 +14980,7 @@
           },
           {
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "type": "string"
             },
             "required": false,
             "name": "agentId",
@@ -15933,6 +15925,309 @@
           },
           "404": {
             "description": "Task not found"
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/steer": {
+      "post": {
+        "summary": "Deliver a steering message to a running task",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "message": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "steer",
+                      "queue"
+                    ],
+                    "default": "queue"
+                  },
+                  "onUnsupported": {
+                    "type": "string",
+                    "enum": [
+                      "degrade",
+                      "fail"
+                    ],
+                    "default": "degrade"
+                  },
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "ui",
+                      "mcp",
+                      "script",
+                      "slack",
+                      "api"
+                    ]
+                  },
+                  "requestedByUserId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "message"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Steering accepted (see `outcome` for what actually happened)"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "Caller cannot steer this task"
+          },
+          "404": {
+            "description": "Task not found"
+          },
+          "422": {
+            "description": "Requested mode unsupported by the target harness and onUnsupported=fail"
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/steering-messages": {
+      "get": {
+        "summary": "List steering messages for a task",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Steering messages"
+          },
+          "404": {
+            "description": "Task not found"
+          }
+        }
+      }
+    },
+    "/api/steering-messages": {
+      "get": {
+        "summary": "List pending steering messages for the current worker",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "taskId",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending steering messages"
+          },
+          "400": {
+            "description": "Missing X-Agent-ID header"
+          },
+          "404": {
+            "description": "Agent not found"
+          }
+        }
+      }
+    },
+    "/api/steering-messages/{id}/delivered": {
+      "post": {
+        "summary": "Mark a steering message delivered",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "steer",
+                      "queue"
+                    ]
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Steering message delivery recorded"
+          },
+          "400": {
+            "description": "Missing X-Agent-ID header or validation error"
+          },
+          "403": {
+            "description": "Steering message task is assigned to another agent"
+          },
+          "404": {
+            "description": "Agent or steering message not found"
+          }
+        }
+      }
+    },
+    "/api/steering-messages/{id}/handled": {
+      "post": {
+        "summary": "Mark a steering message handled",
+        "description": "Optionally accepts a JSON body `{ note?: string }` — a short acceptance note describing how the steering was incorporated, persisted as `handledNote`.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Steering message acknowledgement recorded"
+          },
+          "400": {
+            "description": "Missing X-Agent-ID header or validation error"
+          },
+          "403": {
+            "description": "Steering message task is assigned to another agent"
+          },
+          "404": {
+            "description": "Agent or steering message not found"
+          }
+        }
+      }
+    },
+    "/api/steering-messages/{id}/undeliverable": {
+      "post": {
+        "summary": "Promote an undeliverable steering message",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "reason"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Steering message promoted to a follow-up task"
+          },
+          "400": {
+            "description": "Missing X-Agent-ID header or validation error"
+          },
+          "403": {
+            "description": "Steering message task is assigned to another agent"
+          },
+          "404": {
+            "description": "Agent or steering message not found"
           }
         }
       }

@@ -226,6 +226,9 @@ export async function handleCore(
     const version = (await Bun.file("package.json").json()).version;
 
     res.writeHead(200, { "Content-Type": "application/json" });
+    // NOTE: /health is unauthenticated — never expose server configuration
+    // here (feature flags, capabilities, integration state). `steeringEnabled`
+    // lives on the authenticated /api/stats payload instead.
     res.end(
       JSON.stringify({
         status: "ok",

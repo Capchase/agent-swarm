@@ -29,11 +29,13 @@ import {
   User,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import "streamdown/styles.css";
 import { useAgents } from "@/api/hooks/use-agents";
 import { useSessionCosts } from "@/api/hooks/use-costs";
+import { useFeatureGate } from "@/api/hooks/use-feature-gate";
+import { useSteeringEnabled } from "@/api/hooks/use-stats";
 import {
   useCancelTask,
   usePauseTask,
@@ -41,6 +43,7 @@ import {
   useTask,
   useTaskContext,
   useTaskSessionLogs,
+  useTaskSteeringMessages,
 } from "@/api/hooks/use-tasks";
 import { useUsers } from "@/api/hooks/use-users";
 import type {
@@ -59,6 +62,8 @@ import { SessionId } from "@/components/shared/session-id";
 import { SessionLogViewer } from "@/components/shared/session-log-viewer";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { TaskAttachmentsSection } from "@/components/shared/task-attachments-section";
+import { CollapsibleComposerDock } from "@/components/steering/collapsible-composer-dock";
+import { SteerComposer } from "@/components/steering/steer-composer";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -78,6 +83,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useLocalToggle } from "@/hooks/use-local-toggle";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import { formatCost } from "@/lib/cost-format";
 import { formatDurationMs } from "@/lib/format-duration-ms";
@@ -498,6 +504,25 @@ export default function TaskDetailPage() {
   const { data: users } = useUsers();
   const { data: costs, isLoading: costsLoading } = useSessionCosts({ taskId: id });
   const { data: contextData, isLoading: contextLoading } = useTaskContext(id!);
+  // Steering (≥1.122.1) — soft-degrade against older API servers, which 404
+  // both `/steer` and `/steering-messages`.
+  const steerGate = useFeatureGate("1.122.1");
+  const { data: steeringEnabled = true } = useSteeringEnabled();
+  const { data: steeringMessages } = useTaskSteeringMessages(id!, {
+    enabled: steerGate.supported && steeringEnabled,
+  });
+  // Composer dock is collapsible on this page only (the sessions surface is a
+  // chat — its composer always stays put). Default expanded.
+  const [composerCollapsed, setComposerCollapsed] = useLocalToggle(
+    "tasks:steer-composer-collapsed",
+    false,
+  );
+  // Draft is owned by the page, not the composer. Two reasons: the mobile and
+  // desktop layouts each mount their own <SteerComposer>, and the composer
+  // itself unmounts whenever the task leaves a steerable status. Holding the
+  // text here means crossing the `lg` breakpoint — or a status flip that
+  // hides and later restores the dock — doesn't eat what the user typed.
+  const [steerDraft, setSteerDraft] = useState("");
   const cancelTask = useCancelTask();
   const pauseTask = usePauseTask();
   const resumeTask = useResumeTask();
@@ -555,6 +580,14 @@ export default function TaskDetailPage() {
   const canCancel = !terminalStatuses.includes(task.status) && task.status !== "paused";
   const canPause = task.status === "in_progress";
   const canResume = task.status === "paused";
+
+  // Steering reaches a running task directly, and a `pending` one by queueing:
+  // the server holds the message and delivers it when the session starts.
+  // Everything else falls back to the existing follow-up-task paths.
+  const canSteer =
+    steerGate.supported &&
+    steeringEnabled &&
+    (task.status === "in_progress" || task.status === "pending");
 
   const isFailed = task.status === "failed";
   const isCompleted = task.status === "completed";
@@ -855,11 +888,26 @@ export default function TaskDetailPage() {
     </div>
   );
 
-  const sessionLogsContent = hasSessionLogs ? (
+  // STEERING — no longer its own box above the logs. Delivered/handled rows
+  // interleave into the SESSION LOGS stream at `deliveredAt`, promoted/
+  // cancelled at `createdAt`, and still-pending ones pin to the tail box above
+  // the "Agent is working…" footer. `undefined` when gated off, which makes
+  // <SessionLogViewer> behave exactly as it did pre-steering.
+  const steeringForViewer =
+    steerGate.supported && steeringEnabled ? (steeringMessages ?? []) : undefined;
+  const hasSteering = (steeringForViewer?.length ?? 0) > 0;
+
+  // Render the viewer whenever there's anything to show — steering-only is a
+  // real state right after the first message is queued but before the harness
+  // has written any session log lines.
+  const showLogViewer = hasSessionLogs || hasSteering;
+
+  const sessionLogsContent = showLogViewer ? (
     <SessionLogViewer
-      logs={sessionLogs}
+      logs={sessionLogs ?? []}
       compactionSnapshots={contextData?.snapshots}
       isRunning={taskIsRunning(task.status)}
+      steeringMessages={steeringForViewer}
       className="flex-1 min-h-0"
     />
   ) : (
@@ -870,6 +918,30 @@ export default function TaskDetailPage() {
       </div>
     </div>
   );
+
+  const steerComposer = canSteer ? (
+    <CollapsibleComposerDock
+      collapsed={composerCollapsed}
+      onCollapsedChange={setComposerCollapsed}
+      collapsedLabel={
+        task.supportedSteerModes && task.supportedSteerModes.length === 0
+          ? "Add a follow-up for this task"
+          : task.status === "pending"
+            ? "Send a message to the queued task"
+            : "Send a message to the running task"
+      }
+    >
+      <SteerComposer
+        taskId={task.id}
+        supportedSteerModes={task.supportedSteerModes}
+        providerLabel={task.provider}
+        taskStatus={task.status}
+        value={steerDraft}
+        onValueChange={setSteerDraft}
+        className="px-0 pt-0 pb-0"
+      />
+    </CollapsibleComposerDock>
+  ) : null;
 
   // HERO — status badge + tags / priority / source / provider / model badges +
   // collapsible description + action buttons. Rendered inside the center column
@@ -1063,8 +1135,9 @@ export default function TaskDetailPage() {
           <TabsContent value="outcome" className="flex-1 overflow-y-auto px-1 py-3">
             {outcomeContent}
           </TabsContent>
-          <TabsContent value="logs" className="flex flex-col flex-1 min-h-0 px-1 py-3">
+          <TabsContent value="logs" className="flex flex-col flex-1 min-h-0 px-1 py-3 gap-3">
             {sessionLogsContent}
+            {steerComposer}
           </TabsContent>
         </Tabs>
       </div>
@@ -1126,21 +1199,9 @@ export default function TaskDetailPage() {
 
             <TaskAttachmentsSection taskId={task.id} attachments={task.attachments} />
 
-            {hasSessionLogs ? (
-              <SessionLogViewer
-                logs={sessionLogs}
-                compactionSnapshots={contextData?.snapshots}
-                isRunning={taskIsRunning(task.status)}
-                className="flex-1 min-h-0"
-              />
-            ) : (
-              <div className="flex-1 flex items-center justify-center min-h-0">
-                <div className="text-center text-muted-foreground">
-                  <Terminal className="h-8 w-8 mx-auto mb-2 opacity-30" />
-                  <p className="text-xs">No session data available</p>
-                </div>
-              </div>
-            )}
+            {sessionLogsContent}
+
+            {steerComposer}
           </div>
         </section>
 

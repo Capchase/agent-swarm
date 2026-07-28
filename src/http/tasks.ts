@@ -8,14 +8,21 @@ import {
   cancelTask,
   completeTask,
   failTask,
+  getAgentById,
   getAllTasks,
   getDb,
   getLeadAgent,
   getLogsByTaskId,
   getPausedTasksForAgent,
+  getPendingSteeringForAgent,
+  getPendingSteeringForTask,
+  getSteeringMessageById,
+  getSteeringMessagesForTask,
   getTaskAttachments,
   getTaskById,
   getTasksCount,
+  markSteeringDelivered,
+  markSteeringHandled,
   pauseTask,
   resumeTask,
   supersedeTask,
@@ -25,10 +32,18 @@ import {
   updateTaskTitle,
   updateTaskVcs,
 } from "../be/db";
+import {
+  getTaskSteeringFields,
+  markSteeringUndeliverable,
+  requestSteering,
+  SteeringRequestError,
+} from "../be/steering";
 import { findUserById } from "../be/users";
+import { can, type RbacPrincipal, type RbacResource } from "../rbac";
 import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { createResumeFollowUp, createWorkerTaskFollowUp } from "../tasks/worker-follow-up";
 import {
+  type AgentTask,
   type AgentTaskSource,
   AgentTaskSourceSchema,
   type AgentTaskStatus,
@@ -36,13 +51,18 @@ import {
   AssetKeySchema,
   isTerminalTaskStatus,
   ModelTierSchema,
+  OnUnsupportedSchema,
   ProviderNameSchema,
   ReasoningEffortSchema,
   ResumeReasonSchema,
+  SteeringSourceSchema,
+  SteerModeSchema,
   splitLegacyModelAlias,
 } from "../types";
+import { getRequestAuth } from "../utils/request-auth-context";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { route } from "./route-def";
-import { json, jsonError } from "./utils";
+import { json, jsonError, parseBody } from "./utils";
 
 // ─── Route Definitions ───────────────────────────────────────────────────────
 
@@ -157,6 +177,127 @@ const cancelTaskRoute = route({
     200: { description: "Task cancelled" },
     400: { description: "Cannot cancel terminal task" },
     404: { description: "Task not found" },
+  },
+});
+
+const steerTaskRoute = route({
+  method: "post",
+  path: "/api/tasks/{id}/steer",
+  pattern: ["api", "tasks", null, "steer"],
+  summary: "Deliver a steering message to a running task",
+  tags: ["Tasks"],
+  params: z.object({ id: z.string() }),
+  body: z.object({
+    message: z.string().min(1),
+    mode: SteerModeSchema.default("queue"),
+    onUnsupported: OnUnsupportedSchema,
+    // Which surface the message came from. Defaults to "api" for raw callers;
+    // the UI, Slack and the script SDK identify themselves so the activity
+    // feed can say where a steer originated.
+    source: SteeringSourceSchema.optional(),
+    requestedByUserId: z.string().optional(),
+  }),
+  rbac: { permission: "task.steer.own" },
+  responses: {
+    200: { description: "Steering accepted (see `outcome` for what actually happened)" },
+    400: { description: "Validation error" },
+    403: { description: "Caller cannot steer this task" },
+    404: { description: "Task not found" },
+    422: {
+      description: "Requested mode unsupported by the target harness and onUnsupported=fail",
+    },
+  },
+});
+
+const getTaskSteeringMessagesRoute = route({
+  method: "get",
+  path: "/api/tasks/{id}/steering-messages",
+  pattern: ["api", "tasks", null, "steering-messages"],
+  summary: "List steering messages for a task",
+  tags: ["Tasks"],
+  params: z.object({ id: z.string() }),
+  responses: {
+    200: { description: "Steering messages" },
+    404: { description: "Task not found" },
+  },
+});
+
+const getPendingSteeringMessagesRoute = route({
+  method: "get",
+  path: "/api/steering-messages",
+  pattern: ["api", "steering-messages"],
+  summary: "List pending steering messages for the current worker",
+  tags: ["Tasks"],
+  query: z.object({ taskId: z.string().optional() }),
+  auth: { apiKey: true, agentId: true },
+  responses: {
+    200: { description: "Pending steering messages" },
+    400: { description: "Missing X-Agent-ID header" },
+    404: { description: "Agent not found" },
+  },
+});
+
+const markSteeringDeliveredRoute = route({
+  method: "post",
+  path: "/api/steering-messages/{id}/delivered",
+  pattern: ["api", "steering-messages", null, "delivered"],
+  summary: "Mark a steering message delivered",
+  tags: ["Tasks"],
+  params: z.object({ id: z.string() }),
+  body: z.object({ mode: SteerModeSchema }),
+  auth: { apiKey: true, agentId: true },
+  rbac: {
+    ungated:
+      "worker callback scoped by required X-Agent-ID and verified against the steering message task assignee",
+  },
+  responses: {
+    200: { description: "Steering message delivery recorded" },
+    400: { description: "Missing X-Agent-ID header or validation error" },
+    403: { description: "Steering message task is assigned to another agent" },
+    404: { description: "Agent or steering message not found" },
+  },
+});
+
+const markSteeringHandledRoute = route({
+  method: "post",
+  path: "/api/steering-messages/{id}/handled",
+  pattern: ["api", "steering-messages", null, "handled"],
+  summary: "Mark a steering message handled",
+  description:
+    "Optionally accepts a JSON body `{ note?: string }` — a short acceptance note describing how the steering was incorporated, persisted as `handledNote`.",
+  tags: ["Tasks"],
+  params: z.object({ id: z.string() }),
+  auth: { apiKey: true, agentId: true },
+  rbac: {
+    ungated:
+      "worker acknowledgement scoped by required X-Agent-ID and verified against the steering message task assignee",
+  },
+  responses: {
+    200: { description: "Steering message acknowledgement recorded" },
+    400: { description: "Missing X-Agent-ID header or validation error" },
+    403: { description: "Steering message task is assigned to another agent" },
+    404: { description: "Agent or steering message not found" },
+  },
+});
+
+const markSteeringUndeliverableRoute = route({
+  method: "post",
+  path: "/api/steering-messages/{id}/undeliverable",
+  pattern: ["api", "steering-messages", null, "undeliverable"],
+  summary: "Promote an undeliverable steering message",
+  tags: ["Tasks"],
+  params: z.object({ id: z.string() }),
+  body: z.object({ reason: z.string().min(1) }),
+  auth: { apiKey: true, agentId: true },
+  rbac: {
+    ungated:
+      "worker callback scoped by required X-Agent-ID and verified against the steering message task assignee",
+  },
+  responses: {
+    200: { description: "Steering message promoted to a follow-up task" },
+    400: { description: "Missing X-Agent-ID header or validation error" },
+    403: { description: "Steering message task is assigned to another agent" },
+    404: { description: "Agent or steering message not found" },
   },
 });
 
@@ -317,6 +458,39 @@ const updateTaskTitleRoute = route({
   },
 });
 
+function canSteerTask(
+  req: IncomingMessage,
+  myAgentId: string | undefined,
+  task: AgentTask,
+): boolean {
+  const resource: RbacResource = {
+    kind: "task",
+    taskId: task.id,
+    requestedByUserId: task.requestedByUserId,
+    creatorAgentId: task.creatorAgentId,
+    agentId: task.agentId,
+  };
+  let principal: RbacPrincipal;
+  let verb: "task.steer.any" | "task.steer.own";
+
+  const auth = getRequestAuth(req);
+  if (auth?.kind === "operator") {
+    principal = { kind: "operator" };
+    verb = "task.steer.own";
+  } else if (auth?.kind === "user") {
+    principal = { kind: "user", userId: auth.userId };
+    verb = "task.steer.own";
+  } else {
+    if (!myAgentId) return false;
+    const agent = getAgentById(myAgentId);
+    if (!agent) return false;
+    principal = { kind: "agent", agentId: myAgentId, isLead: agent.isLead };
+    verb = "task.steer.any";
+  }
+
+  return can({ principal, verb, resource, source: "http" }).allow;
+}
+
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 export async function handleTasks(
@@ -399,20 +573,19 @@ export async function handleTasks(
     // Prefer trusted server-side identity: an authenticated request user, or
     // the caller's own ownership-gated task context (`X-Source-Task-Id` /
     // ambient current task) — same as every other audited write site. This
-    // is the upstream #939 anti-spoofing behavior and stays the default.
+    // is the upstream #939 anti-spoofing behavior.
     //
-    // Fork-specific opt-in: in a single-tenant deployment where every caller
-    // shares ONE operator key (so `auth.kind` is never "user" and there's no
-    // way to bind a caller to a user), TRUST_BODY_REQUESTED_BY_USER_ID=true
-    // re-enables a body-supplied `requestedByUserId` as a last resort, after
-    // validating it names a real user. This is safe ONLY because every
-    // holder of that shared key is already trusted org-wide — it must stay
-    // off (default) anywhere callers of the shared/global key are not all
-    // equally trusted, since it lets any such caller attribute a task to any
-    // user. Must NOT be upstreamed as a default-on behavior.
+    // TRUST_BODY_REQUESTED_BY_USER_ID (default ON) accepts a body-supplied
+    // `requestedByUserId` as a last resort — only when the caller could not be
+    // bound to a user (shared operator key), and only after validating it
+    // names a real user. Typical single-tenant deployments share ONE operator
+    // key, so without this the UI and API callers can never attribute tasks.
+    // Set TRUST_BODY_REQUESTED_BY_USER_ID=false anywhere holders of the
+    // shared/global key are NOT all equally trusted — with it on, any such
+    // caller can attribute a task to any user.
     const trustedUserId = resolveHttpAuditUserId(req, myAgentId);
     let requestedByUserId = trustedUserId ?? undefined;
-    const trustBodyRequestedByUserId = process.env.TRUST_BODY_REQUESTED_BY_USER_ID === "true";
+    const trustBodyRequestedByUserId = process.env.TRUST_BODY_REQUESTED_BY_USER_ID !== "false";
     if (trustBodyRequestedByUserId && !requestedByUserId && parsed.body.requestedByUserId) {
       const candidate = findUserById(parsed.body.requestedByUserId);
       if (candidate) requestedByUserId = candidate.id;
@@ -600,6 +773,227 @@ export async function handleTasks(
     return true;
   }
 
+  if (steerTaskRoute.match(req.method, pathSegments)) {
+    const parsed = await steerTaskRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const task = getTaskById(parsed.params.id);
+
+    if (!task) {
+      jsonError(res, "Task not found", 404);
+      return true;
+    }
+    if (!canSteerTask(req, myAgentId, task)) {
+      jsonError(res, "Forbidden: caller cannot steer this task", 403);
+      return true;
+    }
+
+    const trustedUserId = resolveHttpAuditUserId(req, myAgentId);
+    let requestedByUserId = trustedUserId ?? undefined;
+    if (
+      process.env.TRUST_BODY_REQUESTED_BY_USER_ID !== "false" &&
+      !requestedByUserId &&
+      parsed.body.requestedByUserId
+    ) {
+      requestedByUserId = findUserById(parsed.body.requestedByUserId)?.id;
+    }
+
+    try {
+      const auth = getRequestAuth(req);
+      const createdByAgentId =
+        !auth && myAgentId && getAgentById(myAgentId) ? myAgentId : undefined;
+      const result = requestSteering({
+        taskId: task.id,
+        message: parsed.body.message,
+        mode: parsed.body.mode,
+        onUnsupported: parsed.body.onUnsupported,
+        source: parsed.body.source ?? "api",
+        createdByKind:
+          auth?.kind === "user" || requestedByUserId
+            ? "user"
+            : createdByAgentId
+              ? "agent"
+              : "system",
+        createdByAgentId,
+        createdByUserId: requestedByUserId,
+      });
+      json(res, result);
+    } catch (error) {
+      if (error instanceof SteeringRequestError) {
+        jsonError(res, error.message, error.statusCode);
+        return true;
+      }
+      throw error;
+    }
+    return true;
+  }
+
+  if (getTaskSteeringMessagesRoute.match(req.method, pathSegments)) {
+    // Keep history readable after a kill-switch flip so past steering remains auditable.
+    const parsed = await getTaskSteeringMessagesRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!getTaskById(parsed.params.id)) {
+      jsonError(res, "Task not found", 404);
+      return true;
+    }
+    json(res, { messages: getSteeringMessagesForTask(parsed.params.id) });
+    return true;
+  }
+
+  if (getPendingSteeringMessagesRoute.match(req.method, pathSegments)) {
+    // Keep read-only worker history available while disabled; only new requests are blocked.
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+    const parsed = await getPendingSteeringMessagesRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!getAgentById(myAgentId)) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+
+    if (parsed.query.taskId) {
+      const task = getTaskById(parsed.query.taskId);
+      const messages =
+        task?.agentId === myAgentId ? getPendingSteeringForTask(parsed.query.taskId) : [];
+      json(res, { messages });
+      return true;
+    }
+
+    json(res, { messages: getPendingSteeringForAgent(myAgentId) });
+    return true;
+  }
+
+  if (markSteeringDeliveredRoute.match(req.method, pathSegments)) {
+    // Do not gate drain callbacks: messages in flight must still reach a terminal state.
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+    const parsed = await markSteeringDeliveredRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!getAgentById(myAgentId)) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+
+    const message = getSteeringMessageById(parsed.params.id);
+    if (!message) {
+      jsonError(res, "Steering message not found", 404);
+      return true;
+    }
+    const task = getTaskById(message.taskId);
+    if (task?.agentId !== myAgentId) {
+      jsonError(res, "Steering message task is assigned to another agent", 403);
+      return true;
+    }
+    if (message.status !== "pending") {
+      json(res, { message });
+      return true;
+    }
+
+    const delivered =
+      markSteeringDelivered(message.id, parsed.body.mode) ?? getSteeringMessageById(message.id);
+    if (!delivered) {
+      jsonError(res, "Failed to mark steering message delivered", 500);
+      return true;
+    }
+    json(res, { message: delivered });
+    return true;
+  }
+
+  if (markSteeringHandledRoute.match(req.method, pathSegments)) {
+    // Do not gate drain callbacks: messages in flight must still reach a terminal state.
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+    const parsed = await markSteeringHandledRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!getAgentById(myAgentId)) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+
+    const message = getSteeringMessageById(parsed.params.id);
+    if (!message) {
+      jsonError(res, "Steering message not found", 404);
+      return true;
+    }
+    const task = getTaskById(message.taskId);
+    if (task?.agentId !== myAgentId) {
+      jsonError(res, "Steering message task is assigned to another agent", 403);
+      return true;
+    }
+    if (message.status !== "delivered") {
+      json(res, { message });
+      return true;
+    }
+
+    // Optional acceptance note ("how the steering was incorporated"). Read
+    // tolerantly — existing callers post an empty body, which must stay valid.
+    let note: string | undefined;
+    try {
+      const raw = await parseBody<{ note?: unknown }>(req);
+      if (raw && typeof raw.note === "string" && raw.note.trim().length > 0) {
+        note = scrubSecrets(raw.note.slice(0, 500));
+      }
+    } catch {
+      // No/invalid JSON body — the note is optional.
+    }
+
+    const handled = markSteeringHandled(message.id, note) ?? getSteeringMessageById(message.id);
+    if (!handled) {
+      jsonError(res, "Failed to mark steering message handled", 500);
+      return true;
+    }
+    json(res, { message: handled });
+    return true;
+  }
+
+  if (markSteeringUndeliverableRoute.match(req.method, pathSegments)) {
+    // Do not gate drain callbacks: messages in flight must still reach a terminal state.
+    if (!myAgentId) {
+      jsonError(res, "Missing X-Agent-ID header", 400);
+      return true;
+    }
+    const parsed = await markSteeringUndeliverableRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!getAgentById(myAgentId)) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+
+    const message = getSteeringMessageById(parsed.params.id);
+    if (!message) {
+      jsonError(res, "Steering message not found", 404);
+      return true;
+    }
+    const task = getTaskById(message.taskId);
+    if (task?.agentId !== myAgentId) {
+      jsonError(res, "Steering message task is assigned to another agent", 403);
+      return true;
+    }
+    if (message.status !== "pending") {
+      json(res, {
+        message,
+        promotedTaskId: message.promotedTaskId,
+      });
+      return true;
+    }
+
+    try {
+      json(res, markSteeringUndeliverable(message.id, parsed.body.reason));
+    } catch (error) {
+      if (error instanceof SteeringRequestError) {
+        jsonError(res, error.message, error.statusCode);
+        return true;
+      }
+      throw error;
+    }
+    return true;
+  }
+
   if (getTask.match(req.method, pathSegments)) {
     const parsed = await getTask.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
@@ -612,7 +1006,7 @@ export async function handleTasks(
 
     const logs = getLogsByTaskId(parsed.params.id, parsed.query.logsLimit ?? 200);
     const attachments = getTaskAttachments(parsed.params.id);
-    json(res, { ...task, logs, attachments });
+    json(res, { ...task, ...getTaskSteeringFields(task), logs, attachments });
     return true;
   }
 

@@ -14,6 +14,7 @@ import { useParams } from "react-router-dom";
 import { useSessionCosts } from "@/api/hooks/use-costs";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
 import { useSession, useUpdateSessionTitle } from "@/api/hooks/use-sessions";
+import { useSteeringEnabled } from "@/api/hooks/use-stats";
 import { useUsers } from "@/api/hooks/use-users";
 import { UpgradeRequired } from "@/components/feature-gate/upgrade-required";
 import { SessionComposer } from "@/components/sessions/session-composer";
@@ -38,6 +39,10 @@ export default function SessionDetailPage() {
   const { rootTaskId } = useParams<{ rootTaskId: string }>();
   const gate = useFeatureGate("1.76.0");
   const renameGate = useFeatureGate("1.120.0");
+  // Steering (≥1.122.1) — older servers 404 `/api/tasks/:id/steer`, so the
+  // composer falls back to its pre-steering chained-task behaviour.
+  const steerGate = useFeatureGate("1.122.1");
+  const { data: steeringEnabled = true } = useSteeringEnabled();
   const { data: detail, isLoading: detailLoading } = useSession(rootTaskId);
   const { data: users } = useUsers();
   const { data: costs } = useSessionCosts({ taskId: rootTaskId, enabled: !!rootTaskId });
@@ -58,10 +63,13 @@ export default function SessionDetailPage() {
     updateTitle.mutate({ id: detail.root.id, title: trimmed || null });
   };
 
-  const latestLeafTaskId = useMemo(() => {
+  // The whole leaf task, not just its id: the composer needs `status`,
+  // `isLeadTask`, `provider`, and `supportedSteerModes` to decide between
+  // steering the running task and chaining a new one (decision 6).
+  const latestLeafTask = useMemo(() => {
     if (!detail || detail.chain.length === 0) return null;
     const sorted = [...detail.chain].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    return sorted[0]?.id ?? detail.root.id;
+    return sorted[0] ?? detail.root;
   }, [detail]);
 
   const requestedByUserName = useMemo(() => {
@@ -249,7 +257,11 @@ export default function SessionDetailPage() {
       </div>
 
       {/* Composer dock pinned to bottom */}
-      <SessionComposer rootTaskId={rootTaskId} latestLeafTaskId={latestLeafTaskId} />
+      <SessionComposer
+        rootTaskId={rootTaskId}
+        latestLeafTask={latestLeafTask}
+        steeringSupported={steerGate.supported && steeringEnabled}
+      />
     </SessionsShell>
   );
 }

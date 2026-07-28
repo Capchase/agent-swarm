@@ -4,9 +4,11 @@ import { initDb } from "./be/db";
 import { startPricingRefreshLoop } from "./be/pricing-refresh";
 import { ensureRbacSeedsSynced } from "./be/rbac-roles";
 import { seedPricingFromModelsDev } from "./be/seed-pricing";
+import { isSteeringEnabled } from "./be/steering";
 import { registerGithubTaskReactions } from "./github/task-reactions";
 import { loadGlobalConfigsIntoEnv } from "./http/core";
 import { isRbacEnabled } from "./rbac";
+import { registerAcceptSteerTool } from "./tools/accept-steer";
 import { registerCancelTaskTool } from "./tools/cancel-task";
 import { registerContextDiffTool } from "./tools/context-diff";
 import { registerContextHistoryTool } from "./tools/context-history";
@@ -117,6 +119,7 @@ import { registerSlackReplyTool } from "./tools/slack-reply";
 import { registerSlackStartThreadTool } from "./tools/slack-start-thread";
 import { registerSlackUpdateTool } from "./tools/slack-update";
 import { registerSlackUploadFileTool } from "./tools/slack-upload-file";
+import { registerSteerTaskTool } from "./tools/steer-task";
 import { registerStoreProgressTool } from "./tools/store-progress";
 // Swarm config tools
 import {
@@ -335,6 +338,14 @@ export function createServer(opts: { scriptsOnly?: boolean; fullSurface?: boolea
     // Debug tools (self-guard with lead check)
     registerDbQueryTool(server);
     registerGetOauthAccessTokenTool(server);
+
+    // Steering acknowledgement must ship with core: steering delivery works on
+    // directly-assigned tasks (no task-pool capability required), and without
+    // accept-steer every delivered message would be stuck at `delivered`.
+    if (isSteeringEnabled()) {
+      registerAcceptSteerTool(server);
+      registerSteerTaskTool(server);
+    }
   }
 
   // Task pool capability - task pool operations (create unassigned, claim, release, accept, reject)

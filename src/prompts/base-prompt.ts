@@ -9,6 +9,7 @@
 
 import type { ProviderTraits } from "../providers/types";
 import type { ProviderName } from "../types";
+import { isSteeringEnabled } from "../utils/steering-enabled";
 import { resolveTemplateAsync } from "./resolver";
 
 // Side-effect import: register all system + session templates
@@ -106,6 +107,7 @@ export type BasePromptArgs = {
 export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
   const { role, agentId, swarmUrl, traits } = args;
   const { hasMcp = true, hasLocalEnvironment: hasLocalEnv = true } = traits ?? {};
+  const steerModes = traits?.steerModes ?? [];
 
   const vars: Record<string, string> = { role, agentId, swarmUrl };
 
@@ -185,6 +187,19 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
   if (hasMcp && !scriptsOnlyMode && serverHasCapability("messaging", true)) {
     const messagingResult = await resolveTemplateAsync("system.agent.messaging", {});
     prompt += messagingResult.text;
+  }
+
+  if (
+    hasMcp &&
+    isSteeringEnabled() &&
+    steerModes.length > 0 &&
+    !scriptsOnlyMode &&
+    // steer-task/accept-steer register under the core capability (steering
+    // works on directly-assigned tasks, not just the pool).
+    serverHasCapability("core", true)
+  ) {
+    const steeringResult = await resolveTemplateAsync("system.agent.steering", {});
+    prompt += steeringResult.text;
   }
 
   // Inject agent identity

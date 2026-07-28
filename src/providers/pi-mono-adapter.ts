@@ -43,6 +43,9 @@ import type {
   ProviderResult,
   ProviderSession,
   ProviderSessionConfig,
+  ProviderTraits,
+  SteerDelivery,
+  SteerDeliveryResult,
 } from "./types";
 
 /**
@@ -681,6 +684,15 @@ export class PiMonoSession implements ProviderSession {
   private terminalError: string | null = null;
   /** Reasoning/effort level actually applied (Phase 4) — null when `applyReasoningEffort()` returned noop. */
   private appliedReasoningEffort: ReasoningEffort | null;
+  /**
+   * Set once `runSession()` finishes (success or failure). `steer()`/`followUp()`
+   * on a finished AgentSession enqueue into a dead agent loop and never throw,
+   * so without this gate a late steering delivery would be reported `delivered`
+   * while the message silently rots in the disposed session — and the false
+   * positive suppresses the server's terminal-status promotion to a follow-up
+   * task. Checked by `deliverSteering()`.
+   */
+  private sessionEnded = false;
 
   constructor(
     agentSession: AgentSession,
@@ -952,6 +964,7 @@ export class PiMonoSession implements ProviderSession {
         appliedReasoningEffort: this.appliedReasoningEffort,
       };
     } finally {
+      this.sessionEnded = true;
       await this.logFileHandle.end();
       if (this.createdSymlink) {
         cleanupAgentsMdSymlink(this.config.cwd);
@@ -1018,11 +1031,30 @@ export class PiMonoSession implements ProviderSession {
   async abort(): Promise<void> {
     await this.agentSession.abort();
   }
+
+  async deliverSteering({ mode, text }: SteerDelivery): Promise<SteerDeliveryResult> {
+    if (this.sessionEnded) {
+      // Fail closed: report undeliverable so the server promotes the message
+      // to a follow-up task instead of orphaning it in a dead session.
+      return { delivered: false, reason: "pi session already completed" };
+    }
+    try {
+      if (mode === "steer") await this.agentSession.steer(text);
+      else await this.agentSession.followUp(text);
+      return { delivered: true, mode };
+    } catch (err) {
+      return { delivered: false, reason: String(err) };
+    }
+  }
 }
 
 export class PiMonoAdapter implements ProviderAdapter {
   readonly name = "pi";
-  readonly traits = { hasMcp: true, hasLocalEnvironment: true };
+  readonly traits: ProviderTraits = {
+    hasMcp: true,
+    hasLocalEnvironment: true,
+    steerModes: ["steer", "queue"],
+  };
   private lastCwd = ".";
 
   async createSession(config: ProviderSessionConfig): Promise<ProviderSession> {

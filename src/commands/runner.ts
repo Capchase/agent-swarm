@@ -32,12 +32,14 @@ import {
   type ProviderSession,
   type ProviderSessionConfig,
 } from "../providers/index.ts";
+import type { SteerDeliveryResult } from "../providers/types.ts";
 import { initTelemetry, telemetry } from "../telemetry.ts";
 import {
   type ProviderName,
   type ReasoningEffort,
   type RepoGuidelines,
   resolveTaskModelSelection,
+  type SteeringMessage,
 } from "../types.ts";
 import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
@@ -57,6 +59,7 @@ import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { resolveScriptsOnlyMode } from "../utils/scripts-only-mode.ts";
 import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
+import { isSteeringEnabled } from "../utils/steering-enabled.ts";
 import { interpolate } from "../utils/template.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { validateJsonSchema } from "../workflows/json-schema-validator.ts";
@@ -469,6 +472,117 @@ export interface ApiConfig {
   apiUrl: string;
   apiKey: string;
   agentId: string;
+}
+
+export interface SteeringDispatchState {
+  dispatchedIds: Set<string>;
+  outcomes: Map<string, SteerDeliveryResult>;
+}
+
+export function createSteeringDispatchState(): SteeringDispatchState {
+  return {
+    dispatchedIds: new Set(),
+    outcomes: new Map(),
+  };
+}
+
+/**
+ * Wrap a steering body in the registered delivery envelope so the injected
+ * message carries its own ID. `accept-steer` takes that ID, and it is the only
+ * route to `handled` — without the envelope the agent obeys the message but
+ * can never acknowledge it, and the row sits at `delivered` forever.
+ *
+ * Falls back to the bare body if template resolution fails: delivering an
+ * un-acknowledgeable message beats not delivering one at all.
+ */
+export async function renderSteeringDelivery(
+  steeringMessageId: string,
+  body: string,
+): Promise<string> {
+  try {
+    const result = await resolveTemplateAsync("system.agent.steering.delivery", {
+      steeringMessageId,
+      body,
+    });
+    return result.skipped || !result.text.trim() ? body : result.text;
+  } catch {
+    return body;
+  }
+}
+
+export async function pollAndDispatchSteering(
+  config: ApiConfig,
+  taskId: string,
+  session: ProviderSession,
+  state: SteeringDispatchState,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  if (!isSteeringEnabled()) return;
+
+  const headers = {
+    Authorization: `Bearer ${config.apiKey}`,
+    "X-Agent-ID": config.agentId,
+  };
+  const response = await fetchImpl(
+    `${config.apiUrl}/api/steering-messages?taskId=${encodeURIComponent(taskId)}`,
+    { headers },
+  );
+  if (!response.ok) {
+    throw new Error(`Steering poll failed (HTTP ${response.status})`);
+  }
+
+  const data = (await response.json()) as { messages?: SteeringMessage[] };
+  for (const message of data.messages ?? []) {
+    if (message.status !== "pending") continue;
+
+    let outcome = state.dispatchedIds.has(message.id) ? state.outcomes.get(message.id) : undefined;
+    if (!outcome) {
+      try {
+        outcome = session.deliverSteering
+          ? await session.deliverSteering({
+              mode: message.mode,
+              // Wrap the body so it carries its own ID — the agent needs it to
+              // call `accept-steer`, which is the only path to `handled`.
+              text: await renderSteeringDelivery(message.id, message.body),
+            })
+          : {
+              delivered: false,
+              reason: "Provider session does not support live steering",
+            };
+      } catch (error) {
+        outcome = {
+          delivered: false,
+          reason: scrubSecrets(`Provider steering failed: ${(error as Error).message}`),
+        };
+      }
+      if (!outcome.delivered) {
+        outcome = {
+          delivered: false,
+          reason:
+            scrubSecrets(outcome.reason).trim() || "Provider rejected steering without a reason",
+        };
+      }
+      state.dispatchedIds.add(message.id);
+      state.outcomes.set(message.id, outcome);
+    }
+
+    const endpoint = outcome.delivered ? "delivered" : "undeliverable";
+    const body = outcome.delivered ? { mode: outcome.mode } : { reason: outcome.reason };
+    const reportResponse = await fetchImpl(
+      `${config.apiUrl}/api/steering-messages/${encodeURIComponent(message.id)}/${endpoint}`,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!reportResponse.ok) {
+      throw new Error(`Steering ${endpoint} report failed (HTTP ${reportResponse.status})`);
+    }
+  }
 }
 
 /** Ping the server to indicate activity and update status */
@@ -4341,6 +4455,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
   // Track tasks already signaled for cancellation to avoid repeated SIGTERM
   const cancelledSignaled = new Set<string>();
+  const steeringDispatchState = isSteeringEnabled() ? createSteeringDispatchState() : null;
 
   // Migration 055 — cache the harness_provider value used when we last
   // built a `cred_status` snapshot. Re-runs the post-task check only when
@@ -5227,7 +5342,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       detectVcsForTask(apiUrl, apiKey, taskId, task.workingDir);
     }
 
-    // Check for cancelled tasks and signal their subprocesses
+    // Check for cancelled tasks and signal their subprocesses. Deliberately
+    // NOT gated on steeringDispatchState — cancellation abort must keep
+    // working when steering dispatch is off (STEERING_ENABLED unset).
     if (state.activeTasks.size > 0) {
       for (const [taskId, task] of state.activeTasks) {
         if (cancelledSignaled.has(taskId)) continue; // Already sent SIGTERM
@@ -5255,6 +5372,22 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           }
         } catch {
           // Non-blocking — cancellation check is best-effort
+        }
+      }
+    }
+
+    // Deliver pending steering to live provider sessions and report the actual outcome.
+    if (steeringDispatchState && state.activeTasks.size > 0) {
+      const dispatchState = steeringDispatchState;
+      for (const [taskId, task] of state.activeTasks) {
+        try {
+          await pollAndDispatchSteering(apiConfig, taskId, task.session, dispatchState);
+        } catch (error) {
+          console.warn(
+            `[${role}] Steering dispatch failed for task ${taskId.slice(0, 8)} (non-fatal): ${scrubSecrets(
+              (error as Error).message,
+            )}`,
+          );
         }
       }
     }

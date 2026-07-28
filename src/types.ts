@@ -268,7 +268,7 @@ export const InboxMessageStatusSchema = z.enum([
 
 export const InboxMessageSchema = z.object({
   id: z.uuid(),
-  agentId: z.uuid(), // Lead agent who received this
+  agentId: z.string(), // Lead agent who received this
   content: z.string().min(1), // The message content
   source: z.enum(["slack", "agentmail"]).default("slack"),
   status: InboxMessageStatusSchema.default("unread"),
@@ -325,6 +325,84 @@ export const ProviderNameSchema = z.enum([
 ]);
 export type ProviderName = z.infer<typeof ProviderNameSchema>;
 
+// ============================================================================
+// Task Steering Messages
+// ============================================================================
+//
+// `mode`, `status`, and `createdByKind` MUST stay in sync with the SQL CHECK
+// constraints in migration 121. `source` is intentionally Zod-only.
+
+export const SteerModeSchema = z.enum(["steer", "queue"]);
+export type SteerMode = z.infer<typeof SteerModeSchema>;
+
+export const SteeringStatusSchema = z.enum([
+  "pending",
+  "delivered",
+  "handled",
+  "promoted",
+  "cancelled",
+]);
+export type SteeringStatus = z.infer<typeof SteeringStatusSchema>;
+
+export const SteeringSourceSchema = z.enum(["ui", "mcp", "script", "slack", "api"]);
+export type SteeringSource = z.infer<typeof SteeringSourceSchema>;
+
+export const SteeringMessageSchema = z.object({
+  id: z.uuid(),
+  taskId: z.uuid(),
+  body: z.string().min(1),
+  mode: SteerModeSchema,
+  status: SteeringStatusSchema,
+  deliveredMode: SteerModeSchema.optional(),
+  source: SteeringSourceSchema,
+  createdByKind: z.enum(["user", "agent", "system"]),
+  createdByUserId: z.string().optional(),
+  createdByAgentId: z.string().optional(),
+  promotedTaskId: z.uuid().optional(),
+  createdAt: z.iso.datetime(),
+  deliveredAt: z.iso.datetime().optional(),
+  handledAt: z.iso.datetime().optional(),
+  /** accept-steer's optional note describing how the steering was incorporated. */
+  handledNote: z.string().optional(),
+});
+export type SteeringMessage = z.infer<typeof SteeringMessageSchema>;
+
+export const SteerOutcomeSchema = z.enum(["steered", "queued", "promoted"]);
+export type SteerOutcome = z.infer<typeof SteerOutcomeSchema>;
+
+/** Decision 16 — callers opt into a hard failure instead of a silent downgrade. */
+export const OnUnsupportedSchema = z.enum(["degrade", "fail"]).default("degrade");
+export type OnUnsupported = z.infer<typeof OnUnsupportedSchema>;
+
+export const SteerResultSchema = z.object({
+  outcome: SteerOutcomeSchema,
+  steeringMessageId: z.uuid().optional(),
+  promotedTaskId: z.uuid().optional(),
+  effectiveMode: SteerModeSchema,
+  degradedFrom: SteerModeSchema.optional(),
+});
+export type SteerResult = z.infer<typeof SteerResultSchema>;
+
+/**
+ * Static per-provider capability map. MUST stay in sync with each adapter's
+ * `traits.steerModes` (step-3) — asserted by a test, not by convention.
+ */
+export const PROVIDER_STEER_CAPABILITIES: Record<ProviderName, SteerMode[]> = {
+  pi: ["steer", "queue"],
+  "claude-managed": ["steer", "queue"],
+  // Devin's message API accepts a session in `working` state but does not
+  // guarantee the in-flight turn is interrupted, so we advertise queue only
+  // rather than promise semantics we can't honor (step-7 finding).
+  devin: ["queue"],
+  // Interrupt is abort + re-prompt, and E2E showed the re-prompt fails after
+  // the abort — the message came back undeliverable and was promoted to a
+  // follow-up task. Queue (plain promptAsync) works and is verified. Advertise
+  // only what we can honor; revisit if the abort+prompt path is fixed.
+  opencode: ["queue"],
+  claude: ["queue"],
+  codex: [],
+};
+
 export type DevinProviderMeta = {
   sessionUrl: string;
   maxAcuLimit?: number;
@@ -358,7 +436,7 @@ export type FollowUpConfig = z.infer<typeof FollowUpConfigSchema>;
 // session resume is deprecated, so it is never enforced by the eligibility
 // gate). See `isAgentEligibleForTask` in `src/be/db.ts`.
 export const RoutingAffinitySchema = z.object({
-  sourceAgentId: z.uuid().optional(),
+  sourceAgentId: z.string().optional(),
   role: z.string().max(100).optional(),
   harnessProvider: ProviderNameSchema.optional(),
   capabilities: z.array(z.string()).default([]),
@@ -368,8 +446,11 @@ export type RoutingAffinity = z.infer<typeof RoutingAffinitySchema>;
 export const AgentTaskSchema = z.object({
   id: z.uuid(),
   key: AssetKeySchema,
-  agentId: z.uuid().nullable(), // Nullable for unassigned tasks
-  creatorAgentId: z.uuid().optional(), // Who created this task (optional for Slack/API)
+  // Agent-id fields are plain strings, NOT .uuid(): agents may join with custom
+  // IDs (AGENT_ID env / join-swarm agentId), and a UUID constraint here makes MCP
+  // tool responses fail output validation after the write already applied.
+  agentId: z.string().nullable(), // Nullable for unassigned tasks
+  creatorAgentId: z.string().optional(), // Who created this task (optional for Slack/API)
   task: z.string().min(1),
   title: z.string().optional(), // Human-facing display title override (e.g. session rename); falls back to `task` when unset
   status: AgentTaskStatusSchema,
@@ -382,7 +463,7 @@ export const AgentTaskSchema = z.object({
   dependsOn: z.array(z.uuid()).default([]), // Task IDs this depends on
 
   // Acceptance tracking
-  offeredTo: z.uuid().optional(), // Agent the task was offered to
+  offeredTo: z.string().optional(), // Agent the task was offered to
   offeredAt: z.iso.datetime().optional(),
   acceptedAt: z.iso.datetime().optional(),
   rejectionReason: z.string().optional(),
@@ -570,7 +651,7 @@ export type AttachmentInput = z.infer<typeof AttachmentInputSchema>;
 export const TaskAttachmentSchema = z.object({
   id: z.uuid(),
   taskId: z.uuid(),
-  agentId: z.uuid().nullable(),
+  agentId: z.string().nullable(),
   name: z.string(),
   kind: TaskAttachmentKindSchema,
   url: z.string().optional(),
@@ -746,7 +827,9 @@ export const AgentAvatarSchema = z.discriminatedUnion("type", [
 export type AgentAvatar = z.infer<typeof AgentAvatarSchema>;
 
 export const AgentSchema = z.object({
-  id: z.uuid(),
+  // Plain string, NOT .uuid(): agents may join with custom IDs (AGENT_ID env /
+  // join-swarm agentId).
+  id: z.string(),
   name: z.string().min(1),
   isLead: z.boolean().default(false),
   status: AgentStatusSchema,
@@ -918,12 +1001,12 @@ export const VersionableFieldSchema = z.enum([
 
 export const ContextVersionSchema = z.object({
   id: z.uuid(),
-  agentId: z.uuid(),
+  agentId: z.string(),
   field: VersionableFieldSchema,
   content: z.string(),
   version: z.number().int().min(1),
   changeSource: ChangeSourceSchema,
-  changedByAgentId: z.uuid().nullable(),
+  changedByAgentId: z.string().nullable(),
   changeReason: z.string().nullable(),
   contentHash: z.string(),
   previousVersionId: z.uuid().nullable(),
@@ -948,19 +1031,19 @@ export const ChannelSchema = z.object({
   name: z.string().min(1).max(100),
   description: z.string().max(500).optional(),
   type: ChannelTypeSchema.default("public"),
-  createdBy: z.uuid().optional(),
-  participants: z.array(z.uuid()).default([]), // For DMs
+  createdBy: z.string().optional(),
+  participants: z.array(z.string()).default([]), // For DMs
   createdAt: z.iso.datetime(),
 });
 
 export const ChannelMessageSchema = z.object({
   id: z.uuid(),
   channelId: z.uuid(),
-  agentId: z.uuid().nullable(), // Null for human users
+  agentId: z.string().nullable(), // Null for human users
   agentName: z.string().optional(), // Denormalized for convenience, "Human" when agentId is null
   content: z.string().min(1).max(4000),
   replyToId: z.uuid().optional(),
-  mentions: z.array(z.uuid()).default([]), // Agent IDs mentioned
+  mentions: z.array(z.string()).default([]), // Agent IDs mentioned
   createdAt: z.iso.datetime(),
 });
 
@@ -973,7 +1056,7 @@ export const ServiceStatusSchema = z.enum(["starting", "healthy", "unhealthy", "
 
 export const ServiceSchema = z.object({
   id: z.uuid(),
-  agentId: z.uuid(),
+  agentId: z.string(),
   name: z.string().min(1).max(50),
   port: z.number().int().min(1).max(65535).default(3000),
   description: z.string().optional(),
@@ -1004,6 +1087,7 @@ export const AgentLogEventTypeSchema = z.enum([
   "task_created",
   "task_status_change",
   "task_progress",
+  "task_steering",
   // Task pool events
   "task_offered",
   "task_accepted",
@@ -1074,7 +1158,7 @@ export const SessionCostSchema = z.object({
   id: z.uuid(),
   sessionId: z.string(),
   taskId: z.uuid().optional(),
-  agentId: z.uuid(),
+  agentId: z.string(),
   totalCostUsd: z.number().min(0),
   inputTokens: z.number().int().min(0).default(0),
   outputTokens: z.number().int().min(0).default(0),
@@ -1195,11 +1279,11 @@ export const ScheduledTaskSchema = z
     taskType: z.string().max(50).optional(),
     tags: z.array(z.string()).default([]),
     priority: z.number().int().min(0).max(100).default(50),
-    targetAgentId: z.uuid().optional(),
+    targetAgentId: z.string().optional(),
     enabled: z.boolean().default(true),
     lastRunAt: z.iso.datetime().optional(),
     nextRunAt: z.iso.datetime().optional(),
-    createdByAgentId: z.uuid().optional(),
+    createdByAgentId: z.string().optional(),
     timezone: z.string().default("UTC"),
     consecutiveErrors: z.number().int().min(0).default(0),
     lastErrorAt: z.iso.datetime().optional(),
@@ -1321,7 +1405,7 @@ export const AgentMemorySourceSchema = z.enum([
 
 export const AgentMemorySchema = z.object({
   id: z.string().uuid(),
-  agentId: z.string().uuid().nullable(),
+  agentId: z.string().nullable(),
   scope: AgentMemoryScopeSchema,
   key: z.string().nullable().optional(),
   name: z.string().min(1).max(500),
@@ -1353,7 +1437,7 @@ export type AgentMemory = z.infer<typeof AgentMemorySchema>;
 
 export const ActiveSessionSchema = z.object({
   id: z.uuid(),
-  agentId: z.uuid(),
+  agentId: z.string(),
   taskId: z.string().nullable(),
   triggerType: z.string(),
   inboxMessageId: z.string().nullable(),
@@ -1686,7 +1770,7 @@ export const WorkflowSchema = z.object({
   triggerSchema: z.record(z.string(), z.unknown()).optional(),
   dir: z.string().min(1).startsWith("/").optional(),
   vcsRepo: z.string().min(1).optional(),
-  createdByAgentId: z.string().uuid().optional(),
+  createdByAgentId: z.string().optional(),
   createdAt: z.string(),
   lastUpdatedAt: z.string(),
   createdBy: z.string().optional(),
@@ -1702,7 +1786,7 @@ export const WorkflowVersionSchema = z.object({
   workflowId: z.string().uuid(),
   version: z.number().int().min(1),
   snapshot: WorkflowSnapshotSchema,
-  changedByAgentId: z.string().uuid().optional(),
+  changedByAgentId: z.string().optional(),
   createdAt: z.string(),
 });
 export type WorkflowVersion = z.infer<typeof WorkflowVersionSchema>;
@@ -2379,7 +2463,7 @@ export type ContextFormula = z.infer<typeof ContextFormulaSchema>;
 export const ContextSnapshotSchema = z.object({
   id: z.uuid(),
   taskId: z.uuid(),
-  agentId: z.uuid(),
+  agentId: z.string(),
   sessionId: z.string(),
 
   // Context window state

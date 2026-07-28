@@ -158,19 +158,21 @@ export {
   useUninstallSkill,
   useUpdateSkill,
 } from "./use-skills";
-export { useApiVersion, useHealth, useLogs, useStats } from "./use-stats";
+export { useApiVersion, useHealth, useLogs, useStats, useSteeringEnabled } from "./use-stats";
 export { useStatus, useTestConnection } from "./use-status";
 export type { UseTaskTemplatesOptions } from "./use-task-templates";
 export { useTaskTemplates } from "./use-task-templates";
-export type { TaskFilters } from "./use-tasks";
+export type { SteerTaskInput, TaskFilters } from "./use-tasks";
 export {
   useCancelTask,
   useCreateTask,
   usePauseTask,
   useResumeTask,
+  useSteerTask,
   useTask,
   useTaskContext,
   useTaskSessionLogs,
+  useTaskSteeringMessages,
   useTasks,
 } from "./use-tasks";
 export {
