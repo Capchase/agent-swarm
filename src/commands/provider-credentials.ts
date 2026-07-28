@@ -350,9 +350,6 @@ export async function validateProviderCredentials(provider: string): Promise<Liv
           };
         }
         const baseUrl = env.DEVIN_API_BASE_URL ?? "https://api.devin.ai";
-        // v3-only: current-generation `cog_` keys 403 on any `/v1/...` route,
-        // so the health check must hit a v3 endpoint. `/v3/self` is a cheap,
-        // org-independent liveness probe (see devin-v1-403-means-version-not-key).
         const r = await timedFetch(`${baseUrl.replace(/\/+$/, "")}/v3/self`, {
           method: "GET",
           headers: {
