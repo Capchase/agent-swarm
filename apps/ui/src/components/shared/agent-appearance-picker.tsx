@@ -71,32 +71,39 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
                 value={iconQuery}
                 onChange={(e) => setIconQuery(e.target.value)}
                 placeholder="Search icons…"
+                aria-label="Search icons"
                 className="h-8 pl-7 text-sm"
               />
             </div>
             <ScrollArea className="h-40 rounded-md border">
-              <div className="grid grid-cols-8 gap-1 p-2">
-                {iconNames.map((key) => {
-                  const Icon = getIconComponentByName(key);
-                  if (!Icon) return null;
-                  return (
-                    <button
-                      key={key}
-                      type="button"
-                      title={key}
-                      aria-label={key}
-                      aria-pressed={avatar?.icon === key}
-                      onClick={() => pickIcon(key)}
-                      className={cn(
-                        "flex items-center justify-center rounded-md p-1.5 hover:bg-accent transition-colors",
-                        avatar?.icon === key && "bg-accent ring-1 ring-ring",
-                      )}
-                    >
-                      <Icon className="h-4 w-4" />
-                    </button>
-                  );
-                })}
-              </div>
+              {iconNames.length === 0 ? (
+                <p className="flex h-40 items-center justify-center px-4 text-center text-xs text-muted-foreground">
+                  No icons match &ldquo;{iconQuery}&rdquo;
+                </p>
+              ) : (
+                <div className="grid grid-cols-8 gap-1 p-2">
+                  {iconNames.map((key) => {
+                    const Icon = getIconComponentByName(key);
+                    if (!Icon) return null;
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        title={key}
+                        aria-label={key}
+                        aria-pressed={avatar?.icon === key}
+                        onClick={() => pickIcon(key)}
+                        className={cn(
+                          "flex items-center justify-center rounded-md p-1.5 hover:bg-accent transition-colors",
+                          avatar?.icon === key && "bg-accent ring-1 ring-ring",
+                        )}
+                      >
+                        <Icon className="h-4 w-4" />
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </ScrollArea>
             {totalMatches > iconNames.length && (
               <p className="mt-1 text-xs text-muted-foreground">
