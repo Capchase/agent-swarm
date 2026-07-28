@@ -36,7 +36,7 @@ export type ReasoningEffortLevel = (typeof REASONING_EFFORT_LEVELS)[number];
  * server validates shape only; the UI owns the icon catalog + fallback. */
 export interface AgentAvatarLucide {
   type: "lucide";
-  /** Kebab-case lucide icon name, e.g. "rocket". Must exist in AVATAR_ICON_CATALOG to render. */
+  /** Kebab-case lucide icon name, e.g. "rocket". Must resolve via `getIconComponentByName` (agent-icon.ts) to render. */
   icon: string;
   /** `#RRGGBB`. Omitted = use the deterministic color derivation. */
   color?: string;

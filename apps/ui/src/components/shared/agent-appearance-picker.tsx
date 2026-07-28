@@ -6,11 +6,11 @@
  * `avatar: null` to fall back to the deterministic hash-derived icon/color.
  */
 
-import { RotateCcw } from "lucide-react";
-import { useState } from "react";
+import { RotateCcw, Search } from "lucide-react";
+import { useMemo, useState } from "react";
 import type { AgentAvatar } from "@/api/types";
 import { AVATAR_SUGGESTED_SWATCHES } from "@/lib/agent-color";
-import { AVATAR_ICON_CATALOG } from "@/lib/agent-icon";
+import { getIconComponentByName, searchAvatarIcons } from "@/lib/agent-icon";
 import { cn } from "@/lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -28,7 +28,12 @@ export interface AgentAppearancePickerProps {
 
 export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppearancePickerProps) {
   const [hexDraft, setHexDraft] = useState(avatar?.color ?? "");
+  const [iconQuery, setIconQuery] = useState("");
   const hexValid = hexDraft === "" || HEX_RE.test(hexDraft);
+  const { names: iconNames, totalMatches } = useMemo(
+    () => searchAvatarIcons(iconQuery),
+    [iconQuery],
+  );
 
   function pickIcon(icon: string) {
     onChange({ type: "lucide", icon, color: avatar?.color });
@@ -42,13 +47,17 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
 
   function reset() {
     setHexDraft("");
+    setIconQuery("");
     onChange(null);
   }
 
   return (
     <Popover
       onOpenChange={(open) => {
-        if (open) setHexDraft(avatar?.color ?? "");
+        if (open) {
+          setHexDraft(avatar?.color ?? "");
+          setIconQuery("");
+        }
       }}
     >
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
@@ -56,24 +65,44 @@ export function AgentAppearancePicker({ avatar, onChange, trigger }: AgentAppear
         <div className="space-y-3">
           <div>
             <p className="text-sm font-medium mb-2">Icon</p>
+            <div className="relative mb-2">
+              <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={iconQuery}
+                onChange={(e) => setIconQuery(e.target.value)}
+                placeholder="Search icons…"
+                className="h-8 pl-7 text-sm"
+              />
+            </div>
             <ScrollArea className="h-40 rounded-md border">
               <div className="grid grid-cols-8 gap-1 p-2">
-                {Object.entries(AVATAR_ICON_CATALOG).map(([key, Icon]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    title={key}
-                    onClick={() => pickIcon(key)}
-                    className={cn(
-                      "flex items-center justify-center rounded-md p-1.5 hover:bg-accent transition-colors",
-                      avatar?.icon === key && "bg-accent ring-1 ring-ring",
-                    )}
-                  >
-                    <Icon className="h-4 w-4" />
-                  </button>
-                ))}
+                {iconNames.map((key) => {
+                  const Icon = getIconComponentByName(key);
+                  if (!Icon) return null;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      title={key}
+                      aria-label={key}
+                      aria-pressed={avatar?.icon === key}
+                      onClick={() => pickIcon(key)}
+                      className={cn(
+                        "flex items-center justify-center rounded-md p-1.5 hover:bg-accent transition-colors",
+                        avatar?.icon === key && "bg-accent ring-1 ring-ring",
+                      )}
+                    >
+                      <Icon className="h-4 w-4" />
+                    </button>
+                  );
+                })}
               </div>
             </ScrollArea>
+            {totalMatches > iconNames.length && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Showing {iconNames.length} of {totalMatches}
+              </p>
+            )}
           </div>
 
           <div>

@@ -4,7 +4,34 @@ import {
   AVATAR_ICON_CATALOG,
   getAgentIcon,
   resolveAgentIcon,
+  searchAvatarIcons,
 } from "../../apps/ui/src/lib/agent-icon";
+import { LUCIDE_ICON_NAMES } from "../../apps/ui/src/lib/lucide-icon-names.generated";
+
+// Concrete names from Daniel's bug report (swarm task 0fb80209) that the old
+// ~64-icon hand-written AVATAR_ICON_CATALOG couldn't reach at all.
+const PREVIOUSLY_MISSING_ICON_NAMES = [
+  "spell-check",
+  "scan-eye",
+  "hand-coins",
+  "git-pull-request-arrow",
+  "flask-conical",
+  "pen-tool",
+  "search-check",
+  "file-pen-line",
+  "book-open-check",
+  "text-quote",
+  "calendar-clock",
+  "file-check",
+  "file-lock",
+  "check-check",
+  "radar",
+  "microscope",
+  "crosshair",
+  "landmark",
+  "receipt",
+  "file-search",
+];
 
 /**
  * Covers the pure avatar-resolution logic behind the customizable agent
@@ -63,6 +90,50 @@ describe("agent avatar resolution", () => {
       const fallback = { agentId: "some-agent", isLead: false };
       expect(resolveAgentIcon(null, fallback)).toBe(getAgentIcon(fallback));
       expect(resolveAgentIcon(undefined, fallback)).toBe(getAgentIcon(fallback));
+    });
+
+    test.each(
+      PREVIOUSLY_MISSING_ICON_NAMES,
+    )("%s (outside the curated catalog) resolves via the full lucide library, not the fallback", (name) => {
+      const avatar = { type: "lucide" as const, icon: name };
+      const fallback = { agentId: "some-agent" };
+      const Icon = resolveAgentIcon(avatar, fallback);
+      expect(Icon).not.toBe(getAgentIcon(fallback));
+      expect(Icon.displayName).toBe(`DynamicAvatarIcon(${name})`);
+    });
+  });
+
+  describe("searchAvatarIcons (full lucide library, not just the curated catalog)", () => {
+    test("the generated icon-name catalog has four-digit coverage of the real library, not a hand-curated subset", () => {
+      expect(LUCIDE_ICON_NAMES.length).toBeGreaterThanOrEqual(1000);
+      expect(LUCIDE_ICON_NAMES.length).toBeLessThan(10000);
+    });
+
+    test.each(PREVIOUSLY_MISSING_ICON_NAMES)("%s is a searchable icon name", (name) => {
+      const { names } = searchAvatarIcons(name);
+      expect(names).toContain(name);
+    });
+
+    test("search is space/hyphen-insensitive", () => {
+      expect(searchAvatarIcons("tree deciduous").names).toContain("tree-deciduous");
+      expect(searchAvatarIcons("treedeciduous").names).toContain("tree-deciduous");
+    });
+
+    test("an empty query returns the curated default shortlist, not the full library", () => {
+      const { names, totalMatches } = searchAvatarIcons("");
+      expect(names.length).toBe(Object.keys(AVATAR_ICON_CATALOG).length);
+      expect(totalMatches).toBe(names.length);
+    });
+
+    test("totalMatches reports the true count even when results are capped", () => {
+      const { names, totalMatches } = searchAvatarIcons("a");
+      expect(totalMatches).toBeGreaterThan(names.length);
+    });
+
+    test("a nonsense query returns no matches", () => {
+      const { names, totalMatches } = searchAvatarIcons("zzzznotarealiconzzzz");
+      expect(names).toEqual([]);
+      expect(totalMatches).toBe(0);
     });
   });
 
