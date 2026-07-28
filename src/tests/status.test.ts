@@ -670,9 +670,6 @@ describe("validateProviderCredentials — error scrubbing", () => {
   });
 
   test("devin hits v3/self (not the deprecated v1 endpoint) and passes on 2xx", async () => {
-    // Current-generation `cog_` Devin API keys 403 on any `/v1/...` route, so
-    // the health check must target a v3 endpoint or it permanently benches
-    // the devin-harness pool once a new key is in place.
     process.env.DEVIN_API_KEY = "cog_fake-devin-key-1234";
     let capturedUrl = "";
     globalThis.fetch = (async (url) => {
