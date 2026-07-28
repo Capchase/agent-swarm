@@ -359,6 +359,20 @@ jobs:
         run: bun run check:tokens
         working-directory: apps/ui
 
+      - name: Check lucide icon catalog freshness
+        # Regenerate and diff, not just lint: a lucide-react bump can drift the
+        # generated content (icon count/names) without breaking formatting, which
+        # the "Run Biome linter" step below would miss.
+        run: |
+          bun run refresh:lucide-icon-names
+          if ! git diff --exit-code -- src/lib/lucide-icon-names.generated.ts; then
+            echo "::error::lucide-icon-names.generated.ts is out of date! Run 'bun run refresh:lucide-icon-names' (apps/ui) and commit the changes."
+            git diff --stat -- src/lib/lucide-icon-names.generated.ts
+            exit 1
+          fi
+          echo "lucide icon catalog is up to date."
+        working-directory: apps/ui
+
       - name: Run Biome linter
         run: bun run lint
         working-directory: apps/ui

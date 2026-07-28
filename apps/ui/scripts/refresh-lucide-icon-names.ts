@@ -53,6 +53,10 @@ async function main() {
   const body = `export const LUCIDE_ICON_NAMES: readonly string[] = ${JSON.stringify(canonicalNames, null, 2)};\n`;
 
   writeFileSync(OUTPUT_PATH, header + body);
+  // JSON.stringify omits the trailing comma Biome's formatter requires —
+  // format through Biome itself (not a hand-rolled serializer) so this stays
+  // correct across future Biome config changes.
+  await Bun.$`bunx biome format --write ${OUTPUT_PATH}`;
   console.log(
     `Wrote ${canonicalNames.length} canonical icon names (deduped from ${allNames.length} raw names, lucide-react@${lucidePackageJson.version}) to ${OUTPUT_PATH}`,
   );
