@@ -1,11 +1,12 @@
 import { AlertTriangle, ArrowUpCircle, Check, ChevronsUpDown, Lock, Save } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useUpdateAgentRuntime } from "@/api/hooks/use-agents";
 import { useResolvedConfigs } from "@/api/hooks/use-config-api";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
 import { useEnvPresence } from "@/api/hooks/use-integrations-meta";
+import { useModelsCatalog } from "@/api/hooks/use-models-catalog";
 import { type Agent, REASONING_EFFORT_LEVELS, type ReasoningEffortLevel } from "@/api/types";
 import { HarnessIcon } from "@/components/shared/harness-icon";
 import { ProviderIcon } from "@/components/shared/provider-icon";
@@ -113,25 +114,45 @@ export function AgentRuntimeSettings({ agent }: { agent: Agent }) {
         : null,
     [agent.credStatus?.bedrock],
   );
+  const catalogQuery = useModelsCatalog();
+  const liveCatalog = catalogQuery.data?.providers ?? null;
   const groups = useMemo(
-    () => modelGroupsForHarness(harness, configs, envPresenceQuery.data, liveBedrockStatus),
-    [harness, configs, envPresenceQuery.data, liveBedrockStatus],
+    () =>
+      modelGroupsForHarness(
+        harness,
+        configs,
+        envPresenceQuery.data,
+        liveBedrockStatus,
+        liveCatalog,
+      ),
+    [harness, configs, envPresenceQuery.data, liveBedrockStatus, liveCatalog],
   );
   const modelOption = findModelOption(model, groups);
   const latestModel = agent.credStatus?.latestModel ?? null;
 
+  // Re-syncs the editable fields from PERSISTED settings only when those
+  // settings actually change. The async inputs (env presence, Bedrock probe,
+  // live catalog — which also refetches on an interval) stay in the dependency
+  // list because the default-model pick reads them, but their arrival must not
+  // reinitialize the form and discard in-progress edits — hence the syncKey
+  // guard.
+  const syncKey = `${agent.id}|${initialHarness}|${configuredModel(configs)}|${configuredEffort(configs)}`;
+  const lastSyncKey = useRef<string | null>(null);
   useEffect(() => {
+    if (lastSyncKey.current === syncKey) return;
+    lastSyncKey.current = syncKey;
     const nextModel = configuredModel(configs);
     const nextGroups = modelGroupsForHarness(
       initialHarness,
       configs,
       envPresenceQuery.data,
       liveBedrockStatus,
+      liveCatalog,
     );
     setHarness(initialHarness);
     setModel(nextModel || pickDefaultModelForHarness(initialHarness, nextGroups));
     setEffort(configuredEffort(configs));
-  }, [configs, initialHarness, envPresenceQuery.data, liveBedrockStatus]);
+  }, [syncKey, configs, initialHarness, envPresenceQuery.data, liveBedrockStatus, liveCatalog]);
 
   // Clears `effort` whenever it ends up unsupported by the (possibly new)
   // selected model, rather than silently coercing it to a supported value.
@@ -154,6 +175,7 @@ export function AgentRuntimeSettings({ agent }: { agent: Agent }) {
       configs,
       envPresenceQuery.data,
       liveBedrockStatus,
+      liveCatalog,
     );
     setHarness(nextHarness);
     const nextModel = findModelOption(model, nextGroups)
@@ -301,7 +323,9 @@ export function AgentRuntimeSettings({ agent }: { agent: Agent }) {
           {modelOption.contextWindow
             ? ` · ${formatContext(modelOption.contextWindow)} context`
             : ""}
-          . Prices from <code>models.dev</code> snapshot — verify against provider billing.
+          . Prices from <code>models.dev</code>{" "}
+          {catalogQuery.data?.source === "live" ? "live catalog" : "snapshot"} — verify against
+          provider billing.
         </p>
       ) : null}
     </div>
