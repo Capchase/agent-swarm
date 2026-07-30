@@ -13657,6 +13657,36 @@ export function getKv(namespace: string, key: string): KvEntry | null {
   return decodeKvRow(row);
 }
 
+/** Delete expired entries in one namespace. Used by internal TTL-backed stores
+ * that need proactive cleanup rather than waiting for a point read. */
+export function sweepExpiredKv(namespace: string, now = Date.now()): number {
+  const result = getDb()
+    .prepare<unknown, [string, number]>(
+      `DELETE FROM kv_entries
+        WHERE namespace = ?
+          AND expires_at IS NOT NULL
+          AND expires_at <= ?`,
+    )
+    .run(namespace, now);
+  return result.changes;
+}
+
+/** Delete expired entries across a namespace family (`prefix` and
+ * `prefix:*`). Used by per-agent internal stores whose inactive owners may
+ * never return to trigger a namespace-local sweep. */
+export function sweepExpiredKvPrefix(prefix: string, now = Date.now()): number {
+  const escaped = prefix.replace(/[\\%_]/g, "\\$&");
+  const result = getDb()
+    .prepare<unknown, [string, string, number]>(
+      `DELETE FROM kv_entries
+        WHERE (namespace = ? OR namespace LIKE ? ESCAPE '\\')
+          AND expires_at IS NOT NULL
+          AND expires_at <= ?`,
+    )
+    .run(prefix, `${escaped}:%`, now);
+  return result.changes;
+}
+
 /**
  * Upsert a KV entry. Caller passes the decoded value + valueType; we encode
  * before storing. `expiresAt` is unix-ms (NULL means no expiry).

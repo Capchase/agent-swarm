@@ -13,6 +13,8 @@ import type {
   ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod";
+import { sweepExpiredKvPrefix, upsertKv } from "../be/db";
+import { MCP_OVERFLOW_NAMESPACE, mcpOverflowNamespace } from "../kv-overflow";
 import { withSpan } from "../otel";
 import type { PermissionVerb } from "../rbac/permissions";
 import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
@@ -100,6 +102,14 @@ function toolResultAttributes(result: CallToolResult) {
  */
 export type SwarmToolData = Record<string, unknown>;
 
+export type SwarmToolTruncation = {
+  truncated: true;
+  fullValueAt: string;
+  originalBytes: number;
+  limitBytes: number;
+  retrieval: string;
+};
+
 export type SwarmToolResult<TData extends SwarmToolData = SwarmToolData> = {
   /** Truthful outcome. Becomes `isError = !ok` and `structuredContent.success`. */
   ok: boolean;
@@ -111,6 +121,8 @@ export type SwarmToolResult<TData extends SwarmToolData = SwarmToolData> = {
   data?: TData;
   /** Single-sentence conditional steer, appended to BOTH channels. */
   nudge?: string;
+  /** Ctx-control metadata attached centrally when the full wire result is spilled. */
+  truncation?: SwarmToolTruncation;
   /**
    * Skip the finalize pipeline's secret scrubbing for this result. ONLY for
    * deliberate credential-reveal branches (oauth-access-token, script-apis
@@ -138,11 +150,20 @@ export const toolErr = <TData extends SwarmToolData = SwarmToolData>(
  * client-side validators (opencode's official-SDK client) reject the spread
  * `data` keys after the write already landed.
  */
+const swarmToolTruncationSchema = z.looseObject({
+  truncated: z.literal(true),
+  fullValueAt: z.string(),
+  originalBytes: z.number(),
+  limitBytes: z.number(),
+  retrieval: z.string(),
+});
+
 export const swarmToolEnvelopeShape = {
   success: z.boolean(),
   message: z.string(),
   details: z.string().optional(),
   nudge: z.string().optional(),
+  truncation: swarmToolTruncationSchema.optional(),
 };
 
 /** Build a permissive output schema: envelope + optional tool-specific data shape. */
@@ -187,19 +208,27 @@ export const NUDGES: Record<string, (result: SwarmToolResult) => string | undefi
       ? "Rate memories that help or mislead you with memory_rate."
       : undefined;
   },
+  // kv-get is spill-exempt (retrieval path), so oversized values reach the
+  // harness whole and get natively truncated there. Steer big-value work
+  // toward scripts, where the full value stays out of the model's context.
+  "kv-get": (r) => {
+    if (!r.ok) return undefined;
+    const entry = (r.data as { entry?: { value?: unknown } | null } | undefined)?.entry;
+    if (!entry) return undefined;
+    const rendered =
+      typeof entry.value === "string" ? entry.value : (JSON.stringify(entry.value) ?? "");
+    return rendered.length > MCP_RESULT_WIRE_LIMIT_BYTES
+      ? "Large value — your harness may truncate this result; to filter or aggregate it, process it in a script via ctx.swarm.kv_get instead."
+      : undefined;
+  },
 };
 
-// Cap for any rendered details string — Codex's ~10KB middle-out truncation is
-// the tightest harness budget. Structured data remains intact; only the
-// human/model-facing rendering is bounded.
-const DETAILS_CAP = 8_000;
+export const MCP_RESULT_WIRE_LIMIT_BYTES = 10_000;
+export { MCP_OVERFLOW_NAMESPACE, mcpOverflowNamespace };
+export const MCP_OVERFLOW_TTL_MS = 24 * 60 * 60 * 1_000;
+const MCP_PROSE_PREVIEW_CHARS = 1_200;
 
-function truncateForText(text: string): string {
-  if (text.length <= DETAILS_CAP) return text;
-  return `${text.slice(0, DETAILS_CAP)}\n… [truncated ${text.length - DETAILS_CAP} chars]`;
-}
-
-type FinalizeContext = { toolName: string };
+type FinalizeContext = { toolName: string; agentId: string | undefined };
 type FinalizeMiddleware = (result: SwarmToolResult, ctx: FinalizeContext) => SwarmToolResult;
 
 const scrubMiddleware: FinalizeMiddleware = (result) =>
@@ -211,10 +240,170 @@ const nudgeMiddleware: FinalizeMiddleware = (result, ctx) => {
   return nudge ? { ...result, nudge } : result;
 };
 
-// Ordered: scrub first so nudges (and any future middleware) only ever see
-// scrubbed data. Future ctx-control middleware (response pruning, auto-KV
-// overflow) slots in between nudge and the final transform.
-const FINALIZE_PIPELINE: FinalizeMiddleware[] = [scrubMiddleware, nudgeMiddleware];
+/**
+ * Compose the wire shape without applying size control. Ctx-control calls this
+ * once to measure the complete text + structured result, then the finalizer
+ * calls it again after any overflow replacement.
+ */
+function composeWireResult(r: SwarmToolResult): CallToolResult {
+  const normalizedDetails = r.details?.trim() || undefined;
+
+  // Text-channel completeness guarantee: when a tool sets data but no details,
+  // render the data as JSON into the text channel. Most harnesses only ever
+  // show the model content.text — without this fallback, a data-only payload
+  // would be invisible there. Not copied into structuredContent.details (the
+  // structured channel already carries data verbatim).
+  const dataFallback =
+    !normalizedDetails && r.data && Object.keys(r.data).length > 0
+      ? JSON.stringify(r.data, null, 2)
+      : undefined;
+
+  // Payload LAST: harnesses truncate oversized text from the tail (or keep
+  // head+tail), so message and nudge lead and a cut lands inside the payload
+  // rendering — a truncated JSON prefix still shows its first key values.
+  const text = [r.message, r.nudge, normalizedDetails ?? dataFallback]
+    .filter((part): part is string => Boolean(part?.trim()))
+    .join("\n\n");
+  const structuredContent: Record<string, unknown> = {
+    ...(r.data ?? {}),
+    success: r.ok,
+    message: r.message,
+  };
+  if (normalizedDetails) structuredContent.details = normalizedDetails;
+  if (r.nudge) structuredContent.nudge = r.nudge;
+  if (r.truncation) structuredContent.truncation = r.truncation;
+
+  return {
+    content: [{ type: "text", text }],
+    structuredContent,
+    isError: !r.ok,
+  };
+}
+
+function overflowKey(toolName: string, value: string): string {
+  const safeToolName = toolName.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80);
+  const hash = new Bun.CryptoHasher("sha256").update(value).digest("hex");
+  return `v1/${safeToolName}/${hash}`;
+}
+
+function overflowRetrieval(namespace: string, key: string): string {
+  return (
+    `kv-get(${JSON.stringify({ namespace, key })}) returns the full value ` +
+    `(your harness may truncate it); to filter or aggregate it instead, ` +
+    `process it in a script via ctx.swarm.kv_get.`
+  );
+}
+
+function canonicalOverflowPayload(toolName: string, result: SwarmToolResult): string {
+  // `allowSecretEgress` deliberately bypasses the normal wire scrubber. Never
+  // persist that escape hatch: overflow KV is readable by authenticated agents,
+  // so the stored canonical payload is always scrubbed independently.
+  const safe = result.allowSecretEgress ? scrubObject(result) : result;
+  return JSON.stringify({
+    version: 1,
+    toolName,
+    outcome: {
+      ok: safe.ok,
+      message: safe.message,
+      ...(safe.details ? { details: safe.details } : {}),
+      ...(safe.data ? { data: safe.data } : {}),
+      ...(safe.nudge ? { nudge: safe.nudge } : {}),
+    },
+  });
+}
+
+/**
+ * Tools the spill middleware must never rewrite. kv-get IS the retrieval path
+ * for spilled values — bounding it would re-spill the read into a new pointer
+ * and the full value could never leave the store over MCP. Its oversized
+ * results go out whole; the harness applies its own truncation and the
+ * kv-get nudge steers big-value processing toward scripts.
+ */
+export const CTX_CONTROL_EXEMPT_TOOLS: ReadonlySet<string> = new Set(["kv-get"]);
+
+const ctxControlMiddleware: FinalizeMiddleware = (result, ctx) => {
+  if (CTX_CONTROL_EXEMPT_TOOLS.has(ctx.toolName)) return result;
+
+  const fullWire = composeWireResult(result);
+  const fullWireJson = JSON.stringify(fullWire);
+  const fullWireBytes = Buffer.byteLength(fullWireJson, "utf8");
+  if (fullWireBytes <= MCP_RESULT_WIRE_LIMIT_BYTES) {
+    return result;
+  }
+
+  if (!ctx.agentId) {
+    const truncation: SwarmToolTruncation = {
+      truncated: true,
+      fullValueAt: "unavailable: authenticated agent identity required",
+      originalBytes: fullWireBytes,
+      limitBytes: MCP_RESULT_WIRE_LIMIT_BYTES,
+      retrieval: "Retry the tool with an authenticated X-Agent-ID to retain the full value.",
+    };
+    return {
+      ok: result.ok,
+      message: result.message,
+      details:
+        `Result omitted because the composed result exceeded ${MCP_RESULT_WIRE_LIMIT_BYTES} bytes and no authenticated agent identity was available.\n` +
+        `Truncation: ${JSON.stringify(truncation)}`,
+      nudge: result.nudge,
+      truncation,
+    };
+  }
+
+  const storedValue = canonicalOverflowPayload(ctx.toolName, result);
+  const key = overflowKey(ctx.toolName, storedValue);
+  const namespace = mcpOverflowNamespace(ctx.agentId);
+  const fullValueAt = `kv://${namespace}/${key}`;
+  const retrieval = overflowRetrieval(namespace, key);
+  const expiresAt = Date.now() + MCP_OVERFLOW_TTL_MS;
+
+  // The public KV write surfaces cap values at 2 MiB, while the SQLite TEXT
+  // column and this direct server-side helper have no declared size limit.
+  // Sweep the whole per-agent namespace family so expired rows from inactive
+  // agents do not wait for their owner to spill again.
+  sweepExpiredKvPrefix(MCP_OVERFLOW_NAMESPACE);
+  upsertKv({
+    namespace,
+    key,
+    value: storedValue,
+    valueType: "string",
+    expiresAt,
+  });
+
+  const truncation: SwarmToolTruncation = {
+    truncated: true,
+    fullValueAt,
+    originalBytes: fullWireBytes,
+    limitBytes: MCP_RESULT_WIRE_LIMIT_BYTES,
+    retrieval,
+  };
+  const pointer =
+    `Full value: ${fullValueAt}\nRetrieval: ${retrieval}\n` +
+    `Truncation: ${JSON.stringify(truncation)}`;
+  const normalizedDetails = result.details?.trim() || undefined;
+  const details = normalizedDetails
+    ? `${normalizedDetails.slice(0, MCP_PROSE_PREVIEW_CHARS)}\n… [truncated ${Math.max(
+        normalizedDetails.length - MCP_PROSE_PREVIEW_CHARS,
+        0,
+      )} chars]\n${pointer}`
+    : `JSON payload omitted because the composed result exceeded ${MCP_RESULT_WIRE_LIMIT_BYTES} bytes.\n${pointer}`;
+
+  return {
+    ok: result.ok,
+    message: result.message,
+    details,
+    nudge: result.nudge,
+    truncation,
+  };
+};
+
+// Ordered and security-sensitive: ctx-control runs only after the result and
+// any dynamic nudge have been scrubbed, and before the final wire transform.
+const FINALIZE_PIPELINE: FinalizeMiddleware[] = [
+  scrubMiddleware,
+  nudgeMiddleware,
+  ctxControlMiddleware,
+];
 
 /**
  * Transform a SwarmToolResult into the wire CallToolResult. Both channels are
@@ -223,7 +412,11 @@ const FINALIZE_PIPELINE: FinalizeMiddleware[] = [scrubMiddleware, nudgeMiddlewar
  * structuredContent is ALWAYS present (opencode's SDK client throws when a
  * declared outputSchema has no structuredContent).
  */
-export function finalizeSwarmToolResult(toolName: string, result: SwarmToolResult): CallToolResult {
+export function finalizeSwarmToolResult(
+  toolName: string,
+  result: SwarmToolResult,
+  requestInfo: Pick<RequestInfo, "agentId"> = { agentId: undefined },
+): CallToolResult {
   let r = result;
   if (!r.message?.trim()) {
     console.warn(`[mcp] tool ${toolName} returned an empty message — every tool must summarize`);
@@ -234,39 +427,10 @@ export function finalizeSwarmToolResult(toolName: string, result: SwarmToolResul
         : "Tool call failed (no message provided).",
     };
   }
-  for (const middleware of FINALIZE_PIPELINE) r = middleware(r, { toolName });
-
-  // Normalize and cap explicit details only after the scrub middleware has
-  // removed secrets. The same bounded value feeds both wire channels.
-  // Whitespace-only details count as absent so data fallback remains visible.
-  const explicitDetails = r.details?.trim() ? truncateForText(r.details.trim()) : undefined;
-
-  // Text-channel completeness guarantee: when a tool sets data but no details,
-  // render the data as JSON into the text channel. Most harnesses only ever
-  // show the model content.text — without this fallback, a data-only payload
-  // would be invisible there. Not copied into structuredContent.details (the
-  // structured channel already carries data verbatim).
-  const dataFallback =
-    !explicitDetails && r.data && Object.keys(r.data).length > 0
-      ? truncateForText(JSON.stringify(r.data, null, 2))
-      : undefined;
-
-  const text = [r.message, explicitDetails ?? dataFallback, r.nudge]
-    .filter((part): part is string => Boolean(part?.trim()))
-    .join("\n\n");
-  const structuredContent: Record<string, unknown> = {
-    ...(r.data ?? {}),
-    success: r.ok,
-    message: r.message,
-  };
-  if (explicitDetails) structuredContent.details = explicitDetails;
-  if (r.nudge) structuredContent.nudge = r.nudge;
-
-  return {
-    content: [{ type: "text", text }],
-    structuredContent,
-    isError: !r.ok,
-  };
+  for (const middleware of FINALIZE_PIPELINE) {
+    r = middleware(r, { toolName, agentId: requestInfo.agentId });
+  }
+  return composeWireResult(r);
 }
 
 // Infer the input type from the schema
@@ -340,7 +504,7 @@ export const createToolRegistrar = (server: McpServer) => {
                 meta: Meta,
               ) => SwarmToolResult | Promise<SwarmToolResult>
             )(requestInfo, meta);
-            const result = finalizeSwarmToolResult(name, outcome);
+            const result = finalizeSwarmToolResult(name, outcome, requestInfo);
             span.setAttributes(toolResultAttributes(result));
             return result;
           },
@@ -363,7 +527,7 @@ export const createToolRegistrar = (server: McpServer) => {
               meta: Meta,
             ) => SwarmToolResult | Promise<SwarmToolResult>
           )(args, requestInfo, meta);
-          const result = finalizeSwarmToolResult(name, outcome);
+          const result = finalizeSwarmToolResult(name, outcome, requestInfo);
           span.setAttributes(toolResultAttributes(result));
           return result;
         },
