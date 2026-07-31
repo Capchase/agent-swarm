@@ -7,6 +7,7 @@ import {
   ensureTaskFinished,
   getBridgeFailureDiagnostics,
   handleStructuredOutputFallback,
+  trackAssistantText,
 } from "../commands/runner";
 
 // Configurable mock responses per test
@@ -16,6 +17,15 @@ let lastFinishBody: Record<string, unknown> | null = null;
 let mockFinishResponse: Record<string, unknown> = { success: true };
 let mockFetchError: Error | null = null;
 let originalFetch: typeof fetch;
+// Result the mocked `claude -p --json-schema` extraction call (invoked by
+// handleStructuredOutputFallback's claude-adapter branch) resolves with.
+// null means "extraction fails" (mirrors the real `.catch(() => null)`).
+let mockClaudeExtractionResult: Record<string, unknown> | null = null;
+let originalBunShell: typeof Bun.$;
+// Captures the tagged-template args of the last `Bun.$`claude -p ...``` call
+// so tests can assert on the exact extraction prompt handleStructuredOutputFallback
+// sent — in particular, whether it included the captured providerOutput.
+let lastBunShellArgs: unknown[] | null = null;
 
 function resetMocks() {
   mockGetTask = null;
@@ -23,6 +33,8 @@ function resetMocks() {
   lastFinishBody = null;
   mockFinishResponse = { success: true };
   mockFetchError = null;
+  mockClaudeExtractionResult = null;
+  lastBunShellArgs = null;
 }
 
 function makeConfig(): ApiConfig {
@@ -65,10 +77,27 @@ beforeAll(() => {
 
     return new Response("Not found", { status: 404 });
   }) as typeof fetch;
+
+  // Stub the shell tag Bun.$ so handleStructuredOutputFallback's claude-adapter
+  // extraction branch (`Bun.$`claude -p ... --json-schema ...`.json()`) never
+  // spawns the real CLI in a unit test.
+  originalBunShell = Bun.$;
+  Bun.$ = ((...args: unknown[]) => {
+    lastBunShellArgs = args;
+    return {
+      json: async () => {
+        if (mockClaudeExtractionResult === null) {
+          throw new Error("mock claude extraction not configured for this test");
+        }
+        return mockClaudeExtractionResult;
+      },
+    };
+  }) as unknown as typeof Bun.$;
 });
 
 afterAll(() => {
   globalThis.fetch = originalFetch;
+  Bun.$ = originalBunShell;
 });
 
 describe("handleStructuredOutputFallback", () => {
@@ -181,8 +210,54 @@ describe("handleStructuredOutputFallback", () => {
   });
 });
 
+describe("trackAssistantText", () => {
+  test("ignores non-message events", () => {
+    const holder: { value?: string } = {};
+    trackAssistantText(holder, { type: "tool_start", toolCallId: "1", toolName: "Read", args: {} });
+    expect(holder.value).toBeUndefined();
+  });
+
+  test("ignores user-role message events", () => {
+    const holder: { value?: string } = {};
+    trackAssistantText(holder, { type: "message", role: "user", content: "hi" });
+    expect(holder.value).toBeUndefined();
+  });
+
+  test("ignores empty/whitespace-only assistant content without clearing a prior capture", () => {
+    const holder: { value?: string } = { value: "earlier answer" };
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "" });
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "   " });
+    // Tool-use-only / thinking-only frames emit empty content — must not
+    // clear a previously captured message.
+    expect(holder.value).toBe("earlier answer");
+  });
+
+  test("keeps the last non-empty assistant message across multiple turns", () => {
+    const holder: { value?: string } = {};
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "first turn" });
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "second turn" });
+    expect(holder.value).toBe("second turn");
+  });
+
+  test("truncates content above the output cap with a marker", () => {
+    const holder: { value?: string } = {};
+    const longText = "x".repeat(30_001);
+    trackAssistantText(holder, { type: "message", role: "assistant", content: longText });
+    expect(holder.value?.length).toBe(30_000 + "… [truncated]".length);
+    expect(holder.value?.startsWith("x".repeat(30_000))).toBe(true);
+    expect(holder.value?.endsWith("… [truncated]")).toBe(true);
+  });
+
+  test("does not truncate content at or under the cap", () => {
+    const holder: { value?: string } = {};
+    const exactText = "y".repeat(30_000);
+    trackAssistantText(holder, { type: "message", role: "assistant", content: exactText });
+    expect(holder.value).toBe(exactText);
+  });
+});
+
 describe("ensureTaskFinished", () => {
-  test("sets output to last progress for no-schema fallback", async () => {
+  test("does not back-fill progress narration into output for no-schema fallback", async () => {
     resetMocks();
     mockGetTask = {
       id: "task-10",
@@ -193,7 +268,7 @@ describe("ensureTaskFinished", () => {
       logs: [
         {
           eventType: "task_progress",
-          newValue: "Did some work here",
+          newValue: "📋 Checking task list",
           createdAt: "2025-01-01T00:00:00Z",
         },
       ],
@@ -203,7 +278,10 @@ describe("ensureTaskFinished", () => {
 
     expect(lastFinishBody).toBeTruthy();
     expect(lastFinishBody!.status).toBe("completed");
-    expect(lastFinishBody!.output).toBe("Did some work here");
+    // The tool-narration progress line must never become the task output —
+    // an honest "no output captured" sentinel is preferable to a misleading
+    // tool label.
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
   });
 
   test("sets generic message when no-schema and no progress", async () => {
@@ -248,6 +326,99 @@ describe("ensureTaskFinished", () => {
     expect(lastFinishBody).toBeTruthy();
     expect(lastFinishBody!.status).toBe("completed");
     expect(lastFinishBody!.output).toBe("Provider final answer");
+  });
+
+  test("uses the runner-buffered assistant text for codex (adapter never sets ProviderResult.output)", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-codex-buffer",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "📋 Checking task list",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    // Codex's ProviderResult never populates `output`; the runner's call
+    // site merges `result.output ?? assistantText?.value` before calling
+    // ensureTaskFinished, so `providerOutput` here is the buffered text —
+    // never the tool-narration progress line above.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-codex-buffer",
+      0,
+      undefined,
+      "the real answer",
+      "codex",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("the real answer");
+  });
+
+  test("empty buffer falls through to the sentinel, never the progress narration", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-codex-empty-buffer",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "📋 Checking task list",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    // `result.output ?? assistantText?.value` is `undefined` when the
+    // adapter emitted no `message` events at all (e.g. OpenCode) — call-site
+    // behavior must be byte-identical to passing no providerOutput.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-codex-empty-buffer",
+      0,
+      undefined,
+      undefined,
+      "codex",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
+  });
+
+  test("ignores buffered/provider output on the failure path", async () => {
+    resetMocks();
+
+    // status !== 0 short-circuits to the failed branch before any output
+    // logic runs — buffered assistant text must never leak into `output` on
+    // an abnormal exit; `failureReason` is the honest signal.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-codex-failure-buffer",
+      1,
+      "Out of memory",
+      "Let me check the last thing before I finish",
+      "codex",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toBe("Out of memory");
+    expect(lastFinishBody!.output).toBeUndefined();
   });
 
   test("accepts provider output that satisfies outputSchema", async () => {
@@ -308,6 +479,135 @@ describe("ensureTaskFinished", () => {
     expect(lastFinishBody).toBeTruthy();
     expect(lastFinishBody!.status).toBe("failed");
     expect(lastFinishBody!.failureReason).toContain("outputSchema");
+  });
+
+  test("falls through to extraction instead of failing when the claude adapter's free-text output violates outputSchema", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-provider-schema-fallthrough",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      outputSchema: {
+        type: "object",
+        required: ["result"],
+        properties: { result: { type: "string" } },
+      },
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "⚡ Doing the work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+    mockClaudeExtractionResult = { result: "extracted via fallback" };
+
+    // providerOutput is the agent's real free-form final message (Change 1) —
+    // it doesn't satisfy the task's outputSchema, but that must not regress
+    // the task from "extracted" to "failed" (the one risk called out for
+    // this fix): it should fall through to the existing claude -p
+    // --json-schema extraction fallback and still succeed.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-provider-schema-fallthrough",
+      0,
+      undefined,
+      "Here's a free-form summary of what I did, not JSON.",
+      "claude",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe(JSON.stringify({ result: "extracted via fallback" }));
+  });
+
+  test("fails the task when free-text output violates outputSchema AND the extraction fallback itself fails", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-provider-schema-fallthrough-extraction-fails",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      outputSchema: {
+        type: "object",
+        required: ["result"],
+        properties: { result: { type: "string" } },
+      },
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "⚡ Doing the work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+    // mockClaudeExtractionResult stays null (via resetMocks) — the mocked
+    // `claude -p --json-schema` call throws, mirroring the real `.catch(() =>
+    // null)` extraction-failure path. This is the guard the fallthrough test
+    // above doesn't cover: a genuine schema violation must still surface as
+    // a real failure, not get silently masked by the fallthrough.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-provider-schema-fallthrough-extraction-fails",
+      0,
+      undefined,
+      "Here's a free-form summary of what I did, not JSON.",
+      "claude",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toContain("Structured output extraction fallback failed");
+  });
+
+  test("extraction prompt includes the captured providerOutput, not just progress history", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-provider-schema-fallthrough-prompt-source",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      outputSchema: {
+        type: "object",
+        required: ["result"],
+        properties: { result: { type: "string" } },
+      },
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "⚡ Doing the work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+    mockClaudeExtractionResult = { result: "extracted via fallback" };
+    const finalMessage = "UNIQUE-FINAL-ANSWER-TOKEN-42: the result is done.";
+
+    // Deliberate design choice (Finding 2, option a): the extraction prompt
+    // is built from BOTH the agent's captured free-form final message AND
+    // progress history — the final message is the agent's own stated
+    // conclusion and a strictly richer extraction source than chronological
+    // progress narration alone. Pin that the prompt actually carries it.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-provider-schema-fallthrough-prompt-source",
+      0,
+      undefined,
+      finalMessage,
+      "claude",
+    );
+
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastBunShellArgs).toBeTruthy();
+    // Tagged-template call: args[0] is the literal-string-parts array,
+    // args[1] is the interpolated `extractionPrompt` value.
+    const extractionPrompt = lastBunShellArgs?.[1];
+    expect(typeof extractionPrompt).toBe("string");
+    expect(extractionPrompt as string).toContain(finalMessage);
   });
 
   test("sets failed status for schema-fail fallback", async () => {
@@ -406,7 +706,7 @@ describe("ensureTaskFinished", () => {
     );
   });
 
-  test("truncates long progress to 2000 chars", async () => {
+  test("does not leak a long progress narration into output either", async () => {
     resetMocks();
     const longProgress = "x".repeat(3000);
     mockGetTask = {
@@ -421,7 +721,7 @@ describe("ensureTaskFinished", () => {
     await ensureTaskFinished(makeConfig(), "worker", "task-15", 0);
 
     expect(lastFinishBody).toBeTruthy();
-    expect((lastFinishBody!.output as string).length).toBe(2000);
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
   });
 });
 

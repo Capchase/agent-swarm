@@ -327,7 +327,7 @@ All steps live in [`src/commands/runner.ts`](https://github.com/desplega-ai/agen
 | `buildPromptForTrigger` | Constructs the user prompt from the trigger |
 | `fetchRelevantMemories` | Enriches context (memory vectors + installed skills) |
 | `buildSystemPrompt` | Composes the full system prompt (see §6) |
-| `spawnProviderProcess` | Calls `adapter.createSession(config)` |
+| `spawnProviderProcess` | Calls `adapter.createSession(config)`; also buffers the last non-empty assistant `message` event as a harness-agnostic output fallback (see below) |
 | `session.onEvent(...)` | Each `ProviderEvent` → API call (progress, logs, cost, context) |
 | `session.waitForCompletion` | Blocks until the adapter resolves |
 | `ensureTaskFinished` | `POST /api/tasks/{id}/finish` |
@@ -336,6 +336,8 @@ All steps live in [`src/commands/runner.ts`](https://github.com/desplega-ai/agen
 <Callout type="info">
   **One task → one session.** The runner tracks concurrent tasks in `state.activeTasks: Map<taskId, RunningTask>` up to `MAX_CONCURRENT_TASKS`. An adapter never needs to multiplex tasks internally — if the worker should handle two at once, the runner spawns two sessions.
 </Callout>
+
+**Last-assistant-text fallback:** if the session ends without an explicit `store-progress` call and the adapter's `ProviderResult.output` is empty, `ensureTaskFinished` falls back to the last non-empty assistant `message` event buffered during `session.onEvent(...)` (capped at 30,000 characters), instead of the last tool-narration progress line. This covers harnesses that never populate `ProviderResult.output` (`codex` today) without any adapter-specific code — see [`runbooks/harness-providers.md`](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/harness-providers.md#per-task-outputschema-support) for the full precedence order.
 
 ### Session-end identity / config sync (FS → DB)
 
