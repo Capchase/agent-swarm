@@ -7,6 +7,7 @@ import {
   ensureTaskFinished,
   getBridgeFailureDiagnostics,
   handleStructuredOutputFallback,
+  trackAssistantText,
 } from "../commands/runner";
 
 // Configurable mock responses per test
@@ -209,6 +210,52 @@ describe("handleStructuredOutputFallback", () => {
   });
 });
 
+describe("trackAssistantText", () => {
+  test("ignores non-message events", () => {
+    const holder: { value?: string } = {};
+    trackAssistantText(holder, { type: "tool_start", toolCallId: "1", toolName: "Read", args: {} });
+    expect(holder.value).toBeUndefined();
+  });
+
+  test("ignores user-role message events", () => {
+    const holder: { value?: string } = {};
+    trackAssistantText(holder, { type: "message", role: "user", content: "hi" });
+    expect(holder.value).toBeUndefined();
+  });
+
+  test("ignores empty/whitespace-only assistant content without clearing a prior capture", () => {
+    const holder: { value?: string } = { value: "earlier answer" };
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "" });
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "   " });
+    // Tool-use-only / thinking-only frames emit empty content — must not
+    // clear a previously captured message.
+    expect(holder.value).toBe("earlier answer");
+  });
+
+  test("keeps the last non-empty assistant message across multiple turns", () => {
+    const holder: { value?: string } = {};
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "first turn" });
+    trackAssistantText(holder, { type: "message", role: "assistant", content: "second turn" });
+    expect(holder.value).toBe("second turn");
+  });
+
+  test("truncates content above the output cap with a marker", () => {
+    const holder: { value?: string } = {};
+    const longText = "x".repeat(30_001);
+    trackAssistantText(holder, { type: "message", role: "assistant", content: longText });
+    expect(holder.value?.length).toBe(30_000 + "… [truncated]".length);
+    expect(holder.value?.startsWith("x".repeat(30_000))).toBe(true);
+    expect(holder.value?.endsWith("… [truncated]")).toBe(true);
+  });
+
+  test("does not truncate content at or under the cap", () => {
+    const holder: { value?: string } = {};
+    const exactText = "y".repeat(30_000);
+    trackAssistantText(holder, { type: "message", role: "assistant", content: exactText });
+    expect(holder.value).toBe(exactText);
+  });
+});
+
 describe("ensureTaskFinished", () => {
   test("does not back-fill progress narration into output for no-schema fallback", async () => {
     resetMocks();
@@ -279,6 +326,99 @@ describe("ensureTaskFinished", () => {
     expect(lastFinishBody).toBeTruthy();
     expect(lastFinishBody!.status).toBe("completed");
     expect(lastFinishBody!.output).toBe("Provider final answer");
+  });
+
+  test("uses the runner-buffered assistant text for codex (adapter never sets ProviderResult.output)", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-codex-buffer",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "📋 Checking task list",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    // Codex's ProviderResult never populates `output`; the runner's call
+    // site merges `result.output ?? assistantText?.value` before calling
+    // ensureTaskFinished, so `providerOutput` here is the buffered text —
+    // never the tool-narration progress line above.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-codex-buffer",
+      0,
+      undefined,
+      "the real answer",
+      "codex",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("the real answer");
+  });
+
+  test("empty buffer falls through to the sentinel, never the progress narration", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-codex-empty-buffer",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      progress: null,
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "📋 Checking task list",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    // `result.output ?? assistantText?.value` is `undefined` when the
+    // adapter emitted no `message` events at all (e.g. OpenCode) — call-site
+    // behavior must be byte-identical to passing no providerOutput.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-codex-empty-buffer",
+      0,
+      undefined,
+      undefined,
+      "codex",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
+  });
+
+  test("ignores buffered/provider output on the failure path", async () => {
+    resetMocks();
+
+    // status !== 0 short-circuits to the failed branch before any output
+    // logic runs — buffered assistant text must never leak into `output` on
+    // an abnormal exit; `failureReason` is the honest signal.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-codex-failure-buffer",
+      1,
+      "Out of memory",
+      "Let me check the last thing before I finish",
+      "codex",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toBe("Out of memory");
+    expect(lastFinishBody!.output).toBeUndefined();
   });
 
   test("accepts provider output that satisfies outputSchema", async () => {

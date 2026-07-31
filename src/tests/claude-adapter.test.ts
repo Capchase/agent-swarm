@@ -271,6 +271,27 @@ describe("ClaudeSession processStreams — ProviderResult.output capture", () =>
     expect(result.output).toBe("Real answer");
   });
 
+  test("subagent sidechain frames (parent_tool_use_id) do not overwrite the captured output", async () => {
+    const lines = [
+      assistantLine([{ type: "text", text: "Main thread final answer" }]),
+      // A subagent (sidechain) frame carries a truthy `parent_tool_use_id` at
+      // the top level of the raw stream-json frame — only the main thread's
+      // text should win the `ProviderResult.output` fallback.
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Subagent chatter" }] },
+        parent_tool_use_id: "tool-call-1",
+      }),
+    ];
+    spawnSpy.mockImplementation((() => makeStreamingFakeProc(lines)) as typeof Bun.spawn);
+
+    const adapter = new ClaudeAdapter();
+    const session = await adapter.createSession(makeConfig({ env: CLEAN_ENV }));
+    const result = await session.waitForCompletion();
+
+    expect(result.output).toBe("Main thread final answer");
+  });
+
   test("a stream with no assistant text at all leaves output undefined", async () => {
     const lines = [
       JSON.stringify({ type: "system", subtype: "init", session_id: "sess-1" }),
