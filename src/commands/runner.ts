@@ -1250,6 +1250,37 @@ export async function ensureTaskFinished(
   let status = exitCode === 0 ? "completed" : "failed";
   const body: Record<string, string> = { status };
 
+  // Applies a structured-output fallback result to `body`/`status`. Shared by
+  // the no-providerOutput path and the providerOutput-failed-schema-validation
+  // path below, so a schema'd task ending in free-form prose falls through to
+  // the same extraction fallback instead of hard-failing.
+  const applyFallback = (fallback: FallbackResult) => {
+    console.log(`[${role}] Task ${taskId.slice(0, 8)} fallback result: ${fallback.kind}`);
+    switch (fallback.kind) {
+      case "extracted":
+        body.output = fallback.output;
+        break;
+      case "already-has-output":
+        body.output = "Process completed successfully";
+        break;
+      case "no-schema":
+        // No structured output required, and no real final message was
+        // captured either. Never back-fill a tool-narration progress line
+        // into output here — a misleading tool label (e.g. "📋 Checking task
+        // list") is worse than an honest "no output" sentinel.
+        body.output = "Process completed successfully (no output captured)";
+        break;
+      case "schema-fail":
+        status = "failed";
+        body.status = "failed";
+        body.failureReason = fallback.failReason;
+        break;
+      case "fetch-error":
+        body.output = `Process completed (could not verify task state: ${fallback.error})`;
+        break;
+    }
+  };
+
   if (status === "failed") {
     body.failureReason = failureReason || `Claude process exited with code ${exitCode}`;
     if (failureDiagnostics) {
@@ -1260,41 +1291,20 @@ export async function ensureTaskFinished(
     if (validation.ok) {
       body.output = providerOutput;
     } else {
-      status = "failed";
-      body.status = "failed";
-      body.failureReason = validation.failReason;
+      // The task declared an outputSchema but the provider's final message
+      // is free-form prose that doesn't satisfy it. Don't convert this into
+      // a hard failure — fall through to the existing structured-output
+      // fallback (claude -p --json-schema extraction) so the task still
+      // succeeds via extraction.
+      const adapterType = provider ?? process.env.HARNESS_PROVIDER ?? "claude";
+      const fallback = await handleStructuredOutputFallback(config, taskId, adapterType);
+      applyFallback(fallback);
     }
   } else {
     // Try structured output fallback if the task has an outputSchema
     const adapterType = provider ?? process.env.HARNESS_PROVIDER ?? "claude";
     const fallback = await handleStructuredOutputFallback(config, taskId, adapterType);
-
-    console.log(`[${role}] Task ${taskId.slice(0, 8)} fallback result: ${fallback.kind}`);
-
-    switch (fallback.kind) {
-      case "extracted":
-        body.output = fallback.output;
-        break;
-      case "already-has-output":
-        body.output = "Process completed successfully";
-        break;
-      case "no-schema": {
-        if (fallback.lastProgress) {
-          body.output = fallback.lastProgress.slice(0, 2000);
-        } else {
-          body.output = "Process completed successfully (no output captured)";
-        }
-        break;
-      }
-      case "schema-fail":
-        status = "failed";
-        body.status = "failed";
-        body.failureReason = fallback.failReason;
-        break;
-      case "fetch-error":
-        body.output = `Process completed (could not verify task state: ${fallback.error})`;
-        break;
-    }
+    applyFallback(fallback);
   }
 
   try {

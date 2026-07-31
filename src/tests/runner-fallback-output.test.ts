@@ -16,6 +16,11 @@ let lastFinishBody: Record<string, unknown> | null = null;
 let mockFinishResponse: Record<string, unknown> = { success: true };
 let mockFetchError: Error | null = null;
 let originalFetch: typeof fetch;
+// Result the mocked `claude -p --json-schema` extraction call (invoked by
+// handleStructuredOutputFallback's claude-adapter branch) resolves with.
+// null means "extraction fails" (mirrors the real `.catch(() => null)`).
+let mockClaudeExtractionResult: Record<string, unknown> | null = null;
+let originalBunShell: typeof Bun.$;
 
 function resetMocks() {
   mockGetTask = null;
@@ -23,6 +28,7 @@ function resetMocks() {
   lastFinishBody = null;
   mockFinishResponse = { success: true };
   mockFetchError = null;
+  mockClaudeExtractionResult = null;
 }
 
 function makeConfig(): ApiConfig {
@@ -65,10 +71,24 @@ beforeAll(() => {
 
     return new Response("Not found", { status: 404 });
   }) as typeof fetch;
+
+  // Stub the shell tag Bun.$ so handleStructuredOutputFallback's claude-adapter
+  // extraction branch (`Bun.$`claude -p ... --json-schema ...`.json()`) never
+  // spawns the real CLI in a unit test.
+  originalBunShell = Bun.$;
+  Bun.$ = ((..._args: unknown[]) => ({
+    json: async () => {
+      if (mockClaudeExtractionResult === null) {
+        throw new Error("mock claude extraction not configured for this test");
+      }
+      return mockClaudeExtractionResult;
+    },
+  })) as unknown as typeof Bun.$;
 });
 
 afterAll(() => {
   globalThis.fetch = originalFetch;
+  Bun.$ = originalBunShell;
 });
 
 describe("handleStructuredOutputFallback", () => {
@@ -182,7 +202,7 @@ describe("handleStructuredOutputFallback", () => {
 });
 
 describe("ensureTaskFinished", () => {
-  test("sets output to last progress for no-schema fallback", async () => {
+  test("does not back-fill progress narration into output for no-schema fallback", async () => {
     resetMocks();
     mockGetTask = {
       id: "task-10",
@@ -193,7 +213,7 @@ describe("ensureTaskFinished", () => {
       logs: [
         {
           eventType: "task_progress",
-          newValue: "Did some work here",
+          newValue: "📋 Checking task list",
           createdAt: "2025-01-01T00:00:00Z",
         },
       ],
@@ -203,7 +223,10 @@ describe("ensureTaskFinished", () => {
 
     expect(lastFinishBody).toBeTruthy();
     expect(lastFinishBody!.status).toBe("completed");
-    expect(lastFinishBody!.output).toBe("Did some work here");
+    // The tool-narration progress line must never become the task output —
+    // an honest "no output captured" sentinel is preferable to a misleading
+    // tool label.
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
   });
 
   test("sets generic message when no-schema and no progress", async () => {
@@ -310,6 +333,48 @@ describe("ensureTaskFinished", () => {
     expect(lastFinishBody!.failureReason).toContain("outputSchema");
   });
 
+  test("falls through to extraction instead of failing when the claude adapter's free-text output violates outputSchema", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-provider-schema-fallthrough",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      outputSchema: {
+        type: "object",
+        required: ["result"],
+        properties: { result: { type: "string" } },
+      },
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "⚡ Doing the work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+    mockClaudeExtractionResult = { result: "extracted via fallback" };
+
+    // providerOutput is the agent's real free-form final message (Change 1) —
+    // it doesn't satisfy the task's outputSchema, but that must not regress
+    // the task from "extracted" to "failed" (the one risk called out for
+    // this fix): it should fall through to the existing claude -p
+    // --json-schema extraction fallback and still succeed.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-provider-schema-fallthrough",
+      0,
+      undefined,
+      "Here's a free-form summary of what I did, not JSON.",
+      "claude",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastFinishBody!.output).toBe(JSON.stringify({ result: "extracted via fallback" }));
+  });
+
   test("sets failed status for schema-fail fallback", async () => {
     resetMocks();
     mockGetTask = {
@@ -406,7 +471,7 @@ describe("ensureTaskFinished", () => {
     );
   });
 
-  test("truncates long progress to 2000 chars", async () => {
+  test("does not leak a long progress narration into output either", async () => {
     resetMocks();
     const longProgress = "x".repeat(3000);
     mockGetTask = {
@@ -421,7 +486,7 @@ describe("ensureTaskFinished", () => {
     await ensureTaskFinished(makeConfig(), "worker", "task-15", 0);
 
     expect(lastFinishBody).toBeTruthy();
-    expect((lastFinishBody!.output as string).length).toBe(2000);
+    expect(lastFinishBody!.output).toBe("Process completed successfully (no output captured)");
   });
 });
 
