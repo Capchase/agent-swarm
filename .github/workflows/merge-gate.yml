@@ -18,6 +18,7 @@ jobs:
       lint: ${{ steps.check.outputs.lint }}
       test: ${{ steps.check.outputs.test }}
       pi_skills: ${{ steps.check.outputs.pi_skills }}
+      seed_skills: ${{ steps.check.outputs.seed_skills }}
       script_types: ${{ steps.check.outputs.script_types }}
       openapi: ${{ steps.check.outputs.openapi }}
       vendored_openapi: ${{ steps.check.outputs.vendored_openapi }}
@@ -26,7 +27,7 @@ jobs:
       templates_workflows: ${{ steps.check.outputs.templates_workflows }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -80,6 +81,22 @@ jobs:
           # pi-skills freshness: generator inputs + outputs.
           PI_SKILLS=$(match '^(plugin/commands/|plugin/pi-skills/|plugin/build-pi-skills\.ts$)')
 
+          # seeded-skill invariants + manifest freshness + the skill seeder tests.
+          # NOTE: neither LINT nor TEST matches templates/ or plugin/skills/, so
+          # without this flag a PR touching only those would run nothing but the
+          # Docker build and could merge a stale bundled-files.generated.json — or a
+          # baked skill colliding with a seeded one, which is the exact bug
+          # check-skill-sources.ts exists to prevent.
+          #
+          # This must list every INPUT the checks read, not just the seeded content:
+          #   templates/skills/       seeded skills + bundled files
+          #   plugin/skills/          baked skills (duplicate-delivery-path rule)
+          #   integrations-catalog.ts templatePath entries (missing-remote-skill rule)
+          #   the two scripts         the checkers themselves
+          #   src/be/seed-skills/     seeder + generated manifest
+          #   skill-fs-writer.ts      the FS reconcile the tests cover
+          SEED_SKILLS=$(match '^(templates/skills/|plugin/skills/|src/be/seed-skills/|src/utils/skill-fs-writer\.ts$|scripts/(build-seed-skill-files|check-skill-sources)\.ts$|apps/ui/src/lib/integrations-catalog\.ts$)')
+
           # script SDK types freshness: source constants + generator + outputs +
           # allowlist/registry (generation validates SDK_ALLOWLIST against server.ts).
           SCRIPT_TYPES=$(match '^(src/be/scripts/typecheck\.ts$|src/scripts-runtime/types/|src/scripts-runtime/sdk-allowlist\.ts$|scripts/bundle-script-types\.ts$|src/server\.ts$)')
@@ -101,7 +118,7 @@ jobs:
           # workflow template validation: content.md changes in templates/workflows/.
           TEMPLATES_WORKFLOWS=$(match '^(templates/workflows/|scripts/validate-template-workflows\.ts$|src/workflows/definition\.ts$|src/types\.ts$)')
 
-          for k in LINT TEST PI_SKILLS SCRIPT_TYPES OPENAPI VENDORED_OPENAPI DOCKER UI TEMPLATES_WORKFLOWS; do
+          for k in LINT TEST PI_SKILLS SEED_SKILLS SCRIPT_TYPES OPENAPI VENDORED_OPENAPI DOCKER UI TEMPLATES_WORKFLOWS; do
             v=$(eval echo \$$k)
             key=$(echo "$k" | tr '[:upper:]' '[:lower:]')
             echo "${key}=${v}" >> $GITHUB_OUTPUT
@@ -116,10 +133,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -184,10 +201,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -208,10 +225,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -228,6 +245,35 @@ jobs:
           fi
           echo "pi-skills are up to date."
 
+  seed-skills:
+    name: Seeded Skills Check
+    needs: detect-changes
+    if: needs.detect-changes.outputs.seed_skills == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check skill source-of-truth invariants
+        run: bun run check:skill-sources
+
+      - name: Check bundled-file manifest freshness
+        run: bun run check:seed-skill-files
+
+      - name: Run skill seeder tests
+        # LINT/TEST do not match templates/, so these would not otherwise run for
+        # a templates/skills-only change.
+        run: bun run test:root -- src/tests/seed-skills-bundled-files.test.ts src/tests/system-default-skills.test.ts src/tests/skill-fs-writer.test.ts src/tests/skill-sync.test.ts
+
   script-types-freshness:
     name: Script SDK Types Freshness Check
     needs: detect-changes
@@ -236,10 +282,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -256,9 +302,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
       - name: Install dependencies
@@ -297,9 +343,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
       - name: Install dependencies
@@ -337,13 +383,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./${{ matrix.dockerfile }}
@@ -389,10 +435,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -421,10 +467,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -436,7 +482,7 @@ jobs:
 
   gate:
     name: Merge Gate
-    needs: [detect-changes, lint-and-typecheck, test, pi-skills-freshness, script-types-freshness, openapi-freshness, vendored-openapi, docker-build, ui-lint, template-workflow-validation]
+    needs: [detect-changes, lint-and-typecheck, test, pi-skills-freshness, seed-skills, script-types-freshness, openapi-freshness, vendored-openapi, docker-build, ui-lint, template-workflow-validation]
     if: always()
     runs-on: ubuntu-latest
 

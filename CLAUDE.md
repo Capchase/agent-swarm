@@ -57,6 +57,7 @@ New MCP tools: when adding a tool, register it in `SDK_TOOL_NAME_MAP` (`src/scri
 | `bun run docs:openapi` | Regenerate `openapi.json` |
 | `bun run docs:business-use` | Regenerate `BUSINESS_USE.md` (requires BU backend) |
 | `bun run build:pi-skills` | Regenerate `plugin/pi-skills/` from `plugin/commands/*.md` |
+| `bun run build:seed-skill-files` | Regenerate the seeded-skill bundled-file manifest from `templates/skills/*/files/` |
 | `docker compose -f docker-compose.local.yml up --build` | Local compose (API + lead + worker) |
 | `uvx business-use-core@latest server dev` | BU backend on :13370 |
 
@@ -122,6 +123,28 @@ Default Gemini model: `google/gemini-3-flash-preview` (this is from OpenRouter).
 File-based, forward-only SQL in `src/be/migrations/NNN_descriptive_name.sql`. Runner auto-applies on startup.
 
 Test against a fresh DB (`rm agent-swarm-db.sqlite && bun run start:http`) **and** an existing one. Never modify an applied migration — create a new one. No `down` migrations (SQLite rollbacks flake). Keep `AgentTaskSourceSchema` in `src/types.ts` in sync with SQL CHECK constraints.
+
+</important>
+
+<important if="you are adding or editing an agent skill (templates/skills/, plugin/skills/, or src/be/seed-skills/)">
+
+Full authoring guide, the three delivery paths, versioning semantics, and every enforced rule: [runbooks/skills.md](./runbooks/skills.md).
+
+**The rule that matters: one skill name must not be both seeded and baked.** `templates/skills/<name>/` (DB-seeded) and `plugin/skills/<name>/` (baked into the worker image) both write `~/.claude/skills/<name>/SKILL.md`. The DB copy wins, the baked content is silently discarded, and the FS writer then prunes any bundled file with no `skill_files` row. That truncated `artifacts` / `kv-storage` / `pages` and deleted their examples in production.
+
+**Prefer `templates/skills/`** — seeded skills are live-updatable (no image rebuild), listed by the skills API, editable in the UI, per-agent toggleable, and version-tracked with user-edit preservation.
+
+```
+templates/skills/<name>/
+  config.json          # name (= directory), description, runAllSeedersCandidate, systemDefault
+  content.md           # SKILL.md body — NO frontmatter (generated from config.json)
+  files/               # optional bundled files → skill_files rows
+```
+
+- New skill → add **static** `config.json` + `content.md` text-imports to `BUILT_IN_SKILL_SOURCES` in `src/be/seed-skills/index.ts`. Static because the API runs from a compiled binary and `templates/` only exists in the Dockerfile builder stage.
+- Touched `files/`? → `bun run build:seed-skill-files`, commit `bundled-files.generated.json` (never hand-edit it).
+- A `SKILL.md` beside a `content.md` is **not** a mistake — the seeder reads `content.md`, while `skill-install-remote` serves `SKILL.md` to the integrations catalog.
+- Verify: `bun run check:skill-sources && bun run check:seed-skill-files` (both CI-enforced via the **Seeded Skills Check** job).
 
 </important>
 
@@ -270,6 +293,7 @@ bun run check:dep-graph
 Drift checks — run only if you touched the trigger files, MUST commit any regenerated output:
 
 - Edited `plugin/commands/*.md`? → `bun run build:pi-skills`
+- Added/edited a file under `templates/skills/*/files/`? → `bun run build:seed-skill-files` and commit `src/be/seed-skills/bundled-files.generated.json` (NEVER hand-edit that JSON)
 - Edited `src/be/scripts/typecheck.ts` or `src/scripts-runtime/sdk-allowlist.ts`? → `bun run build:script-types` and commit `src/scripts-runtime/types/*.d.ts` (NEVER edit those `.d.ts` files directly — they're generated from `typecheck.ts`)
 - Edited an HTTP route OR bumped `package.json` `version`? → `bun run docs:openapi` (regenerates `openapi.json` AND `docs-site/content/docs/api-reference/**`)
 - Touched `apps/ui/` — or root `bun.lock`/`package.json`/`bunfig.toml` (ui deps resolve from the root lock)? → `cd apps/ui && bun install --frozen-lockfile && bun run lint && bunx tsc -b` (CI uses `tsc -b`, not `--noEmit`)
@@ -313,7 +337,7 @@ Full rulebook: [apps/evals/SCENARIO-AUTHORING.md](./apps/evals/SCENARIO-AUTHORIN
 
 ## Related
 
-- [runbooks/](./runbooks/) — ci, release, local-development, testing, workflows, memory-system, secret-scrubbing, harness-providers, seed-scripts, heartbeat-crash-recovery
+- [runbooks/](./runbooks/) — ci, release, local-development, testing, workflows, skills, memory-system, secret-scrubbing, harness-providers, seed-scripts, heartbeat-crash-recovery
 - [LOCAL_TESTING.md](./LOCAL_TESTING.md) — unit / E2E / entrypoint / MCP / UI testing recipes
 - [BUSINESS_USE.md](./BUSINESS_USE.md) — flow diagrams and instrumentation
 - [MCP.md](./MCP.md) — MCP tools reference
