@@ -1087,6 +1087,14 @@ export async function handleStructuredOutputFallback(
   config: ApiConfig,
   taskId: string,
   adapterType: string,
+  /**
+   * The provider's captured free-form final message, when one exists (e.g.
+   * it failed outputSchema validation in `ensureTaskFinished`). Threaded
+   * into the extraction prompt ahead of progress history — it's the agent's
+   * own stated conclusion, and a strictly richer extraction source than the
+   * chronological progress narration, which may be sparse or tool-labeled.
+   */
+  providerOutput?: string,
 ): Promise<FallbackResult> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -1143,14 +1151,21 @@ export async function handleStructuredOutputFallback(
 
 ## Task Description
 ${taskData.task || "(no description)"}
-
+${
+  providerOutput
+    ? `
+## Final Agent Message
+${providerOutput}
+`
+    : ""
+}
 ## Progress Updates (chronological)
 ${progressEntries || "(no progress recorded)"}
 
 ## Required Output Schema
 ${JSON.stringify(taskData.outputSchema, null, 2)}
 
-Extract the structured data from the progress updates above. Return ONLY valid JSON matching the schema.`;
+Extract the structured data from the progress updates above${providerOutput ? " and the agent's final message" : ""}. Return ONLY valid JSON matching the schema.`;
 
     const schemaJson = JSON.stringify(taskData.outputSchema);
     const result =
@@ -1297,7 +1312,12 @@ export async function ensureTaskFinished(
       // fallback (claude -p --json-schema extraction) so the task still
       // succeeds via extraction.
       const adapterType = provider ?? process.env.HARNESS_PROVIDER ?? "claude";
-      const fallback = await handleStructuredOutputFallback(config, taskId, adapterType);
+      const fallback = await handleStructuredOutputFallback(
+        config,
+        taskId,
+        adapterType,
+        providerOutput,
+      );
       applyFallback(fallback);
     }
   } else {

@@ -21,6 +21,10 @@ let originalFetch: typeof fetch;
 // null means "extraction fails" (mirrors the real `.catch(() => null)`).
 let mockClaudeExtractionResult: Record<string, unknown> | null = null;
 let originalBunShell: typeof Bun.$;
+// Captures the tagged-template args of the last `Bun.$`claude -p ...``` call
+// so tests can assert on the exact extraction prompt handleStructuredOutputFallback
+// sent — in particular, whether it included the captured providerOutput.
+let lastBunShellArgs: unknown[] | null = null;
 
 function resetMocks() {
   mockGetTask = null;
@@ -29,6 +33,7 @@ function resetMocks() {
   mockFinishResponse = { success: true };
   mockFetchError = null;
   mockClaudeExtractionResult = null;
+  lastBunShellArgs = null;
 }
 
 function makeConfig(): ApiConfig {
@@ -76,14 +81,17 @@ beforeAll(() => {
   // extraction branch (`Bun.$`claude -p ... --json-schema ...`.json()`) never
   // spawns the real CLI in a unit test.
   originalBunShell = Bun.$;
-  Bun.$ = ((..._args: unknown[]) => ({
-    json: async () => {
-      if (mockClaudeExtractionResult === null) {
-        throw new Error("mock claude extraction not configured for this test");
-      }
-      return mockClaudeExtractionResult;
-    },
-  })) as unknown as typeof Bun.$;
+  Bun.$ = ((...args: unknown[]) => {
+    lastBunShellArgs = args;
+    return {
+      json: async () => {
+        if (mockClaudeExtractionResult === null) {
+          throw new Error("mock claude extraction not configured for this test");
+        }
+        return mockClaudeExtractionResult;
+      },
+    };
+  }) as unknown as typeof Bun.$;
 });
 
 afterAll(() => {
@@ -373,6 +381,93 @@ describe("ensureTaskFinished", () => {
     expect(lastFinishBody).toBeTruthy();
     expect(lastFinishBody!.status).toBe("completed");
     expect(lastFinishBody!.output).toBe(JSON.stringify({ result: "extracted via fallback" }));
+  });
+
+  test("fails the task when free-text output violates outputSchema AND the extraction fallback itself fails", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-provider-schema-fallthrough-extraction-fails",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      outputSchema: {
+        type: "object",
+        required: ["result"],
+        properties: { result: { type: "string" } },
+      },
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "⚡ Doing the work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+    // mockClaudeExtractionResult stays null (via resetMocks) — the mocked
+    // `claude -p --json-schema` call throws, mirroring the real `.catch(() =>
+    // null)` extraction-failure path. This is the guard the fallthrough test
+    // above doesn't cover: a genuine schema violation must still surface as
+    // a real failure, not get silently masked by the fallthrough.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-provider-schema-fallthrough-extraction-fails",
+      0,
+      undefined,
+      "Here's a free-form summary of what I did, not JSON.",
+      "claude",
+    );
+
+    expect(lastFinishBody).toBeTruthy();
+    expect(lastFinishBody!.status).toBe("failed");
+    expect(lastFinishBody!.failureReason).toContain("Structured output extraction fallback failed");
+  });
+
+  test("extraction prompt includes the captured providerOutput, not just progress history", async () => {
+    resetMocks();
+    mockGetTask = {
+      id: "task-provider-schema-fallthrough-prompt-source",
+      task: "Do work",
+      status: "in_progress",
+      output: null,
+      outputSchema: {
+        type: "object",
+        required: ["result"],
+        properties: { result: { type: "string" } },
+      },
+      logs: [
+        {
+          eventType: "task_progress",
+          newValue: "⚡ Doing the work",
+          createdAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    };
+    mockClaudeExtractionResult = { result: "extracted via fallback" };
+    const finalMessage = "UNIQUE-FINAL-ANSWER-TOKEN-42: the result is done.";
+
+    // Deliberate design choice (Finding 2, option a): the extraction prompt
+    // is built from BOTH the agent's captured free-form final message AND
+    // progress history — the final message is the agent's own stated
+    // conclusion and a strictly richer extraction source than chronological
+    // progress narration alone. Pin that the prompt actually carries it.
+    await ensureTaskFinished(
+      makeConfig(),
+      "worker",
+      "task-provider-schema-fallthrough-prompt-source",
+      0,
+      undefined,
+      finalMessage,
+      "claude",
+    );
+
+    expect(lastFinishBody!.status).toBe("completed");
+    expect(lastBunShellArgs).toBeTruthy();
+    // Tagged-template call: args[0] is the literal-string-parts array,
+    // args[1] is the interpolated `extractionPrompt` value.
+    const extractionPrompt = lastBunShellArgs?.[1];
+    expect(typeof extractionPrompt).toBe("string");
+    expect(extractionPrompt as string).toContain(finalMessage);
   });
 
   test("sets failed status for schema-fail fallback", async () => {
