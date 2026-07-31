@@ -91,6 +91,13 @@ import "./templates.ts";
 /** Throttle interval for progress updates (3 seconds). */
 const PROGRESS_THROTTLE_MS = 3000;
 
+/**
+ * Cap on the runner-buffered last-assistant-text fallback (see
+ * `trackAssistantText`), aligned with the ~30K output-size budget documented
+ * in the `/workflow-output-size-budget` skill.
+ */
+const ASSISTANT_TEXT_OUTPUT_CAP = 30_000;
+
 /** Minimum spacing for explicit runner GC sweeps. */
 const RUNNER_GC_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -1039,6 +1046,23 @@ export function toolCallToProgress(toolName: string, args: unknown): string | nu
 }
 
 /**
+ * Capture the last non-empty assistant message text from the provider event
+ * stream, so adapters that never populate `ProviderResult.output` (Codex
+ * today, any future adapter) still surface the agent's real final message
+ * instead of tool narration. Tool-use-only / thinking-only frames emit empty
+ * `content` and must not clear a previously captured message.
+ */
+export function trackAssistantText(holder: { value?: string }, event: ProviderEvent): void {
+  if (event.type !== "message" || event.role !== "assistant") return;
+  const text = event.content;
+  if (!text || !text.trim()) return;
+  holder.value =
+    text.length > ASSISTANT_TEXT_OUTPUT_CAP
+      ? `${text.slice(0, ASSISTANT_TEXT_OUTPUT_CAP)}… [truncated]`
+      : text;
+}
+
+/**
  * Report task progress via the API (fire-and-forget).
  */
 async function updateProgressViaAPI(
@@ -1948,6 +1972,12 @@ interface RunningTask {
   harnessVariantMeta?: Record<string, unknown>;
   /** Resolved model used for the provider session, when configured */
   model?: string;
+  /**
+   * Last non-empty assistant text captured from `message` events, shared by
+   * reference with the `onEvent` closure. Fallback `providerOutput` when the
+   * adapter's `ProviderResult.output` is empty (see `trackAssistantText`).
+   */
+  assistantText?: { value?: string };
 }
 
 /** Runner state for tracking concurrent tasks */
@@ -3294,6 +3324,10 @@ async function spawnProviderProcess(
   // Auto-progress throttle: don't update more than once per 3 seconds
   let lastProgressTime = 0;
 
+  // Shared holder mutated by `onEvent`'s "message" case, read back after the
+  // session promise resolves (see `trackAssistantText`).
+  const assistantTextHolder: { value?: string } = {};
+
   // Context usage throttle: max 1 snapshot per 30 seconds
   let lastContextPostTime = 0;
   const CONTEXT_THROTTLE_MS = 30_000;
@@ -3394,6 +3428,7 @@ async function spawnProviderProcess(
           if (event.role === "assistant") {
             implicitCloseActiveToolSpans(activeToolSpans);
           }
+          trackAssistantText(assistantTextHolder, event);
           break;
         }
         case "tool_start": {
@@ -3847,6 +3882,7 @@ async function spawnProviderProcess(
     harnessProvider: opts.harnessProvider,
     hasLocalEnvironment: adapter.traits.hasLocalEnvironment,
     model: model || undefined,
+    assistantText: assistantTextHolder,
   };
   runningTaskForSessionInit = runningTask;
   if (pendingHarnessVariant !== undefined) {
@@ -3888,6 +3924,7 @@ async function checkCompletedProcesses(
     harnessVariantMeta?: Record<string, unknown>;
     model?: string;
     durationMs: number;
+    assistantText?: RunningTask["assistantText"];
   }> = [];
 
   for (const [taskId, task] of state.activeTasks) {
@@ -3909,6 +3946,7 @@ async function checkCompletedProcesses(
         harnessVariantMeta: task.harnessVariantMeta,
         model: task.model,
         durationMs: Date.now() - task.startTime.getTime(),
+        assistantText: task.assistantText,
       });
     }
   }
@@ -3925,6 +3963,7 @@ async function checkCompletedProcesses(
     harnessVariantMeta,
     model,
     durationMs,
+    assistantText,
   } of completedTasks) {
     state.activeTasks.delete(taskId);
     vcsDetectedTasks.delete(taskId);
@@ -4040,7 +4079,11 @@ async function checkCompletedProcesses(
         taskId,
         result.exitCode,
         failureReason,
-        result.output,
+        // Runner-buffered last assistant text is a harness-agnostic fallback
+        // for adapters that never populate `ProviderResult.output` (Codex
+        // today, any future adapter). Empty buffer -> `undefined`, byte
+        // identical to pre-fix behavior.
+        result.output ?? assistantText?.value,
         harnessProvider,
         bridgeFailureDiagnostics,
       );

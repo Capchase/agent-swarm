@@ -1003,7 +1003,9 @@ class ClaudeSession implements ProviderSession {
               .join("")
           : "";
         this.emit({ type: "message", role: "assistant", content: text });
-        if (text) {
+        // Subagent (sidechain) frames carry `parent_tool_use_id`; only the
+        // main thread's text should win the `ProviderResult.output` fallback.
+        if (text && !json.parent_tool_use_id) {
           this.lastAssistantText = text;
         }
 
