@@ -89,6 +89,12 @@ const listTasks = route({
     createdBefore: z.string().datetime().optional(),
     /** Comma-separated source filter (e.g. `ui,slack`). Omit to include all. */
     source: z.string().optional(),
+    /**
+     * When present, restrict results to tasks where `agent_tasks.requestedByUserId`
+     * equals this value. The sentinel `none` matches rows where it IS NULL
+     * instead. Omit to return every task regardless of requester.
+     */
+    requestedByUserId: z.string().min(1).optional(),
     /** `createdAt` enables stable time-axis paging; default preserves table freshness ordering. */
     orderBy: z.enum(["lastUpdatedAt", "createdAt"]).optional(),
     limit: z.coerce.number().int().optional(),
@@ -553,6 +559,11 @@ export async function handleTasks(
       createdAfter: parsed.query.createdAfter || undefined,
       createdBefore: parsed.query.createdBefore || undefined,
       source,
+      requestedByUserId:
+        parsed.query.requestedByUserId && parsed.query.requestedByUserId !== "none"
+          ? parsed.query.requestedByUserId
+          : undefined,
+      requestedByUserIdIsNull: parsed.query.requestedByUserId === "none" || undefined,
       orderBy: parsed.query.orderBy,
       limit: parsed.query.limit,
       offset: parsed.query.offset,

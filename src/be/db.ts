@@ -2217,6 +2217,8 @@ export interface TaskFilters {
   createdBefore?: string;
   /** Only return tasks requested by this canonical user. NULL rows are excluded. */
   requestedByUserId?: string;
+  /** When set, restrict to rows where `requestedByUserId` IS NULL. Takes priority over `requestedByUserId`. */
+  requestedByUserIdIsNull?: boolean;
   /** Sort list rows for either table freshness or timeline paging. */
   orderBy?: "lastUpdatedAt" | "createdAt";
   limit?: number;
@@ -2315,7 +2317,9 @@ export function getAllTasks(
     params.push(filters.createdBefore);
   }
 
-  if (filters?.requestedByUserId) {
+  if (filters?.requestedByUserIdIsNull) {
+    conditions.push("requestedByUserId IS NULL");
+  } else if (filters?.requestedByUserId) {
     conditions.push("requestedByUserId = ?");
     params.push(filters.requestedByUserId);
   }
@@ -2449,7 +2453,9 @@ export function getTasksCount(filters?: Omit<TaskFilters, "limit" | "readyOnly">
     params.push(filters.createdBefore);
   }
 
-  if (filters?.requestedByUserId) {
+  if (filters?.requestedByUserIdIsNull) {
+    conditions.push("requestedByUserId IS NULL");
+  } else if (filters?.requestedByUserId) {
     conditions.push("requestedByUserId = ?");
     params.push(filters.requestedByUserId);
   }
