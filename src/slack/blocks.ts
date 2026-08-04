@@ -20,13 +20,13 @@ type SlackBlock = any;
 
 /**
  * Get a Slack-formatted clickable link to the task in the dashboard.
- * Always returns Slack mrkdwn link syntax (`<url|label>`) so partial task
- * IDs are clickable in every message — falls back to the public dashboard
- * when APP_URL is not configured.
+ * Always returns Slack mrkdwn link syntax (`<url|Task in Dashboard>`) — a
+ * fixed label, never a bare URL — so Slack's client doesn't treat it as a
+ * top-level link eligible for its own preview card. Falls back to the
+ * public dashboard when APP_URL is not configured.
  */
 export function getTaskLink(taskId: string): string {
-  const shortId = taskId.slice(0, 8);
-  return `<${getTaskUrl(taskId)}|\`${shortId}\`>`;
+  return `<${getTaskUrl(taskId)}|Task in Dashboard>`;
 }
 
 /**

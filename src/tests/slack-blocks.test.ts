@@ -51,14 +51,14 @@ describe("markdownToSlack", () => {
 });
 
 describe("getTaskLink", () => {
-  test("always returns a Slack hyperlink with clickable short ID", () => {
+  test("always returns a Slack hyperlink labeled 'Task in Dashboard'", () => {
     const taskId = "abcdef12-3456-7890-abcd-ef1234567890";
     const link = getTaskLink(taskId);
     // Slack mrkdwn link syntax: <url|label>
     expect(link).toMatch(
-      /^<https?:\/\/.+\/tasks\/abcdef12-3456-7890-abcd-ef1234567890\|`abcdef12`>$/,
+      /^<https?:\/\/.+\/tasks\/abcdef12-3456-7890-abcd-ef1234567890\|Task in Dashboard>$/,
     );
-    expect(link).toContain("|`abcdef12`>");
+    expect(link).toContain("|Task in Dashboard>");
     expect(link).toContain(taskId);
   });
 
@@ -150,7 +150,7 @@ describe("buildCompletedBlocks", () => {
       body: "Done",
     });
     expect(blocks[0].text.text).toMatch(
-      /<https?:\/\/[^|>]+\/tasks\/abcdef12-3456-7890-abcd-ef1234567890\|`abcdef12`>/,
+      /<https?:\/\/[^|>]+\/tasks\/abcdef12-3456-7890-abcd-ef1234567890\|Task in Dashboard>/,
     );
   });
 
@@ -230,7 +230,7 @@ describe("buildProgressBlocks", () => {
     });
 
     expect(blocks.length).toBe(2);
-    // Single line: *Gamma* (<URL|`aabbccdd`>): Analyzing codebase...
+    // Single line: *Gamma* (<URL|Task in Dashboard>): Analyzing codebase...
     // (no ⏳ prefix — progress strings now carry their own emoji)
     expect(blocks[0].type).toBe("section");
     expect(blocks[0].text.text).not.toContain("⏳");
@@ -251,9 +251,9 @@ describe("buildProgressBlocks", () => {
       taskId,
       progress: "Working...",
     });
-    // Slack mrkdwn link syntax: <url|`shortId`>
+    // Slack mrkdwn link syntax: <url|Task in Dashboard>
     expect(blocks[0].text.text).toMatch(
-      /<https?:\/\/[^|>]+\/tasks\/aabbccdd-1234-5678-9012-abcdefabcdef\|`aabbccdd`>/,
+      /<https?:\/\/[^|>]+\/tasks\/aabbccdd-1234-5678-9012-abcdefabcdef\|Task in Dashboard>/,
     );
   });
 });

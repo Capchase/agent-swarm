@@ -150,7 +150,7 @@ describe("Slack tool Block Kit support", () => {
       elements: [
         {
           type: "mrkdwn",
-          text: `Researcher Blocks · <https://app.agent-swarm.dev/tasks/${taskId}|\`${taskId.slice(0, 8)}\`>`,
+          text: `Researcher Blocks · <https://app.agent-swarm.dev/tasks/${taskId}|Task in Dashboard>`,
         },
       ],
     });

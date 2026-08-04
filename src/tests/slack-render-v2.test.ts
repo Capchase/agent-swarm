@@ -624,17 +624,17 @@ describe("Slack renderer v2", () => {
     expect(text).toBe(
       [
         "🧵 worked for 8m05s",
-        ` ↳ ⏳ format tests · 8m05s · <https://app.agent-swarm.dev/tasks/${ask.id}|\`${ask.id.slice(0, 8)}\`>`,
-        `    ↳ ⏳ Researcher · 8m05s · <https://app.agent-swarm.dev/tasks/${child.id}|\`${child.id.slice(0, 8)}\`> · Reading *Slack docs* carefully…`,
-        `       ↳ ✅ Researcher · 4m · <https://app.agent-swarm.dev/tasks/${grandchild.id}|\`${grandchild.id.slice(0, 8)}\`>`,
-        ` ↳ ⏳ ship this PR · 8m05s · <https://app.agent-swarm.dev/tasks/${secondAsk.id}|\`${secondAsk.id.slice(0, 8)}\`>`,
+        ` ↳ ⏳ format tests · 8m05s · <https://app.agent-swarm.dev/tasks/${ask.id}|Task in Dashboard>`,
+        `    ↳ ⏳ Researcher · 8m05s · <https://app.agent-swarm.dev/tasks/${child.id}|Task in Dashboard> · Reading *Slack docs* carefully…`,
+        `       ↳ ✅ Researcher · 4m · <https://app.agent-swarm.dev/tasks/${grandchild.id}|Task in Dashboard>`,
+        ` ↳ ⏳ ship this PR · 8m05s · <https://app.agent-swarm.dev/tasks/${secondAsk.id}|Task in Dashboard>`,
       ].join("\n"),
     );
     expect(text).not.toContain("workspace.slack.com");
     expect(text).not.toContain("|↵>");
     expect(text).not.toContain("|result>");
     expect(text).toContain(getTaskLink(ask.id));
-    expect(text).toContain(`\`${ask.id.slice(0, 8)}\``);
+    expect(text).toContain("|Task in Dashboard>");
     expect(text).not.toContain("```");
     expect(text).not.toContain("↩");
     expect(text).not.toContain(":leftwards_arrow_with_hook:");
