@@ -53,7 +53,7 @@ describe("Slack inline completion output", () => {
     expect(text).toContain("*Answer:*");
     expect(text).not.toContain("###");
     expect(text).not.toContain("**Answer:**");
-    expect(text).toContain("|`abcdef12`>");
+    expect(text).toContain("|Task in Dashboard>");
     expect(text).toContain(finalMarker);
   });
 });
