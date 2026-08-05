@@ -507,6 +507,13 @@ if [ -n "$GITHUB_TOKEN" ]; then
     git config --global user.email "$GIT_EMAIL"
     git config --global user.name "$GIT_NAME"
 
+    # Pin the identity at the environment level so repo-local config and
+    # session-level `git config` writes cannot change commit identity.
+    export GIT_AUTHOR_NAME="$GIT_NAME"
+    export GIT_AUTHOR_EMAIL="$GIT_EMAIL"
+    export GIT_COMMITTER_NAME="$GIT_NAME"
+    export GIT_COMMITTER_EMAIL="$GIT_EMAIL"
+
     echo "GitHub authentication configured successfully"
     echo "Git user: $GIT_NAME <$GIT_EMAIL>"
 else
@@ -535,6 +542,10 @@ elif [ -n "$GITLAB_TOKEN" ]; then
     if [ -z "$GITHUB_TOKEN" ]; then
         git config --global user.email "$GITLAB_GIT_EMAIL"
         git config --global user.name "$GITLAB_GIT_NAME"
+        export GIT_AUTHOR_NAME="$GITLAB_GIT_NAME"
+        export GIT_AUTHOR_EMAIL="$GITLAB_GIT_EMAIL"
+        export GIT_COMMITTER_NAME="$GITLAB_GIT_NAME"
+        export GIT_COMMITTER_EMAIL="$GITLAB_GIT_EMAIL"
     fi
 
     echo "GitLab authentication configured successfully (host: $GITLAB_HOST_BARE)"
