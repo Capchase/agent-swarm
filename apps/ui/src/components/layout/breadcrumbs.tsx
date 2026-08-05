@@ -2,6 +2,7 @@ import { ChevronDown, ChevronRight, CornerDownRight, Home } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
 import { useAgent } from "@/api/hooks/use-agents";
 import { useApprovalRequest } from "@/api/hooks/use-approval-requests";
+import { useApp } from "@/api/hooks/use-apps";
 import { useMcpServer } from "@/api/hooks/use-mcp-servers";
 import { usePage } from "@/api/hooks/use-pages";
 import { useRepo } from "@/api/hooks/use-repos";
@@ -25,6 +26,7 @@ import { cn, sessionDisplayTitle } from "@/lib/utils";
 
 const routeLabels: Record<string, string> = {
   dashboard: "Dashboard",
+  apps: "Apps",
   agents: "Agents",
   tasks: "Tasks",
   sessions: "Sessions",
@@ -124,6 +126,7 @@ export function Breadcrumbs() {
   const sessionId = parent === "sessions" && detailId ? detailId : undefined;
   const { data: sessionMeta } = useSession(sessionId);
 
+  const { data: appMeta } = useApp(idFor("apps") || undefined);
   const { data: agentMeta } = useAgent(idFor("agents"));
   const { data: taskMeta } = useTask(idFor("tasks"));
   const { data: workflowMeta } = useWorkflow(idFor("workflows"));
@@ -141,51 +144,67 @@ export function Breadcrumbs() {
   // Resolve the contextual name for the detail-id segment, if any. Falls back
   // to `undefined` (→ truncated-id display) while the entity is still loading.
   const contextualName: string | undefined = detailId
-    ? parent === "pages"
-      ? pageMeta?.title
-      : parent === "people"
-        ? personMeta?.name
-        : parent === "sessions"
-          ? sessionMeta && sessionDisplayTitle(sessionMeta.root)
-          : parent === "agents"
-            ? agentMeta?.name
-            : parent === "tasks"
-              ? taskMeta?.task
-              : parent === "workflows"
-                ? workflowMeta?.name
-                : parent === "schedules"
-                  ? scheduleMeta?.name
-                  : parent === "scripts"
-                    ? scriptMeta?.name
-                    : parent === "script-runs"
-                      ? scriptRunMeta?.run.scriptName
-                      : parent === "skills"
-                        ? skillMeta?.name
-                        : parent === "mcp-servers"
-                          ? mcpServerMeta?.name
-                          : parent === "repos"
-                            ? repoMeta?.name
-                            : parent === "approval-requests"
-                              ? approvalMeta?.title
-                              : parent === "connections"
-                                ? connectionMeta?.slug
-                                : undefined
+    ? parent === "apps"
+      ? appMeta?.app.name
+      : parent === "pages"
+        ? pageMeta?.title
+        : parent === "people"
+          ? personMeta?.name
+          : parent === "sessions"
+            ? sessionMeta && sessionDisplayTitle(sessionMeta.root)
+            : parent === "agents"
+              ? agentMeta?.name
+              : parent === "tasks"
+                ? taskMeta?.task
+                : parent === "workflows"
+                  ? workflowMeta?.name
+                  : parent === "schedules"
+                    ? scheduleMeta?.name
+                    : parent === "scripts"
+                      ? scriptMeta?.name
+                      : parent === "script-runs"
+                        ? scriptRunMeta?.run.scriptName
+                        : parent === "skills"
+                          ? skillMeta?.name
+                          : parent === "mcp-servers"
+                            ? mcpServerMeta?.name
+                            : parent === "repos"
+                              ? repoMeta?.name
+                              : parent === "approval-requests"
+                                ? approvalMeta?.title
+                                : parent === "connections"
+                                  ? connectionMeta?.slug
+                                  : undefined
     : undefined;
 
-  const crumbs = segments.map((segment, index) => {
-    const defaultPath = `/${segments.slice(0, index + 1).join("/")}`;
-    const path = routeRedirects[segment] ?? defaultPath;
-    let label = formatSegment(segment, segments[index - 1]);
-    // Pretty-print the detail-id leaf with the resolved entity name. Only the
-    // id segment at index 1 is replaced — other path segments keep their
-    // routeLabels behavior.
-    if (index === 1 && segment === detailId && contextualName) {
-      label = capContextualName(contextualName);
-    }
-    const isLast = index === segments.length - 1;
+  // `/apps/:id/p/<page>` — one app page. The literal `p` segment is not a
+  // route, so it is dropped from the trail and the page segment renders the
+  // page's declared title (falling back to its name).
+  const appPageName =
+    parent === "apps" && segments[2] === "p" && segments[3] ? segments[3] : undefined;
+  const appPageTitle = appPageName
+    ? (appMeta?.app.definition.pages?.[appPageName]?.title ?? appPageName)
+    : undefined;
 
-    return { path, label, isLast };
-  });
+  const crumbs = segments
+    .map((segment, index) => {
+      const defaultPath = `/${segments.slice(0, index + 1).join("/")}`;
+      const path = routeRedirects[segment] ?? defaultPath;
+      let label = formatSegment(segment, segments[index - 1]);
+      // Pretty-print the detail-id leaf with the resolved entity name. Only the
+      // id segment at index 1 is replaced — other path segments keep their
+      // routeLabels behavior.
+      if (index === 1 && segment === detailId && contextualName) {
+        label = capContextualName(contextualName);
+      }
+      if (index === 3 && appPageTitle) {
+        label = capContextualName(appPageTitle);
+      }
+      const isLast = index === segments.length - 1;
+
+      return { path, label, isLast };
+    })
+    .filter((_, index) => !(appPageName && index === 2));
 
   const leaf = crumbs[crumbs.length - 1];
 

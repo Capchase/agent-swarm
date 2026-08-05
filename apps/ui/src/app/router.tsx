@@ -55,7 +55,27 @@ const MemoryPage = lazy(() => import("@/pages/memory/page"));
 const MetricsPage = lazy(() => import("@/pages/metrics/page"));
 const PageDetailPage = lazy(() => import("@/pages/pages/[id]/page"));
 const PagesListingPage = lazy(() => import("@/pages/pages/page"));
+const AppsListingPage = lazy(() => import("@/pages/apps/page"));
+const AppDetailPage = lazy(() => import("@/pages/apps/[id]/page"));
 const NotFoundPage = lazy(() => import("@/pages/not-found/page"));
+
+/**
+ * Dev-only routes. `/dev/embed-test` mounts an `<AppSurface>` outside the
+ * `/apps` tier — the standing proof that the app runtime is embeddable
+ * anywhere in the dashboard.
+ *
+ * The `lazy(() => import(…))` lives INSIDE the `import.meta.env.DEV` branch on
+ * purpose: at module scope it would be an unconditional dynamic import, and
+ * the dev page would be emitted as a (dead but shipped) chunk in production
+ * builds. Behind the constant-folded flag the whole branch is dropped.
+ */
+function devRouteTable(): RouteObject[] {
+  if (!import.meta.env.DEV) return [];
+  const DevEmbedTestPage = lazy(() => import("@/pages/dev/embed-test/page"));
+  return [{ path: "dev/embed-test", element: <DevEmbedTestPage /> }];
+}
+
+const devRoutes: RouteObject[] = devRouteTable();
 
 /**
  * Backward-compat redirect table — every old top-level URL that moved during
@@ -157,6 +177,12 @@ export const router = createBrowserRouter([
       { path: "memory", element: <MemoryPage /> },
       { path: "pages", element: <PagesListingPage /> },
       { path: "pages/:id", element: <PageDetailPage /> },
+      { path: "apps", element: <AppsListingPage /> },
+      { path: "apps/:id", element: <AppDetailPage /> },
+      // A named page of a multi-page app. Same component as `apps/:id` (which
+      // renders the app's `defaultPage`) — both URLs stay valid, no redirect.
+      { path: "apps/:id/p/:page", element: <AppDetailPage /> },
+      ...devRoutes,
       ...redirectRoutes,
       { path: "*", element: <NotFoundPage /> },
     ],

@@ -58,6 +58,7 @@ const PIN_REASON =
   "no hard authorization gate at the slice-1 pin (plan Appendix A) — open to all authenticated agents";
 
 const UNGATED_TOOL_FILES: Record<string, string> = {
+  "src/tools/app-list.ts": "app summaries are list-level; per-app filtering is future work",
   "src/tools/create-channel.ts": PIN_REASON,
   "src/tools/create-metric.ts": PIN_REASON,
   "src/tools/create-page.ts": PIN_REASON,
@@ -161,8 +162,7 @@ function checkTools(): string[] {
     const src = readFileSync(file, "utf8");
     // Helper detection matches the import specifier's basename, so both
     // same-dir (./kv-write-auth) and aliased (@/tools/task-tool-ctx) imports count.
-    const gated =
-      /\bcan\(/.test(src) || GATE_HELPER_SPECIFIERS.some((h) => src.includes(`${h}"`));
+    const gated = /\bcan\(/.test(src) || GATE_HELPER_SPECIFIERS.some((h) => src.includes(`${h}"`));
     const allowlisted = rel in UNGATED_TOOL_FILES;
 
     if (gated && allowlisted) {

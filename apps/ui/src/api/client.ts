@@ -8,8 +8,14 @@ import type {
   AgentTask,
   AgentWithTasks,
   ApiKeyStatusResponse,
+  AppActionResponse,
+  AppDetail,
+  AppListItem,
+  AppRow,
   ApprovalRequest,
   ApprovalRequestsResponse,
+  AppUserConfigResponse,
+  AppUserConfigValue,
   AssetEntityType,
   AssetKeyAuditResult,
   AssetKeyMapping,
@@ -149,6 +155,23 @@ export class TriggerSchemaApiError extends Error {
     this.name = "TriggerSchemaApiError";
     this.details = details;
     this.validationMessage = message;
+  }
+}
+
+/**
+ * Every non-OK `/api/apps/*` answer. `message` is the flattened, human-readable
+ * form (what generic error surfaces render); `issues` is the server's own
+ * field-level list — `[{ path: "values.density", message: "…" }]` — which
+ * schema-driven forms place next to the offending input.
+ */
+export class AppApiError extends Error {
+  readonly status: number;
+  readonly issues: { path?: string; message?: string }[];
+  constructor(message: string, status: number, issues: { path?: string; message?: string }[]) {
+    super(message);
+    this.name = "AppApiError";
+    this.status = status;
+    this.issues = issues;
   }
 }
 
@@ -2756,6 +2779,154 @@ class ApiClient {
     });
     if (!res.ok) throw new Error(`runMetric ${id}: ${res.status}`);
     return res.json();
+  }
+
+  // ─── Swarm apps (spike) ───────────────────────────────────────────────────
+  // `/api/apps/*`. Validation failures come back as 400 with
+  // `{ error, issues?: [{path, message}] }` — surfaced verbatim (see
+  // `AppApiError`) so the app runtime can show the server's own wording.
+
+  private async appRequest<T>(
+    path: string,
+    init: RequestInit | undefined,
+    label: string,
+  ): Promise<T> {
+    const res = await fetch(`${this.getBaseUrl()}${path}`, {
+      ...init,
+      headers: this.getHeaders(),
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as {
+        error?: string;
+        issues?: { path?: string; message?: string }[];
+      } | null;
+      const issues = body?.issues?.length
+        ? ` (${body.issues.map((i) => `${i.path ?? ""}: ${i.message ?? ""}`).join("; ")})`
+        : "";
+      // Message shape is unchanged (every existing caller renders it as-is);
+      // the structured `issues` ride along for surfaces that can place a
+      // validation message on the field it belongs to.
+      throw new AppApiError(`${label}: ${body?.error ?? res.status}${issues}`, res.status, [
+        ...(body?.issues ?? []),
+      ]);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  async listApps(): Promise<{ apps: AppListItem[] }> {
+    return this.appRequest("/api/apps", undefined, "Failed to list apps");
+  }
+
+  async getApp(id: string): Promise<{ app: AppDetail }> {
+    return this.appRequest(`/api/apps/${encodeURIComponent(id)}`, undefined, "Failed to load app");
+  }
+
+  /**
+   * Resolve a named query from the app definition. `params` feed the query's
+   * `{ "$param": "<name>" }` filters and ride as repeatable `param.<name>=`
+   * keys (same idiom as the row-list `filter.<col>=`).
+   */
+  async runAppQuery(
+    appId: string,
+    queryName: string,
+    params?: Record<string, string | number | boolean>,
+  ): Promise<{ rows: AppRow[] }> {
+    const search = new URLSearchParams();
+    for (const [name, value] of Object.entries(params ?? {})) {
+      search.set(`param.${name}`, String(value));
+    }
+    const query = search.toString();
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/queries/${encodeURIComponent(queryName)}${
+        query ? `?${query}` : ""
+      }`,
+      undefined,
+      `Failed to run query ${queryName}`,
+    );
+  }
+
+  async createAppRow(
+    appId: string,
+    model: string,
+    values: Record<string, unknown>,
+  ): Promise<{ row: AppRow }> {
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/models/${encodeURIComponent(model)}/rows`,
+      { method: "POST", body: JSON.stringify({ values }) },
+      `Failed to create ${model}`,
+    );
+  }
+
+  async updateAppRow(
+    appId: string,
+    model: string,
+    rowId: string,
+    values: Record<string, unknown>,
+  ): Promise<{ row: AppRow }> {
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/models/${encodeURIComponent(
+        model,
+      )}/rows/${encodeURIComponent(rowId)}`,
+      { method: "PATCH", body: JSON.stringify({ values }) },
+      `Failed to update ${model}`,
+    );
+  }
+
+  /**
+   * Invoke a named custom action from the app definition's `actions` map.
+   * Script actions answer inline (`ok`/`result`/`stdout`); task actions answer
+   * with the created `taskId`, whose status the caller then polls via
+   * `fetchTask`.
+   */
+  async invokeAppAction(
+    appId: string,
+    name: string,
+    input?: Record<string, unknown>,
+  ): Promise<AppActionResponse> {
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/actions/${encodeURIComponent(name)}`,
+      { method: "POST", body: JSON.stringify({ input: input ?? {} }) },
+      `Failed to run action ${name}`,
+    );
+  }
+
+  /**
+   * This viewer's preferences for one app, already merged against the current
+   * schema server-side. An app declaring no `userConfig` answers
+   * `{ values: {}, schema: {} }` rather than 404.
+   */
+  async getAppUserConfig(appId: string): Promise<AppUserConfigResponse> {
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/user-config`,
+      undefined,
+      "Failed to load app settings",
+    );
+  }
+
+  /**
+   * Replace this viewer's stored preferences wholesale — a field left OUT of
+   * `values` is unset, and reads back as its declared default (or null).
+   * Invalid values answer 400 with per-field `issues` (see `AppApiError`).
+   */
+  async putAppUserConfig(
+    appId: string,
+    values: Record<string, AppUserConfigValue>,
+  ): Promise<AppUserConfigResponse> {
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/user-config`,
+      { method: "PUT", body: JSON.stringify({ values }) },
+      "Failed to save app settings",
+    );
+  }
+
+  async deleteAppRow(appId: string, model: string, rowId: string): Promise<{ ok: boolean }> {
+    return this.appRequest(
+      `/api/apps/${encodeURIComponent(appId)}/models/${encodeURIComponent(
+        model,
+      )}/rows/${encodeURIComponent(rowId)}`,
+      { method: "DELETE" },
+      `Failed to delete ${model}`,
+    );
   }
 }
 

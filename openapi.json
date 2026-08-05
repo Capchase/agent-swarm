@@ -316,6 +316,1580 @@
         }
       }
     },
+    "/api/apps/{id}/user-config": {
+      "get": {
+        "summary": "Get app user configuration",
+        "description": "Returns the current definition schema and this principal's tolerantly merged values.",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Merged user configuration"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App not found"
+          },
+          "409": {
+            "description": "App definition needs repair"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set app user configuration",
+        "description": "Stores validated per-user values outside the versioned app definition.",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored user configuration"
+          },
+          "400": {
+            "description": "Invalid user configuration"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App not found"
+          },
+          "409": {
+            "description": "App definition needs repair"
+          },
+          "413": {
+            "description": "Request exceeds 64 KB or serialized values exceed 16 KB"
+          }
+        }
+      }
+    },
+    "/api/apps": {
+      "get": {
+        "summary": "List apps",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App summaries without definitions"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an app",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "definition": {},
+                  "forceElementBreak": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                    },
+                    "maxItems": 20
+                  }
+                },
+                "required": [
+                  "name"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created app"
+          },
+          "400": {
+            "description": "Invalid app definition"
+          },
+          "403": {
+            "description": "Permission denied"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/versions": {
+      "get": {
+        "summary": "List app definition versions",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App definition versions"
+          },
+          "404": {
+            "description": "App not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/versions/{version}": {
+      "get": {
+        "summary": "Get an app definition version",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            },
+            "required": true,
+            "name": "version",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App definition version"
+          },
+          "404": {
+            "description": "App or version not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/rollback": {
+      "post": {
+        "summary": "Rollback an app definition",
+        "description": "Restores a snapshot through the ordinary schema migration engine. Lossy restores require migration directives.",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0
+                  },
+                  "migration": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "set": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "set"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "from": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                            },
+                            "map": {
+                              "type": "object",
+                              "additionalProperties": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "boolean"
+                                  }
+                                ]
+                              }
+                            },
+                            "else": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "from"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "coerce": {
+                              "type": "boolean",
+                              "enum": [
+                                true
+                              ]
+                            },
+                            "else": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "coerce"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "purge": {
+                              "type": "boolean",
+                              "enum": [
+                                true
+                              ]
+                            }
+                          },
+                          "required": [
+                            "purge"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "forceElementBreak": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                    },
+                    "maxItems": 20
+                  }
+                },
+                "required": [
+                  "version"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rolled back app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "app": {},
+                    "migration": {
+                      "type": "object",
+                      "properties": {
+                        "scanned": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "backfilled": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "coerced": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "mapped": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "elsed": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "purgedValues": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "idxRebuilt": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "orphanFields": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "userConfigChanged": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "scanned",
+                        "backfilled",
+                        "coerced",
+                        "mapped",
+                        "elsed",
+                        "purgedValues",
+                        "idxRebuilt",
+                        "orphanFields",
+                        "userConfigChanged"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "migration"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid rollback definition or schema migration"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App or app version not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}": {
+      "get": {
+        "summary": "Get an app",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App including its definition"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App not found"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update an app",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "definition": {},
+                  "migration": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "set": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "set"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "from": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                            },
+                            "map": {
+                              "type": "object",
+                              "additionalProperties": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "boolean"
+                                  }
+                                ]
+                              }
+                            },
+                            "else": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "from"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "coerce": {
+                              "type": "boolean",
+                              "enum": [
+                                true
+                              ]
+                            },
+                            "else": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "coerce"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "purge": {
+                              "type": "boolean",
+                              "enum": [
+                                true
+                              ]
+                            }
+                          },
+                          "required": [
+                            "purge"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "forceElementBreak": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                    },
+                    "maxItems": 20
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "app": {},
+                    "migration": {
+                      "type": "object",
+                      "properties": {
+                        "scanned": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "backfilled": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "coerced": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "mapped": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "elsed": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "purgedValues": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "idxRebuilt": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "orphanFields": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "userConfigChanged": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "scanned",
+                        "backfilled",
+                        "coerced",
+                        "mapped",
+                        "elsed",
+                        "purgedValues",
+                        "idxRebuilt",
+                        "orphanFields",
+                        "userConfigChanged"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "migration"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid app definition"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App not found"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch an app",
+        "description": "Applies an RFC 7396 merge patch to the definition, with reusable elements, app actions, page elements, and model columns treated as atomic entries.",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "definition": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  },
+                  "migration": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "set": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "set"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "from": {
+                              "type": "string",
+                              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                            },
+                            "map": {
+                              "type": "object",
+                              "additionalProperties": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "boolean"
+                                  }
+                                ]
+                              }
+                            },
+                            "else": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "from"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "coerce": {
+                              "type": "boolean",
+                              "enum": [
+                                true
+                              ]
+                            },
+                            "else": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "coerce"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "purge": {
+                              "type": "boolean",
+                              "enum": [
+                                true
+                              ]
+                            }
+                          },
+                          "required": [
+                            "purge"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "forceElementBreak": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                    },
+                    "maxItems": 20
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Patched app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "app": {},
+                    "migration": {
+                      "type": "object",
+                      "properties": {
+                        "scanned": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "backfilled": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "coerced": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "mapped": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "elsed": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "purgedValues": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "idxRebuilt": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "orphanFields": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "userConfigChanged": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "scanned",
+                        "backfilled",
+                        "coerced",
+                        "mapped",
+                        "elsed",
+                        "purgedValues",
+                        "idxRebuilt",
+                        "orphanFields",
+                        "userConfigChanged"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "migration"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid app definition"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete an app and all of its rows",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App deleted"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/models/{model}/rows": {
+      "post": {
+        "summary": "Create an app model row",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "values"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created row"
+          },
+          "400": {
+            "description": "Invalid row values"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App or model not found"
+          }
+        }
+      },
+      "get": {
+        "summary": "List app model rows",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "sort",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 1000
+            },
+            "required": false,
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Filtered app model rows"
+          },
+          "400": {
+            "description": "Invalid filter or sort"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App or model not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/models/{model}/rows/bulk": {
+      "post": {
+        "summary": "Bulk-create app model rows",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "rows": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "values": {
+                          "type": "object",
+                          "additionalProperties": {}
+                        }
+                      },
+                      "required": [
+                        "values"
+                      ]
+                    },
+                    "maxItems": 500
+                  }
+                },
+                "required": [
+                  "rows"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created rows"
+          },
+          "400": {
+            "description": "Invalid row values"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App or model not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/models/{model}/rows/{rowId}": {
+      "get": {
+        "summary": "Get an app model row",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "rowId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App model row"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App, model, or row not found"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch an app model row",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "rowId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "values"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated row"
+          },
+          "400": {
+            "description": "Invalid row values"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App, model, or row not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete an app model row",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "model",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "rowId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Row deleted"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App, model, or row not found"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/queries/{name}": {
+      "get": {
+        "summary": "Run a named app query",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "name",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Named query rows"
+          },
+          "400": {
+            "description": "Missing or invalid named query parameters"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App or query not found"
+          },
+          "409": {
+            "description": "App definition needs repair"
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/actions/{name}": {
+      "post": {
+        "summary": "Run a custom app action",
+        "description": "Runs the saved script, or creates the agent task, named by the app definition.",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+            },
+            "required": true,
+            "name": "name",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action invoked"
+          },
+          "400": {
+            "description": "Invalid action input or stale script reference"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "App or action not found"
+          },
+          "409": {
+            "description": "App definition needs repair"
+          }
+        }
+      }
+    },
     "/api/db-query": {
       "post": {
         "summary": "Execute a read-only SQL query",

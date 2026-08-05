@@ -201,6 +201,14 @@ export const PERMISSIONS = {
     description: "Delete a page the caller does not own.",
     namespace: "page",
   },
+  "app.manage": {
+    description: "Create, update, delete, or roll back apps, and inspect app version history.",
+    namespace: "app",
+  },
+  "app.use": {
+    description: "View an app and act through it: queries, rows, and actions.",
+    namespace: "app",
+  },
   "script.global.write": {
     description: "Create or update a global-scope script.",
     namespace: "script",

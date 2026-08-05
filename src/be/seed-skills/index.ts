@@ -8,6 +8,8 @@
  */
 
 import { join } from "node:path";
+import appsConfig from "../../../templates/skills/apps/config.json" with { type: "text" };
+import appsContent from "../../../templates/skills/apps/content.md" with { type: "text" };
 import artifactsConfig from "../../../templates/skills/artifacts/config.json" with { type: "text" };
 import artifactsContent from "../../../templates/skills/artifacts/content.md" with { type: "text" };
 import askUserConfig from "../../../templates/skills/ask-user/config.json" with { type: "text" };
@@ -251,6 +253,7 @@ export type SeedSkill = {
 const BUILT_IN_SKILL_FILES = bundledFilesManifest as Record<string, SeedSkillFile[]>;
 
 const BUILT_IN_SKILL_SOURCES = [
+  { config: appsConfig, body: appsContent },
   { config: artifactsConfig, body: artifactsContent },
   { config: askUserConfig, body: askUserContent },
   { config: assetNamespacesConfig, body: assetNamespacesContent },

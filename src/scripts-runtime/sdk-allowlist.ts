@@ -141,6 +141,14 @@ export const SDK_TOOL_NAME_MAP = {
   mcpServer_uninstall: "mcp-server-uninstall", // destructive
 
   // ── pages & metrics ──
+  app_get: "app-get",
+  app_history: "app-history",
+  app_diff: "app-diff",
+  app_list: "app-list",
+  app_patch: "app-patch",
+  app_query: "app-query",
+  app_rollback: "app-rollback",
+  app_upsert: "app-upsert",
   page_create: "create_page",
   page_delete: "delete-page", // destructive
   metric_create: "create_metric",

@@ -2496,3 +2496,161 @@ export interface SwarmMetrics {
   sessions: { active: number };
   skills: { total: number };
 }
+
+// ─── Swarm apps (spike) ─────────────────────────────────────────────────────
+// Mirrors the frozen `AppDefinition` contract served by `/api/apps/*`.
+
+export type AppColumnKind = "string" | "number" | "boolean" | "date" | "enum";
+
+export interface AppColumnDef {
+  kind: AppColumnKind;
+  required?: boolean;
+  enum?: string[];
+  index?: boolean;
+  default?: string | number | boolean;
+}
+
+export interface AppModelDef {
+  columns: Record<string, AppColumnDef>;
+}
+
+/**
+ * A named query filter value: a literal, or `{ "$param": "<name>" }` — a route
+ * param resolved server-side at query time (see `AppPageDef.params`).
+ */
+export type AppQueryFilterValue = string | number | boolean | { $param: string };
+
+export interface AppQueryDef {
+  model: string;
+  filter?: Record<string, AppQueryFilterValue>;
+  sort?: { column: string; dir: "asc" | "desc" };
+  limit?: number;
+}
+
+/**
+ * A named custom action of an app definition, invoked from the runtime via the
+ * `app.action` json-render action (`POST /api/apps/:id/actions/:name`).
+ */
+export type AppActionDef =
+  | { kind: "script"; scriptId: string; args?: Record<string, unknown> }
+  | { kind: "task"; prompt: string; agentId?: string };
+
+/** Route param declared by a page; URL strings are coerced to `kind`. */
+export interface AppPageParamDef {
+  kind?: "string" | "number" | "boolean";
+  required?: boolean;
+}
+
+/**
+ * One page of an app — a json-render spec (`root` + `elements`) plus the route
+ * params it reads. Rendered at `/apps/:id/p/<name>`.
+ */
+export interface AppPageDef {
+  root: string;
+  elements: Record<string, unknown>;
+  /** Display title (breadcrumb / header); defaults to the page name. */
+  title?: string;
+  params?: Record<string, AppPageParamDef>;
+}
+
+/** One declared prop of a reusable element (`definition.elements.<name>`). */
+export interface AppElementPropDef {
+  kind: AppColumnKind;
+  required?: boolean;
+  enum?: string[];
+  default?: string | number | boolean;
+}
+
+/**
+ * A reusable element: a json-render subtree (`root` + `elements`) referenced
+ * from a page — or, when `export` is set, from another app — through an
+ * `ElementRef` node. `pure` elements render only from their declared `props`;
+ * `bound` elements additionally read their OWN app's queries and actions,
+ * which the client assembler rewrites to `/refs/<definingAppId>/…` when the
+ * element is borrowed (see `@/lib/json-render/assemble`).
+ */
+export interface AppElementDef {
+  mode: "pure" | "bound";
+  export?: boolean;
+  props?: Record<string, AppElementPropDef>;
+  root: string;
+  elements: Record<string, unknown>;
+}
+
+/**
+ * One declared per-viewer preference. The SCHEMA is versioned with the app
+ * definition; the VALUES live outside it (per app × user), which is what makes
+ * a definition rollback leave a viewer's preferences intact.
+ *
+ * No `required`: every field must be total through `default` or read as null.
+ */
+export interface AppUserConfigField {
+  kind: AppColumnKind;
+  default?: string | number | boolean;
+  enum?: string[];
+  label?: string;
+}
+
+/** A stored userConfig value — `null` means "unset, and no declared default". */
+export type AppUserConfigValue = string | number | boolean | null;
+
+/**
+ * `GET|PUT /api/apps/:id/user-config`. `values` is the server's tolerant merge
+ * of the stored row against the CURRENT schema: unknown fields dropped,
+ * nonconforming ones replaced by their default (or null). An app with no
+ * declared `userConfig` answers `{ values: {}, schema: {} }`.
+ */
+export interface AppUserConfigResponse {
+  values: Record<string, AppUserConfigValue>;
+  schema: Record<string, AppUserConfigField>;
+}
+
+export interface AppDefinition {
+  models: Record<string, AppModelDef>;
+  queries?: Record<string, AppQueryDef>;
+  actions?: Record<string, AppActionDef>;
+  /** Reusable element subtrees, referenced by `ElementRef` nodes. */
+  elements?: Record<string, AppElementDef>;
+  /**
+   * The canonical multi-page form (server-normalized on every write): named
+   * json-render specs plus the page a bare `/apps/:id` renders.
+   */
+  pages?: Record<string, AppPageDef>;
+  defaultPage?: string;
+  /** Per-viewer preference SCHEMA; the values live outside the definition. */
+  userConfig?: Record<string, AppUserConfigField>;
+}
+
+/**
+ * `POST /api/apps/:id/actions/:name` response. One loose shape covering both
+ * action kinds: script runs answer with `result`/`stdout`/`durationMs`, task
+ * actions answer with `taskId` + the freshly created task's `status`.
+ */
+export interface AppActionResponse {
+  ok: boolean;
+  result?: unknown;
+  stdout?: string;
+  error?: string;
+  durationMs?: number;
+  taskId?: string;
+  status?: AgentTaskStatus;
+}
+
+export interface AppListItem {
+  id: string;
+  name: string;
+  description?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AppDetail extends AppListItem {
+  definition: AppDefinition;
+}
+
+/** A row from `app/<appId>/<model>/row/<rowId>`. */
+export type AppRow = Record<string, unknown> & {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+};
