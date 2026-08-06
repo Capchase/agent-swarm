@@ -441,6 +441,11 @@ async function runAuthorizeFlow(
       (reusable.registeredScopes === null ||
         scopesAreCovered(scopesToRequest, reusable.registeredScopes))
     ) {
+      // We know the true registered set here (or it's a legacy unknown, same
+      // as registeredScopes staying undefined below) — record it so a
+      // pending row backing THIS reused authorize call doesn't fall back to
+      // a literal null if this is the flow that ends up completing.
+      registeredScopes = reusable.registeredScopes ?? undefined;
       client = {
         clientId: reusable.clientId,
         clientSecret: reusable.clientSecret,
