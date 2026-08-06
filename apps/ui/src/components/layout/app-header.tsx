@@ -1,8 +1,10 @@
-import { Github, Moon, Sun } from "lucide-react";
+import { Github } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useHealth } from "@/api/hooks/use-stats";
 import type { StatusHealth } from "@/api/types";
 import { useStatusContext } from "@/app/status-context";
+import { MoonIcon } from "@/components/icons/moon";
+import { SunIcon } from "@/components/icons/sun";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
@@ -40,13 +42,15 @@ export function AppHeader() {
   const connectionErrorMessage = statusError?.message || healthError?.message || null;
 
   return (
-    <header className="flex h-14 items-center gap-2 border-b border-border px-4">
+    <header className="flex h-14 items-center gap-2 px-4">
       <SidebarTrigger className="md:hidden" />
       <Separator orientation="vertical" className="mr-2 h-4 md:hidden" />
 
-      <Breadcrumbs />
-
-      <div className="flex-1" />
+      {/* The trail owns the header's free space (no fixed spacer) so long
+          entity names only truncate when the width is actually exhausted. */}
+      <div className="flex flex-1 items-center min-w-0">
+        <Breadcrumbs />
+      </div>
 
       <div className="flex items-center gap-3">
         {/* Phase 2: aggregate health badge — clickable, pulls from /status. */}
@@ -140,7 +144,9 @@ export function AppHeader() {
               className="size-8"
               aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
             >
-              {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+              {/* Animated icons (lucide-animated): rays fade in / moon tilts
+                  on hover — affordance feedback on an interactive control. */}
+              {theme === "dark" ? <SunIcon size={16} /> : <MoonIcon size={16} />}
               <span className="sr-only">Toggle theme</span>
             </Button>
           </TooltipTrigger>

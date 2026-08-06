@@ -76,6 +76,12 @@ Every successful definition write snapshots the previous definition. Use `app-hi
 
 Use `{ "$state": "/user/<field>" }` on a page for the read-only current-user binding; the field must be declared and the path cannot continue below it. Pure and bound reusable elements cannot bind `/user` directly — pass the value through an element prop from the consuming page. An agent acting on an owned user-requested task reads and edits that requester's preferences. `userConfig` schema changes are always migration-compatible and appear in migration reports; no migration directives are needed. Rollback restores the historical schema but never alters saved per-user values, so values can resurface when a field returns.
 
+### Theming
+
+An optional top-level `"theme"` sets the preset the dashboard applies to the app's rendered canvas — a lowercase slug validated by shape only. The preset catalog ships with the dashboard (`apps/ui/src/lib/themes.ts` + `theme-classics.ts` — update this list and the `app-upsert` tool description when it changes); current ids: `hive` (the stock look), the accent/field presets `meadow`, `iris`, `rose`, `cobalt`, `ember`, `carbon`, and the classic editor/platform presets `github`, `vscode`, `material`, `solarized`, `tokyo`, `monokai`, `gruvbox`. Action and destructive tones are never themed; status tones are themed ONLY by the classic presets (their identity includes a status palette — hue semantics stay fixed, success reads green and error reads red everywhere). An id the viewer's dashboard build does not know degrades to the dashboard's own theme, so unknown slugs are safe but pointless. Omit `theme` to inherit whatever theme the viewer runs; `"hive"` is an explicit reset to the stock look even inside a themed dashboard.
+
+Viewers can override the preset per app from the app's settings drawer; the override rides the reserved `$theme` key of the user-config values (accepted on every app, even without a declared `userConfig` schema, and never visible at `/user/...`). A present override always beats the definition's `theme` — even an unrecognized one, which degrades to the dashboard theme — so treat `theme` as the app's default styling, not a guarantee.
+
 Distinguish the two rollback 400s. A lossy-migration 400 is fixable: copy the required `migration` entries from the message and retry. A target-snapshot validation 400 explicitly says that directives cannot repair that historical definition; use `app-history` and choose a different version.
 
 When a schema patch reports stale page/query bindings, repair them in that same patch. Page elements are atomic: replace the complete `pages.<page>.elements.<id>` declaration, removing any reference to a hidden or deleted column, instead of sending only the changed nested prop. This is also the repair move for older apps whose stored page already references an undeclared column; full-definition validation otherwise blocks every patch.
@@ -100,7 +106,8 @@ When a schema patch reports stale page/query bindings, repair them in that same 
       "elements": { "root": { "type": "Container", "props": {} } }
     }
   },
-  "defaultPage": "main"
+  "defaultPage": "main",
+  "theme": "ember"
 }
 ```
 
@@ -349,18 +356,19 @@ Props reject unknown keys. A `{"$state":"..."}` binding may replace a literal pr
 | `Markdown` | `content` | Rendered Markdown for help, instructions, and rich prose; no children. |
 | `SearchInput` | `id` | `placeholder`, `label`; writes debounced text to `/ui/<id>/value`; no children. |
 | `Select` | `id`, `options` | `options` are strings or `{ value, label? }`; `placeholder`, `label`, `clearable`; writes a string or null to `/ui/<id>/value`; no children. |
-| `Button` | `label` | `variant: "default", "secondary", "outline", "ghost", or "destructive"`; dispatch with element-level `on.press`. |
-| `Metric` | `label`, `value` | `value` is string or number. |
+| `Button` | `label` | `variant: "default", "secondary", "outline", "ghost", "destructive", or "destructive-outline"` (use `destructive-outline` for standalone deletes); `disabled` (constant or bound boolean); `busyWith: "<actionName>"` disables and spins while that custom action's `/actions/<name>/status` is `"running"`; dispatch with element-level `on.press`. |
+| `Metric` | `label`, `value` | `value` is string or number; bind `loading` to `/queries/<name>/loading` for a skeleton while the query loads. |
 | `Alert` | `message` | `title`, `tone: "info", "success", "warning", or "error"`. |
 | `Badge` | `text` | `text` is string or number; `tone: "neutral", "success", "active", "error", "info", "pending", "warning", or "paused"`. |
 | `Table` | `columns` | `data`, `loading`, `error`, `emptyMessage`, `rowActions`, `search`, `filters`; see below. |
 | `Form` | `id`, `fields`, `onSubmit` | `title`, `submitLabel`; see below. |
 | `Drawer` | `param` | `title`, `description`, `side: "right" or "left"`, `size: "sm", "md", "lg", or "xl"`; has the `default` child slot. |
-| `DetailList` | `fields` | `data`, `emptyMessage`, `columns: 1 or 2`; renders one record without edit controls. |
+| `DetailList` | `fields` | `data`, `emptyMessage`, `columns: 1 or 2`, `loading` (bind `/queries/<name>/loading` for skeleton fields while loading); renders one record without edit controls. |
 
 Table details:
 
-- `columns[]`: `{ key, label?, kind?, tones?: {value: badgeTone}, width?: number }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, or `badge`; `string` and `enum` render as text.
+- `columns[]`: `{ key, label?, kind?, tones?: {value: badgeTone}, width?: number, pinned?: "left" or "right" }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, or `badge`; `string` and `enum` render as text. Pin id/actions columns so they survive horizontal scroll on narrow viewports.
+- `pagination`: boolean; defaults to auto-enabling past 200 rows (set `false` to force one scroll region). `density: "compact"` tightens row height for dense readouts.
 - `rowActions[]`: `{ label, variant?, confirm?, actions }`. Variants add `destructive-outline` to the Button variants. `destructive` and `destructive-outline` confirm by default; customize with `{ "title": ..., "description": ..., "confirmLabel": ... }`, or use a bare `confirm` string as the dialog description (use `confirm: false` only for a reversible action).
 - `search`: optional string; case-insensitive substring matching across the listed string and number columns. Bind a SearchInput value for client-side search.
 - `filters`: optional record of per-column string, number, boolean, or null values. Null, empty, or absent values disable one filter. Bind Select values for client-side equality filters.
@@ -369,6 +377,7 @@ Form details:
 
 - `fields[]`: `{ name, label?, kind?, options?: string[], placeholder?, required? }`; `kind` is `string`, `text`, `number`, `boolean`, `date`, or `enum`, and enum fields need `options`.
 - Values live at `/forms/<formId>/<fieldName>`. `onSubmit` is an action chain.
+- The submit button shows a pending spinner while the chain runs, and `app.mutate` failures in the chain render inline under the fields (not the page banner) — no extra wiring needed.
 
 Drawer details:
 
@@ -380,7 +389,7 @@ DetailList details:
 
 ## Layout & interactivity
 
-Use `Stack` as the primary page and section layout; `Container` is the legacy two-prop primitive retained for existing pages. Stack supports vertical or horizontal flow, shared spacing, alignment, justification, wrapping, and padding. Use `Grid` for responsive card or metric strips: set one column count or breakpoint counts such as `{ "base": 1, "md": 2, "lg": 3 }`.
+Use `Stack` as the primary page and section layout; `Container` is the legacy two-prop primitive retained for existing pages. Stack supports vertical or horizontal flow, shared spacing, alignment, justification, wrapping, and padding; row Stacks (filter bars, button rows) should set `collapseBelow: "sm"|"md"|"lg"` so they stack vertically on phones. Use `Grid` for responsive card or metric strips: a bare column count is responsive shorthand (1 column on phones, 2 from `sm`, the count from `md` up), or pin breakpoints explicitly with `{ "base": 1, "md": 2, "lg": 3 }`. `Grid` and `Split` also accept `padding` on the shared spacing scale.
 
 `Split` and `Tabs` children are positional. For Split, `children[0]` is the first pane, `children[1]` is the second, and extra children append inside the second pane. Below `collapseBelow`, panes stack; `reverse` changes only that narrow-layout stacking order. For Tabs, `children[i]` is the body for `tabs[i]`; keep both arrays in the same order and with the same count. Inactive tab children stay mounted but hidden, so Tables keep polling. Use `Divider` to separate sections and `Markdown` for richer explanatory content.
 

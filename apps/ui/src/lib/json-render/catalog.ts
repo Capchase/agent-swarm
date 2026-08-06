@@ -49,8 +49,10 @@ export const swarmCallActionSchema = z.object({
 
 /**
  * `app.mutate` — server-native row CRUD against `/api/apps/:id/models/:model/rows`.
- * `formId` is optional in JSON: the `Form` component injects its own `id` when
- * it dispatches a `create`, so the originating form clears itself on success.
+ * `formId` is optional in JSON: the `Form` component injects its own `id` into
+ * every `app.mutate` of its submit chain, so the originating form clears itself
+ * on a successful `create` and receives mutate failures inline (the handler
+ * writes them to `/forms/<id>/$error` instead of the page-level banner).
  */
 export const appMutateActionSchema = z.object({
   model: z.string(),
@@ -111,12 +113,23 @@ const stackProps = z.object({
   justify: z.enum(["start", "center", "end", "between"]).optional(),
   wrap: z.boolean().optional(),
   padding: spacing.optional(),
+  /**
+   * For `direction: "row"` only: below this breakpoint the row stacks
+   * vertically (same semantics as Split.collapseBelow). Filter bars and
+   * button rows should set it so they don't crush on phones.
+   */
+  collapseBelow: z.enum(["sm", "md", "lg"]).optional(),
 });
 
 /** Grid tracks are capped at 6 — beyond that a page is a table, not a layout. */
 const gridColumnCount = z.number().int().min(1).max(6);
 
 const gridProps = z.object({
+  /**
+   * A bare count is responsive shorthand: 1 column on phones, 2 from `sm`,
+   * the declared count from `md` up. The object form pins breakpoints
+   * explicitly.
+   */
   columns: z
     .union([
       gridColumnCount,
@@ -129,6 +142,7 @@ const gridProps = z.object({
     ])
     .optional(),
   gap: spacing.optional(),
+  padding: spacing.optional(),
 });
 
 const splitProps = z.object({
@@ -136,6 +150,7 @@ const splitProps = z.object({
   gap: spacing.optional(),
   collapseBelow: z.enum(["sm", "md", "lg"]).optional(),
   reverse: z.boolean().optional(),
+  padding: spacing.optional(),
 });
 
 const dividerProps = z.object({
@@ -196,12 +211,25 @@ const textProps = z.object({
 
 const buttonProps = z.object({
   label: z.string(),
-  variant: z.enum(["default", "secondary", "outline", "ghost", "destructive"]).optional(),
+  variant: z
+    .enum(["default", "secondary", "outline", "ghost", "destructive", "destructive-outline"])
+    .optional(),
+  /** Constant or bound (e.g. `{ "$state": "/queries/<name>/loading" }`). */
+  disabled: z.boolean().optional(),
+  /**
+   * Name of a custom action from the app definition's `actions` map. While
+   * `/actions/<name>/status` is `"running"` the button disables and shows a
+   * spinner — pair it with an `on.press` chain dispatching `app.action` for
+   * the same name.
+   */
+  busyWith: z.string().optional(),
 });
 
 const metricProps = z.object({
   label: z.string(),
   value: z.union([z.string(), z.number()]),
+  /** Usually `{ "$state": "/queries/<name>/loading" }` — skeleton while true. */
+  loading: z.boolean().optional(),
 });
 
 const alertProps = z.object({
@@ -255,6 +283,8 @@ const tableColumnSchema = z.object({
   /** For `kind: "badge"` — cell value → badge tone. Falls back to `neutral`. */
   tones: z.record(z.string(), z.enum(BADGE_TONES)).optional(),
   width: z.number().optional(),
+  /** Pin the column to an edge so it survives horizontal scroll (id, actions). */
+  pinned: z.enum(["left", "right"]).optional(),
 });
 
 /** Copy overrides for a row action's `AlertDialog` confirmation step. */
@@ -312,10 +342,20 @@ const tableProps = z.object({
   filters: z
     .record(z.string(), z.union([z.string(), z.number(), z.boolean()]).nullable())
     .optional(),
+  /**
+   * Page the grid instead of one endless scroll region. Defaults to
+   * auto-enabling past 200 rows; set `false` to force the scroll region.
+   */
+  pagination: z.boolean().optional(),
+  /** Row density — `compact` tightens row height for dense readouts. */
+  density: z.enum(["comfortable", "compact"]).optional(),
 });
 
 const formFieldSchema = z.object({
-  name: z.string(),
+  /** `$`-prefixed names are reserved runtime slots under `/forms/<id>/` —
+   * `$error` holds the inline mutate failure, and a field stored there would
+   * render as (and be clobbered by) the failure state. */
+  name: z.string().regex(/^[^$]/, "field names must not start with '$' (reserved)"),
   label: z.string().optional(),
   /** `text` is a multi-line variant of `string` (textarea). */
   kind: z.enum(["string", "text", "number", "boolean", "date", "enum"]).optional(),
@@ -372,6 +412,11 @@ const detailListProps = z.object({
   emptyMessage: z.string().optional(),
   /** Label/value pairs flow into 1 (default) or 2 columns. */
   columns: z.union([z.literal(1), z.literal(2)]).optional(),
+  /**
+   * Usually `{ "$state": "/queries/<name>/loading" }` — skeleton fields while
+   * true and `data` is still missing, instead of a premature `emptyMessage`.
+   */
+  loading: z.boolean().optional(),
 });
 
 const elementRefProps = z.object({
@@ -411,13 +456,13 @@ export const swarmCatalogSpec = {
       props: stackProps,
       slots: ["default"],
       description:
-        "THE primary layout primitive — a flex column (default) or row of its children. `gap`/`padding` use the shared spacing scale (none|xs|sm|md|lg|xl, default gap md); `align` is the cross axis, `justify` the main axis, `wrap` lets a row reflow. Use this as the page root and for every section; `Container` is the legacy 2-prop alias kept for older pages.",
+        "THE primary layout primitive — a flex column (default) or row of its children. `gap`/`padding` use the shared spacing scale (none|xs|sm|md|lg|xl, default gap md); `align` is the cross axis, `justify` the main axis, `wrap` lets a row reflow. For rows, set `collapseBelow` (sm|md|lg) so the row stacks vertically on narrow viewports — filter bars should always set it. Use this as the page root and for every section; `Container` is the legacy 2-prop alias kept for older pages.",
     },
     Grid: {
       props: gridProps,
       slots: ["default"],
       description:
-        "Responsive grid of equal-width cells, one per child. `columns` is either a single count (1-6) or a per-breakpoint object `{ base, sm, md, lg }` (default `{ base: 1, md: 2, lg: 3 }`) so cards reflow on narrow viewports. Prefer this over a wrapping Stack for card strips and metric tiles.",
+        "Responsive grid of equal-width cells, one per child. `columns` is either a single count (1-6) — responsive shorthand: 1 column on phones, 2 from `sm`, the count from `md` up — or a per-breakpoint object `{ base, sm, md, lg }` (default `{ base: 1, md: 2, lg: 3 }`). Prefer this over a wrapping Stack for card strips and metric tiles.",
     },
     Split: {
       props: splitProps,
@@ -472,11 +517,13 @@ export const swarmCatalogSpec = {
     },
     Button: {
       props: buttonProps,
-      description: "Interactive button. Wire to actions via `on.press`.",
+      description:
+        'Interactive button. Wire to actions via `on.press`. `variant: "destructive-outline"` is the canonical red-outlined destructive look (standalone deletes should use it, not solid red). `disabled` accepts a constant or a bound boolean; `busyWith: "<actionName>"` disables the button and shows a spinner while that custom action is running.',
     },
     Metric: {
       props: metricProps,
-      description: "Single label/value tile for status pages.",
+      description:
+        'Single label/value tile for status pages. Bind `loading` to the backing query (`{ "$state": "/queries/<name>/loading" }`) to show a skeleton instead of a blank value while it loads.',
     },
     Alert: {
       props: alertProps,
@@ -489,12 +536,12 @@ export const swarmCatalogSpec = {
     Table: {
       props: tableProps,
       description:
-        'Data table. Bind `data`/`loading`/`error` to a named query (`/queries/<name>/...`). `rowActions` chains receive `{ "$row": "<col>" }` (or `{ "$row": "" }` for the whole row) and `{ "$rowIndex": true }`. Destructive row actions always confirm via a dialog; override the copy with `confirm: { title, description, confirmLabel }`. `search` (case-insensitive substring across every listed column) and `filters` (per-column equality, `null`/`""` disables one) narrow the polled rows client-side — bind them to a `SearchInput` / `Select` via `/ui/<id>/value`, or pin a constant (e.g. `"filters": { "pinned": true }`).',
+        'Data table. Bind `data`/`loading`/`error` to a named query (`/queries/<name>/...`). `rowActions` chains receive `{ "$row": "<col>" }` (or `{ "$row": "" }` for the whole row) and `{ "$rowIndex": true }`. Destructive row actions always confirm via a dialog; override the copy with `confirm: { title, description, confirmLabel }`. `search` (case-insensitive substring across every listed column) and `filters` (per-column equality, `null`/`""` disables one) narrow the polled rows client-side — bind them to a `SearchInput` / `Select` via `/ui/<id>/value`, or pin a constant (e.g. `"filters": { "pinned": true }`). Columns take `pinned: "left"|"right"` to survive horizontal scroll; `pagination` pages large row sets (auto past 200 rows); `density: "compact"` tightens row height.',
     },
     Form: {
       props: formProps,
       description:
-        'Field form. Values live in state under `/forms/<id>/<field>`; `onSubmit` chains receive `$form` (all collected values) and `$form: "<field>"` for one.',
+        'Field form. Values live in state under `/forms/<id>/<field>`; `onSubmit` chains receive `$form` (all collected values) and `$form: "<field>"` for one. `app.mutate` failures in the chain surface inline under the fields (not the page banner), and the submit button shows a pending spinner while the chain runs.',
     },
     Drawer: {
       props: drawerProps,
@@ -505,7 +552,7 @@ export const swarmCatalogSpec = {
     DetailList: {
       props: detailListProps,
       description:
-        'Read-only label/value detail view for ONE record. Bind `data` to a single row — usually `{ "$state": "/queries/<name>/data/0" }` with a `$param`-filtered query. `fields` pick and format properties with the same kinds as Table columns (badge tones, relative dates) plus `code` for raw/JSON values. Shows `emptyMessage` while the record is loading or missing.',
+        'Read-only label/value detail view for ONE record. Bind `data` to a single row — usually `{ "$state": "/queries/<name>/data/0" }` with a `$param`-filtered query. `fields` pick and format properties with the same kinds as Table columns (badge tones, relative dates) plus `code` for raw/JSON values. Bind `loading` to the query (`/queries/<name>/loading`) for skeleton fields while it loads; `emptyMessage` shows when the record is genuinely missing.',
     },
     ElementRef: {
       props: elementRefProps,

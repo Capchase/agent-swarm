@@ -28,6 +28,7 @@ import { Streamdown } from "streamdown";
 import "streamdown/styles.css";
 
 import type { ContextSnapshot, SessionLog, SteeringMessage } from "@/api/types";
+import { AnimatedReveal } from "@/components/shared/animated-reveal";
 import {
   SubagentDetails,
   SubagentDot,
@@ -1269,14 +1270,14 @@ function RawDetails({ data }: { data: unknown }) {
         </button>
         <CopyIconButton text={text} label="Copy raw event" className="size-5" />
       </div>
-      {open && (
+      <AnimatedReveal open={open} speed="fast">
         <JsonTree
           data={data}
           defaultExpandDepth={1}
           maxHeight="260px"
           className="mt-1 bg-muted/50"
         />
-      )}
+      </AnimatedReveal>
     </div>
   );
 }
@@ -1322,14 +1323,14 @@ function LowKeyMetaLine({
         </span>
       </div>
       {children && <div className="ml-6 mt-1 space-y-1">{children}</div>}
-      {open && (
+      <AnimatedReveal open={open} speed="fast">
         <JsonTree
           data={raw}
           defaultExpandDepth={1}
           maxHeight="220px"
           className="mt-1.5 bg-muted/50"
         />
-      )}
+      </AnimatedReveal>
     </div>
   );
 }
@@ -1859,7 +1860,7 @@ function ToolRow({
         {dur && <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{dur}</span>}
       </button>
 
-      {open && (
+      <AnimatedReveal open={open} speed="fast">
         <div className="border-t border-border">
           {hasInput && (
             <>
@@ -1878,7 +1879,7 @@ function ToolRow({
           </div>
           <ResultSection body={tool.body} open={outputOpen} onToggle={onToggleOutput} />
         </div>
-      )}
+      </AnimatedReveal>
     </div>
   );
 }
@@ -2209,24 +2210,45 @@ export function SessionLogViewer({
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
 
-  const stickToBottom = useCallback(() => {
-    const el = parentRef.current;
-    if (!el) return;
-    // In virtualized mode getTotalSize() is an estimate until rows measure, so a
-    // bare scrollTop can undershoot the real bottom. scrollToIndex forces the
-    // tail to render + measure; the scrollTop assignment then lands flush.
-    if (virtualize && visibleRows.length > 0) {
-      virtualizer.scrollToIndex(visibleRows.length - 1, { align: "end" });
-    }
-    el.scrollTop = el.scrollHeight;
-    setPending(0);
-  }, [virtualize, virtualizer, visibleRows.length]);
+  const stickToBottom = useCallback(
+    (behavior: ScrollBehavior = "auto") => {
+      const el = parentRef.current;
+      if (!el) return;
+      // User-initiated jumps glide; the auto-follow callers stay instant (they
+      // fire per content-growth frame — animating those would fight the
+      // stream). Reduced motion keeps everything instant.
+      if (
+        behavior === "smooth" &&
+        !(
+          typeof window !== "undefined" &&
+          window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+        )
+      ) {
+        // No scrollToIndex first — it snaps instantly and defeats the glide.
+        // The estimate can undershoot in virtualized mode; once the scroll
+        // lands, the keep-pinned effect snaps the last few px after the tail
+        // rows measure.
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        setPending(0);
+        return;
+      }
+      // In virtualized mode getTotalSize() is an estimate until rows measure, so a
+      // bare scrollTop can undershoot the real bottom. scrollToIndex forces the
+      // tail to render + measure; the scrollTop assignment then lands flush.
+      if (virtualize && visibleRows.length > 0) {
+        virtualizer.scrollToIndex(visibleRows.length - 1, { align: "end" });
+      }
+      el.scrollTop = el.scrollHeight;
+      setPending(0);
+    },
+    [virtualize, virtualizer, visibleRows.length],
+  );
 
   // Keep pinned to the bottom as content grows/measures (only when already there).
   const totalSize = virtualize ? virtualizer.getTotalSize() : 0;
   // biome-ignore lint/correctness/useExhaustiveDependencies: totalSize + visibleRows.length are intentional re-stick triggers — the effect reacts to content growth without reading them in the body.
   useEffect(() => {
-    if (atBottomRef.current) requestAnimationFrame(stickToBottom);
+    if (atBottomRef.current) requestAnimationFrame(() => stickToBottom());
   }, [totalSize, visibleRows.length, stickToBottom]);
 
   // Land at the newest event when the viewer first populates, and re-pin across
@@ -2446,11 +2468,11 @@ export function SessionLogViewer({
                 </span>
               )}
             </button>
-            {open && (
+            <AnimatedReveal open={open} speed="fast">
               <div className="mt-1.5 border-t border-border/40 py-2 pr-2 sm:ml-9">
                 <SubagentDetails run={row.run} />
               </div>
-            )}
+            </AnimatedReveal>
           </RowShell>
         );
       }
@@ -2485,7 +2507,7 @@ export function SessionLogViewer({
               {groupHeader(row.names)}
             </span>
           </button>
-          {open && (
+          <AnimatedReveal open={open} speed="fast">
             <div className="mt-1.5 flex flex-col gap-1.5 pl-0.5">
               {row.tools.map((t) => (
                 <ToolRow
@@ -2498,7 +2520,7 @@ export function SessionLogViewer({
                 />
               ))}
             </div>
-          )}
+          </AnimatedReveal>
         </RowShell>
       );
     },
@@ -2616,7 +2638,7 @@ export function SessionLogViewer({
               {/* Jump-to-latest pill */}
               <button
                 type="button"
-                onClick={stickToBottom}
+                onClick={() => stickToBottom("smooth")}
                 aria-label="Scroll to latest"
                 className={cn(
                   "absolute bottom-4 left-1/2 z-10 inline-flex -translate-x-1/2 cursor-pointer items-center gap-2 rounded-full bg-primary px-3.5 py-[7px] text-[12.5px] font-semibold text-primary-foreground shadow-lg transition-all",
@@ -2678,13 +2700,13 @@ function ThinkingRow({ text }: { text: string }) {
           </span>
         )}
       </button>
-      {open && (
+      <AnimatedReveal open={open} speed="fast">
         <div className="border-t border-border/60 px-2.5 py-2">
           <div className="prose-chat prose-session-log text-xs text-muted-foreground">
             <LogMarkdown>{text}</LogMarkdown>
           </div>
         </div>
-      )}
+      </AnimatedReveal>
     </div>
   );
 }
@@ -2695,7 +2717,10 @@ function RunningFooter({ count, isRunning }: { count: number; isRunning?: boolea
       {isRunning === true ? (
         <>
           <span className="sl-orb size-[9px] shrink-0 rounded-full bg-status-active" aria-hidden />
-          <span className="font-medium text-foreground">Agent is working…</span>
+          {/* Shimmer = the semantic liveness signal (DESIGN.md § Motion): this
+              footer is the one always-visible "agent is live" line per open
+              task, so it carries the treatment. */}
+          <span className="shimmer-text font-medium">Agent is working…</span>
         </>
       ) : isRunning === false ? (
         <>

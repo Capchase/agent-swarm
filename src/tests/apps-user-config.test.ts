@@ -261,6 +261,12 @@ describe("userConfig HTTP storage", () => {
     expect((await put({ density: "spacious" })).status).toBe(400);
     expect((await put({ pageSize: "20" })).status).toBe(400);
     expect((await put({ absent: true })).status).toBe(400);
+    // Prototype-named fields are ordinary unknown fields (400) — the reserved-
+    // key map lookup must not resolve inherited Object.prototype members
+    // (`.test()` on a function threw, turning bad input into a 500; a null
+    // value even skipped validation and was stored).
+    expect((await put({ toString: "x" })).status).toBe(400);
+    expect((await put({ hasOwnProperty: null })).status).toBe(400);
     expect((await put({ title: "x".repeat(16 * 1024) })).status).toBe(413);
     expect(
       (
@@ -498,5 +504,48 @@ describe("mergeUserConfigValues", () => {
       visible: true,
       pageSize: 20,
     });
+  });
+
+  test("preserves a valid reserved $theme and drops an invalid one", () => {
+    expect(
+      mergeUserConfigValues(
+        { title: { kind: "string", default: "default" } },
+        { title: "kept", $theme: "cobalt" },
+      ),
+    ).toEqual({ title: "kept", $theme: "cobalt" });
+    expect(mergeUserConfigValues({}, { $theme: "Not A Slug", $unknown: "dropped" })).toEqual({});
+  });
+});
+
+describe("app theme", () => {
+  test("definition accepts a slug theme, rejects malformed ones, and suggests the key", () => {
+    expect(parseAppDefinition({ ...definition(), theme: "cobalt" }).success).toBe(true);
+    expectDefinitionIssue({ ...definition(), theme: "Not A Slug" }, "must be a lowercase slug");
+    expectDefinitionIssue({ ...definition(), styling: "cobalt" }, 'did you mean "theme"');
+  });
+
+  test("PUT accepts the reserved $theme alongside declared fields and round-trips it", async () => {
+    const saved = await put({ $theme: "ember", density: "compact" });
+    expect(saved.status).toBe(200);
+    expect(saved.body.values).toMatchObject({ $theme: "ember", density: "compact" });
+    expect((await get()).body.values).toMatchObject({ $theme: "ember" });
+    expect((await put({ $theme: "Not A Slug" })).status).toBe(400);
+  });
+
+  test("no-schema apps accept reserved-only writes but keep the historical 400 otherwise", async () => {
+    getDb().run("DELETE FROM apps");
+    appId = await createFixture(null);
+    expect((await put({})).status).toBe(400);
+    expect((await put({ title: "author key" })).status).toBe(400);
+    expect((await put({ $theme: "ember", title: "author key" })).status).toBe(400);
+    const saved = await put({ $theme: "ember" });
+    expect(saved.status).toBe(200);
+    expect(saved.body.values).toEqual({ $theme: "ember" });
+    expect((await get()).body.values).toEqual({ $theme: "ember" });
+    // Explicit clear: null is accepted and the merged read drops the key.
+    const cleared = await put({ $theme: null });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.values).toEqual({});
+    expect((await get()).body.values).toEqual({});
   });
 });

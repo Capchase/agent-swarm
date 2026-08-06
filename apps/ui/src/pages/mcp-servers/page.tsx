@@ -28,6 +28,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import { formatRelativeTime } from "@/lib/utils";
 
@@ -196,7 +197,7 @@ function TransportBadge({ transport }: { transport: string }) {
 
 function AuthMethodBadge({ method }: { method: string }) {
   const colors: Record<string, string> = {
-    static: "border-status-neutral/30 text-status-neutral",
+    static: "border-status-neutral/30 text-status-neutral-strong",
     oauth: "border-action-delegate-to-agent/30 text-action-delegate-to-agent",
     auto: "border-action-raw-llm/30 text-action-raw-llm",
   };
@@ -209,9 +210,9 @@ function AuthMethodBadge({ method }: { method: string }) {
 
 function ScopeBadge({ scope }: { scope: string }) {
   const colors: Record<string, string> = {
-    global: "border-status-success/30 text-status-success",
-    swarm: "border-status-active/30 text-status-active",
-    agent: "border-status-neutral/30 text-status-neutral",
+    global: "border-status-success/30 text-status-success-strong",
+    swarm: "border-status-active/30 text-status-active-strong",
+    agent: "border-status-neutral/30 text-status-neutral-strong",
   };
   return (
     <Badge variant="outline" size="tag" className={`${colors[scope] || ""}`}>
@@ -298,8 +299,8 @@ export default function McpServersPage() {
             size="tag"
             className={`${
               params.value
-                ? "border-status-success/30 text-status-success"
-                : "border-status-error/30 text-status-error"
+                ? "border-status-success/30 text-status-success-strong"
+                : "border-status-error/30 text-status-error-strong"
             }`}
           >
             {params.value ? "Enabled" : "Disabled"}
@@ -325,16 +326,7 @@ export default function McpServersPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
-      <PageHeader
-        title="MCP Servers"
-        className="shrink-0"
-        action={
-          <Button onClick={() => setCreateOpen(true)}>
-            <Plus className="size-4" />
-            Add Server
-          </Button>
-        }
-      />
+      <PageHeader title="MCP Servers" className="shrink-0" />
 
       <div className="flex items-center gap-3 shrink-0">
         <Input
@@ -381,6 +373,20 @@ export default function McpServersPage() {
             <SelectItem value="agent">Agent</SelectItem>
           </SelectContent>
         </Select>
+        {/* Add lives in the toolbar as a bare "+" — no lone header action row. */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="icon"
+              className="size-8 ml-auto"
+              onClick={() => setCreateOpen(true)}
+              aria-label="Add server"
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Add server</TooltipContent>
+        </Tooltip>
       </div>
 
       <DataGrid

@@ -4,6 +4,7 @@ import { useAgent } from "@/api/hooks/use-agents";
 import { useApprovalRequest } from "@/api/hooks/use-approval-requests";
 import { useApp } from "@/api/hooks/use-apps";
 import { useMcpServer } from "@/api/hooks/use-mcp-servers";
+import { useMetricDefinition } from "@/api/hooks/use-metric-definitions";
 import { usePage } from "@/api/hooks/use-pages";
 import { useRepo } from "@/api/hooks/use-repos";
 import { useScheduledTask } from "@/api/hooks/use-schedules";
@@ -21,6 +22,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useCurrentUser } from "@/contexts/current-user-context";
 import { INTEGRATIONS } from "@/lib/integrations-catalog";
 import { cn, sessionDisplayTitle } from "@/lib/utils";
 
@@ -76,6 +78,27 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 // Pages use 32-char random-hex IDs (`lower(hex(randomblob(16)))`), not UUIDs.
 const HEX32_REGEX = /^[0-9a-f]{32}$/i;
 
+/** Fallback for segments without a routeLabels entry: kebab-case → Title Case
+ * ("embed-test" → "Embed Test"). Keeps unknown routes readable without having
+ * to register every new path here; routeLabels stays for names automatic
+ * casing can't produce ("mcp-servers" → "MCP Servers", "keys" → "API Keys"). */
+function humanizeSegment(segment: string): string {
+  // Malformed percent escapes ("/%", "/apps/%ZZ") make decodeURIComponent
+  // throw — and the header renders OUTSIDE the route error boundary, so an
+  // uncaught URIError here would take down the whole shell. Show the raw
+  // segment instead.
+  let decoded = segment;
+  try {
+    decoded = decodeURIComponent(segment);
+  } catch {
+    // keep the raw segment
+  }
+  return decoded
+    .split("-")
+    .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : word))
+    .join(" ");
+}
+
 function formatSegment(segment: string, prevSegment?: string): string {
   if (routeLabels[segment]) return routeLabels[segment];
   if (prevSegment === "integrations" && INTEGRATION_NAME_BY_ID[segment]) {
@@ -84,7 +107,7 @@ function formatSegment(segment: string, prevSegment?: string): string {
   if (UUID_REGEX.test(segment) || HEX32_REGEX.test(segment)) {
     return `${segment.slice(0, 8)}...`;
   }
-  return segment;
+  return humanizeSegment(segment);
 }
 
 /** True when a path segment looks like an entity id (UUID or 32-char hex). */
@@ -92,17 +115,18 @@ function isEntityId(segment: string | undefined): boolean {
   return !!segment && (UUID_REGEX.test(segment) || HEX32_REGEX.test(segment));
 }
 
-/** Cap a contextual breadcrumb name at a safe length, appending an ellipsis. */
-const CONTEXTUAL_NAME_MAX = 40;
-function capContextualName(name: string): string {
-  const trimmed = name.trim();
-  if (trimmed.length <= CONTEXTUAL_NAME_MAX) return trimmed;
-  return `${trimmed.slice(0, CONTEXTUAL_NAME_MAX)}…`;
-}
+// Contextual names are NOT length-capped in JS (a 40-char cap ellipsized long
+// ago before the header ran out of room — Taras). The trail takes the header's
+// free space (flex-1 in AppHeader) and CSS `truncate` clips only when the
+// space is actually exhausted; mobile always has the dropdown fallback.
 
 export function Breadcrumbs() {
   const location = useLocation();
   const segments = location.pathname.split("/").filter(Boolean);
+  // Home shows the greeting in the breadcrumb slot (there is no trail to
+  // draw and no in-page h1 anymore). Called before the early return so hook
+  // order stays stable across routes.
+  const { user } = useCurrentUser();
 
   // Detail routes (/<parent>/:id[/...]) get a contextual leaf name fetched
   // from the matching single-entity hook instead of the truncated raw id.
@@ -139,7 +163,20 @@ export function Breadcrumbs() {
   const { data: approvalMeta } = useApprovalRequest(idFor("approval-requests"));
   const { data: connectionMeta } = useScriptConnection(idFor("connections") || undefined);
 
-  if (segments.length === 0) return null;
+  // `/usage/metrics/:id` — the one detail id at segment index 2. Resolved
+  // here (like the index-1 entities above) because `PageHeader` drops string
+  // titles: without this the dashboard's name would appear nowhere.
+  const metricId =
+    parent === "usage" && segments[1] === "metrics" && segments[2] ? segments[2] : undefined;
+  const { data: metricMeta } = useMetricDefinition(metricId);
+
+  if (segments.length === 0) {
+    return (
+      <span className="min-w-0 truncate text-sm font-medium text-foreground">
+        {user?.name ? `Welcome back, ${user.name}` : "Welcome to Agent Swarm"}
+      </span>
+    );
+  }
 
   // Resolve the contextual name for the detail-id segment, if any. Falls back
   // to `undefined` (→ truncated-id display) while the entity is still loading.
@@ -195,10 +232,13 @@ export function Breadcrumbs() {
       // id segment at index 1 is replaced — other path segments keep their
       // routeLabels behavior.
       if (index === 1 && segment === detailId && contextualName) {
-        label = capContextualName(contextualName);
+        label = contextualName.trim();
       }
       if (index === 3 && appPageTitle) {
-        label = capContextualName(appPageTitle);
+        label = appPageTitle.trim();
+      }
+      if (index === 2 && metricId && segment === metricId && metricMeta?.title) {
+        label = metricMeta.title.trim();
       }
       const isLast = index === segments.length - 1;
 

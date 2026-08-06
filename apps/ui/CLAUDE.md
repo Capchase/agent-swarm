@@ -81,7 +81,7 @@ Use `variant="destructive-outline"` on `Button` for red-outlined destructive act
 <Button variant="destructive-outline" size="sm">Delete</Button>
 ```
 
-Do not re-inline the underlying classes (`border-status-error/30 text-status-error hover:bg-status-error/10`) or — worse — raw palette literals (`border-red-500/30 text-red-400 hover:bg-red-500/10`); the lint gate fails the build on the latter. Pair with `AlertDialog` for confirmation.
+Do not re-inline the underlying classes (`border-status-error/30 text-status-error-strong hover:bg-status-error/10`) or — worse — raw palette literals (`border-red-500/30 text-red-400 hover:bg-red-500/10`); the lint gate fails the build on the latter. Pair with `AlertDialog` for confirmation.
 
 </important>
 
@@ -100,17 +100,21 @@ Brand-kit divergences are tracked in [`thoughts/taras/research/2026-05-06-design
 ## Theming
 
 - **Never hardcode dark-mode colors** (no `bg-zinc-950`, `text-zinc-400`, etc.). Use CSS variable classes: `bg-background`, `bg-muted`, `text-foreground`, `text-muted-foreground`, `border-border`, `bg-accent`.
+- **Two-tier lines.** Non-structural lines — `Separator`, `divide-y` row rules, data-grid row borders — sit on the subtle tier: `divide-border-subtle` / `bg-border-subtle` / `border-border-subtle`. Card outlines and inputs keep full `border-border` / `border-input` (the stronger stop is the affordance). See DESIGN.md § Elevation.
 - **Amber** is brand `--primary` — use it for interactive / active states only.
 - **Status colors come from named semantic tokens** — `bg-status-success`, `text-status-error`, `bg-status-active`, etc. — defined in `src/styles/globals.css` (light + dark). Action-type colors (workflow nodes) come from `bg-action-*` tokens. **Do not** use raw Tailwind palette literals (`bg-emerald-500`, `text-amber-400`, `border-red-500/30`, etc.) in app code. Translucent fills use the standard Tailwind opacity syntax: `bg-status-success/10`, `border-action-script/50`.
 - **Color literal lint gate.** `bun run check:tokens` (also runs in CI via `merge-gate.yml`'s `ui-lint` job) fails the build on any raw Tailwind color palette literal, `dark:` palette variant, arbitrary color literal (e.g. `bg-[#0d1117]`), or hardcoded hex in `src/`. To use a new color, add a token to `src/styles/globals.css`. Monaco editor themes are exempt and live in `src/lib/monaco-themes.ts`.
 - CSS variables defined in `src/styles/globals.css`; AG Grid themed via `src/styles/ag-grid.css`.
+- **Theme presets** live in `src/lib/themes.ts` (+ `src/lib/theme-classics.ts` for the classic editor themes): named bundles of token overrides emitted as `[data-theme="<id>"]` rules (light + dark), applied on `<html>` (Settings → Appearance, localStorage) or scoped to one swarm-app canvas (`definition.theme` + the viewer's reserved `$theme` user-config override). Emitted blocks are SELF-CONTAINED (the builder spreads the stock base under each preset's overrides), so a scoped preset fully resets its canvas instead of blending with the dashboard preset; `hive` scoped = explicit reset to stock, NO attribute = inherit the dashboard. Action/destructive tokens are never themed; status tokens are themed ONLY by the classic presets (hue semantics fixed). The preset id list is duplicated in two agent-facing texts — `templates/skills/apps/content.md` and the `app-upsert` tool description — update them when the catalog changes.
+- **Clickable = pointer** is enforced globally in `globals.css` (`button:not(:disabled)`, `[role="button"]`, `summary`, …) — never add per-component `cursor-pointer` again; disabled controls keep the default cursor. Exception: buttons inside the global sidebar (`[data-slot="sidebar-container"]`) keep the default arrow (Taras's call — nav-rail feel); its nav anchors stay pointer natively.
+- **Colorless borders are themed.** A base rule defaults `border-color` to `var(--color-border)` (Tailwind v4 otherwise leaves bare `border`/`border-r` utilities on `currentColor` — near-black in light, and blind to theme presets). Explicit `border-<color>` utilities still win; anything needing a text-colored border must say `border-current`. Dark overrides in `globals.css` MUST stay on `.dark` alone (never `.dark *`) or scoped wrappers break; portalled content inside an app canvas re-stamps `data-theme` via `useJsonRenderThemeAttr()` from `src/lib/json-render/theme-scope.tsx`.
 - Use `cn()` from `@/lib/utils` for conditional class merging.
 
 ### Semantic token reference
 
 Status tokens (cover the 18 statuses in `status-badge.tsx`'s `statusConfig` map plus a few extras used by integrations and workflow runs).
 
-`-strong` variants exist for text emphasis on neutral surfaces (one Tailwind stop darker in light mode for contrast). Use `bg-status-X` for fills, `text-status-X-strong` for emphasis text on cards/pages. In dark mode the `-strong` variant collapses to the same `*-400` stop as the canonical token — pixel parity preserved across the existing `bg-{color}-500 + text-{color}-600 dark:text-{color}-400` literal pattern.
+`-strong` variants exist for text emphasis on neutral surfaces (darker in light mode for contrast). Use `bg-status-X` for fills, `text-status-X-strong` for emphasis text on cards/pages. In dark mode `-strong` collapses to the canonical value. **2026-08-06: the palette migrated to the PALE set** (same hues, ~40% less chroma, lifted lightness; fills take dark `-foreground` text in both modes) — the `*-500`/`*-400` source columns below describe the original derivation only; current values live in `src/styles/globals.css`. Classic-theme presets (`src/lib/theme-classics.ts`) carry their own status palettes — the only sanctioned status theming; hue semantics never change.
 
 | Token | Usage | Light source | Dark source |
 |---|---|---|---|
@@ -128,7 +132,8 @@ Status tokens (cover the 18 statuses in `status-badge.tsx`'s `statusConfig` map 
 | `status-warning-strong` | warning-state text emphasis | orange-600 | orange-400 |
 | `status-paused` | paused, reviewing (fill) | blue-500 | blue-400 |
 | `status-paused-strong` | paused-state text emphasis | blue-600 | blue-400 |
-| `status-neutral` | offline, backlog, unassigned, cancelled, stopped, skipped | zinc-500 | zinc-400 |
+| `status-neutral` | offline, backlog, unassigned, cancelled, stopped, skipped (fill) | zinc-500 | zinc-400 |
+| `status-neutral-strong` | neutral-state text emphasis | zinc-600 | zinc-400 |
 
 Action-type tokens (workflow node types from `components/workflows/action-node.tsx` and `condition-node.tsx`):
 
@@ -147,6 +152,22 @@ Action-type tokens (workflow node types from `components/workflows/action-node.t
 | `action-raw-llm` | `raw-llm` (condition) | sky-500 | sky-400 |
 
 Each status token has a paired `-foreground` for legible text on the colored fill (e.g. `text-status-success-foreground`). Action tokens do not — workflow nodes pair the colored token with `bg-action-X/10` (translucent fill) and `text-action-X` (text + border).
+
+</important>
+
+<important if="you are adding animation, transitions, easing, or an animated icon in ui">
+
+## Motion
+
+Doctrine lives in [DESIGN.md § Motion](./DESIGN.md) — read it first. Hard points: <300ms budget, exits faster than enters, `ease-swift`/`ease-snappy` tokens (never `ease-in`), transform/opacity only, no animation on keyboard-driven or high-frequency interactions, `MotionConfig reducedMotion="user"` is already mounted in `app/providers.tsx`.
+
+Standard timings (all `ease-snappy` unless noted): Dialog/AlertDialog 200ms in / 150ms out; Popover/DropdownMenu/Select/Tooltip 150ms in / 100ms out; Sheet/Drawer 400/250 on `ease-swift` (the large-surface exception); collapse/reveal via the shared `AnimatedReveal` (`components/shared/animated-reveal.tsx`) — 200/150 default (`CollapsibleSection`, settings rail), 150/120 `speed="fast"` for frequently-toggled surfaces like session-log expanders (click-driven toggles animate; data CHANGES never do); global sidebar rail width/left 200ms on `ease-swift` (the stock shadcn `ease-linear` is banned — no linear easing anywhere except shimmer loops). Keep Radix overlays on the shadcn CSS `animate-in/out` classes — do not rebase them onto motion/react.
+
+`Button` transitions live in the un-layered `[data-slot="button"]` block in `globals.css`, NOT in Tailwind classes: colors follow linger timing while transform presses at 100ms and releases at 200ms. Don't re-add `transition-*` utilities to `button.tsx`; press scale is 0.98 (0.97 on sm/icon sizes, via the size variants). Sidebar nav rows don't press-scale (frequency rule).
+
+Animated icons are vendored into `src/components/icons/` — sources in preference order: lucide-animated (`bunx shadcn@latest add "https://lucide-animated.com/r/<icon>.json"`, then move the file out of the literal `@/` directory the CLI creates), animateicons (`https://animateicons.in/r/lu-<icon>.json`) for gaps, hand-written on the same pattern (exact lucide path data) when neither ships one. Interactive-control and nav-row affordance only — never decorative, never in data rows (tables, logs, per-record lists). When the icon sits in a larger click target, drive it from the container via the `startAnimation`/`stopAnimation` handle ref (see `NavIconLink`). Icon variants must be transform-based — never animate `pathLength`/`opacity` from 0 (draw-ins blank the glyph on quick pass-overs; retune registry icons that ship one — see DESIGN.md § Motion "Animated icons").
+
+Hover timing is asymmetric: pointer-hover surfaces enter instantly and release softly via the `.hover-linger` utility (timing-only; composes with the element's `transition-property`; never on keyboard-driven highlights or transform transitions — `Button` gets the same color timing through its own per-property block instead) — see DESIGN.md § Motion "linger rule".
 
 </important>
 
@@ -213,7 +234,7 @@ Pages and composed components are built from primitives. Raw `<div>` layouts tha
 | `InfoRow`, `DefinitionList` | uppercase-label + value pair, used in detail pages | `<DefinitionList><InfoRow label="Role">Engineer</InfoRow></DefinitionList>` |
 | `Input` | text input | `<Input id="name" value={v} onChange={...} />` |
 | `Label` | form-control label (use inside `SettingsRow`) | `<Label htmlFor="name">Name</Label>` |
-| `PageHeader` | route-page top heading (title + optional description + optional action) | `<PageHeader title="Tasks" action={<Button>New</Button>} />` |
+| `PageHeader` | route-page description + action row. Plain-string `title`s are NOT rendered (the breadcrumb owns page identity) — keep passing them anyway; only ReactNode titles render (badges, back buttons, editable names). On LIST pages with a filter/toolbar row, don't park a lone action here — render it as an icon Button + Tooltip at the toolbar's right end (see tasks/skills/mcp-servers/connections) | `<PageHeader title="Pages" description="…" />` |
 | `Progress` | linear progress bar | `<Progress value={75} />` |
 | `ScrollArea`, `ScrollBar` | scrollable container with custom scrollbar | `<ScrollArea className="h-72">...</ScrollArea>` |
 | `Select`, `SelectTrigger`, `SelectValue`, `SelectContent`, `SelectItem` | dropdown select | `<Select value={v} onValueChange={...}><SelectTrigger>...</SelectTrigger>...` |
@@ -239,7 +260,7 @@ Pages and composed components are built from primitives. Raw `<div>` layouts tha
 | `CollapsibleSection` | folding section header | `<CollapsibleSection title="Details">...</CollapsibleSection>` |
 | `CommandMenu` | global ⌘K palette | mounted at root |
 | `DataGrid` | AG Grid wrapper — REQUIRED for all data lists | `<DataGrid rowData={rows} columnDefs={cols} />` |
-| `EmptyState` | icon + title + description + optional action for empty lists | `<EmptyState icon={Inbox} title="No tasks" description="..." />` |
+| `EmptyState` | icon + title + description + optional action. First-run page empties add `entity` (renders an "Ask the swarm" CTA that seeds a new session) + `fullPage` (vertical centering) | `<EmptyState icon={Inbox} title="No tasks yet" description="..." entity="task" fullPage />` |
 | `ErrorBoundary` | top-level error fallback | wrap routes |
 | `JsonViewer` | collapsible JSON tree with copy | `<JsonViewer data={obj} />` |
 | `NameConnectionModal` | first-time connection naming | mounted on first connect |
@@ -257,7 +278,7 @@ If you find yourself writing `<div className="flex items-center gap-2">` or `<di
 ### Detail-page layout convention
 
 Detail pages (`pages/*/[id]/page.tsx`) follow the brand-kit's `preview/detail-page-template.html` contract:
-- Header: `<PageHeader />` (title, badges, primary actions). Single destructive actions (Delete) go in the header alongside other primary actions — they are first-class operations, not buried below the fold.
+- Header: `<PageHeader />` (badges, primary actions — the entity NAME belongs to the breadcrumb, so don't re-render it in an h1 when the breadcrumb resolves it). Single destructive actions (Delete) go in the header alongside other primary actions — they are first-class operations, not buried below the fold.
 - Body: `<DetailPageBody main={...} rail={<DetailPageRail>…</DetailPageRail>} />`. Right rail is fixed 280px; below `lg` the rail stacks below main.
 - Rail sections, in order: `<QuickStats>` (k/v at-a-glance) → `<Relationships>` (linked entities, arrow link) → `<DangerZone>` (full-width destructive button — use only when a page has multiple destructive actions or the action is genuinely supplementary, e.g. an irreversible reset paired with a primary save).
 

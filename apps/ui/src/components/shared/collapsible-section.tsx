@@ -1,5 +1,6 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronRight } from "lucide-react";
 import { useState } from "react";
+import { AnimatedReveal } from "@/components/shared/animated-reveal";
 import { cn } from "@/lib/utils";
 
 /**
@@ -68,6 +69,16 @@ export function CollapsibleSection({
     }
   };
 
+  const chevron = (
+    <ChevronRight
+      className={cn(
+        "h-3 w-3 shrink-0 transition-transform duration-150 ease-snappy motion-reduce:transition-none",
+        open && "rotate-90",
+        variant === "card" ? iconColor : "text-muted-foreground",
+      )}
+    />
+  );
+
   if (variant === "card") {
     return (
       <div className={cn("rounded-md border shrink-0", borderColor, bgColor, className)}>
@@ -76,16 +87,14 @@ export function CollapsibleSection({
           onClick={toggle}
           className="flex items-center gap-2 w-full px-3 py-2 text-left"
         >
-          {open ? (
-            <ChevronDown className={cn("h-3 w-3 shrink-0", iconColor)} />
-          ) : (
-            <ChevronRight className={cn("h-3 w-3 shrink-0", iconColor)} />
-          )}
+          {chevron}
           {Icon && <Icon className={cn("h-3.5 w-3.5 shrink-0", iconColor)} />}
           <span className={cn("text-xs font-semibold", iconColor)}>{title}</span>
           {badge}
         </button>
-        {open && <div className="px-3 pb-2.5">{children}</div>}
+        <AnimatedReveal open={open}>
+          <div className="px-3 pb-2.5">{children}</div>
+        </AnimatedReveal>
       </div>
     );
   }
@@ -93,18 +102,14 @@ export function CollapsibleSection({
   return (
     <div className={cn("space-y-1", className)}>
       <button type="button" onClick={toggle} className="flex items-center gap-1.5 text-left group">
-        {open ? (
-          <ChevronDown className="h-3 w-3 text-muted-foreground" />
-        ) : (
-          <ChevronRight className="h-3 w-3 text-muted-foreground" />
-        )}
+        {chevron}
         {Icon && <Icon className={cn("h-3 w-3 text-muted-foreground", iconColor)} />}
         <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
           {title}
         </span>
         {badge}
       </button>
-      {open && children}
+      <AnimatedReveal open={open}>{children}</AnimatedReveal>
     </div>
   );
 }

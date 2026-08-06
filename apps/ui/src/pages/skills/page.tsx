@@ -31,9 +31,9 @@ function TypeBadge({ type }: { type: string }) {
 
 function ScopeBadge({ scope }: { scope: string }) {
   const colors: Record<string, string> = {
-    global: "border-status-success/30 text-status-success",
-    swarm: "border-status-active/30 text-status-active",
-    agent: "border-status-neutral/30 text-status-neutral",
+    global: "border-status-success/30 text-status-success-strong",
+    swarm: "border-status-active/30 text-status-active-strong",
+    agent: "border-status-neutral/30 text-status-neutral-strong",
   };
   return (
     <Badge variant="outline" size="tag" className={`${colors[scope] || ""}`}>
@@ -47,7 +47,7 @@ function SystemDefaultBadge() {
     <Badge
       variant="outline"
       size="tag"
-      className="border-status-info/30 text-status-info inline-flex items-center gap-1"
+      className="border-status-info/30 text-status-info-strong inline-flex items-center gap-1"
     >
       <ShieldCheck className="h-3 w-3" />
       System
@@ -141,8 +141,8 @@ export default function SkillsPage() {
             size="tag"
             className={`${
               params.value
-                ? "border-status-success/30 text-status-success"
-                : "border-status-error/30 text-status-error"
+                ? "border-status-success/30 text-status-success-strong"
+                : "border-status-error/30 text-status-error-strong"
             }`}
           >
             {params.value ? "Enabled" : "Disabled"}
@@ -168,21 +168,7 @@ export default function SkillsPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
-      <PageHeader
-        className="shrink-0"
-        title="Skills"
-        action={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => syncRemote.mutate({})}
-            disabled={syncRemote.isPending}
-          >
-            <RefreshCw className={`h-4 w-4 mr-2 ${syncRemote.isPending ? "animate-spin" : ""}`} />
-            Sync Remote
-          </Button>
-        }
-      />
+      <PageHeader className="shrink-0" title="Skills" />
 
       <div className="flex items-center gap-3 shrink-0">
         <Input
@@ -222,14 +208,23 @@ export default function SkillsPage() {
             <SelectItem value="agent">Agent</SelectItem>
           </SelectContent>
         </Select>
+        {/* Sync lives in the toolbar as a bare icon — no lone header action row. */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="outline"
+              size="icon"
+              className="size-8 ml-auto"
+              onClick={() => syncRemote.mutate({})}
+              disabled={syncRemote.isPending}
+              aria-label="Sync remote skills"
+            >
+              <RefreshCw className={`h-4 w-4 ${syncRemote.isPending ? "animate-spin" : ""}`} />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Sync remote skills</TooltipContent>
+        </Tooltip>
       </div>
-      {skills.some((skill) => skill.systemDefault) && (
-        <p className="text-xs text-muted-foreground shrink-0">
-          System skills are managed by the swarm and re-seeded on start. Fork one under a new name
-          to customize its content.
-        </p>
-      )}
-
       <DataGrid
         rowData={skills}
         columnDefs={columnDefs}

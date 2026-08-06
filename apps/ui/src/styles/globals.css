@@ -20,11 +20,19 @@
   --color-secondary-foreground: oklch(0.21 0.006 285.885);
   --color-muted: oklch(0.967 0.001 286.375);
   --color-muted-foreground: oklch(0.552 0.016 285.938);
-  --color-accent: oklch(0.967 0.001 286.375);
+  /* Accent is the interactive hover/highlight fill — one step darker than
+     muted (zinc-100 → ~zinc-150): at zinc-100 on a white field the hover was
+     a 3% lightness step, effectively invisible. Muted stays zinc-100 for
+     quiet resting surfaces. */
+  --color-accent: oklch(0.943 0.003 286.375);
   --color-accent-foreground: oklch(0.21 0.006 285.885);
   --color-destructive: oklch(0.577 0.245 27.325);
   --color-destructive-foreground: oklch(0.985 0 0);
   --color-border: oklch(0.92 0.004 286.32);
+  /* Subtle tier of the two-tier line system: separators, row rules, grid
+     lines. Structural outlines (cards, inputs) stay on `border` — the full
+     stop keeps the affordance read. */
+  --color-border-subtle: oklch(0.945 0.003 286);
   --color-input: oklch(0.92 0.004 286.32);
   --color-ring: oklch(0.555 0.163 48.998);
   --color-chart-1: oklch(0.646 0.222 41.116);
@@ -36,42 +44,47 @@
   --color-sidebar-foreground: oklch(0.141 0.005 285.823);
   --color-sidebar-primary: oklch(0.555 0.163 48.998);
   --color-sidebar-primary-foreground: oklch(0.985 0 0);
-  --color-sidebar-accent: oklch(0.967 0.001 286.375);
+  --color-sidebar-accent: oklch(0.943 0.003 286.375);
   --color-sidebar-accent-foreground: oklch(0.21 0.006 285.885);
-  --color-sidebar-border: oklch(0.92 0.004 286.32);
+  /* Sidebar chrome lines live on the subtle tier: the panel reads as a tonal
+     plane (bg step + quiet rules), not a boxed column. */
+  --color-sidebar-border: oklch(0.945 0.003 286);
   --color-sidebar-ring: oklch(0.555 0.163 48.998);
 
-  /* Semantic status tokens — light mode
-     Source: existing utility OKLCH literals being replaced (see audit doc).
-     Canonical token = fill stop (matches `bg-{color}-500` literals).
-     `-strong` variant = text-emphasis stop (one Tailwind stop darker for
-     contrast on neutral surfaces — matches `text-{color}-600` literals).
-     `-foreground` variant = legible text on the colored fill.
-     Pixel parity preserved: existing `bg-{color}-500 + text-{color}-600`
-     pairs migrate to `bg-status-X + text-status-X-strong`. */
-  --color-status-success: oklch(0.696 0.17 162.48);          /* emerald-500 */
-  --color-status-success-strong: oklch(0.596 0.145 163.225); /* emerald-600 */
-  --color-status-success-foreground: oklch(0.985 0 0);
-  --color-status-active: oklch(0.769 0.188 70.08);           /* amber-500 */
-  --color-status-active-strong: oklch(0.666 0.179 58.318);   /* amber-600 */
-  --color-status-active-foreground: oklch(0.141 0.005 285.823);
-  --color-status-error: oklch(0.637 0.237 25.331);           /* red-500 */
-  --color-status-error-strong: oklch(0.577 0.245 27.325);    /* red-600 */
-  --color-status-error-foreground: oklch(0.985 0 0);
-  --color-status-info: oklch(0.685 0.169 237.323);           /* sky-500 */
-  --color-status-info-strong: oklch(0.588 0.158 241.966);    /* sky-600 */
-  --color-status-info-foreground: oklch(0.985 0 0);
-  --color-status-pending: oklch(0.795 0.184 86.047);         /* yellow-500 */
-  --color-status-pending-strong: oklch(0.681 0.162 75.834);  /* yellow-600 */
-  --color-status-pending-foreground: oklch(0.141 0.005 285.823);
-  --color-status-warning: oklch(0.705 0.213 47.604);         /* orange-500 */
-  --color-status-warning-strong: oklch(0.646 0.222 41.116);  /* orange-600 */
-  --color-status-warning-foreground: oklch(0.985 0 0);
-  --color-status-paused: oklch(0.623 0.214 259.815);         /* blue-500 */
-  --color-status-paused-strong: oklch(0.546 0.245 262.881);  /* blue-600 */
-  --color-status-paused-foreground: oklch(0.985 0 0);
-  --color-status-neutral: oklch(0.552 0.016 285.938);        /* zinc-500 */
-  --color-status-neutral-foreground: oklch(0.985 0 0);
+  /* Semantic status tokens — light mode. PALE SET (2026-08-06, Taras-approved
+     board): same hues as the original Tailwind-500 stops, ~40% less chroma,
+     lifted lightness — status reads as a quiet annotation on the zinc field,
+     not a saturated shout. Canonical token = fill; `-strong` = text emphasis
+     on neutral surfaces (darker, contrast-safe); `-foreground` = text ON the
+     fill — dark now, because the fills are pale. */
+  --color-status-success: oklch(0.74 0.1 163);
+  --color-status-success-strong: oklch(0.5 0.09 163);
+  --color-status-success-foreground: oklch(0.21 0.006 285.885);
+  --color-status-active: oklch(0.81 0.11 75);
+  --color-status-active-strong: oklch(0.55 0.1 68);
+  --color-status-active-foreground: oklch(0.21 0.006 285.885);
+  --color-status-error: oklch(0.72 0.12 25);
+  --color-status-error-strong: oklch(0.51 0.14 25);
+  --color-status-error-foreground: oklch(0.21 0.006 285.885);
+  --color-status-info: oklch(0.74 0.09 235);
+  --color-status-info-strong: oklch(0.5 0.09 240);
+  --color-status-info-foreground: oklch(0.21 0.006 285.885);
+  --color-status-pending: oklch(0.84 0.1 95);
+  --color-status-pending-strong: oklch(0.55 0.09 90);
+  --color-status-pending-foreground: oklch(0.21 0.006 285.885);
+  --color-status-warning: oklch(0.76 0.11 55);
+  --color-status-warning-strong: oklch(0.53 0.11 50);
+  --color-status-warning-foreground: oklch(0.21 0.006 285.885);
+  --color-status-paused: oklch(0.71 0.1 262);
+  --color-status-paused-strong: oklch(0.5 0.1 262);
+  --color-status-paused-foreground: oklch(0.21 0.006 285.885);
+  /* Neutral doubles as small text in places, so it stays a touch darker than
+     the board sketch (0.65) for contrast on white. Like every pale fill it
+     takes the dark foreground; the near-white one it launched with sat at
+     ~2:1 over a light field. */
+  --color-status-neutral: oklch(0.62 0.014 286);
+  --color-status-neutral-strong: oklch(0.48 0.014 286);
+  --color-status-neutral-foreground: oklch(0.21 0.006 285.885);
 
   /* Action-type tokens — light mode
      Source: components/workflows/action-node.tsx L18-L72 and
@@ -94,20 +107,32 @@
   --color-action-code-match: oklch(0.795 0.184 86.047);       /* yellow-500 — condition */
   --color-action-raw-llm: oklch(0.685 0.169 237.323);         /* sky-500 — condition */
 
+  /* Motion — the two named curves of the motion doctrine (DESIGN.md § Motion).
+     swift: the iOS-sheet curve, for large surfaces (sheets, drawers).
+     snappy: fast-start ease-out, for small user-initiated UI (menus, reveals). */
+  --ease-swift: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-snappy: cubic-bezier(0.2, 0, 0, 1);
+
   /* Fonts */
   --font-sans: "Space Grotesk", sans-serif;
   --font-mono: "Space Mono", monospace;
 
-  /* Border radius — shadcn/ui default */
+  /* Border radius — shadcn/ui default, except `xl` tuned 12px → 10px so
+     cards read tighter and more technical; controls stay 8px, tags 6px. */
   --radius-sm: 0.375rem;
   --radius-md: 0.5rem;
   --radius-lg: 0.625rem;
-  --radius-xl: 0.75rem;
+  --radius-xl: 0.625rem;
 }
 
-/* Dark mode overrides */
-.dark,
-.dark * {
+/* Dark mode overrides.
+ *
+ * Scoped to `.dark` ONLY (values reach descendants through custom-property
+ * inheritance). Do NOT widen this to `.dark *`: stamping the variables onto
+ * every element would override the inherited values of any scoped theme
+ * wrapper (`[data-theme="..."]` — see `src/lib/themes.ts`), which is how
+ * swarm apps carry a per-app preset. */
+.dark {
   --color-background: oklch(0.141 0.005 285.823);
   --color-foreground: oklch(0.985 0 0);
   --color-card: oklch(0.21 0.006 285.885);
@@ -126,6 +151,7 @@
   --color-destructive: oklch(0.704 0.191 22.216);
   --color-destructive-foreground: oklch(0.985 0 0);
   --color-border: oklch(1 0 0 / 10%);
+  --color-border-subtle: oklch(1 0 0 / 8%);
   --color-input: oklch(1 0 0 / 15%);
   --color-ring: oklch(0.769 0.188 70.08);
   --color-chart-1: oklch(0.488 0.243 264.376);
@@ -139,38 +165,36 @@
   --color-sidebar-primary-foreground: oklch(0.985 0 0);
   --color-sidebar-accent: oklch(0.274 0.006 286.033);
   --color-sidebar-accent-foreground: oklch(0.985 0 0);
-  --color-sidebar-border: oklch(1 0 0 / 10%);
+  --color-sidebar-border: oklch(1 0 0 / 8%);
   --color-sidebar-ring: oklch(0.769 0.188 70.08);
 
-  /* Semantic status tokens — dark mode
-     Match the lighter *-400 palette stops the codebase already uses
-     for `dark:text-*-400` overrides in status-badge.tsx etc.
-     `-strong` variants mirror the canonical *-400 stops in dark mode —
-     existing pairs `bg-{color}-500 + dark:text-{color}-400` and
-     `text-{color}-600 + dark:text-{color}-400` both become
-     `bg-status-X + text-status-X-strong` with identical dark output. */
-  --color-status-success: oklch(0.765 0.177 163.223);        /* emerald-400 */
-  --color-status-success-strong: oklch(0.765 0.177 163.223); /* emerald-400 */
+  /* Semantic status tokens — dark mode. PALE SET (2026-08-06): same hues as
+     the old *-400 stops with chroma pulled down — glows, not neon. `-strong`
+     collapses to the canonical value as before (text and fill share the stop
+     in dark). Foregrounds stay dark-on-fill. */
+  --color-status-success: oklch(0.78 0.1 163);
+  --color-status-success-strong: oklch(0.78 0.1 163);
   --color-status-success-foreground: oklch(0.21 0.006 285.885);
-  --color-status-active: oklch(0.828 0.189 84.429);          /* amber-400 */
-  --color-status-active-strong: oklch(0.828 0.189 84.429);   /* amber-400 */
+  --color-status-active: oklch(0.84 0.1 80);
+  --color-status-active-strong: oklch(0.84 0.1 80);
   --color-status-active-foreground: oklch(0.21 0.006 285.885);
-  --color-status-error: oklch(0.704 0.191 22.216);           /* red-400 */
-  --color-status-error-strong: oklch(0.704 0.191 22.216);    /* red-400 */
+  --color-status-error: oklch(0.74 0.11 22);
+  --color-status-error-strong: oklch(0.74 0.11 22);
   --color-status-error-foreground: oklch(0.21 0.006 285.885);
-  --color-status-info: oklch(0.746 0.16 232.661);            /* sky-400 */
-  --color-status-info-strong: oklch(0.746 0.16 232.661);     /* sky-400 */
+  --color-status-info: oklch(0.78 0.09 235);
+  --color-status-info-strong: oklch(0.78 0.09 235);
   --color-status-info-foreground: oklch(0.21 0.006 285.885);
-  --color-status-pending: oklch(0.852 0.199 91.936);         /* yellow-400 */
-  --color-status-pending-strong: oklch(0.852 0.199 91.936);  /* yellow-400 */
+  --color-status-pending: oklch(0.86 0.09 95);
+  --color-status-pending-strong: oklch(0.86 0.09 95);
   --color-status-pending-foreground: oklch(0.21 0.006 285.885);
-  --color-status-warning: oklch(0.75 0.183 55.934);          /* orange-400 */
-  --color-status-warning-strong: oklch(0.75 0.183 55.934);   /* orange-400 */
+  --color-status-warning: oklch(0.79 0.1 55);
+  --color-status-warning-strong: oklch(0.79 0.1 55);
   --color-status-warning-foreground: oklch(0.21 0.006 285.885);
-  --color-status-paused: oklch(0.707 0.165 254.624);         /* blue-400 */
-  --color-status-paused-strong: oklch(0.707 0.165 254.624);  /* blue-400 */
+  --color-status-paused: oklch(0.74 0.09 260);
+  --color-status-paused-strong: oklch(0.74 0.09 260);
   --color-status-paused-foreground: oklch(0.21 0.006 285.885);
-  --color-status-neutral: oklch(0.705 0.015 286.067);        /* zinc-400 */
+  --color-status-neutral: oklch(0.72 0.012 286);
+  --color-status-neutral-strong: oklch(0.72 0.012 286);
   --color-status-neutral-foreground: oklch(0.21 0.006 285.885);
 
   /* Action-type tokens — dark mode (lighter *-400 stops for legibility) */
@@ -196,12 +220,119 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Tailwind v4 leaves colorless `border-*` utilities on `currentColor`, which
+ * renders near-black hairlines in light mode and ignores theme presets.
+ * Default every border to the themed token instead (the standard shadcn v4
+ * base rule) — explicit `border-<color>` utilities still win. */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-border);
+  }
+}
+
 body {
   margin: 0;
   background: var(--color-background);
   color: var(--color-foreground);
   font-family: var(--font-sans);
   min-height: 100vh;
+}
+
+/* Clickable = pointer, enforced globally. Tailwind v4's preflight leaves
+ * buttons on the UA default cursor; restoring it here means no component ever
+ * needs a per-instance cursor-pointer again (existing ones are redundant, not
+ * harmful). Disabled controls keep the default cursor. */
+button:not(:disabled, [aria-disabled="true"]),
+[role="button"]:not([aria-disabled="true"]),
+input[type="submit"]:not(:disabled),
+input[type="checkbox"]:not(:disabled),
+input[type="radio"]:not(:disabled),
+select:not(:disabled),
+label[for],
+summary {
+  cursor: pointer;
+}
+
+/* Exception (Taras): the global sidebar keeps the pre-rule feel — nav
+ * anchors stay pointer natively, but its buttons (group labels, toggles,
+ * menu buttons) keep the default arrow. The rail (the collapse/expand
+ * border strip) is carved back out: it looks like inert chrome, so it
+ * needs the pointer to signal it's clickable. */
+[data-slot="sidebar-container"] button:not(:disabled, [data-slot="sidebar-rail"]),
+[data-slot="sidebar-container"] [role="button"] {
+  cursor: default;
+}
+
+/* Hover linger — the Linear hover: enter instantly, release softly. A pure
+ * TIMING modifier: it sets duration/easing/delay only, so it composes with
+ * whatever `transition-property` the element already declares
+ * (`transition-colors`, `transition-[width,height,padding,...]`). The base
+ * rule owns the EXIT (slight delay, then a soft fade); the :hover rule zeroes
+ * both so entering is immediate. Un-layered on purpose — it must outrank the
+ * duration set by Tailwind's layered transition utilities.
+ * Do not put this on anything that transitions `transform` (press scale must
+ * stay instant in both directions) or on keyboard-driven highlights. */
+.hover-linger {
+  transition-duration: 200ms;
+  transition-timing-function: var(--ease-snappy);
+  transition-delay: 50ms;
+}
+
+.hover-linger:hover {
+  transition-duration: 0s;
+  transition-delay: 0s;
+}
+
+/* Button motion — the per-property split that lets one control obey two
+ * timing rules at once (DESIGN.md § Motion):
+ *   - colors follow the linger rule: hover states land instantly, release
+ *     through a 50ms delay + 200ms snappy fade;
+ *   - transform (the press scale) is its own channel: pressing is FAST
+ *     (100ms), releasing eases back slightly slower (200ms), and neither
+ *     direction ever inherits the linger delay — a lagging press reads as a
+ *     broken button.
+ * Property order is significant: the duration/delay lists below map
+ * positionally onto `transition-property`. Un-layered, like `.hover-linger`,
+ * so it outranks Tailwind's layered transition utilities. `button.tsx` owns
+ * WHAT changes (variant colors, active:scale); this block owns only WHEN. */
+[data-slot="button"] {
+  transition-property: color, background-color, border-color, transform;
+  transition-timing-function: var(--ease-snappy);
+  transition-duration: 200ms;
+  transition-delay: 50ms, 50ms, 50ms, 0s;
+}
+
+[data-slot="button"]:hover {
+  transition-duration: 0s, 0s, 0s, 200ms;
+  transition-delay: 0s;
+}
+
+[data-slot="button"]:active {
+  transition-duration: 0s, 0s, 0s, 100ms;
+  transition-delay: 0s;
+}
+
+/* Sidebar menu-button motion — same per-property split as Button, tuned for
+ * the icon-collapse gesture. `.hover-linger` must NOT sit on these buttons:
+ * their transition list includes width/height/padding, and the linger's 50ms
+ * rest delay made every row trail the rail's width animation ("laggy").
+ * Colors keep the linger feel; layout properties ride the rail — same 200ms
+ * and the same swift curve as the sidebar container, zero delay. */
+[data-sidebar="menu-button"] {
+  transition-property: color, background-color, width, height, padding;
+  transition-duration: 200ms;
+  transition-timing-function: var(--ease-snappy), var(--ease-snappy), var(--ease-swift),
+    var(--ease-swift), var(--ease-swift);
+  transition-delay: 50ms, 50ms, 0s, 0s, 0s;
+}
+
+[data-sidebar="menu-button"]:hover {
+  transition-duration: 0s, 0s, 200ms, 200ms, 200ms;
+  transition-delay: 0s;
 }
 
 /* Scrollbar */

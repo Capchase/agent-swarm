@@ -29,6 +29,7 @@ import {
   User,
   Zap,
 } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import "streamdown/styles.css";
@@ -150,11 +151,11 @@ function renderLogContent(log: AgentLog): React.ReactNode {
     case "task_offered":
       return <span className="text-xs font-medium">Offered to agent</span>;
     case "task_accepted":
-      return <span className="text-xs font-medium text-status-success">Accepted</span>;
+      return <span className="text-xs font-medium text-status-success-strong">Accepted</span>;
     case "task_rejected":
-      return <span className="text-xs font-medium text-status-error">Rejected</span>;
+      return <span className="text-xs font-medium text-status-error-strong">Rejected</span>;
     case "task_claimed":
-      return <span className="text-xs font-medium text-status-success">Claimed</span>;
+      return <span className="text-xs font-medium text-status-success-strong">Claimed</span>;
     case "task_released":
       return <span className="text-xs font-medium">Released</span>;
     default:
@@ -874,12 +875,12 @@ export default function TaskDetailPage() {
           variant="card"
           title="Failure Reason"
           icon={AlertTriangle}
-          iconColor="text-status-error"
+          iconColor="text-status-error-strong"
           borderColor="border-status-error/30"
           bgColor="bg-status-error/5"
           defaultOpen
         >
-          <div className="text-sm text-status-error/80 leading-relaxed max-h-64 overflow-auto">
+          <div className="text-sm text-status-error-strong/80 leading-relaxed max-h-64 overflow-auto">
             <MarkdownView text={task.failureReason ?? ""} />
           </div>
         </CollapsibleSection>
@@ -890,7 +891,7 @@ export default function TaskDetailPage() {
           variant="card"
           title="Output"
           icon={isCompleted ? CheckCircle2 : Terminal}
-          iconColor={isCompleted ? "text-status-success" : "text-muted-foreground"}
+          iconColor={isCompleted ? "text-status-success-strong" : "text-muted-foreground"}
           borderColor={isCompleted ? "border-status-success/30" : "border-border"}
           bgColor={isCompleted ? "bg-status-success/5" : "bg-muted/20"}
           defaultOpen
@@ -959,6 +960,7 @@ export default function TaskDetailPage() {
         taskStatus={task.status}
         value={steerDraft}
         onValueChange={setSteerDraft}
+        fullWidth
         className="px-0 pt-0 pb-0"
       />
     </CollapsibleComposerDock>
@@ -1173,7 +1175,10 @@ export default function TaskDetailPage() {
           take the freed width. State persists in localStorage. */}
       <div
         className={cn(
+          // The rail collapse animates the grid track itself (browsers tween
+          // grid-template-columns) — swift, like every rail (DESIGN.md § Motion).
           "hidden lg:grid flex-1 min-h-0 overflow-hidden",
+          "transition-[grid-template-columns] duration-200 ease-swift motion-reduce:transition-none",
           railCollapsed ? "lg:grid-cols-[280px_1fr_36px]" : "lg:grid-cols-[280px_1fr_280px]",
         )}
       >
@@ -1195,11 +1200,11 @@ export default function TaskDetailPage() {
                 variant="card"
                 title="Failure Reason"
                 icon={AlertTriangle}
-                iconColor="text-status-error"
+                iconColor="text-status-error-strong"
                 borderColor="border-status-error/30"
                 bgColor="bg-status-error/5"
               >
-                <div className="text-sm text-status-error/80 leading-relaxed max-h-48 overflow-auto">
+                <div className="text-sm text-status-error-strong/80 leading-relaxed max-h-48 overflow-auto">
                   <MarkdownView text={task.failureReason ?? ""} />
                 </div>
               </CollapsibleSection>
@@ -1210,7 +1215,7 @@ export default function TaskDetailPage() {
                 variant="card"
                 title="Output"
                 icon={isCompleted ? CheckCircle2 : Terminal}
-                iconColor={isCompleted ? "text-status-success" : "text-muted-foreground"}
+                iconColor={isCompleted ? "text-status-success-strong" : "text-muted-foreground"}
                 borderColor={isCompleted ? "border-status-success/30" : "border-border"}
                 bgColor={isCompleted ? "bg-status-success/5" : "bg-muted/20"}
               >
@@ -1264,7 +1269,20 @@ export default function TaskDetailPage() {
               {railCollapsed ? "Activity" : "Collapse activity"}
             </TooltipContent>
           </Tooltip>
-          {!railCollapsed && rightRailContent}
+          {/* Fade the timeline while the grid track tweens — without this the
+              content pops out a frame before the column starts shrinking. */}
+          <AnimatePresence initial={false}>
+            {!railCollapsed && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0, transition: { duration: 0.12 } }}
+                transition={{ duration: 0.15 }}
+              >
+                {rightRailContent}
+              </motion.div>
+            )}
+          </AnimatePresence>
         </aside>
       </div>
     </div>
