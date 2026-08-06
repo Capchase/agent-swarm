@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  authMethodForStoredClient,
   assertUrlSafe,
   buildAuthorizeUrl,
   computeExpiresAt,
@@ -613,6 +614,14 @@ describe("normalizeTokenEndpointAuthMethod", () => {
   });
 });
 
+describe("authMethodForStoredClient", () => {
+  test("preserves legacy body-post behavior when the field is absent", () => {
+    expect(authMethodForStoredClient(undefined)).toBe("client_secret_post");
+    expect(authMethodForStoredClient(null)).toBe("client_secret_post");
+    expect(authMethodForStoredClient("")).toBe("client_secret_post");
+  });
+});
+
 describe("token-endpoint client authentication is applied per the registered method", () => {
   const original = globalThis.fetch;
   afterEach(() => {
@@ -675,6 +684,35 @@ describe("token-endpoint client authentication is applied per the registered met
       expect(params.get("client_id")).toBeNull();
       expect(params.get("client_secret")).toBeNull();
     }
+  });
+
+  test("a public client recorded as basic identifies itself in the body", async () => {
+    let capturedBody = "";
+    let capturedHeaders: Record<string, string> = {};
+    globalThis.fetch = async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedBody = (init?.body as string) ?? "";
+      capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+      return new Response(JSON.stringify({ access_token: "at-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    await exchangeCodeForTokens({
+      tokenUrl: "https://as.example.com/token",
+      clientId: "public-client",
+      clientSecret: null,
+      tokenEndpointAuthMethod: "client_secret_basic",
+      redirectUri: "https://swarm.example.com/callback",
+      code: "authcode-1",
+      codeVerifier: "verifier-1",
+      resource: "https://mcp.example.com/",
+    });
+
+    const params = new URLSearchParams(capturedBody);
+    expect(capturedHeaders.Authorization).toBeUndefined();
+    expect(params.get("client_id")).toBe("public-client");
+    expect(params.get("client_secret")).toBeNull();
   });
 
   test("refreshMcpToken applies the same rule on the refresh_token grant", async () => {

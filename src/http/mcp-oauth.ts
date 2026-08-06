@@ -13,6 +13,7 @@ import {
 } from "../be/db-queries/mcp-oauth";
 import { ensureMcpToken } from "../oauth/ensure-mcp-token";
 import {
+  authMethodForStoredClient,
   assertUrlSafe,
   buildAuthorizeUrl,
   computeExpiresAt,
@@ -679,7 +680,7 @@ export async function handleMcpOAuth(
         tokenUrl: existing.tokenUrl,
         clientId: existing.dcrClientId ?? "",
         clientSecret: existing.dcrClientSecret ?? undefined,
-        tokenEndpointAuthMethod: existing.tokenEndpointAuthMethod,
+        tokenEndpointAuthMethod: authMethodForStoredClient(existing.tokenEndpointAuthMethod),
         refreshToken: existing.refreshToken,
         resource: existing.resourceUrl,
       });
@@ -722,7 +723,7 @@ export async function handleMcpOAuth(
           tokenTypeHint: "access_token",
           clientId: token.dcrClientId ?? "",
           clientSecret: token.dcrClientSecret ?? undefined,
-          tokenEndpointAuthMethod: token.tokenEndpointAuthMethod,
+          tokenEndpointAuthMethod: authMethodForStoredClient(token.tokenEndpointAuthMethod),
         });
       } catch (err) {
         console.warn(

@@ -144,6 +144,29 @@ describe("ensureMcpToken", () => {
     expect(calls).toBe(1);
   });
 
+  test("uses body-post authentication for a legacy row with no recorded method", async () => {
+    const input = makeToken({
+      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+      tokenEndpointAuthMethod: null,
+    });
+    upsertMcpOAuthToken(input);
+
+    globalThis.fetch = async (_url: string | URL | Request, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      const params = new URLSearchParams((init?.body as string) ?? "");
+      expect(headers.Authorization).toBeUndefined();
+      expect(params.get("client_id")).toBe("client-abc");
+      expect(params.get("client_secret")).toBe("secret-xyz");
+      return new Response(JSON.stringify({ access_token: "refreshed-access", expires_in: 3600 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const token = await ensureMcpToken(input.mcpServerId);
+    expect(token!.accessToken).toBe("refreshed-access");
+  });
+
   test("flips status to 'error' on refresh failure", async () => {
     const input = makeToken({
       expiresAt: new Date(Date.now() + 30_000).toISOString(),

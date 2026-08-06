@@ -254,6 +254,17 @@ export function normalizeTokenEndpointAuthMethod(
 }
 
 /**
+ * Read the method from a persisted client. Older rows predate this field and
+ * used client_secret_post, so preserve that known-working behavior.
+ */
+export function authMethodForStoredClient(
+  value: string | null | undefined,
+): TokenEndpointAuthMethod {
+  if (value == null || value === "") return "client_secret_post";
+  return normalizeTokenEndpointAuthMethod(value);
+}
+
+/**
  * Pick the method to REQUEST during DCR from the AS's advertised
  * `token_endpoint_auth_methods_supported`. Prefers the RFC-preferred Basic
  * form, then body-post, then public (`none`); falls back to the RFC 7591 §2
@@ -287,11 +298,14 @@ function applyClientAuthentication(
   body: URLSearchParams,
   headers: Record<string, string>,
 ): void {
-  if (method === "client_secret_basic") {
-    const credentials = `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret ?? "")}`;
+  if (method === "client_secret_basic" && clientSecret) {
+    const credentials = `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`;
     headers.Authorization = `Basic ${Buffer.from(credentials).toString("base64")}`;
     return;
   }
+
+  // A public client must identify itself in the body, whatever method was
+  // recorded for a client with no secret.
   body.set("client_id", clientId);
   if (method === "client_secret_post" && clientSecret) {
     body.set("client_secret", clientSecret);
