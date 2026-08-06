@@ -55,6 +55,15 @@ function isPrivateIPv6(host: string): boolean {
   return false;
 }
 
+// Deliberately does NOT match "invalid_client_metadata" (a distinct DCR-only
+// error) — the `\b` boundary fails on the following underscore. Shared by
+// every MCP OAuth call site (explicit /refresh route, automatic
+// ensureMcpToken refresh, callback token exchange) that needs to decide
+// whether a provider has disowned a stored DCR client.
+export function isInvalidClientError(message: string): boolean {
+  return /invalid_client\b/i.test(message);
+}
+
 export interface SsrfGuardOptions {
   /** Allow loopback and RFC1918 hosts (dev / self-hosting). Opt-in only. */
   allowPrivateHosts?: boolean;

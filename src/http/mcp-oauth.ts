@@ -22,6 +22,7 @@ import {
   discoverAuthorizationServerMetadata,
   discoverProtectedResourceMetadata,
   exchangeCodeForTokens,
+  isInvalidClientError,
   refreshMcpToken,
   registerClient,
   revokeMcpToken,
@@ -53,12 +54,6 @@ function dashboardBase(): string {
 
 function defaultFinalRedirect(mcpServerId: string): string {
   return `${dashboardBase()}/mcp-servers/${mcpServerId}?oauth=success`;
-}
-
-// Deliberately does NOT match "invalid_client_metadata" (a distinct DCR-only
-// error) — the `\b` boundary fails on the following underscore.
-function isInvalidClientError(message: string): boolean {
-  return /invalid_client\b/i.test(message);
 }
 
 interface DiscoveryResult {
