@@ -40,7 +40,9 @@ describe("task attachment links", () => {
         const html = renderToStaticMarkup(<AttachmentName href={href} name="Report" />);
 
         expect(href).toBeNull();
-        expect(html).toBe('<span class="truncate text-sm font-medium text-foreground">Report</span>');
+        expect(html).toBe(
+          '<span class="truncate text-sm font-medium text-foreground">Report</span>',
+        );
       }
     } finally {
       if (previousOrgId === undefined) delete process.env.VITE_AGENT_FS_DEFAULT_ORG_ID;
