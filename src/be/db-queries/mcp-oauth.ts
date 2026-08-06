@@ -446,27 +446,42 @@ export function findReusableMcpOAuthClient(
 }
 
 /**
- * Mark the stored DCR client for this connector+user as invalid without
- * deleting it (deleting would cascade and destroy authorization history).
- * The next /authorize call's findReusableMcpOAuthClient will skip it and
- * register fresh exactly once.
+ * Mark an app's stored DCR client as invalid without deleting it (deleting
+ * would cascade and destroy authorization history). Idempotent per
+ * client_id: a client stays the same row's `clientId` until the next
+ * successful registration clears `invalidated` (see `upsertMcpApp`), so once
+ * this fires, later invalid_client errors against that SAME still-stored
+ * client — from the other call sites, or repeated automatic-refresh retries
+ * before the next /authorize re-registers — are no-ops instead of redundant
+ * writes.
  */
-export function invalidateMcpOAuthClient(mcpServerId: string, userId: string | null = null): void {
-  const tokenRow = rawMcpToken(mcpServerId, userId);
-  const appId = tokenRow?.appId ?? rawPendingAppIdForUser(mcpServerId, userId);
-  if (!appId) return;
-
+function invalidateMcpOAuthApp(appId: string): void {
   const row = getDb().query("SELECT metadata FROM oauth_apps WHERE id = ?").get(appId) as {
     metadata: string;
   } | null;
   if (!row) return;
 
-  const metadata = JSON.stringify({ ...parseObject(row.metadata), invalidated: true });
+  const meta = parseObject(row.metadata);
+  if (meta.invalidated === true) return;
+
+  const metadata = JSON.stringify({ ...meta, invalidated: true });
   getDb()
     .query(
       "UPDATE oauth_apps SET metadata = ?, updatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .run(metadata, appId);
+}
+
+/**
+ * Mark the stored DCR client for this connector+user as invalid. The next
+ * /authorize call's findReusableMcpOAuthClient will skip it and register
+ * fresh exactly once.
+ */
+export function invalidateMcpOAuthClient(mcpServerId: string, userId: string | null = null): void {
+  const tokenRow = rawMcpToken(mcpServerId, userId);
+  const appId = tokenRow?.appId ?? rawPendingAppIdForUser(mcpServerId, userId);
+  if (!appId) return;
+  invalidateMcpOAuthApp(appId);
 }
 
 export interface UpsertMcpOAuthTokenInput {
@@ -490,6 +505,7 @@ export interface UpsertMcpOAuthTokenInput {
   lastErrorMessage?: string | null;
   lastRefreshedAt?: string | null;
   connectedByUserId?: string | null;
+  redirectUri?: string;
 }
 
 export function upsertMcpOAuthToken(input: UpsertMcpOAuthTokenInput): void {
@@ -505,6 +521,7 @@ export function upsertMcpOAuthToken(input: UpsertMcpOAuthTokenInput): void {
       authorizeUrl: input.authorizeUrl,
       tokenUrl: input.tokenUrl,
       revocationUrl: input.revocationUrl,
+      redirectUri: input.redirectUri,
       scopes: input.scope,
       dcrClientId: input.dcrClientId,
       dcrClientSecret: input.dcrClientSecret,
@@ -582,6 +599,13 @@ export function deleteMcpOAuthToken(mcpServerId: string, userId: string | null =
        WHERE id = ?`,
     )
     .run(encryptSecret("", getEncryptionKey()), existing.id);
+  if (result.changes === 1) {
+    // Disconnect is the canonical user recovery gesture. Clear the stored
+    // DCR client too, or Reconnect silently hands back the same client_id —
+    // rawMcpToken has no status filter, so findReusableMcpOAuthClient would
+    // otherwise still surface a "revoked" token's client as reusable.
+    invalidateMcpOAuthApp(existing.appId);
+  }
   return result.changes === 1;
 }
 

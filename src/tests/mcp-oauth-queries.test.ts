@@ -400,6 +400,24 @@ describe("findReusableMcpOAuthClient / invalidateMcpOAuthClient", () => {
     });
   });
 
+  test("upsertMcpOAuthToken persists redirectUri onto the app row (first-connect reuse case)", () => {
+    const server = makeServer("mcp-reuse-connected-redirect-uri");
+    // Before this fix, upsertMcpOAuthToken never passed redirectUri through
+    // to upsertMcpApp, so the FIRST successful connect (which always creates
+    // a brand new oauth_apps row here, since the pending row's app was
+    // already deleted as an orphan by consumeMcpOAuthPending) left
+    // redirectUri as "" — silently failing every subsequent
+    // `reusable.redirectUri === callbackRedirectUri()` reuse check and
+    // forcing a fresh DCR registration on every re-authorize.
+    upsertMcpOAuthToken({
+      ...base(server.id),
+      redirectUri: "https://swarm.example.com/api/mcp-oauth/callback",
+    });
+
+    const reusable = findReusableMcpOAuthClient(server.id);
+    expect(reusable?.redirectUri).toBe("https://swarm.example.com/api/mcp-oauth/callback");
+  });
+
   test("reuses a still-live pending's client when no token exists yet", () => {
     const server = makeServer("mcp-reuse-pending");
     insertMcpOAuthPending({
@@ -476,6 +494,36 @@ describe("findReusableMcpOAuthClient / invalidateMcpOAuthClient", () => {
 
   test("invalidate on an unknown connector is a no-op", () => {
     expect(() => invalidateMcpOAuthClient("00000000-0000-0000-0000-000000000000")).not.toThrow();
+  });
+
+  test("invalidate is idempotent for an already-invalidated client", () => {
+    const server = makeServer("mcp-reuse-invalidate-idempotent");
+    upsertMcpOAuthToken(base(server.id));
+
+    invalidateMcpOAuthClient(server.id);
+    expect(findReusableMcpOAuthClient(server.id)).toBeNull();
+
+    // A second invalidate call against the SAME still-invalidated client
+    // must not throw and must not disturb the invalidated state (this is
+    // what "cap invalidation to once per client_id" means in practice — the
+    // other call sites can all observe the same failure and each call this,
+    // but only the first one actually does anything).
+    expect(() => invalidateMcpOAuthClient(server.id)).not.toThrow();
+    expect(findReusableMcpOAuthClient(server.id)).toBeNull();
+  });
+
+  test("disconnect clears the stored DCR client so Reconnect forces a fresh registration", () => {
+    const server = makeServer("mcp-disconnect-clears-client");
+    upsertMcpOAuthToken(base(server.id));
+    expect(findReusableMcpOAuthClient(server.id)).not.toBeNull();
+
+    expect(deleteMcpOAuthToken(server.id)).toBe(true);
+
+    // Disconnect is the canonical user recovery gesture — before this fix,
+    // deleteMcpOAuthToken only soft-revoked oauth_authorizations and left
+    // oauth_apps untouched, so a Reconnect silently got the same client_id
+    // back (rawMcpToken has no status filter).
+    expect(findReusableMcpOAuthClient(server.id)).toBeNull();
   });
 });
 
