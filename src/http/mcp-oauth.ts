@@ -325,6 +325,42 @@ interface AuthorizeFlowQuery {
   scopes?: string;
 }
 
+// ─── Per-connector+user authorize-flow lock ──────────────────────────────────
+// Two concurrent first `/authorize` requests for the same (mcpServerId,
+// userId) can otherwise both observe "no reusable client" from
+// findReusableMcpOAuthClient, each register a fresh provider client before
+// either reaches insertMcpOAuthPending, and race to persist — the later
+// insert reuses/overwrites the earlier app row while its own pending context
+// still points at the OTHER (now orphaned) client. That leaves duplicate
+// provider registrations and can pair a connected authorization with the
+// wrong client. Serialize the whole check-reusable-through-persist critical
+// section per key so only one call at a time can decide "no reusable client
+// exists, register one".
+const authorizeFlowLocks = new Map<string, Promise<void>>();
+
+function authorizeFlowLockKey(mcpServerId: string, userId: string | null): string {
+  return `${mcpServerId}::${userId ?? "_"}`;
+}
+
+async function withAuthorizeFlowLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prior = authorizeFlowLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = prior.then(() => mine);
+  authorizeFlowLocks.set(key, chained);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (authorizeFlowLocks.get(key) === chained) {
+      authorizeFlowLocks.delete(key);
+    }
+  }
+}
+
 /**
  * Use a stored manual client or discover metadata + DCR-register, build the
  * authorize URL, and persist the pending session. Returns the provider
@@ -338,6 +374,18 @@ async function prepareAuthorizeFlow(
   q: AuthorizeFlowQuery,
 ): Promise<string | null> {
   const userId = q.userId ?? null;
+  return withAuthorizeFlowLock(authorizeFlowLockKey(mcpServerId, userId), () =>
+    runAuthorizeFlow(res, mcpServerId, server, q, userId),
+  );
+}
+
+async function runAuthorizeFlow(
+  res: ServerResponse,
+  mcpServerId: string,
+  server: NonNullable<ReturnType<typeof getMcpServerById>>,
+  q: AuthorizeFlowQuery,
+  userId: string | null,
+): Promise<string | null> {
   let client = manualClientFromToken(getMcpOAuthToken(mcpServerId, userId));
   let discovery: DiscoveryResult | null = null;
   let registrationEndpoint: string | null = null;

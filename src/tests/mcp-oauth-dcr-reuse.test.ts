@@ -265,6 +265,38 @@ describe("MCP OAuth DCR client reuse", () => {
     expect(fourth.searchParams.get("client_id")).toBe(third.searchParams.get("client_id"));
   });
 
+  test("two concurrent first authorize calls for the same connector+user register exactly one DCR client (no TOCTOU race)", async () => {
+    const server = createMcpServer({
+      name: "reuse-concurrent",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    // Delay the DCR registration response so two concurrent callers are
+    // guaranteed to overlap inside the check-reusable-then-register critical
+    // section if it isn't serialized.
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const href = input.toString();
+      if (href === `https://${issuerHost}${registrationPath}` && init?.method === "POST") {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const [a, b] = await Promise.all([authorizeUrl(server.id), authorizeUrl(server.id)]);
+
+    expect(dcrCallCount).toBe(1);
+    expect(a.searchParams.get("client_id")).toBe(b.searchParams.get("client_id"));
+
+    // The persisted app row must not have been split/corrupted by the race —
+    // a subsequent call keeps reusing the same single client.
+    const third = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(third.searchParams.get("client_id")).toBe(a.searchParams.get("client_id"));
+  });
+
   test("a requested scope not covered by the stored client forces re-registration", async () => {
     const server = createMcpServer({
       name: "reuse-scope-change",
