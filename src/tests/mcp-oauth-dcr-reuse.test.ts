@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { closeDb, createMcpServer, initDb } from "../be/db";
+import { closeDb, createMcpServer, getDb, initDb } from "../be/db";
 import { getMcpOAuthToken } from "../be/db-queries/mcp-oauth";
 import { handleCore } from "../http/core";
 import { handleMcpOAuth } from "../http/mcp-oauth";
@@ -96,6 +96,7 @@ describe("MCP OAuth DCR client reuse", () => {
   let issuerHost = "as-1.example.test";
   let registrationPath = "/register-1";
   let tokenShouldFail: "" | "invalid_client" = "";
+  let asScopesSupported: string[] = [];
 
   const MCP_URL = "https://mcp.example.test/mcp";
 
@@ -105,6 +106,7 @@ describe("MCP OAuth DCR client reuse", () => {
     issuerHost = "as-1.example.test";
     registrationPath = "/register-1";
     tokenShouldFail = "";
+    asScopesSupported = [];
     process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 11).toString("base64");
     process.env.MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "false";
     process.env.PUBLIC_MCP_BASE_URL = "https://swarm.example.test";
@@ -134,6 +136,7 @@ describe("MCP OAuth DCR client reuse", () => {
           authorization_endpoint: `https://${issuerHost}/authorize`,
           token_endpoint: `https://${issuerHost}/token`,
           registration_endpoint: `https://${issuerHost}${registrationPath}`,
+          scopes_supported: asScopesSupported,
         });
       }
       if (href === `https://${issuerHost}${registrationPath}` && init?.method === "POST") {
@@ -325,5 +328,164 @@ describe("MCP OAuth DCR client reuse", () => {
     const third = await authorizeUrl(server.id, "read write");
     expect(dcrCallCount).toBe(2);
     expect(third.searchParams.get("client_id")).toBe(second.searchParams.get("client_id"));
+  });
+
+  test("an invalid_client from a freshly-registered client's callback does not invalidate the different, connected client", async () => {
+    const server = createMcpServer({
+      name: "invalidate-wrong-target",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    // Connect once — client A.
+    const first = await authorizeUrl(server.id);
+    const stateA = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(stateA)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    const clientA = getMcpOAuthToken(server.id)?.dcrClientId;
+    expect(dcrCallCount).toBe(1);
+
+    // A second flow requests a scope the connected client wasn't registered
+    // with — forces a FRESH registration (client B) while client A stays
+    // connected and untouched.
+    const second = await authorizeUrl(server.id, "read write");
+    expect(dcrCallCount).toBe(2);
+    const stateB = second.searchParams.get("state")!;
+    const clientB = second.searchParams.get("client_id");
+    expect(clientB).not.toBe(clientA);
+
+    // The provider rejects client B (the one actually used) at the token
+    // endpoint.
+    tokenShouldFail = "invalid_client";
+    const callbackRes = await dispatch(
+      `/api/mcp-oauth/callback?state=${encodeURIComponent(stateB)}&code=auth-code-2`,
+    );
+    expect(callbackRes.status).toBe(302);
+    expect(callbackRes.headers.location).toContain("oauth=error");
+
+    // Client A must still be connected with its ORIGINAL client_id — the bug
+    // resolved the invalidation target via rawMcpToken(...)?.appId (the
+    // connected app) regardless of which client actually failed, silently
+    // corrupting it on the next /authorize call.
+    tokenShouldFail = "";
+    const afterFailure = getMcpOAuthToken(server.id);
+    expect(afterFailure?.status).toBe("connected");
+    expect(afterFailure?.dcrClientId).toBe(clientA);
+
+    // Reusing client A's original (no-explicit-scope) conditions must still
+    // work without a fresh registration — proving the connected app wasn't
+    // flagged invalid by the unrelated client-B failure.
+    const third = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(2);
+    expect(third.searchParams.get("client_id")).toBe(clientA);
+    expect(getMcpOAuthToken(server.id)?.dcrClientId).toBe(clientA);
+  });
+
+  test("authorize-endpoint rejection (query.error) invalidates the reused client instead of waiting for GC", async () => {
+    const server = createMcpServer({
+      name: "authorize-endpoint-reject",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    const stateA = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(stateA)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    expect(dcrCallCount).toBe(1);
+
+    // Re-authorize reuses the connected client (no new registration yet) —
+    // but the provider rejects it at the AUTHORIZE endpoint, redirecting
+    // back with an error instead of a code.
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    const stateB = second.searchParams.get("state")!;
+    const rejectRes = await dispatch(
+      `/api/mcp-oauth/callback?state=${encodeURIComponent(stateB)}&error=unauthorized_client`,
+    );
+    expect(rejectRes.status).toBe(302);
+    expect(rejectRes.headers.location).toContain("error=unauthorized_client");
+
+    // The next authorize call must register fresh — not keep offering the
+    // client the provider just rejected at the authorize endpoint.
+    const third = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(2);
+    expect(third.searchParams.get("client_id")).not.toBe(first.searchParams.get("client_id"));
+  });
+
+  test("a legacy connector with no recorded registrationEndpoint reuses instead of re-registering forever", async () => {
+    const server = createMcpServer({
+      name: "legacy-null-registration-endpoint",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    const state = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    const clientId = getMcpOAuthToken(server.id)?.dcrClientId;
+    expect(dcrCallCount).toBe(1);
+
+    // Simulate a pre-this-PR row: registrationEndpoint was never recorded.
+    const db = getDb();
+    const appRow = db
+      .query(
+        `SELECT a.id, a.metadata FROM oauth_apps a
+         JOIN oauth_authorizations z ON z.appId = a.id
+         WHERE a.mcpServerId = ?`,
+      )
+      .get(server.id) as { id: string; metadata: string };
+    const metadata = JSON.parse(appRow.metadata);
+    metadata.registrationEndpoint = null;
+    db.query("UPDATE oauth_apps SET metadata = ? WHERE id = ?").run(
+      JSON.stringify(metadata),
+      appRow.id,
+    );
+
+    // An abandoned/retried flow must NOT force a fresh registration just
+    // because the legacy row predates this field.
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(second.searchParams.get("client_id")).toBe(clientId);
+  });
+
+  test("no explicit scopes + an empty registered scope set does not reuse with the full discovery scope set", async () => {
+    const server = createMcpServer({
+      name: "empty-registered-scope",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    const state = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    const originalClientId = getMcpOAuthToken(server.id)?.dcrClientId;
+    expect(dcrCallCount).toBe(1);
+
+    // Simulate a client whose registered scope set was never recorded (e.g.
+    // registered while the provider advertised none), while the provider now
+    // advertises real scopes.
+    const db = getDb();
+    const appRow = db
+      .query(
+        `SELECT a.id FROM oauth_apps a JOIN oauth_authorizations z ON z.appId = a.id WHERE a.mcpServerId = ?`,
+      )
+      .get(server.id) as { id: string };
+    db.query("UPDATE oauth_apps SET scopes = '[]' WHERE id = ?").run(appRow.id);
+    asScopesSupported = ["read", "write"];
+
+    // No explicit ?scopes= — must NOT silently reuse the unscoped client
+    // with the AS's full advertised scope set. Must re-register properly
+    // scoped instead.
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(2);
+    expect(second.searchParams.get("client_id")).not.toBe(originalClientId);
+    expect(second.searchParams.get("scope")).toBe("read write");
   });
 });

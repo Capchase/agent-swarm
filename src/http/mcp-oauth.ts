@@ -407,15 +407,24 @@ async function runAuthorizeFlow(
 
     // A caller-requested scope set that the stored client wasn't registered
     // with must not be silently narrowed to the stored client's scopes —
-    // fall through to fresh registration below instead of reusing.
+    // fall through to fresh registration below instead of reusing. With no
+    // explicit request, fall back to what would actually be sent
+    // (discovery.scopes, same as the else-branch below) so the coverage
+    // check below still catches an empty registered set against a
+    // non-empty advertised one — see scopesAreCovered's docstring.
     const requestedScopes = q.scopes ? splitScopes(q.scopes) : null;
+    const scopesToRequest = requestedScopes ?? discovery.scopes;
 
     if (
       reusable &&
       reusable.authorizationServerIssuer === discovery.authorizationServerIssuer &&
-      reusable.registrationEndpoint === discovery.registrationEndpoint &&
+      // A stored null means the client was registered before we persisted
+      // this field — treat it as unknown rather than as a mismatch, or every
+      // pre-existing connector re-registers on each abandoned authorize call.
+      (reusable.registrationEndpoint === null ||
+        reusable.registrationEndpoint === discovery.registrationEndpoint) &&
       reusable.redirectUri === callbackRedirectUri() &&
-      (requestedScopes === null || scopesAreCovered(requestedScopes, reusable.scopes))
+      scopesAreCovered(scopesToRequest, reusable.scopes)
     ) {
       client = {
         clientId: reusable.clientId,
@@ -542,6 +551,17 @@ export async function completeMcpOAuthCallback(
   const dashboardBaseUrl = pending.finalRedirect ?? defaultFinalRedirect(pending.mcpServerId);
 
   if (query.error) {
+    // A provider that rejects the client at the AUTHORIZE endpoint (rather
+    // than the token endpoint) never reaches the exchange try/catch below,
+    // so without this the stored client stays "reusable" until GC drops the
+    // orphaned pending row — a floor of 10 minutes, not a bound. Same
+    // wrong-target guard as the exchange-failure path below.
+    if (isInvalidClientError(query.error) || query.error === "unauthorized_client") {
+      const connected = getMcpOAuthToken(pending.mcpServerId, pending.userId);
+      if (!connected || connected.dcrClientId === pending.dcrClientId) {
+        invalidateMcpOAuthClient(pending.mcpServerId, pending.userId);
+      }
+    }
     const target = new URL(dashboardBaseUrl);
     target.searchParams.set("oauth", "error");
     target.searchParams.set("error", query.error);
@@ -587,6 +607,7 @@ export async function completeMcpOAuthCallback(
       authorizeUrl: pending.authorizeUrl,
       tokenUrl: pending.tokenUrl,
       revocationUrl: pending.revocationUrl,
+      redirectUri: pending.redirectUri,
       dcrClientId: pending.dcrClientId,
       dcrClientSecret: pending.dcrClientSecret,
       clientSource,
@@ -606,8 +627,15 @@ export async function completeMcpOAuthCallback(
     if (isInvalidClientError(message)) {
       // The provider rejected the client we stored — invalidate it so the
       // next /authorize call re-registers exactly once instead of retrying
-      // with a client the provider has already disowned.
-      invalidateMcpOAuthClient(pending.mcpServerId, pending.userId);
+      // with a client the provider has already disowned. Only invalidate the
+      // client the provider actually rejected: when this flow used a freshly
+      // registered client (AS identity, redirect URI, or scope set moved),
+      // the connected app still holds a different, working client_id, and
+      // invalidating it would corrupt a working connection.
+      const connected = getMcpOAuthToken(pending.mcpServerId, pending.userId);
+      if (!connected || connected.dcrClientId === pending.dcrClientId) {
+        invalidateMcpOAuthClient(pending.mcpServerId, pending.userId);
+      }
     }
     const target = new URL(dashboardBaseUrl);
     target.searchParams.set("oauth", "error");
