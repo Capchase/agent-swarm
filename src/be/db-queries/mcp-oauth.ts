@@ -74,6 +74,7 @@ export interface McpOAuthPendingRow {
   nonce: string | null;
   resourceUrl: string;
   authorizationServerIssuer: string;
+  registrationEndpoint: string | null;
   authorizeUrl: string;
   tokenUrl: string;
   revocationUrl: string | null;
@@ -199,6 +200,7 @@ function upsertMcpApp(input: {
   mcpServerId: string;
   resourceUrl: string;
   authorizationServerIssuer: string;
+  registrationEndpoint?: string | null;
   authorizeUrl: string;
   tokenUrl: string;
   revocationUrl?: string | null;
@@ -208,9 +210,10 @@ function upsertMcpApp(input: {
   clientSource: McpOAuthClientSource;
   redirectUri?: string;
 }): string {
-  // An app is reused only through an existing authorization's exact appId.
-  // Looking up by mcpServerId alone would collapse the dormant per-user
-  // dimension and let one user's client context overwrite another's.
+  // An app is reused only through an existing authorization's or pending
+  // attempt's exact appId. Looking up by mcpServerId alone would collapse
+  // the dormant per-user dimension and let one user's client context
+  // overwrite another's.
   const existing = input.appId
     ? (getDb()
         .query(
@@ -225,11 +228,15 @@ function upsertMcpApp(input: {
         scopes: string;
       } | null)
     : null;
+  // A write means the client is currently in use / believed valid — clear
+  // any stale `invalidated` flag left over from a prior provider rejection.
   const metadata = JSON.stringify({
     ...parseObject(existing?.metadata),
     resourceUrl: input.resourceUrl,
     authorizationServerIssuer: input.authorizationServerIssuer,
+    registrationEndpoint: input.registrationEndpoint ?? null,
     clientSource: input.clientSource,
+    invalidated: false,
   });
   const encryptedClientSecret =
     input.dcrClientSecret == null || input.dcrClientSecret === ""
@@ -312,6 +319,156 @@ export function listMcpOAuthTokensForMcp(mcpServerId: string): McpOAuthToken[] {
   return rows.map(decryptTokenRow);
 }
 
+// ─── DCR client reuse (avoid re-registering on every /authorize call) ────────
+
+export interface StoredMcpOAuthClient {
+  appId: string;
+  clientId: string;
+  clientSecret: string | null;
+  authorizeUrl: string;
+  tokenUrl: string;
+  revocationUrl: string | null;
+  redirectUri: string;
+  scopes: string[];
+  resourceUrl: string;
+  authorizationServerIssuer: string;
+  registrationEndpoint: string | null;
+  clientSource: McpOAuthClientSource;
+}
+
+type RawAppRow = {
+  id: string;
+  clientId: string;
+  clientSecret: string | null;
+  clientSecretEncrypted: number;
+  authorizeUrl: string;
+  tokenUrl: string;
+  revocationUrl: string | null;
+  redirectUri: string;
+  scopes: string;
+  metadata: string;
+};
+
+function readMcpOAuthApp(appId: string): StoredMcpOAuthClient | null {
+  const row = getDb()
+    .query(
+      `SELECT id, clientId, clientSecret, clientSecretEncrypted, authorizeUrl, tokenUrl,
+              revocationUrl, redirectUri, scopes, metadata
+       FROM oauth_apps WHERE id = ?`,
+    )
+    .get(appId) as RawAppRow | null;
+  if (!row || !row.clientId) return null;
+
+  const metadata = parseObject(row.metadata);
+  if (metadata.invalidated === true) return null;
+
+  const clientSource =
+    metadata.clientSource === "manual" ||
+    metadata.clientSource === "dcr" ||
+    metadata.clientSource === "preregistered"
+      ? metadata.clientSource
+      : "dcr";
+  // Manual clients are resolved through manualClientFromToken (http layer);
+  // never surface them through this reuse path.
+  if (clientSource === "manual") return null;
+
+  const clientKey = row.clientSecretEncrypted === 1 ? getEncryptionKey() : null;
+  return {
+    appId: row.id,
+    clientId: row.clientId,
+    clientSecret:
+      row.clientSecret == null
+        ? null
+        : clientKey
+          ? decryptSecret(row.clientSecret, clientKey)
+          : row.clientSecret,
+    authorizeUrl: row.authorizeUrl,
+    tokenUrl: row.tokenUrl,
+    revocationUrl: row.revocationUrl,
+    redirectUri: row.redirectUri,
+    scopes: (() => {
+      try {
+        const parsed = JSON.parse(row.scopes || "[]");
+        return Array.isArray(parsed) ? (parsed as string[]) : [];
+      } catch {
+        return [];
+      }
+    })(),
+    resourceUrl: typeof metadata.resourceUrl === "string" ? metadata.resourceUrl : "",
+    authorizationServerIssuer:
+      typeof metadata.authorizationServerIssuer === "string"
+        ? metadata.authorizationServerIssuer
+        : "",
+    registrationEndpoint:
+      typeof metadata.registrationEndpoint === "string" ? metadata.registrationEndpoint : null,
+    clientSource,
+  };
+}
+
+function rawPendingAppIdForUser(mcpServerId: string, userId: string | null): string | null {
+  const row = getDb()
+    .query(
+      `SELECT p.appId FROM oauth_pending p
+       JOIN oauth_apps a ON a.id = p.appId
+       WHERE p.flow = 'mcp' AND a.mcpServerId = ?
+         AND ${userId == null ? "p.userId IS NULL" : "p.userId = ?"}
+       ORDER BY p.createdAt DESC LIMIT 1`,
+    )
+    .get(...(userId == null ? [mcpServerId] : [mcpServerId, userId])) as { appId: string } | null;
+  return row?.appId ?? null;
+}
+
+/**
+ * Find a previously-registered (or manually-preregistered, excluded here)
+ * DCR client that can be reused for this connector+user instead of running a
+ * fresh RFC 7591 registration. Checks the existing token's app first (covers
+ * re-authorizing an already-connected DCR client), then the most recent
+ * still-live pending attempt's app (covers retrying an abandoned flow before
+ * the 10-minute GC sweep). Callers must still verify AS identity
+ * (issuer/registrationEndpoint/redirectUri) against fresh discovery before
+ * trusting the result — this only returns what's stored.
+ */
+export function findReusableMcpOAuthClient(
+  mcpServerId: string,
+  userId: string | null = null,
+): StoredMcpOAuthClient | null {
+  const tokenRow = rawMcpToken(mcpServerId, userId);
+  if (tokenRow) {
+    const client = readMcpOAuthApp(tokenRow.appId);
+    if (client) return client;
+  }
+  const pendingAppId = rawPendingAppIdForUser(mcpServerId, userId);
+  if (pendingAppId) {
+    const client = readMcpOAuthApp(pendingAppId);
+    if (client) return client;
+  }
+  return null;
+}
+
+/**
+ * Mark the stored DCR client for this connector+user as invalid without
+ * deleting it (deleting would cascade and destroy authorization history).
+ * The next /authorize call's findReusableMcpOAuthClient will skip it and
+ * register fresh exactly once.
+ */
+export function invalidateMcpOAuthClient(mcpServerId: string, userId: string | null = null): void {
+  const tokenRow = rawMcpToken(mcpServerId, userId);
+  const appId = tokenRow?.appId ?? rawPendingAppIdForUser(mcpServerId, userId);
+  if (!appId) return;
+
+  const row = getDb().query("SELECT metadata FROM oauth_apps WHERE id = ?").get(appId) as {
+    metadata: string;
+  } | null;
+  if (!row) return;
+
+  const metadata = JSON.stringify({ ...parseObject(row.metadata), invalidated: true });
+  getDb()
+    .query(
+      "UPDATE oauth_apps SET metadata = ?, updatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .run(metadata, appId);
+}
+
 export interface UpsertMcpOAuthTokenInput {
   mcpServerId: string;
   userId?: string | null;
@@ -322,6 +479,7 @@ export interface UpsertMcpOAuthTokenInput {
   scope?: string | null;
   resourceUrl: string;
   authorizationServerIssuer: string;
+  registrationEndpoint?: string | null;
   authorizeUrl: string;
   tokenUrl: string;
   revocationUrl?: string | null;
@@ -343,6 +501,7 @@ export function upsertMcpOAuthToken(input: UpsertMcpOAuthTokenInput): void {
       mcpServerId: input.mcpServerId,
       resourceUrl: input.resourceUrl,
       authorizationServerIssuer: input.authorizationServerIssuer,
+      registrationEndpoint: input.registrationEndpoint ?? null,
       authorizeUrl: input.authorizeUrl,
       tokenUrl: input.tokenUrl,
       revocationUrl: input.revocationUrl,
@@ -441,6 +600,7 @@ export interface InsertMcpOAuthPendingInput {
   nonce?: string | null;
   resourceUrl: string;
   authorizationServerIssuer: string;
+  registrationEndpoint?: string | null;
   authorizeUrl: string;
   tokenUrl: string;
   revocationUrl?: string | null;
@@ -453,33 +613,54 @@ export interface InsertMcpOAuthPendingInput {
 
 export function insertMcpOAuthPending(input: InsertMcpOAuthPendingInput): void {
   getDb().transaction(() => {
-    const existingToken = rawMcpToken(input.mcpServerId, input.userId ?? null);
+    const userId = input.userId ?? null;
+    const existingToken = rawMcpToken(input.mcpServerId, userId);
     const clientSource = existingToken
       ? decryptTokenRow(existingToken).clientSource
       : input.dcrClientId
         ? "dcr"
         : "preregistered";
-    // A pending attempt must not mutate the connected app. If no authorization
-    // exists yet, create a short-lived app solely to satisfy oauth_pending's FK;
-    // consume/GC removes it when it remains orphaned.
+    // A pending attempt must not mutate a *valid* connected app — a different
+    // client context might be tried concurrently while the old one keeps
+    // working. But if the connected app was invalidated (provider rejected
+    // it — see invalidateMcpOAuthClient), this pending attempt IS the
+    // recovery registration for that exact appId, so it must update the row
+    // in place; otherwise the invalidated flag never clears and every future
+    // /authorize call re-registers again (an infinite-registration loop).
+    // If no authorization exists yet, reuse the most recent still-live
+    // pending attempt's app for this same connector+user (this is what lets
+    // a retried/abandoned authorize call share one DCR client instead of
+    // registering a fresh one — see findReusableMcpOAuthClient in the http
+    // layer) instead of always creating a new row; consume/GC removes it
+    // once it's orphaned.
+    const existingTokenAppValid = existingToken
+      ? readMcpOAuthApp(existingToken.appId) != null
+      : false;
+    const reuseAppId = existingToken
+      ? existingToken.appId
+      : rawPendingAppIdForUser(input.mcpServerId, userId);
     const appId =
-      existingToken?.appId ??
-      upsertMcpApp({
-        mcpServerId: input.mcpServerId,
-        resourceUrl: input.resourceUrl,
-        authorizationServerIssuer: input.authorizationServerIssuer,
-        authorizeUrl: input.authorizeUrl,
-        tokenUrl: input.tokenUrl,
-        revocationUrl: input.revocationUrl,
-        scopes: input.scopes,
-        dcrClientId: input.dcrClientId,
-        dcrClientSecret: input.dcrClientSecret,
-        clientSource,
-        redirectUri: input.redirectUri,
-      });
+      existingToken && existingTokenAppValid
+        ? existingToken.appId
+        : upsertMcpApp({
+            ...(reuseAppId ? { appId: reuseAppId } : {}),
+            mcpServerId: input.mcpServerId,
+            resourceUrl: input.resourceUrl,
+            authorizationServerIssuer: input.authorizationServerIssuer,
+            registrationEndpoint: input.registrationEndpoint ?? null,
+            authorizeUrl: input.authorizeUrl,
+            tokenUrl: input.tokenUrl,
+            revocationUrl: input.revocationUrl,
+            scopes: input.scopes,
+            dcrClientId: input.dcrClientId,
+            dcrClientSecret: input.dcrClientSecret,
+            clientSource,
+            redirectUri: input.redirectUri,
+          });
     const contextJson = JSON.stringify({
       resourceUrl: input.resourceUrl,
       authorizationServerIssuer: input.authorizationServerIssuer,
+      registrationEndpoint: input.registrationEndpoint ?? null,
       authorizeUrl: input.authorizeUrl,
       tokenUrl: input.tokenUrl,
       revocationUrl: input.revocationUrl ?? null,
@@ -501,12 +682,12 @@ export function insertMcpOAuthPending(input: InsertMcpOAuthPendingInput): void {
       .run(
         input.state,
         appId,
-        input.userId ? `user:${input.userId}` : "default",
+        userId ? `user:${userId}` : "default",
         encryptSecret(input.codeVerifier, getEncryptionKey()),
         input.nonce ?? null,
         input.redirectUri,
         input.finalRedirect ?? null,
-        input.userId ?? null,
+        userId,
         contextJson,
       );
   })();
@@ -569,6 +750,8 @@ export function consumeMcpOAuthPending(state: string): McpOAuthPendingRow | null
         typeof context.authorizationServerIssuer === "string"
           ? context.authorizationServerIssuer
           : "",
+      registrationEndpoint:
+        typeof context.registrationEndpoint === "string" ? context.registrationEndpoint : null,
       authorizeUrl: typeof context.authorizeUrl === "string" ? context.authorizeUrl : "",
       tokenUrl: typeof context.tokenUrl === "string" ? context.tokenUrl : "",
       revocationUrl: typeof context.revocationUrl === "string" ? context.revocationUrl : null,

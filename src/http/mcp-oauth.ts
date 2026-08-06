@@ -6,8 +6,11 @@ import {
   applyMcpOAuthRefresh,
   consumeMcpOAuthPending,
   deleteMcpOAuthToken,
+  findReusableMcpOAuthClient,
   getMcpOAuthToken,
   insertMcpOAuthPending,
+  invalidateMcpOAuthClient,
+  markMcpOAuthTokenStatus,
   setMcpServerAuthMethod,
   upsertMcpOAuthToken,
 } from "../be/db-queries/mcp-oauth";
@@ -50,6 +53,12 @@ function dashboardBase(): string {
 
 function defaultFinalRedirect(mcpServerId: string): string {
   return `${dashboardBase()}/mcp-servers/${mcpServerId}?oauth=success`;
+}
+
+// Deliberately does NOT match "invalid_client_metadata" (a distinct DCR-only
+// error) — the `\b` boundary fails on the following underscore.
+function isInvalidClientError(message: string): boolean {
+  return /invalid_client\b/i.test(message);
 }
 
 interface DiscoveryResult {
@@ -322,9 +331,44 @@ async function prepareAuthorizeFlow(
 ): Promise<string | null> {
   const userId = q.userId ?? null;
   let client = manualClientFromToken(getMcpOAuthToken(mcpServerId, userId));
+  let discovery: DiscoveryResult | null = null;
+  let registrationEndpoint: string | null = null;
 
   if (!client) {
-    const discovery = await discoverForMcp(server.url!);
+    // Reuse a previously-registered DCR client for this connector+user
+    // instead of hitting the provider's registration endpoint again — either
+    // an already-connected client (re-authorizing) or a still-live pending
+    // attempt (retrying before it's completed/GC'd). Discovery is still run
+    // (cheap metadata GET, not a mutating registration) to get the current
+    // authorize/token URLs and to confirm the AS identity hasn't moved.
+    const reusable = findReusableMcpOAuthClient(mcpServerId, userId);
+    discovery = await discoverForMcp(server.url!);
+    if (!discovery) {
+      jsonError(res, "MCP server does not require OAuth", 400);
+      return null;
+    }
+    registrationEndpoint = discovery.registrationEndpoint;
+
+    if (
+      reusable &&
+      reusable.authorizationServerIssuer === discovery.authorizationServerIssuer &&
+      reusable.registrationEndpoint === discovery.registrationEndpoint &&
+      reusable.redirectUri === callbackRedirectUri()
+    ) {
+      client = {
+        clientId: reusable.clientId,
+        clientSecret: reusable.clientSecret,
+        resourceUrl: discovery.resourceUrl,
+        authorizationServerIssuer: discovery.authorizationServerIssuer,
+        authorizeUrl: discovery.authorizeUrl,
+        tokenUrl: discovery.tokenUrl,
+        revocationUrl: discovery.revocationUrl,
+        scopes: reusable.scopes.length > 0 ? reusable.scopes : discovery.scopes,
+      };
+    }
+  }
+
+  if (!client) {
     if (!discovery) {
       jsonError(res, "MCP server does not require OAuth", 400);
       return null;
@@ -394,6 +438,7 @@ async function prepareAuthorizeFlow(
     codeVerifier: built.codeVerifier,
     resourceUrl: client.resourceUrl,
     authorizationServerIssuer: client.authorizationServerIssuer,
+    registrationEndpoint,
     authorizeUrl: client.authorizeUrl,
     tokenUrl: client.tokenUrl,
     revocationUrl: client.revocationUrl,
@@ -476,6 +521,7 @@ export async function completeMcpOAuthCallback(
       scope: tokens.scope ?? pending.scopes ?? null,
       resourceUrl: pending.resourceUrl,
       authorizationServerIssuer: pending.authorizationServerIssuer,
+      registrationEndpoint: pending.registrationEndpoint,
       authorizeUrl: pending.authorizeUrl,
       tokenUrl: pending.tokenUrl,
       revocationUrl: pending.revocationUrl,
@@ -495,6 +541,12 @@ export async function completeMcpOAuthCallback(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[mcp-oauth] callback exchange failed:", message);
+    if (isInvalidClientError(message)) {
+      // The provider rejected the client we stored — invalidate it so the
+      // next /authorize call re-registers exactly once instead of retrying
+      // with a client the provider has already disowned.
+      invalidateMcpOAuthClient(pending.mcpServerId, pending.userId);
+    }
     const target = new URL(dashboardBaseUrl);
     target.searchParams.set("oauth", "error");
     target.searchParams.set("error_description", message);
@@ -673,6 +725,13 @@ export async function handleMcpOAuth(
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (isInvalidClientError(message)) {
+        // The provider has disowned this client — invalidate it so the next
+        // /authorize call re-registers exactly once instead of continuing to
+        // refresh against a client_id the provider now rejects.
+        invalidateMcpOAuthClient(parsed.params.mcpServerId, userId);
+        markMcpOAuthTokenStatus(existing.id, "error", message);
+      }
       jsonError(res, `Refresh failed: ${message}`, 500);
     }
     return true;
