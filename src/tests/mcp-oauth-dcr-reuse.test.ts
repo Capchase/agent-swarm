@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { closeDb, createMcpServer, getDb, initDb } from "../be/db";
-import { getMcpOAuthToken } from "../be/db-queries/mcp-oauth";
+import { findReusableMcpOAuthClient, getMcpOAuthToken } from "../be/db-queries/mcp-oauth";
 import { handleCore } from "../http/core";
 import { handleMcpOAuth } from "../http/mcp-oauth";
 import { getPathSegments, parseQueryParams } from "../http/utils";
@@ -361,6 +361,39 @@ describe("MCP OAuth DCR client reuse", () => {
     const third = await authorizeUrl(server.id);
     expect(dcrCallCount).toBe(1);
     expect(third.searchParams.get("client_id")).toBe(clientId);
+  });
+
+  test("completing a reused authorize call (not the one that registered) still records the real registered scope set", async () => {
+    // Two overlapping /authorize calls: #1 freshly registers, #2 reuses that
+    // client before #1's flow ever completes. The user then finishes flow
+    // #2, not #1 — the reuse branch left `registeredScopes` undefined, so
+    // the pending row backing #2 recorded a literal `null` for the
+    // connector's registered scope set even though the reuse check just
+    // above already knew the true value (`reusable.registeredScopes`).
+    asScopesSupported = ["read", "write"];
+    const server = createMcpServer({
+      name: "reuse-completes-not-register",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(first.searchParams.get("scope")).toBe("read write");
+
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    const stateB = second.searchParams.get("state")!;
+
+    const callbackRes = await dispatch(
+      `/api/mcp-oauth/callback?state=${encodeURIComponent(stateB)}&code=auth-code`,
+    );
+    expect(callbackRes.status).toBe(302);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+
+    const stored = findReusableMcpOAuthClient(server.id);
+    expect(stored?.registeredScopes).toEqual(["read", "write"]);
   });
 
   test("an invalid_client from a freshly-registered client's callback does not invalidate the different, connected client", async () => {
