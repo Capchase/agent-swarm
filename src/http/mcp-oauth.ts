@@ -389,6 +389,10 @@ async function runAuthorizeFlow(
   let client = manualClientFromToken(getMcpOAuthToken(mcpServerId, userId));
   let discovery: DiscoveryResult | null = null;
   let registrationEndpoint: string | null = null;
+  // Only set when THIS call freshly registers (or otherwise knows the true
+  // registered set) — left undefined on reuse so the previously-recorded
+  // value survives (see upsertMcpApp's `registeredScopes` doc).
+  let registeredScopes: string[] | undefined;
 
   if (!client) {
     // Reuse a previously-registered DCR client for this connector+user
@@ -423,8 +427,19 @@ async function runAuthorizeFlow(
       // pre-existing connector re-registers on each abandoned authorize call.
       (reusable.registrationEndpoint === null ||
         reusable.registrationEndpoint === discovery.registrationEndpoint) &&
-      reusable.redirectUri === callbackRedirectUri() &&
-      scopesAreCovered(scopesToRequest, reusable.scopes)
+      // "" is the legacy/unrecorded sentinel: migration 117 backfilled it for
+      // every pre-existing MCP app row, and connects before we persisted
+      // pending.redirectUri wrote it too. Treat it as unknown rather than a
+      // mismatch, same as a null registrationEndpoint above.
+      (reusable.redirectUri === "" || reusable.redirectUri === callbackRedirectUri()) &&
+      // Compare against the REGISTERED scope set, not the granted one — a
+      // provider that narrows the granted token scope below what the client
+      // was registered with (the common case) must not make every later
+      // /authorize believe the stored client needs re-registering. A null
+      // registeredScopes is a legacy row from before this field existed —
+      // treat it as unknown, same pattern as registrationEndpoint above.
+      (reusable.registeredScopes === null ||
+        scopesAreCovered(scopesToRequest, reusable.registeredScopes))
     ) {
       client = {
         clientId: reusable.clientId,
@@ -465,6 +480,7 @@ async function runAuthorizeFlow(
       scope: scopes.join(" ") || undefined,
     });
 
+    registeredScopes = scopes;
     client = {
       clientId: dcr.client_id,
       clientSecret: dcr.client_secret ?? null,
@@ -514,6 +530,7 @@ async function runAuthorizeFlow(
     tokenUrl: client.tokenUrl,
     revocationUrl: client.revocationUrl,
     scopes: scopes.join(" "),
+    registeredScopes,
     dcrClientId: client.clientId,
     dcrClientSecret: client.clientSecret,
     redirectUri: callbackRedirectUri(),
@@ -608,6 +625,10 @@ export async function completeMcpOAuthCallback(
       tokenUrl: pending.tokenUrl,
       revocationUrl: pending.revocationUrl,
       redirectUri: pending.redirectUri,
+      // undefined (not null) when the pending row doesn't know one — this
+      // app row's app may not have been recreated by the orphan-app deletion
+      // above, and an explicit null would wipe out an already-correct value.
+      registeredScopes: pending.registeredScopes ?? undefined,
       dcrClientId: pending.dcrClientId,
       dcrClientSecret: pending.dcrClientSecret,
       clientSource,

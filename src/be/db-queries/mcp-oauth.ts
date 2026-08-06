@@ -79,6 +79,7 @@ export interface McpOAuthPendingRow {
   tokenUrl: string;
   revocationUrl: string | null;
   scopes: string | null;
+  registeredScopes: string[] | null;
   dcrClientId: string | null;
   dcrClientSecret: string | null;
   redirectUri: string;
@@ -205,6 +206,13 @@ function upsertMcpApp(input: {
   tokenUrl: string;
   revocationUrl?: string | null;
   scopes?: string | null;
+  // The scope set the client was actually REGISTERED with at the provider —
+  // distinct from `scopes` above, which becomes the token's GRANTED scope
+  // once a callback completes. Omit (undefined) when this call isn't a
+  // fresh registration, so the previously-recorded value survives; pass an
+  // explicit array (possibly empty) only at the point a registration — fresh
+  // or reused-as-is — is known to have happened.
+  registeredScopes?: string[];
   dcrClientId?: string | null;
   dcrClientSecret?: string | null;
   clientSource: McpOAuthClientSource;
@@ -230,12 +238,17 @@ function upsertMcpApp(input: {
     : null;
   // A write means the client is currently in use / believed valid — clear
   // any stale `invalidated` flag left over from a prior provider rejection.
+  const existingMetadata = parseObject(existing?.metadata);
   const metadata = JSON.stringify({
-    ...parseObject(existing?.metadata),
+    ...existingMetadata,
     resourceUrl: input.resourceUrl,
     authorizationServerIssuer: input.authorizationServerIssuer,
     registrationEndpoint: input.registrationEndpoint ?? null,
     clientSource: input.clientSource,
+    registeredScopes:
+      input.registeredScopes !== undefined
+        ? input.registeredScopes
+        : (existingMetadata.registeredScopes ?? null),
     invalidated: false,
   });
   const encryptedClientSecret =
@@ -330,6 +343,10 @@ export interface StoredMcpOAuthClient {
   revocationUrl: string | null;
   redirectUri: string;
   scopes: string[];
+  // The scope set the client was registered with, tracked separately from
+  // `scopes` (which holds the token's granted scope once connected). Null
+  // means unknown — a legacy row from before this field was recorded.
+  registeredScopes: string[] | null;
   resourceUrl: string;
   authorizationServerIssuer: string;
   registrationEndpoint: string | null;
@@ -401,6 +418,9 @@ function readMcpOAuthApp(appId: string): StoredMcpOAuthClient | null {
         : "",
     registrationEndpoint:
       typeof metadata.registrationEndpoint === "string" ? metadata.registrationEndpoint : null,
+    registeredScopes: Array.isArray(metadata.registeredScopes)
+      ? (metadata.registeredScopes as string[])
+      : null,
     clientSource,
   };
 }
@@ -498,6 +518,10 @@ export interface UpsertMcpOAuthTokenInput {
   authorizeUrl: string;
   tokenUrl: string;
   revocationUrl?: string | null;
+  // Pass the pending row's registeredScopes (undefined if it doesn't know
+  // one) — never pass an explicit null here, or a reuse flow that already
+  // has a correctly-tracked value on the still-live app row gets clobbered.
+  registeredScopes?: string[];
   dcrClientId?: string | null;
   dcrClientSecret?: string | null;
   clientSource: McpOAuthClientSource;
@@ -523,6 +547,7 @@ export function upsertMcpOAuthToken(input: UpsertMcpOAuthTokenInput): void {
       revocationUrl: input.revocationUrl,
       redirectUri: input.redirectUri,
       scopes: input.scope,
+      registeredScopes: input.registeredScopes,
       dcrClientId: input.dcrClientId,
       dcrClientSecret: input.dcrClientSecret,
       clientSource: input.clientSource,
@@ -629,6 +654,10 @@ export interface InsertMcpOAuthPendingInput {
   tokenUrl: string;
   revocationUrl?: string | null;
   scopes?: string | null;
+  // Set only when this pending attempt just performed a fresh DCR
+  // registration (or is otherwise the authority on what the client was
+  // registered with) — see upsertMcpApp's `registeredScopes` doc.
+  registeredScopes?: string[];
   dcrClientId?: string | null;
   dcrClientSecret?: string | null;
   redirectUri: string;
@@ -676,6 +705,7 @@ export function insertMcpOAuthPending(input: InsertMcpOAuthPendingInput): void {
             tokenUrl: input.tokenUrl,
             revocationUrl: input.revocationUrl,
             scopes: input.scopes,
+            registeredScopes: input.registeredScopes,
             dcrClientId: input.dcrClientId,
             dcrClientSecret: input.dcrClientSecret,
             clientSource,
@@ -689,6 +719,13 @@ export function insertMcpOAuthPending(input: InsertMcpOAuthPendingInput): void {
       tokenUrl: input.tokenUrl,
       revocationUrl: input.revocationUrl ?? null,
       scopes: input.scopes ?? null,
+      // Carried through the pending row so a first-ever connect's callback
+      // can restore it: consumeMcpOAuthPending's deleteOrphanMcpApp deletes
+      // this app the moment the pending row is consumed (no authorization
+      // exists yet), so the metadata written by insertMcpOAuthPending's own
+      // upsertMcpApp call above does not survive to the following
+      // upsertMcpOAuthToken call — it re-creates the row from scratch.
+      registeredScopes: input.registeredScopes ?? null,
       dcrClientId: input.dcrClientId ?? null,
       dcrClientSecret:
         input.dcrClientSecret == null
@@ -780,6 +817,9 @@ export function consumeMcpOAuthPending(state: string): McpOAuthPendingRow | null
       tokenUrl: typeof context.tokenUrl === "string" ? context.tokenUrl : "",
       revocationUrl: typeof context.revocationUrl === "string" ? context.revocationUrl : null,
       scopes: typeof context.scopes === "string" ? context.scopes : null,
+      registeredScopes: Array.isArray(context.registeredScopes)
+        ? (context.registeredScopes as string[])
+        : null,
       dcrClientId: typeof context.dcrClientId === "string" ? context.dcrClientId : null,
       dcrClientSecret: encryptedClientSecret
         ? decryptSecret(encryptedClientSecret, getEncryptionKey())

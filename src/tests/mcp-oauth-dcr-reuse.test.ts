@@ -494,6 +494,9 @@ describe("MCP OAuth DCR client reuse", () => {
       scope: "swarm",
     });
 
+    // The fixture's default asScopesSupported ([]) means this client is
+    // registered with an empty scope set — registeredScopes naturally ends
+    // up `[]`, no DB fixture hack needed.
     const first = await authorizeUrl(server.id);
     const state = first.searchParams.get("state")!;
     await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`);
@@ -501,16 +504,7 @@ describe("MCP OAuth DCR client reuse", () => {
     const originalClientId = getMcpOAuthToken(server.id)?.dcrClientId;
     expect(dcrCallCount).toBe(1);
 
-    // Simulate a client whose registered scope set was never recorded (e.g.
-    // registered while the provider advertised none), while the provider now
-    // advertises real scopes.
-    const db = getDb();
-    const appRow = db
-      .query(
-        `SELECT a.id FROM oauth_apps a JOIN oauth_authorizations z ON z.appId = a.id WHERE a.mcpServerId = ?`,
-      )
-      .get(server.id) as { id: string };
-    db.query("UPDATE oauth_apps SET scopes = '[]' WHERE id = ?").run(appRow.id);
+    // The provider now advertises real scopes.
     asScopesSupported = ["read", "write"];
 
     // No explicit ?scopes= — must NOT silently reuse the unscoped client
@@ -520,5 +514,37 @@ describe("MCP OAuth DCR client reuse", () => {
     expect(dcrCallCount).toBe(2);
     expect(second.searchParams.get("client_id")).not.toBe(originalClientId);
     expect(second.searchParams.get("scope")).toBe("read write");
+  });
+
+  test("a legacy connector with no recorded redirectUri reuses instead of re-registering forever", async () => {
+    const server = createMcpServer({
+      name: "legacy-empty-redirect-uri",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    const state = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    const clientId = getMcpOAuthToken(server.id)?.dcrClientId;
+    expect(dcrCallCount).toBe(1);
+
+    // Simulate a pre-349b691c row: redirectUri was never persisted (migration
+    // 117's backfill sentinel, or a connect from before that fix).
+    const db = getDb();
+    const appRow = db
+      .query(
+        `SELECT a.id FROM oauth_apps a JOIN oauth_authorizations z ON z.appId = a.id WHERE a.mcpServerId = ?`,
+      )
+      .get(server.id) as { id: string };
+    db.query("UPDATE oauth_apps SET redirectUri = '' WHERE id = ?").run(appRow.id);
+
+    // An abandoned/retried flow must NOT force a fresh registration just
+    // because the legacy row predates this field being recorded.
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(second.searchParams.get("client_id")).toBe(clientId);
   });
 });
