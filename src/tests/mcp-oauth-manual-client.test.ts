@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { closeDb, createMcpServer, initDb } from "../be/db";
+import { closeDb, createMcpServer, getDb, initDb } from "../be/db";
 import { getMcpOAuthToken } from "../be/db-queries/mcp-oauth";
 import { handleCore } from "../http/core";
 import { handleMcpOAuth } from "../http/mcp-oauth";
@@ -89,6 +89,7 @@ async function dispatch(path: string, init: RequestInit = {}): Promise<TestRespo
 describe("MCP OAuth manual client flow", () => {
   let originalFetch: typeof fetch;
   let capturedTokenBody: string | null;
+  let capturedTokenHeaders: Record<string, string> | null;
   let originalPublicMcpBaseUrl: string | undefined;
   let originalAppUrl: string | undefined;
   let originalDashboardUrl: string | undefined;
@@ -97,6 +98,7 @@ describe("MCP OAuth manual client flow", () => {
   beforeEach(async () => {
     originalFetch = globalThis.fetch;
     capturedTokenBody = null;
+    capturedTokenHeaders = null;
     originalPublicMcpBaseUrl = process.env.PUBLIC_MCP_BASE_URL;
     originalAppUrl = process.env.APP_URL;
     originalDashboardUrl = process.env.DASHBOARD_URL;
@@ -113,6 +115,7 @@ describe("MCP OAuth manual client flow", () => {
       const href = input.toString();
       if (href === "https://login.salesforce.com/services/oauth2/token") {
         capturedTokenBody = init?.body?.toString() ?? null;
+        capturedTokenHeaders = (init?.headers as Record<string, string> | undefined) ?? null;
         return new Response(
           JSON.stringify({
             access_token: "sf-access-token",
@@ -140,7 +143,7 @@ describe("MCP OAuth manual client flow", () => {
     else process.env.DASHBOARD_URL = originalDashboardUrl;
   });
 
-  test("authorize-url uses a stored manual client when DCR is not available", async () => {
+  test("a legacy manual client re-authorizes with body-post authentication", async () => {
     const mcpServer = createMcpServer({
       name: "salesforce-sobjects",
       transport: "http",
@@ -167,6 +170,14 @@ describe("MCP OAuth manual client flow", () => {
     const provisionalToken = getMcpOAuthToken(mcpServer.id);
     expect(provisionalToken?.clientSource).toBe("manual");
     expect(provisionalToken?.status).toBe("error");
+
+    // Simulate a manual client that was stored before tokenEndpointAuthMethod
+    // existed. Reauthorization must preserve its historical body-post method.
+    getDb()
+      .query(
+        "UPDATE oauth_apps SET metadata = json_remove(metadata, '$.tokenEndpointAuthMethod') WHERE provider = ?",
+      )
+      .run(`mcp-${mcpServer.id}`);
 
     const authorizeRes = await dispatch(`/api/mcp-oauth/${mcpServer.id}/authorize-url`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
@@ -196,6 +207,8 @@ describe("MCP OAuth manual client flow", () => {
       `${process.env.APP_URL}/mcp-servers/${mcpServer.id}?oauth=success`,
     );
 
+    // The stored method is absent, so this legacy manual client must retain
+    // the body-post behavior that worked before the auth-method field existed.
     const tokenRequest = new URLSearchParams(capturedTokenBody ?? "");
     expect(tokenRequest.get("client_id")).toBe("sf-client-id");
     expect(tokenRequest.get("client_secret")).toBe("sf-client-secret");
@@ -203,6 +216,7 @@ describe("MCP OAuth manual client flow", () => {
     expect(tokenRequest.get("redirect_uri")).toBe(
       "https://swarm.example.test/api/mcp-oauth/callback",
     );
+    expect(capturedTokenHeaders?.Authorization).toBeUndefined();
 
     const connectedToken = getMcpOAuthToken(mcpServer.id);
     expect(connectedToken?.clientSource).toBe("manual");

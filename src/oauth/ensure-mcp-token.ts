@@ -5,7 +5,7 @@ import {
   type McpOAuthToken,
   markMcpOAuthTokenStatus,
 } from "../be/db-queries/mcp-oauth";
-import { computeExpiresAt, refreshMcpToken } from "./mcp-wrapper";
+import { authMethodForStoredClient, computeExpiresAt, refreshMcpToken } from "./mcp-wrapper";
 
 /**
  * Per-mcpServerId in-memory mutex to serialize concurrent refreshes.
@@ -57,6 +57,7 @@ export async function ensureMcpToken(
         tokenUrl: token.tokenUrl,
         clientId: token.dcrClientId ?? "",
         clientSecret: token.dcrClientSecret ?? undefined,
+        tokenEndpointAuthMethod: authMethodForStoredClient(token.tokenEndpointAuthMethod),
         refreshToken: token.refreshToken,
         resource: token.resourceUrl,
         scopes: token.scope ? token.scope.split(" ").filter(Boolean) : undefined,

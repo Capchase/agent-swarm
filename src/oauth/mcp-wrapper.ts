@@ -225,6 +225,93 @@ export async function discoverAuthorizationServerMetadata(
   throw lastError ?? new Error(`Authorization server metadata not found at ${issuer}`);
 }
 
+// ─── Token endpoint client authentication (RFC 6749 §2.3.1 / RFC 7591 §2) ────
+
+/**
+ * The three `token_endpoint_auth_method` values agent-swarm knows how to
+ * apply at the token endpoint. Other RFC 7591 values (e.g. `private_key_jwt`)
+ * are not supported by any MCP provider we've integrated with; they fall
+ * back to the RFC 7591 §2 default below.
+ */
+export type TokenEndpointAuthMethod = "client_secret_basic" | "client_secret_post" | "none";
+
+const KNOWN_TOKEN_ENDPOINT_AUTH_METHODS: readonly TokenEndpointAuthMethod[] = [
+  "client_secret_basic",
+  "client_secret_post",
+  "none",
+];
+
+/** RFC 7591 §2: "client_secret_basic" is the default when unspecified. */
+export const DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD: TokenEndpointAuthMethod = "client_secret_basic";
+
+/** Coerce a value we read back from a provider (or our own storage) to a known method, defaulting per RFC 7591 §2. */
+export function normalizeTokenEndpointAuthMethod(
+  value: string | null | undefined,
+): TokenEndpointAuthMethod {
+  return (KNOWN_TOKEN_ENDPOINT_AUTH_METHODS as readonly string[]).includes(value ?? "")
+    ? (value as TokenEndpointAuthMethod)
+    : DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD;
+}
+
+/**
+ * Read the method from a persisted client. Older rows predate this field and
+ * used client_secret_post, so preserve that known-working behavior.
+ */
+export function authMethodForStoredClient(
+  value: string | null | undefined,
+): TokenEndpointAuthMethod {
+  if (value == null || value === "") return "client_secret_post";
+  return normalizeTokenEndpointAuthMethod(value);
+}
+
+/**
+ * Pick the method to REQUEST during DCR from the AS's advertised
+ * `token_endpoint_auth_methods_supported`. Prefers the RFC-preferred Basic
+ * form, then body-post, then public (`none`); falls back to the RFC 7591 §2
+ * default when the AS didn't advertise anything we recognize.
+ */
+export function selectDcrTokenEndpointAuthMethod(
+  supportedMethods: string[] | undefined,
+): TokenEndpointAuthMethod {
+  if (!supportedMethods || supportedMethods.length === 0) {
+    return DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD;
+  }
+  for (const method of KNOWN_TOKEN_ENDPOINT_AUTH_METHODS) {
+    if (supportedMethods.includes(method)) return method;
+  }
+  return DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD;
+}
+
+/**
+ * Apply the client's registered auth method to a token-endpoint request.
+ * Mutates `body` and `headers` in place so callers can build the rest of the
+ * grant-specific params around it.
+ *
+ *   - client_secret_basic → Authorization: Basic header; no creds in body.
+ *   - client_secret_post  → client_id/client_secret in the body; no header.
+ *   - none (public client) → client_id only in the body; no secret anywhere.
+ */
+function applyClientAuthentication(
+  method: TokenEndpointAuthMethod,
+  clientId: string,
+  clientSecret: string | null | undefined,
+  body: URLSearchParams,
+  headers: Record<string, string>,
+): void {
+  if (method === "client_secret_basic" && clientSecret) {
+    const credentials = `${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`;
+    headers.Authorization = `Basic ${Buffer.from(credentials).toString("base64")}`;
+    return;
+  }
+
+  // A public client must identify itself in the body, whatever method was
+  // recorded for a client with no secret.
+  body.set("client_id", clientId);
+  if (method === "client_secret_post" && clientSecret) {
+    body.set("client_secret", clientSecret);
+  }
+}
+
 // ─── Dynamic Client Registration (RFC 7591) ──────────────────────────────────
 
 export interface DcrRequest {
@@ -329,6 +416,7 @@ export interface ExchangeCodeInput {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   redirectUri: string;
   code: string;
   codeVerifier: string;
@@ -344,22 +432,23 @@ export interface TokenResponse {
 }
 
 export async function exchangeCodeForTokens(input: ExchangeCodeInput): Promise<TokenResponse> {
+  const method = normalizeTokenEndpointAuthMethod(input.tokenEndpointAuthMethod);
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code: input.code,
     redirect_uri: input.redirectUri,
-    client_id: input.clientId,
     code_verifier: input.codeVerifier,
     resource: input.resource,
   });
-  if (input.clientSecret) body.set("client_secret", input.clientSecret);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  applyClientAuthentication(method, input.clientId, input.clientSecret, body, headers);
 
   const res = await safeFetch(input.tokenUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   if (!res.ok) {
@@ -373,27 +462,29 @@ export interface RefreshTokenInput {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   refreshToken: string;
   resource: string;
   scopes?: string[];
 }
 
 export async function refreshMcpToken(input: RefreshTokenInput): Promise<TokenResponse> {
+  const method = normalizeTokenEndpointAuthMethod(input.tokenEndpointAuthMethod);
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: input.refreshToken,
-    client_id: input.clientId,
     resource: input.resource,
   });
-  if (input.clientSecret) body.set("client_secret", input.clientSecret);
   if (input.scopes && input.scopes.length > 0) body.set("scope", input.scopes.join(" "));
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  applyClientAuthentication(method, input.clientId, input.clientSecret, body, headers);
 
   const res = await safeFetch(input.tokenUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   if (!res.ok) {
@@ -409,22 +500,22 @@ export interface RevokeInput {
   tokenTypeHint?: "access_token" | "refresh_token";
   clientId: string;
   clientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
 }
 
 export async function revokeMcpToken(input: RevokeInput): Promise<void> {
-  const body = new URLSearchParams({
-    token: input.token,
-    client_id: input.clientId,
-  });
+  const method = normalizeTokenEndpointAuthMethod(input.tokenEndpointAuthMethod);
+  const body = new URLSearchParams({ token: input.token });
   if (input.tokenTypeHint) body.set("token_type_hint", input.tokenTypeHint);
-  if (input.clientSecret) body.set("client_secret", input.clientSecret);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  applyClientAuthentication(method, input.clientId, input.clientSecret, body, headers);
 
   const res = await safeFetch(input.revocationUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   if (!res.ok && res.status !== 200 && res.status !== 204) {
