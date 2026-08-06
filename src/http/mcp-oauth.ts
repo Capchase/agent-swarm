@@ -104,7 +104,7 @@ function manualClientFromToken(token: McpOAuthToken | null): OAuthClientForAutho
     tokenUrl: token.tokenUrl,
     revocationUrl: token.revocationUrl,
     scopes: splitScopes(token.scope),
-    tokenEndpointAuthMethod: normalizeTokenEndpointAuthMethod(token.tokenEndpointAuthMethod),
+    tokenEndpointAuthMethod: authMethodForStoredClient(token.tokenEndpointAuthMethod),
   };
 }
 

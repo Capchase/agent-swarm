@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { closeDb, createMcpServer, initDb } from "../be/db";
+import { closeDb, createMcpServer, getDb, initDb } from "../be/db";
 import { getMcpOAuthToken } from "../be/db-queries/mcp-oauth";
 import { handleCore } from "../http/core";
 import { handleMcpOAuth } from "../http/mcp-oauth";
@@ -143,7 +143,7 @@ describe("MCP OAuth manual client flow", () => {
     else process.env.DASHBOARD_URL = originalDashboardUrl;
   });
 
-  test("authorize-url uses a stored manual client when DCR is not available", async () => {
+  test("a legacy manual client re-authorizes with body-post authentication", async () => {
     const mcpServer = createMcpServer({
       name: "salesforce-sobjects",
       transport: "http",
@@ -170,6 +170,14 @@ describe("MCP OAuth manual client flow", () => {
     const provisionalToken = getMcpOAuthToken(mcpServer.id);
     expect(provisionalToken?.clientSource).toBe("manual");
     expect(provisionalToken?.status).toBe("error");
+
+    // Simulate a manual client that was stored before tokenEndpointAuthMethod
+    // existed. Reauthorization must preserve its historical body-post method.
+    getDb()
+      .query(
+        "UPDATE oauth_apps SET metadata = json_remove(metadata, '$.tokenEndpointAuthMethod') WHERE provider = ?",
+      )
+      .run(`mcp-${mcpServer.id}`);
 
     const authorizeRes = await dispatch(`/api/mcp-oauth/${mcpServer.id}/authorize-url`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
@@ -199,20 +207,16 @@ describe("MCP OAuth manual client flow", () => {
       `${process.env.APP_URL}/mcp-servers/${mcpServer.id}?oauth=success`,
     );
 
-    // No authorizationServerIssuer/metadata-derived auth method was supplied
-    // (authorizeUrl/tokenUrl were given directly, so discovery never ran), so
-    // the RFC 7591 §2 default (client_secret_basic) applies: credentials go
-    // in the Authorization header, not the body.
+    // The stored method is absent, so this legacy manual client must retain
+    // the body-post behavior that worked before the auth-method field existed.
     const tokenRequest = new URLSearchParams(capturedTokenBody ?? "");
-    expect(tokenRequest.get("client_id")).toBeNull();
-    expect(tokenRequest.get("client_secret")).toBeNull();
+    expect(tokenRequest.get("client_id")).toBe("sf-client-id");
+    expect(tokenRequest.get("client_secret")).toBe("sf-client-secret");
     expect(tokenRequest.get("resource")).toBe(mcpServer.url);
     expect(tokenRequest.get("redirect_uri")).toBe(
       "https://swarm.example.test/api/mcp-oauth/callback",
     );
-    expect(capturedTokenHeaders?.Authorization).toBe(
-      `Basic ${Buffer.from("sf-client-id:sf-client-secret").toString("base64")}`,
-    );
+    expect(capturedTokenHeaders?.Authorization).toBeUndefined();
 
     const connectedToken = getMcpOAuthToken(mcpServer.id);
     expect(connectedToken?.clientSource).toBe("manual");
