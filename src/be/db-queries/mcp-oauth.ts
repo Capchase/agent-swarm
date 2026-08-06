@@ -57,7 +57,6 @@ export interface McpOAuthToken {
   revocationUrl: string | null;
   dcrClientId: string | null;
   dcrClientSecret: string | null;
-  /** How this client authenticates at the token endpoint. Null on rows created before this field existed — treat as client_secret_basic (RFC 7591 §2 default). */
   tokenEndpointAuthMethod: string | null;
   clientSource: McpOAuthClientSource;
   status: McpOAuthStatus;

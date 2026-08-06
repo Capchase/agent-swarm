@@ -402,7 +402,6 @@ export interface ExchangeCodeInput {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string | null;
-  /** How to authenticate this client at the token endpoint. Defaults to client_secret_basic per RFC 7591 §2. */
   tokenEndpointAuthMethod?: string | null;
   redirectUri: string;
   code: string;
@@ -449,7 +448,6 @@ export interface RefreshTokenInput {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string | null;
-  /** How to authenticate this client at the token endpoint. Defaults to client_secret_basic per RFC 7591 §2. */
   tokenEndpointAuthMethod?: string | null;
   refreshToken: string;
   resource: string;
@@ -488,7 +486,6 @@ export interface RevokeInput {
   tokenTypeHint?: "access_token" | "refresh_token";
   clientId: string;
   clientSecret?: string | null;
-  /** How to authenticate this client at the revocation endpoint. Defaults to client_secret_basic per RFC 7591 §2. */
   tokenEndpointAuthMethod?: string | null;
 }
 
