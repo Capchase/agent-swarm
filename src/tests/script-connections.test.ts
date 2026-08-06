@@ -533,6 +533,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "117_unified_oauth.sql");
       markMigrationApplied(database, "119_agent_avatar.sql");
       markMigrationApplied(database, "127_backfill_user_attribution.sql");
+      // 128 alters session_costs, which this partial fixture does not create.
+      markMigrationApplied(database, "128_session_costs_accuracy.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
