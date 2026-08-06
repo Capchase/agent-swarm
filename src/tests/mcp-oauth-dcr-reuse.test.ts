@@ -174,8 +174,9 @@ describe("MCP OAuth DCR client reuse", () => {
     delete process.env.APP_URL;
   });
 
-  async function authorizeUrl(mcpServerId: string) {
-    const res = await dispatch(`/api/mcp-oauth/${mcpServerId}/authorize-url`, {
+  async function authorizeUrl(mcpServerId: string, scopes?: string) {
+    const qs = scopes ? `?scopes=${encodeURIComponent(scopes)}` : "";
+    const res = await dispatch(`/api/mcp-oauth/${mcpServerId}/authorize-url${qs}`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
     });
     expect(res.status).toBe(200);
@@ -262,5 +263,35 @@ describe("MCP OAuth DCR client reuse", () => {
     const fourth = await authorizeUrl(server.id);
     expect(dcrCallCount).toBe(2);
     expect(fourth.searchParams.get("client_id")).toBe(third.searchParams.get("client_id"));
+  });
+
+  test("a requested scope not covered by the stored client forces re-registration", async () => {
+    const server = createMcpServer({
+      name: "reuse-scope-change",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    // First call has no explicit scope request — the fixture's PRMD/AS
+    // metadata advertises no scopes_supported, so the client registers with
+    // no scope restriction recorded.
+    const first = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(first.searchParams.has("scope")).toBe(false);
+
+    // A caller now explicitly requests scopes the stored client was never
+    // registered with. Reusing it would silently send an authorize request
+    // for a scope the provider never granted the client — must re-register.
+    const second = await authorizeUrl(server.id, "read write");
+    expect(dcrCallCount).toBe(2);
+    expect(second.searchParams.get("client_id")).not.toBe(first.searchParams.get("client_id"));
+    expect(second.searchParams.get("scope")).toBe("read write");
+
+    // A further call requesting that SAME now-covered scope set reuses the
+    // new client instead of registering yet again.
+    const third = await authorizeUrl(server.id, "read write");
+    expect(dcrCallCount).toBe(2);
+    expect(third.searchParams.get("client_id")).toBe(second.searchParams.get("client_id"));
   });
 });

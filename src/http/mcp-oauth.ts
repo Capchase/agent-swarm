@@ -84,6 +84,19 @@ function splitScopes(scopes: string | null | undefined): string[] {
   return scopes?.split(/\s+/).filter(Boolean) ?? [];
 }
 
+/**
+ * A registered DCR client is scoped to whatever it was registered with.
+ * `requested` is covered only if every requested scope is already in
+ * `registered` — an empty `registered` set (no scope restriction recorded)
+ * does NOT count as "covers everything", since providers that enforce RFC
+ * 7591 client scope metadata reject a token/authorize request for a scope
+ * the client was never registered with.
+ */
+function scopesAreCovered(requested: string[], registered: string[]): boolean {
+  const registeredSet = new Set(registered);
+  return requested.every((scope) => registeredSet.has(scope));
+}
+
 function manualClientFromToken(token: McpOAuthToken | null): OAuthClientForAuthorize | null {
   if (!token || token.clientSource !== "manual" || !token.dcrClientId) return null;
 
@@ -344,11 +357,17 @@ async function prepareAuthorizeFlow(
     }
     registrationEndpoint = discovery.registrationEndpoint;
 
+    // A caller-requested scope set that the stored client wasn't registered
+    // with must not be silently narrowed to the stored client's scopes —
+    // fall through to fresh registration below instead of reusing.
+    const requestedScopes = q.scopes ? splitScopes(q.scopes) : null;
+
     if (
       reusable &&
       reusable.authorizationServerIssuer === discovery.authorizationServerIssuer &&
       reusable.registrationEndpoint === discovery.registrationEndpoint &&
-      reusable.redirectUri === callbackRedirectUri()
+      reusable.redirectUri === callbackRedirectUri() &&
+      (requestedScopes === null || scopesAreCovered(requestedScopes, reusable.scopes))
     ) {
       client = {
         clientId: reusable.clientId,
