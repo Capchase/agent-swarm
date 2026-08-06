@@ -330,6 +330,39 @@ describe("MCP OAuth DCR client reuse", () => {
     expect(third.searchParams.get("client_id")).toBe(second.searchParams.get("client_id"));
   });
 
+  test("a granted scope narrower than the registered set is still reused, not re-registered", async () => {
+    // The AS advertises a real catalogue, so the client is registered with
+    // "read write" — but the provider's token response only GRANTS "read"
+    // (the fixture's fixed mock). Comparing against the granted scope instead
+    // of the registered scope would make every subsequent /authorize believe
+    // the stored client was never registered with "write" and re-register on
+    // every call.
+    asScopesSupported = ["read", "write"];
+    const server = createMcpServer({
+      name: "granted-narrower-than-registered",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    expect(first.searchParams.get("scope")).toBe("read write");
+    const state = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    expect(getMcpOAuthToken(server.id)?.scope).toBe("read");
+    const clientId = getMcpOAuthToken(server.id)?.dcrClientId;
+    expect(dcrCallCount).toBe(1);
+
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(second.searchParams.get("client_id")).toBe(clientId);
+
+    const third = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(1);
+    expect(third.searchParams.get("client_id")).toBe(clientId);
+  });
+
   test("an invalid_client from a freshly-registered client's callback does not invalidate the different, connected client", async () => {
     const server = createMcpServer({
       name: "invalidate-wrong-target",
