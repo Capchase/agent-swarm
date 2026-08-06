@@ -1,5 +1,6 @@
 import * as oauth from "oauth4webapi";
 import { isEnvFlagEnabled } from "../utils/env-flag";
+import { registerVolatileSecret, scrubSecrets } from "../utils/secret-scrubber";
 
 /**
  * MCP OAuth 2.1 wrapper.
@@ -379,6 +380,14 @@ export interface RefreshTokenInput {
 }
 
 export async function refreshMcpToken(input: RefreshTokenInput): Promise<TokenResponse> {
+  // A misbehaving/compromised provider can echo a submitted credential back
+  // verbatim in an error body (e.g. "invalid client_secret: <value>"). Both
+  // credentials we send are registered as volatile secrets so the scrub pass
+  // below redacts any echo BEFORE the message is persisted to
+  // lastErrorMessage or returned by the status endpoint.
+  if (input.clientSecret) registerVolatileSecret(input.clientSecret, "mcp_oauth_client_secret");
+  registerVolatileSecret(input.refreshToken, "mcp_oauth_refresh_token");
+
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: input.refreshToken,
@@ -398,7 +407,7 @@ export async function refreshMcpToken(input: RefreshTokenInput): Promise<TokenRe
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Token refresh failed (${res.status}): ${text}`);
+    throw new Error(`Token refresh failed (${res.status}): ${scrubSecrets(text)}`);
   }
   return (await res.json()) as TokenResponse;
 }

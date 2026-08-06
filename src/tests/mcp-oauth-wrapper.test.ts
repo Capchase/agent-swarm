@@ -525,6 +525,38 @@ describe("refreshMcpToken", () => {
       }),
     ).rejects.toThrow(/Token refresh failed \(400\)/);
   });
+
+  test("scrubs an echoed client_secret/refresh_token from the thrown error body", async () => {
+    const clientSecret = "super-secret-client-value-123456";
+    const refreshToken = "super-secret-refresh-value-654321";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: "invalid_client",
+          error_description: `client_secret ${clientSecret} rejected for refresh_token ${refreshToken}`,
+        }),
+        { status: 401 },
+      );
+
+    let thrown: Error | undefined;
+    try {
+      await refreshMcpToken({
+        tokenUrl: "https://as.example.com/token",
+        clientId: "c",
+        clientSecret,
+        refreshToken,
+        resource: "https://mcp.example.com/",
+      });
+    } catch (err) {
+      thrown = err as Error;
+    }
+
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).not.toContain(clientSecret);
+    expect(thrown!.message).not.toContain(refreshToken);
+    expect(thrown!.message).toMatch(/\[REDACTED:mcp_oauth_client_secret]/);
+    expect(thrown!.message).toMatch(/\[REDACTED:mcp_oauth_refresh_token]/);
+  });
 });
 
 describe("revokeMcpToken (RFC 7009)", () => {
