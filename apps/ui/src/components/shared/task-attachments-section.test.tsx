@@ -1,0 +1,27 @@
+import { describe, expect, test } from "bun:test";
+import { renderToStaticMarkup } from "react-dom/server";
+import { AttachmentName, buildAgentFsLiveUrl } from "./task-attachment-link";
+
+describe("task attachment links", () => {
+  test("renders an agent-fs attachment name as an inline live-host link", () => {
+    const href = buildAgentFsLiveUrl({
+      path: "thoughts/report.md",
+      orgId: "org-1",
+      driveId: "drive-1",
+    });
+    const html = renderToStaticMarkup(<AttachmentName href={href} name="Report" />);
+
+    expect(html).toContain(
+      'href="https://live.agent-fs.dev/file/~/org-1/drive-1/thoughts/report.md"',
+    );
+    expect(html).toContain(">Report</a>");
+  });
+
+  test("keeps the name as plain text when the agent-fs drive id is missing", () => {
+    const href = buildAgentFsLiveUrl({ path: "thoughts/report.md", orgId: "org-1" });
+    const html = renderToStaticMarkup(<AttachmentName href={href} name="Report" />);
+
+    expect(href).toBeNull();
+    expect(html).toBe('<span class="truncate text-sm font-medium text-foreground">Report</span>');
+  });
+});
