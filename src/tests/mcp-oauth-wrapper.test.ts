@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-  authMethodForStoredClient,
   assertUrlSafe,
+  authMethodForStoredClient,
   buildAuthorizeUrl,
   computeExpiresAt,
   discoverAuthorizationServerMetadata,

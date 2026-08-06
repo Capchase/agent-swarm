@@ -13,8 +13,8 @@ import {
 } from "../be/db-queries/mcp-oauth";
 import { ensureMcpToken } from "../oauth/ensure-mcp-token";
 import {
-  authMethodForStoredClient,
   assertUrlSafe,
+  authMethodForStoredClient,
   buildAuthorizeUrl,
   computeExpiresAt,
   discoverAuthorizationServerMetadata,
