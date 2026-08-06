@@ -89,6 +89,7 @@ async function dispatch(path: string, init: RequestInit = {}): Promise<TestRespo
 describe("MCP OAuth manual client flow", () => {
   let originalFetch: typeof fetch;
   let capturedTokenBody: string | null;
+  let capturedTokenHeaders: Record<string, string> | null;
   let originalPublicMcpBaseUrl: string | undefined;
   let originalAppUrl: string | undefined;
   let originalDashboardUrl: string | undefined;
@@ -97,6 +98,7 @@ describe("MCP OAuth manual client flow", () => {
   beforeEach(async () => {
     originalFetch = globalThis.fetch;
     capturedTokenBody = null;
+    capturedTokenHeaders = null;
     originalPublicMcpBaseUrl = process.env.PUBLIC_MCP_BASE_URL;
     originalAppUrl = process.env.APP_URL;
     originalDashboardUrl = process.env.DASHBOARD_URL;
@@ -113,6 +115,7 @@ describe("MCP OAuth manual client flow", () => {
       const href = input.toString();
       if (href === "https://login.salesforce.com/services/oauth2/token") {
         capturedTokenBody = init?.body?.toString() ?? null;
+        capturedTokenHeaders = (init?.headers as Record<string, string> | undefined) ?? null;
         return new Response(
           JSON.stringify({
             access_token: "sf-access-token",
@@ -196,12 +199,19 @@ describe("MCP OAuth manual client flow", () => {
       `${process.env.APP_URL}/mcp-servers/${mcpServer.id}?oauth=success`,
     );
 
+    // No authorizationServerIssuer/metadata-derived auth method was supplied
+    // (authorizeUrl/tokenUrl were given directly, so discovery never ran), so
+    // the RFC 7591 §2 default (client_secret_basic) applies: credentials go
+    // in the Authorization header, not the body.
     const tokenRequest = new URLSearchParams(capturedTokenBody ?? "");
-    expect(tokenRequest.get("client_id")).toBe("sf-client-id");
-    expect(tokenRequest.get("client_secret")).toBe("sf-client-secret");
+    expect(tokenRequest.get("client_id")).toBeNull();
+    expect(tokenRequest.get("client_secret")).toBeNull();
     expect(tokenRequest.get("resource")).toBe(mcpServer.url);
     expect(tokenRequest.get("redirect_uri")).toBe(
       "https://swarm.example.test/api/mcp-oauth/callback",
+    );
+    expect(capturedTokenHeaders?.Authorization).toBe(
+      `Basic ${Buffer.from("sf-client-id:sf-client-secret").toString("base64")}`,
     );
 
     const connectedToken = getMcpOAuthToken(mcpServer.id);

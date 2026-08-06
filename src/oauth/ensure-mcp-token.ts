@@ -57,6 +57,7 @@ export async function ensureMcpToken(
         tokenUrl: token.tokenUrl,
         clientId: token.dcrClientId ?? "",
         clientSecret: token.dcrClientSecret ?? undefined,
+        tokenEndpointAuthMethod: token.tokenEndpointAuthMethod,
         refreshToken: token.refreshToken,
         resource: token.resourceUrl,
         scopes: token.scope ? token.scope.split(" ").filter(Boolean) : undefined,

@@ -19,9 +19,11 @@ import {
   discoverAuthorizationServerMetadata,
   discoverProtectedResourceMetadata,
   exchangeCodeForTokens,
+  normalizeTokenEndpointAuthMethod,
   refreshMcpToken,
   registerClient,
   revokeMcpToken,
+  selectDcrTokenEndpointAuthMethod,
 } from "../oauth/mcp-wrapper";
 import { getAppUrl, getPublicMcpBaseUrl } from "../utils/constants";
 import { isEnvFlagEnabled } from "../utils/env-flag";
@@ -63,6 +65,7 @@ interface DiscoveryResult {
   requiresOAuth: boolean;
   dcrSupported: boolean;
   bearerMethodsSupported: string[] | null;
+  tokenEndpointAuthMethodsSupported: string[] | null;
 }
 
 interface OAuthClientForAuthorize {
@@ -74,6 +77,7 @@ interface OAuthClientForAuthorize {
   tokenUrl: string;
   revocationUrl: string | null;
   scopes: string[];
+  tokenEndpointAuthMethod: string;
 }
 
 function splitScopes(scopes: string | null | undefined): string[] {
@@ -99,6 +103,7 @@ function manualClientFromToken(token: McpOAuthToken | null): OAuthClientForAutho
     tokenUrl: token.tokenUrl,
     revocationUrl: token.revocationUrl,
     scopes: splitScopes(token.scope),
+    tokenEndpointAuthMethod: normalizeTokenEndpointAuthMethod(token.tokenEndpointAuthMethod),
   };
 }
 
@@ -124,6 +129,7 @@ async function discoverForMcp(resourceUrl: string): Promise<DiscoveryResult | nu
     requiresOAuth: true,
     dcrSupported: !!as.registration_endpoint,
     bearerMethodsSupported: prmd.bearer_methods_supported ?? null,
+    tokenEndpointAuthMethodsSupported: as.token_endpoint_auth_methods_supported ?? null,
   };
 }
 
@@ -292,6 +298,9 @@ const manualClientRoute = route({
     tokenUrl: z.string().url().optional(),
     revocationUrl: z.string().url().optional(),
     scopes: z.array(z.string()).optional(),
+    tokenEndpointAuthMethod: z
+      .enum(["client_secret_basic", "client_secret_post", "none"])
+      .optional(),
   }),
   responses: {
     200: { description: "Pending client stored. Call /authorize to start the flow." },
@@ -340,15 +349,25 @@ async function prepareAuthorizeFlow(
     }
 
     const scopes = q.scopes ? splitScopes(q.scopes) : discovery.scopes;
+    // RFC 7591 §2: request the method the AS actually advertises support for
+    // (preferring Basic), rather than assuming every provider accepts Basic.
+    const requestedAuthMethod = selectDcrTokenEndpointAuthMethod(
+      discovery.tokenEndpointAuthMethodsSupported ?? undefined,
+    );
     const dcr = await registerClient(discovery.registrationEndpoint, {
       client_name: `agent-swarm (${server.name})`,
       redirect_uris: [callbackRedirectUri()],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      token_endpoint_auth_method: "client_secret_basic",
+      token_endpoint_auth_method: requestedAuthMethod,
       application_type: "web",
       scope: scopes.join(" ") || undefined,
     });
+    // The AS's response is authoritative when present (it may differ from
+    // what we asked for); otherwise trust what we requested.
+    const registeredAuthMethod = dcr.token_endpoint_auth_method
+      ? normalizeTokenEndpointAuthMethod(dcr.token_endpoint_auth_method)
+      : requestedAuthMethod;
 
     client = {
       clientId: dcr.client_id,
@@ -359,6 +378,7 @@ async function prepareAuthorizeFlow(
       tokenUrl: discovery.tokenUrl,
       revocationUrl: discovery.revocationUrl,
       scopes,
+      tokenEndpointAuthMethod: registeredAuthMethod,
     };
   }
 
@@ -400,6 +420,7 @@ async function prepareAuthorizeFlow(
     scopes: scopes.join(" "),
     dcrClientId: client.clientId,
     dcrClientSecret: client.clientSecret,
+    tokenEndpointAuthMethod: client.tokenEndpointAuthMethod,
     redirectUri: callbackRedirectUri(),
     finalRedirect: q.redirect ?? null,
   });
@@ -456,6 +477,7 @@ export async function completeMcpOAuthCallback(
       tokenUrl: pending.tokenUrl,
       clientId: pending.dcrClientId ?? "",
       clientSecret: pending.dcrClientSecret ?? undefined,
+      tokenEndpointAuthMethod: pending.tokenEndpointAuthMethod,
       redirectUri: pending.redirectUri,
       code: query.code,
       codeVerifier: pending.codeVerifier,
@@ -481,6 +503,7 @@ export async function completeMcpOAuthCallback(
       revocationUrl: pending.revocationUrl,
       dcrClientId: pending.dcrClientId,
       dcrClientSecret: pending.dcrClientSecret,
+      tokenEndpointAuthMethod: pending.tokenEndpointAuthMethod,
       clientSource,
       lastRefreshedAt: new Date().toISOString(),
     });
@@ -656,6 +679,7 @@ export async function handleMcpOAuth(
         tokenUrl: existing.tokenUrl,
         clientId: existing.dcrClientId ?? "",
         clientSecret: existing.dcrClientSecret ?? undefined,
+        tokenEndpointAuthMethod: existing.tokenEndpointAuthMethod,
         refreshToken: existing.refreshToken,
         resource: existing.resourceUrl,
       });
@@ -698,6 +722,7 @@ export async function handleMcpOAuth(
           tokenTypeHint: "access_token",
           clientId: token.dcrClientId ?? "",
           clientSecret: token.dcrClientSecret ?? undefined,
+          tokenEndpointAuthMethod: token.tokenEndpointAuthMethod,
         });
       } catch (err) {
         console.warn(
@@ -731,6 +756,12 @@ export async function handleMcpOAuth(
       let authorizationServerIssuer = overrides.authorizationServerIssuer ?? null;
       let resourceUrl = server.url!;
       let scopes = overrides.scopes ?? [];
+      // Same rule as DCR: an explicit value from the caller wins; otherwise
+      // infer from discovered AS metadata; otherwise fall back to the RFC
+      // 7591 §2 default (client_secret_basic) rather than assuming body-post.
+      let tokenEndpointAuthMethod = overrides.tokenEndpointAuthMethod
+        ? normalizeTokenEndpointAuthMethod(overrides.tokenEndpointAuthMethod)
+        : undefined;
 
       if (!authorizeUrl || !tokenUrl) {
         const discovery = await discoverForMcp(server.url!);
@@ -749,7 +780,13 @@ export async function handleMcpOAuth(
           authorizationServerIssuer ?? discovery.authorizationServerIssuer;
         resourceUrl = discovery.resourceUrl;
         if (scopes.length === 0) scopes = discovery.scopes;
+        tokenEndpointAuthMethod =
+          tokenEndpointAuthMethod ??
+          selectDcrTokenEndpointAuthMethod(
+            discovery.tokenEndpointAuthMethodsSupported ?? undefined,
+          );
       }
+      tokenEndpointAuthMethod = normalizeTokenEndpointAuthMethod(tokenEndpointAuthMethod);
 
       if (!authorizationServerIssuer) {
         jsonError(
@@ -775,6 +812,7 @@ export async function handleMcpOAuth(
         revocationUrl,
         dcrClientId: overrides.clientId,
         dcrClientSecret: overrides.clientSecret ?? null,
+        tokenEndpointAuthMethod,
         clientSource: "manual",
         status: "error",
         lastErrorMessage: "Manual client pre-registered; awaiting authorize flow.",
