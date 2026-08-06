@@ -5,16 +5,6 @@ function getAgentFsLiveUrl(): string {
   return (raw || DEFAULT_AGENT_FS_LIVE_URL).replace(/\/+$/, "");
 }
 
-function getAgentFsDefaultOrgId(): string | undefined {
-  const raw = import.meta.env.VITE_AGENT_FS_DEFAULT_ORG_ID?.trim();
-  return raw || undefined;
-}
-
-function getAgentFsDefaultDriveId(): string | undefined {
-  const raw = import.meta.env.VITE_AGENT_FS_DEFAULT_DRIVE_ID?.trim();
-  return raw || undefined;
-}
-
 export function buildAgentFsLiveUrl(opts: {
   path?: string | null;
   orgId?: string | null;
@@ -22,8 +12,10 @@ export function buildAgentFsLiveUrl(opts: {
 }): string | null {
   const path = opts.path?.trim();
   if (!path) return null;
-  const orgId = opts.orgId?.trim() || getAgentFsDefaultOrgId();
-  const driveId = opts.driveId?.trim() || getAgentFsDefaultDriveId();
+  // A live URL must use a matched org/drive pair from this attachment row.
+  // Falling back per ID can combine metadata from different drives or orgs.
+  const orgId = opts.orgId?.trim();
+  const driveId = opts.driveId?.trim();
   if (!orgId || !driveId) return null;
   return `${getAgentFsLiveUrl()}/file/~/${orgId}/${driveId}/${path.replace(/^\/+/, "")}`;
 }

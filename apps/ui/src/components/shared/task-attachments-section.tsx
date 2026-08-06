@@ -33,9 +33,8 @@ import { cn } from "@/lib/utils";
 /**
  * Per-row resolution mirrors `resolveAttachmentDisplay` in `src/slack/blocks.ts`.
  * For `agent-fs` we build a public live-URL when the row carries `orgId` and
- * `driveId` (or the operator-set env-var fallbacks supply them); otherwise
- * the row stays non-clickable and we surface the raw path so users can copy
- * it manually.
+ * `driveId` on that same row; otherwise the row stays non-clickable and we
+ * surface the raw path so users can copy it manually.
  */
 function resolveHref(a: TaskAttachment): string | null {
   switch (a.kind) {
