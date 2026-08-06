@@ -417,6 +417,26 @@ describe("registerClient (RFC 7591 DCR)", () => {
       }),
     ).rejects.toThrow(/Dynamic client registration failed/);
   });
+
+  test("attaches a bounded AbortSignal so a non-responding registration endpoint can't hang the caller forever", async () => {
+    let capturedSignal: AbortSignal | null | undefined;
+    globalThis.fetch = async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedSignal = init?.signal;
+      return new Response(JSON.stringify({ client_id: "x" }), { status: 201 });
+    };
+
+    await registerClient("https://as.example.com/register", {
+      client_name: "x",
+      redirect_uris: ["https://swarm.example.com/cb"],
+    });
+
+    // Every safeFetch call (metadata discovery, DCR, token exchange,
+    // refresh, revocation) gets a default timeout — without it, a provider
+    // that accepts the connection and never responds would hold the
+    // per-connector authorize-flow lock indefinitely.
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
+  });
 });
 
 // ─── Token exchange + refresh + revoke ───────────────────────────────────────

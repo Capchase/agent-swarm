@@ -129,9 +129,23 @@ function defaultSsrfOptions(): SsrfGuardOptions {
   };
 }
 
-async function safeFetch(url: string, init?: RequestInit): Promise<Response> {
+// Every safeFetch call is bounded so a provider that accepts the connection
+// and never responds can't hang indefinitely. This matters most for the
+// calls made under `withAuthorizeFlowLock` (metadata discovery + DCR POST in
+// mcp-oauth.ts) — an unbounded fetch there would block every subsequent
+// /authorize for that connector+user behind the lock. 15s is generous for
+// OAuth metadata/DCR/token-endpoint round trips while still bounding the
+// lock hold time; token exchange, refresh, and revocation share the same
+// default since none of them should legitimately take longer.
+const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
+
+async function safeFetch(
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+): Promise<Response> {
   assertUrlSafe(url, defaultSsrfOptions());
-  return fetch(url, init);
+  return fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
 }
 
 // ─── Protected Resource Metadata (RFC 9728) ──────────────────────────────────
