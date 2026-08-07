@@ -519,6 +519,71 @@ describe("MCP OAuth DCR client reuse", () => {
     expect(second.searchParams.get("client_id")).toBe(clientId);
   });
 
+  test("a legacy connector with unknown (null) registeredScopes forces re-registration once a non-empty scope is needed", async () => {
+    // Migration 117 backfilled every pre-existing MCP app row without a
+    // `registeredScopes` value at all — a stored `null` here must mean
+    // "we don't know what this client is registered for", not "compatible
+    // with anything". Treating it as universally compatible would let a
+    // client actually registered for a narrow scope be reused for a
+    // provider-advertised (or caller-requested) broader one, which the
+    // provider may reject or silently narrow.
+    asScopesSupported = ["read"];
+    const server = createMcpServer({
+      name: "legacy-null-registered-scopes",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    expect(first.searchParams.get("scope")).toBe("read");
+    const state = first.searchParams.get("state")!;
+    await dispatch(`/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+    const originalClientId = getMcpOAuthToken(server.id)?.dcrClientId;
+    expect(dcrCallCount).toBe(1);
+
+    // Simulate a pre-this-series row: registeredScopes was never recorded
+    // (migration 117's backfill, or a connect from before that field existed).
+    const db = getDb();
+    const appRow = db
+      .query(
+        `SELECT a.id, a.metadata FROM oauth_apps a
+         JOIN oauth_authorizations z ON z.appId = a.id
+         WHERE a.mcpServerId = ?`,
+      )
+      .get(server.id) as { id: string; metadata: string };
+    const metadata = JSON.parse(appRow.metadata);
+    delete metadata.registeredScopes;
+    db.query("UPDATE oauth_apps SET metadata = ? WHERE id = ?").run(
+      JSON.stringify(metadata),
+      appRow.id,
+    );
+    expect(findReusableMcpOAuthClient(server.id)?.registeredScopes).toBeNull();
+
+    // The provider now advertises a wider scope set than the unknown
+    // registered client might actually support — must NOT infer coverage
+    // from the null and reuse; must do the one fresh DCR needed to establish
+    // a known registered set.
+    asScopesSupported = ["read", "write"];
+    const second = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(2);
+    expect(second.searchParams.get("client_id")).not.toBe(originalClientId);
+    expect(second.searchParams.get("scope")).toBe("read write");
+    const secondState = second.searchParams.get("state")!;
+    await dispatch(
+      `/api/mcp-oauth/callback?state=${encodeURIComponent(secondState)}&code=auth-code-2`,
+    );
+    expect(getMcpOAuthToken(server.id)?.dcrClientId).toBe(second.searchParams.get("client_id"));
+
+    // The new client's registeredScopes is now known — later calls for the
+    // same scope set reuse it without ever falling back to the granted
+    // token scope.
+    const third = await authorizeUrl(server.id);
+    expect(dcrCallCount).toBe(2);
+    expect(third.searchParams.get("client_id")).toBe(second.searchParams.get("client_id"));
+  });
+
   test("no explicit scopes + an empty registered scope set does not reuse with the full discovery scope set", async () => {
     const server = createMcpServer({
       name: "empty-registered-scope",

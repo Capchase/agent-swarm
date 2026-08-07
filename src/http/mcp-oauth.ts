@@ -436,16 +436,23 @@ async function runAuthorizeFlow(
       // provider that narrows the granted token scope below what the client
       // was registered with (the common case) must not make every later
       // /authorize believe the stored client needs re-registering. A null
-      // registeredScopes is a legacy row from before this field existed —
-      // treat it as unknown, same pattern as registrationEndpoint above.
-      (reusable.registeredScopes === null ||
-        scopesAreCovered(scopesToRequest, reusable.registeredScopes))
+      // registeredScopes is a legacy row from before this field existed (see
+      // migration 117) and its true registered set is unknown — unlike
+      // registrationEndpoint/redirectUri above, "unknown" must NOT be treated
+      // as "compatible with anything": we have no evidence the provider ever
+      // granted this client any scope beyond none, so require the requested
+      // set to be empty (or force the one fresh DCR needed to establish a
+      // known set). Do not substitute the granted token scope here — that is
+      // the exact bug this series fixed for the known-scope case.
+      scopesAreCovered(scopesToRequest, reusable.registeredScopes ?? [])
     ) {
-      // We know the true registered set here (or it's a legacy unknown, same
-      // as registeredScopes staying undefined below) — record it so a
-      // pending row backing THIS reused authorize call doesn't fall back to
-      // a literal null if this is the flow that ends up completing.
-      registeredScopes = reusable.registeredScopes ?? undefined;
+      // We know the true registered set here — record it so a pending row
+      // backing THIS reused authorize call doesn't fall back to a literal
+      // null if this is the flow that ends up completing. A legacy-unknown
+      // reuse only reaches this branch when scopesToRequest was empty, so
+      // recording `[]` (rather than leaving it undefined) is accurate: this
+      // flow observed no scope requirement, same as a fresh empty-scope DCR.
+      registeredScopes = reusable.registeredScopes ?? [];
       client = {
         clientId: reusable.clientId,
         clientSecret: reusable.clientSecret,
