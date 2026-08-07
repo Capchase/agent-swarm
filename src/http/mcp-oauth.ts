@@ -6,8 +6,11 @@ import {
   applyMcpOAuthRefresh,
   consumeMcpOAuthPending,
   deleteMcpOAuthToken,
+  findReusableMcpOAuthClient,
   getMcpOAuthToken,
   insertMcpOAuthPending,
+  invalidateMcpOAuthClient,
+  markMcpOAuthTokenStatus,
   setMcpServerAuthMethod,
   upsertMcpOAuthToken,
 } from "../be/db-queries/mcp-oauth";
@@ -19,6 +22,7 @@ import {
   discoverAuthorizationServerMetadata,
   discoverProtectedResourceMetadata,
   exchangeCodeForTokens,
+  isInvalidClientError,
   refreshMcpToken,
   registerClient,
   revokeMcpToken,
@@ -78,6 +82,19 @@ interface OAuthClientForAuthorize {
 
 function splitScopes(scopes: string | null | undefined): string[] {
   return scopes?.split(/\s+/).filter(Boolean) ?? [];
+}
+
+/**
+ * A registered DCR client is scoped to whatever it was registered with.
+ * `requested` is covered only if every requested scope is already in
+ * `registered` — an empty `registered` set (no scope restriction recorded)
+ * does NOT count as "covers everything", since providers that enforce RFC
+ * 7591 client scope metadata reject a token/authorize request for a scope
+ * the client was never registered with.
+ */
+function scopesAreCovered(requested: string[], registered: string[]): boolean {
+  const registeredSet = new Set(registered);
+  return requested.every((scope) => registeredSet.has(scope));
 }
 
 function manualClientFromToken(token: McpOAuthToken | null): OAuthClientForAuthorize | null {
@@ -308,6 +325,42 @@ interface AuthorizeFlowQuery {
   scopes?: string;
 }
 
+// ─── Per-connector+user authorize-flow lock ──────────────────────────────────
+// Two concurrent first `/authorize` requests for the same (mcpServerId,
+// userId) can otherwise both observe "no reusable client" from
+// findReusableMcpOAuthClient, each register a fresh provider client before
+// either reaches insertMcpOAuthPending, and race to persist — the later
+// insert reuses/overwrites the earlier app row while its own pending context
+// still points at the OTHER (now orphaned) client. That leaves duplicate
+// provider registrations and can pair a connected authorization with the
+// wrong client. Serialize the whole check-reusable-through-persist critical
+// section per key so only one call at a time can decide "no reusable client
+// exists, register one".
+const authorizeFlowLocks = new Map<string, Promise<void>>();
+
+function authorizeFlowLockKey(mcpServerId: string, userId: string | null): string {
+  return `${mcpServerId}::${userId ?? "_"}`;
+}
+
+async function withAuthorizeFlowLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prior = authorizeFlowLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = prior.then(() => mine);
+  authorizeFlowLocks.set(key, chained);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (authorizeFlowLocks.get(key) === chained) {
+      authorizeFlowLocks.delete(key);
+    }
+  }
+}
+
 /**
  * Use a stored manual client or discover metadata + DCR-register, build the
  * authorize URL, and persist the pending session. Returns the provider
@@ -321,10 +374,99 @@ async function prepareAuthorizeFlow(
   q: AuthorizeFlowQuery,
 ): Promise<string | null> {
   const userId = q.userId ?? null;
+  return withAuthorizeFlowLock(authorizeFlowLockKey(mcpServerId, userId), () =>
+    runAuthorizeFlow(res, mcpServerId, server, q, userId),
+  );
+}
+
+async function runAuthorizeFlow(
+  res: ServerResponse,
+  mcpServerId: string,
+  server: NonNullable<ReturnType<typeof getMcpServerById>>,
+  q: AuthorizeFlowQuery,
+  userId: string | null,
+): Promise<string | null> {
   let client = manualClientFromToken(getMcpOAuthToken(mcpServerId, userId));
+  let discovery: DiscoveryResult | null = null;
+  let registrationEndpoint: string | null = null;
+  // Only set when THIS call freshly registers (or otherwise knows the true
+  // registered set) — left undefined on reuse so the previously-recorded
+  // value survives (see upsertMcpApp's `registeredScopes` doc).
+  let registeredScopes: string[] | undefined;
 
   if (!client) {
-    const discovery = await discoverForMcp(server.url!);
+    // Reuse a previously-registered DCR client for this connector+user
+    // instead of hitting the provider's registration endpoint again — either
+    // an already-connected client (re-authorizing) or a still-live pending
+    // attempt (retrying before it's completed/GC'd). Discovery is still run
+    // (cheap metadata GET, not a mutating registration) to get the current
+    // authorize/token URLs and to confirm the AS identity hasn't moved.
+    const reusable = findReusableMcpOAuthClient(mcpServerId, userId);
+    discovery = await discoverForMcp(server.url!);
+    if (!discovery) {
+      jsonError(res, "MCP server does not require OAuth", 400);
+      return null;
+    }
+    registrationEndpoint = discovery.registrationEndpoint;
+
+    // A caller-requested scope set that the stored client wasn't registered
+    // with must not be silently narrowed to the stored client's scopes —
+    // fall through to fresh registration below instead of reusing. With no
+    // explicit request, fall back to what would actually be sent
+    // (discovery.scopes, same as the else-branch below) so the coverage
+    // check below still catches an empty registered set against a
+    // non-empty advertised one — see scopesAreCovered's docstring.
+    const requestedScopes = q.scopes ? splitScopes(q.scopes) : null;
+    const scopesToRequest = requestedScopes ?? discovery.scopes;
+
+    if (
+      reusable &&
+      reusable.authorizationServerIssuer === discovery.authorizationServerIssuer &&
+      // A stored null means the client was registered before we persisted
+      // this field — treat it as unknown rather than as a mismatch, or every
+      // pre-existing connector re-registers on each abandoned authorize call.
+      (reusable.registrationEndpoint === null ||
+        reusable.registrationEndpoint === discovery.registrationEndpoint) &&
+      // "" is the legacy/unrecorded sentinel: migration 117 backfilled it for
+      // every pre-existing MCP app row, and connects before we persisted
+      // pending.redirectUri wrote it too. Treat it as unknown rather than a
+      // mismatch, same as a null registrationEndpoint above.
+      (reusable.redirectUri === "" || reusable.redirectUri === callbackRedirectUri()) &&
+      // Compare against the REGISTERED scope set, not the granted one — a
+      // provider that narrows the granted token scope below what the client
+      // was registered with (the common case) must not make every later
+      // /authorize believe the stored client needs re-registering. A null
+      // registeredScopes is a legacy row from before this field existed (see
+      // migration 117) and its true registered set is unknown — unlike
+      // registrationEndpoint/redirectUri above, "unknown" must NOT be treated
+      // as "compatible with anything": we have no evidence the provider ever
+      // granted this client any scope beyond none, so require the requested
+      // set to be empty (or force the one fresh DCR needed to establish a
+      // known set). Do not substitute the granted token scope here — that is
+      // the exact bug this series fixed for the known-scope case.
+      scopesAreCovered(scopesToRequest, reusable.registeredScopes ?? [])
+    ) {
+      // We know the true registered set here — record it so a pending row
+      // backing THIS reused authorize call doesn't fall back to a literal
+      // null if this is the flow that ends up completing. A legacy-unknown
+      // reuse only reaches this branch when scopesToRequest was empty, so
+      // recording `[]` (rather than leaving it undefined) is accurate: this
+      // flow observed no scope requirement, same as a fresh empty-scope DCR.
+      registeredScopes = reusable.registeredScopes ?? [];
+      client = {
+        clientId: reusable.clientId,
+        clientSecret: reusable.clientSecret,
+        resourceUrl: discovery.resourceUrl,
+        authorizationServerIssuer: discovery.authorizationServerIssuer,
+        authorizeUrl: discovery.authorizeUrl,
+        tokenUrl: discovery.tokenUrl,
+        revocationUrl: discovery.revocationUrl,
+        scopes: reusable.scopes.length > 0 ? reusable.scopes : discovery.scopes,
+      };
+    }
+  }
+
+  if (!client) {
     if (!discovery) {
       jsonError(res, "MCP server does not require OAuth", 400);
       return null;
@@ -350,6 +492,7 @@ async function prepareAuthorizeFlow(
       scope: scopes.join(" ") || undefined,
     });
 
+    registeredScopes = scopes;
     client = {
       clientId: dcr.client_id,
       clientSecret: dcr.client_secret ?? null,
@@ -394,10 +537,12 @@ async function prepareAuthorizeFlow(
     codeVerifier: built.codeVerifier,
     resourceUrl: client.resourceUrl,
     authorizationServerIssuer: client.authorizationServerIssuer,
+    registrationEndpoint,
     authorizeUrl: client.authorizeUrl,
     tokenUrl: client.tokenUrl,
     revocationUrl: client.revocationUrl,
     scopes: scopes.join(" "),
+    registeredScopes,
     dcrClientId: client.clientId,
     dcrClientSecret: client.clientSecret,
     redirectUri: callbackRedirectUri(),
@@ -435,6 +580,17 @@ export async function completeMcpOAuthCallback(
   const dashboardBaseUrl = pending.finalRedirect ?? defaultFinalRedirect(pending.mcpServerId);
 
   if (query.error) {
+    // A provider that rejects the client at the AUTHORIZE endpoint (rather
+    // than the token endpoint) never reaches the exchange try/catch below,
+    // so without this the stored client stays "reusable" until GC drops the
+    // orphaned pending row — a floor of 10 minutes, not a bound. Same
+    // wrong-target guard as the exchange-failure path below.
+    if (isInvalidClientError(query.error) || query.error === "unauthorized_client") {
+      const connected = getMcpOAuthToken(pending.mcpServerId, pending.userId);
+      if (!connected || connected.dcrClientId === pending.dcrClientId) {
+        invalidateMcpOAuthClient(pending.mcpServerId, pending.userId);
+      }
+    }
     const target = new URL(dashboardBaseUrl);
     target.searchParams.set("oauth", "error");
     target.searchParams.set("error", query.error);
@@ -476,9 +632,15 @@ export async function completeMcpOAuthCallback(
       scope: tokens.scope ?? pending.scopes ?? null,
       resourceUrl: pending.resourceUrl,
       authorizationServerIssuer: pending.authorizationServerIssuer,
+      registrationEndpoint: pending.registrationEndpoint,
       authorizeUrl: pending.authorizeUrl,
       tokenUrl: pending.tokenUrl,
       revocationUrl: pending.revocationUrl,
+      redirectUri: pending.redirectUri,
+      // undefined (not null) when the pending row doesn't know one — this
+      // app row's app may not have been recreated by the orphan-app deletion
+      // above, and an explicit null would wipe out an already-correct value.
+      registeredScopes: pending.registeredScopes ?? undefined,
       dcrClientId: pending.dcrClientId,
       dcrClientSecret: pending.dcrClientSecret,
       clientSource,
@@ -495,6 +657,19 @@ export async function completeMcpOAuthCallback(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[mcp-oauth] callback exchange failed:", message);
+    if (isInvalidClientError(message)) {
+      // The provider rejected the client we stored — invalidate it so the
+      // next /authorize call re-registers exactly once instead of retrying
+      // with a client the provider has already disowned. Only invalidate the
+      // client the provider actually rejected: when this flow used a freshly
+      // registered client (AS identity, redirect URI, or scope set moved),
+      // the connected app still holds a different, working client_id, and
+      // invalidating it would corrupt a working connection.
+      const connected = getMcpOAuthToken(pending.mcpServerId, pending.userId);
+      if (!connected || connected.dcrClientId === pending.dcrClientId) {
+        invalidateMcpOAuthClient(pending.mcpServerId, pending.userId);
+      }
+    }
     const target = new URL(dashboardBaseUrl);
     target.searchParams.set("oauth", "error");
     target.searchParams.set("error_description", message);
@@ -673,6 +848,13 @@ export async function handleMcpOAuth(
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (isInvalidClientError(message)) {
+        // The provider has disowned this client — invalidate it so the next
+        // /authorize call re-registers exactly once instead of continuing to
+        // refresh against a client_id the provider now rejects.
+        invalidateMcpOAuthClient(parsed.params.mcpServerId, userId);
+        markMcpOAuthTokenStatus(existing.id, "error", message);
+      }
       jsonError(res, `Refresh failed: ${message}`, 500);
     }
     return true;

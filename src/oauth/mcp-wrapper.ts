@@ -1,5 +1,6 @@
 import * as oauth from "oauth4webapi";
 import { isEnvFlagEnabled } from "../utils/env-flag";
+import { registerVolatileSecret, scrubSecrets } from "../utils/secret-scrubber";
 
 /**
  * MCP OAuth 2.1 wrapper.
@@ -52,6 +53,15 @@ function isPrivateIPv6(host: string): boolean {
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // unique local
   if (lower.startsWith("[fc") || lower.startsWith("[fd")) return true;
   return false;
+}
+
+// Deliberately does NOT match "invalid_client_metadata" (a distinct DCR-only
+// error) — the `\b` boundary fails on the following underscore. Shared by
+// every MCP OAuth call site (explicit /refresh route, automatic
+// ensureMcpToken refresh, callback token exchange) that needs to decide
+// whether a provider has disowned a stored DCR client.
+export function isInvalidClientError(message: string): boolean {
+  return /invalid_client\b/i.test(message);
 }
 
 export interface SsrfGuardOptions {
@@ -119,9 +129,23 @@ function defaultSsrfOptions(): SsrfGuardOptions {
   };
 }
 
-async function safeFetch(url: string, init?: RequestInit): Promise<Response> {
+// Every safeFetch call is bounded so a provider that accepts the connection
+// and never responds can't hang indefinitely. This matters most for the
+// calls made under `withAuthorizeFlowLock` (metadata discovery + DCR POST in
+// mcp-oauth.ts) — an unbounded fetch there would block every subsequent
+// /authorize for that connector+user behind the lock. 15s is generous for
+// OAuth metadata/DCR/token-endpoint round trips while still bounding the
+// lock hold time; token exchange, refresh, and revocation share the same
+// default since none of them should legitimately take longer.
+const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
+
+async function safeFetch(
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+): Promise<Response> {
   assertUrlSafe(url, defaultSsrfOptions());
-  return fetch(url, init);
+  return fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
 }
 
 // ─── Protected Resource Metadata (RFC 9728) ──────────────────────────────────
@@ -379,6 +403,14 @@ export interface RefreshTokenInput {
 }
 
 export async function refreshMcpToken(input: RefreshTokenInput): Promise<TokenResponse> {
+  // A misbehaving/compromised provider can echo a submitted credential back
+  // verbatim in an error body (e.g. "invalid client_secret: <value>"). Both
+  // credentials we send are registered as volatile secrets so the scrub pass
+  // below redacts any echo BEFORE the message is persisted to
+  // lastErrorMessage or returned by the status endpoint.
+  if (input.clientSecret) registerVolatileSecret(input.clientSecret, "mcp_oauth_client_secret");
+  registerVolatileSecret(input.refreshToken, "mcp_oauth_refresh_token");
+
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: input.refreshToken,
@@ -398,7 +430,7 @@ export async function refreshMcpToken(input: RefreshTokenInput): Promise<TokenRe
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Token refresh failed (${res.status}): ${text}`);
+    throw new Error(`Token refresh failed (${res.status}): ${scrubSecrets(text)}`);
   }
   return (await res.json()) as TokenResponse;
 }

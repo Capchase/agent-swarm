@@ -1,11 +1,12 @@
 import {
   applyMcpOAuthRefresh,
   getMcpOAuthToken,
+  invalidateMcpOAuthClient,
   isMcpTokenExpiringSoon,
   type McpOAuthToken,
   markMcpOAuthTokenStatus,
 } from "../be/db-queries/mcp-oauth";
-import { computeExpiresAt, refreshMcpToken } from "./mcp-wrapper";
+import { computeExpiresAt, isInvalidClientError, refreshMcpToken } from "./mcp-wrapper";
 
 /**
  * Per-mcpServerId in-memory mutex to serialize concurrent refreshes.
@@ -73,6 +74,14 @@ export async function ensureMcpToken(
       return getMcpOAuthToken(mcpServerId, userId);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (isInvalidClientError(message)) {
+        // The provider has disowned this client. The explicit POST /refresh
+        // route already invalidates on this exact error; automatic refreshes
+        // through this path (the proxy / server resolution) must do the same,
+        // otherwise a revoked client stays "reusable" forever and every
+        // subsequent /authorize call keeps selecting it.
+        invalidateMcpOAuthClient(mcpServerId, userId);
+      }
       markMcpOAuthTokenStatus(token.id, "error", message);
       console.error(`[mcp-oauth] refresh failed for ${mcpServerId}: ${message}`);
       return { ...token, status: "error" as const, lastErrorMessage: message };
