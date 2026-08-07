@@ -3,8 +3,8 @@ date: 2026-08-06T00:00:00+02:00
 author: claude
 topic: "Swarm Apps — sync sources + connections phase (re-add on main, productionized)"
 tags: [plan, swarm-apps, sync, connections, script-connections, schema-change]
-status: draft
-branch: main (cut a feature branch, e.g. `feat/apps-sync-connections`)
+status: completed
+branch: t/des-768-apps-sync-connections
 last_updated: 2026-08-06
 last_updated_by: claude
 ---
@@ -173,13 +173,13 @@ Grow the definition contract: a model-level `sources` map, column-level `source`
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run test:root -- src/tests/apps-sync.test.ts`
-- [ ] No regressions: `bun run test:root -- src/tests/apps-spike.test.ts src/tests/apps-spike2.test.ts src/tests/apps-spike4.test.ts src/tests/apps-spike5.test.ts src/tests/apps-elements.test.ts src/tests/apps-element-assembly.test.ts src/tests/apps-rbac.test.ts src/tests/apps-user-config.test.ts`
-- [ ] `bun run lint && bun run tsc:check`
-- [ ] `bash scripts/check-db-boundary.sh && bun run check:dep-graph`
+- [x] `bun run test:root -- src/tests/apps-sync.test.ts`
+- [x] No regressions: `bun run test:root -- src/tests/apps-spike.test.ts src/tests/apps-spike2.test.ts src/tests/apps-spike4.test.ts src/tests/apps-spike5.test.ts src/tests/apps-elements.test.ts src/tests/apps-element-assembly.test.ts src/tests/apps-rbac.test.ts src/tests/apps-user-config.test.ts`
+- [x] `bun run lint && bun run tsc:check`
+- [x] `bash scripts/check-db-boundary.sh && bun run check:dep-graph`
 
 #### Automated QA:
-- [ ] **Reserved-name preflight (Open decision 2)** — run against a copy of the prod DB and the local dev DB:
+- [x] **Reserved-name preflight (Open decision 2)** — DONE 2026-08-07 (read-only over ssh): prod has 2 collisions — "To Remember" `item.source` (+3 page refs), "Competitor Tracker" `note.source` (+4 page refs); local dev DB has no `apps` table. Hand-rename via app-patch required BEFORE deploy (Taras's call; implementation proceeds, deploy gated). Original recipe:
       `sqlite3 <db> "SELECT id, name FROM apps WHERE definition LIKE '%\"source\"%' OR definition LIKE '%\"syncedAt\"%' OR definition LIKE '%\"stale\"%'"` then inspect each hit's `models.*.columns` keys. Zero collisions → proceed; any collision → stop and take Taras's answer.
 - [ ] Boot the isolated API (Quick Reference recipe) on a copy of the prod DB; `curl -s -H "Authorization: Bearer 123123" http://localhost:3113/api/apps | jq '[.apps[]] | length'` and then `GET /api/apps/<id>` for each — **no** app returns `definitionError`.
 
@@ -217,9 +217,9 @@ Rows learn provenance; external write paths learn that source-bound and join-key
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run test:root -- src/tests/apps-sync.test.ts`
-- [ ] No regressions (same app-test list as Phase 1)
-- [ ] `bun run lint && bun run tsc:check && bash scripts/check-db-boundary.sh`
+- [x] `bun run test:root -- src/tests/apps-sync.test.ts`
+- [x] No regressions (same app-test list as Phase 1)
+- [x] `bun run lint && bun run tsc:check && bash scripts/check-db-boundary.sh`
 
 #### Automated QA:
 - [ ] Against :3113 — create an app with a `gh` source and a bound `title` column, then `POST /api/apps/<id>/models/<m>/rows -d '{"values":{"title":"x"}}'` → 400 with the read-only issue; the same POST with only owned columns → 201.
@@ -267,10 +267,10 @@ Adding, changing, and removing sources / bindings runs through the existing sche
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run test:root -- src/tests/apps-sync.test.ts`
-- [ ] `bun run test:root -- src/tests/apps-spike5.test.ts` (the schema-change engine's own suite — unchanged behaviour for source-less apps)
-- [ ] `bun run lint && bun run tsc:check`
-- [ ] `bun run docs:openapi` — the `detachedRows` report field is OpenAPI-visible; commit `openapi.json` + `docs-site/content/docs/api-reference/**`
+- [x] `bun run test:root -- src/tests/apps-sync.test.ts`
+- [x] `bun run test:root -- src/tests/apps-spike5.test.ts` (the schema-change engine's own suite — unchanged behaviour for source-less apps)
+- [x] `bun run lint && bun run tsc:check`
+- [x] `bun run docs:openapi` — the `detachedRows` report field is OpenAPI-visible; commit `openapi.json` + `docs-site/content/docs/api-reference/**` (docs-site unchanged — the report schema isn't inlined there)
 
 #### Automated QA:
 - [ ] Against :3113 — `app-patch` a live scratch app to add a source → `GET /api/apps/<id>/versions` shows a new version; patch `joinKey` → 400 immutable; remove the source → 200 with `migration.detachedRows > 0` and `GET /rows` shows values intact and no `source` field.
@@ -340,10 +340,10 @@ export async function runAppSync(input: {
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run test:root -- src/tests/apps-sync-engine.test.ts`
-- [ ] `bun run test:root -- src/tests/apps-sync.test.ts`
-- [ ] `bun run lint && bun run tsc:check`
-- [ ] `bash scripts/check-db-boundary.sh && bash scripts/check-api-key-boundary.sh && bun run check:dep-graph`
+- [x] `bun run test:root -- src/tests/apps-sync-engine.test.ts`
+- [x] `bun run test:root -- src/tests/apps-sync.test.ts`
+- [x] `bun run lint && bun run tsc:check`
+- [x] `bash scripts/check-db-boundary.sh && bash scripts/check-api-key-boundary.sh && bun run check:dep-graph`
 
 #### Automated QA:
 - [ ] Against :3113 — upsert a saved script that returns two fixed records, wire it as a source, call the engine through Phase 5's route once it exists (or a temporary `bun` REPL harness against the isolated DB), and confirm rows + envelope in `GET /rows`.
@@ -388,12 +388,12 @@ Expose the one engine through the three entry points, with the sync action delib
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run test:root -- src/tests/apps-sync-engine.test.ts src/tests/apps-sync.test.ts`
-- [ ] `bun run lint && bun run tsc:check`
-- [ ] `bun run check:rbac-coverage`
-- [ ] `bun run scripts/check-sdk-tool-registration.ts`
-- [ ] `bun run build:script-types` → `git diff --stat src/scripts-runtime/types` shows the `app_sync` entry; commit
-- [ ] `bun run docs:openapi` → `git diff --stat openapi.json` shows `/api/apps/{id}/sync`; commit `openapi.json` + `docs-site/content/docs/api-reference/**`
+- [x] `bun run test:root -- src/tests/apps-sync-engine.test.ts src/tests/apps-sync.test.ts`
+- [x] `bun run lint && bun run tsc:check`
+- [x] `bun run check:rbac-coverage`
+- [x] `bun run scripts/check-sdk-tool-registration.ts`
+- [x] `bun run build:script-types` → `git diff --stat src/scripts-runtime/types` shows the `app_sync` entry; commit
+- [x] `bun run docs:openapi` → `git diff --stat openapi.json` shows `/api/apps/{id}/sync`; commit `openapi.json` + `docs-site/content/docs/api-reference/**`
 
 #### Automated QA:
 - [ ] Against :3113 — `POST /api/apps/<id>/sync` returns `{ok:true, passes:[...]}`; invoking a `sync` action through `POST /api/apps/<id>/actions/<name>` returns the same shape without `taskId`; `app-sync` via the MCP handshake (`LOCAL_TESTING.md:100-133`) returns a rendered table.
@@ -439,9 +439,9 @@ Batteries included, in user space: the GitHub source that AMENDMENT v2 moved out
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run test:root -- src/tests/apps-sync-engine.test.ts`
-- [ ] `bun run lint && bun run tsc:check`
-- [ ] Seeder health on a **fresh** isolated DB: `rm -f /tmp/apps-sync-seed.sqlite && BUN_OPTIONS=--no-env-file DATABASE_PATH=/tmp/apps-sync-seed.sqlite PORT=3114 MCP_BASE_URL=http://localhost:3114 bun src/http.ts` boots with both scripts seeded (typecheck runs inside `scriptsSeeder.apply`) — then `curl -s -H "Authorization: Bearer 123123" "http://localhost:3114/api/scripts?scope=global" | jq '[.scripts[].name] | index("github-issues-pull")'` is non-null. Kill the process afterwards.
+- [x] `bun run test:root -- src/tests/apps-sync-engine.test.ts`
+- [x] `bun run lint && bun run tsc:check`
+- [x] Seeder health on a **fresh** isolated DB: `rm -f /tmp/apps-sync-seed.sqlite && BUN_OPTIONS=--no-env-file DATABASE_PATH=/tmp/apps-sync-seed.sqlite PORT=3114 MCP_BASE_URL=http://localhost:3114 bun src/http.ts` boots with both scripts seeded (typecheck runs inside `scriptsSeeder.apply`) — then `curl -s -H "Authorization: Bearer 123123" "http://localhost:3114/api/scripts?scope=global" | jq '[.scripts[].name] | index("github-issues-pull")'` is non-null. Kill the process afterwards.
 
 #### Automated QA:
 - [ ] Against :3113 — a `{connector:"script", scriptId:<github-issues-pull>}` source against a small public repo creates rows; narrow `state` to `closed` and re-sync → previously-seen rows go `stale:true`; widen back → `stale` clears.
@@ -482,10 +482,10 @@ Two small surfaces that decide whether any of the above is actually used: a nudg
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `bun run check:skill-sources && bun run check:skill-md && bun run check:seed-skill-files`
-- [ ] `bun run test:root -- src/tests/apps-sync-engine.test.ts`
-- [ ] `bun run lint && bun run tsc:check`
-- [ ] Full suite once: `bun run test:root`
+- [x] `bun run check:skill-sources && bun run check:skill-md && bun run check:seed-skill-files`
+- [x] `bun run test:root -- src/tests/apps-sync-engine.test.ts` (nudge test lives in swarm-tool-result-gate.test.ts — the NUDGES unit surface)
+- [x] `bun run lint && bun run tsc:check`
+- [x] Full suite once: `bun run test:root` (7332 pass / 5 known pre-existing failures, zero delta)
 
 #### Automated QA:
 - [ ] Restart :3113 → the seeded `apps` skill content updates (version-aware seeding preserves user edits). The list route omits `content` by default, so assert with `curl -s -H "Authorization: Bearer 123123" "http://localhost:3113/api/skills?fields=full" | jq -r '.skills[] | select(.name=="apps") | .content' | grep -c "Sources and sync"` → 1.

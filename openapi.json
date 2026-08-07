@@ -6004,6 +6004,10 @@
                           "type": "integer",
                           "minimum": 0
                         },
+                        "detachedRows": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
                         "orphanFields": {
                           "type": "array",
                           "items": {
@@ -6025,6 +6029,7 @@
                         "elsed",
                         "purgedValues",
                         "idxRebuilt",
+                        "detachedRows",
                         "orphanFields",
                         "userConfigChanged"
                       ]
@@ -6169,6 +6174,47 @@
                         "createdAt",
                         "updatedAt"
                       ]
+                    },
+                    "syncStatus": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "lastStartedAt": {
+                            "type": "string"
+                          },
+                          "lastFinishedAt": {
+                            "type": "string"
+                          },
+                          "ok": {
+                            "type": "boolean"
+                          },
+                          "created": {
+                            "type": "number"
+                          },
+                          "updated": {
+                            "type": "number"
+                          },
+                          "refreshed": {
+                            "type": "number"
+                          },
+                          "markedStale": {
+                            "type": "number"
+                          },
+                          "error": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "lastStartedAt",
+                          "lastFinishedAt",
+                          "ok",
+                          "created",
+                          "updated",
+                          "refreshed",
+                          "markedStale"
+                        ]
+                      }
                     }
                   },
                   "required": [
@@ -6476,6 +6522,10 @@
                           "type": "integer",
                           "minimum": 0
                         },
+                        "detachedRows": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
                         "orphanFields": {
                           "type": "array",
                           "items": {
@@ -6497,6 +6547,7 @@
                         "elsed",
                         "purgedValues",
                         "idxRebuilt",
+                        "detachedRows",
                         "orphanFields",
                         "userConfigChanged"
                       ]
@@ -6825,6 +6876,10 @@
                           "type": "integer",
                           "minimum": 0
                         },
+                        "detachedRows": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
                         "orphanFields": {
                           "type": "array",
                           "items": {
@@ -6846,6 +6901,7 @@
                         "elsed",
                         "purgedValues",
                         "idxRebuilt",
+                        "detachedRows",
                         "orphanFields",
                         "userConfigChanged"
                       ]
@@ -7898,6 +7954,115 @@
                         "taskId",
                         "status"
                       ]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "ok": {
+                          "type": "boolean"
+                        },
+                        "result": {
+                          "type": "object",
+                          "properties": {
+                            "passes": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "model": {
+                                    "type": "string"
+                                  },
+                                  "source": {
+                                    "type": "string"
+                                  },
+                                  "connector": {
+                                    "type": "string",
+                                    "enum": [
+                                      "script",
+                                      "swarm-tasks"
+                                    ]
+                                  },
+                                  "pulled": {
+                                    "type": "number"
+                                  },
+                                  "created": {
+                                    "type": "number"
+                                  },
+                                  "updated": {
+                                    "type": "number"
+                                  },
+                                  "refreshed": {
+                                    "type": "number"
+                                  },
+                                  "unchanged": {
+                                    "type": "number"
+                                  },
+                                  "markedStale": {
+                                    "type": "number"
+                                  },
+                                  "staleSweepSkipped": {
+                                    "type": "boolean"
+                                  },
+                                  "warnings": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "durationMs": {
+                                    "type": "number"
+                                  },
+                                  "invokedBy": {
+                                    "type": "string"
+                                  },
+                                  "error": {
+                                    "type": "string"
+                                  },
+                                  "skipped": {
+                                    "type": "boolean",
+                                    "enum": [
+                                      true
+                                    ]
+                                  },
+                                  "alreadyRunning": {
+                                    "type": "boolean",
+                                    "enum": [
+                                      true
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "model",
+                                  "source",
+                                  "connector",
+                                  "pulled",
+                                  "created",
+                                  "updated",
+                                  "refreshed",
+                                  "unchanged",
+                                  "markedStale",
+                                  "warnings",
+                                  "durationMs"
+                                ]
+                              }
+                            }
+                          },
+                          "required": [
+                            "passes"
+                          ]
+                        },
+                        "error": {
+                          "type": "string"
+                        },
+                        "durationMs": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "ok",
+                        "result",
+                        "durationMs"
+                      ]
                     }
                   ]
                 }
@@ -7926,6 +8091,193 @@
           },
           "404": {
             "description": "App or action not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "App definition needs repair",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/apps/{id}/sync": {
+      "post": {
+        "summary": "Sync an app's declared sources",
+        "description": "Runs every (model x source) pair the body selects. Each pass pulls outside the row mutation lock and reconciles inside it.",
+        "tags": [
+          "Apps"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                  },
+                  "source": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-zA-Z0-9_]{0,39}$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sync passes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "passes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "model": {
+                            "type": "string"
+                          },
+                          "source": {
+                            "type": "string"
+                          },
+                          "connector": {
+                            "type": "string",
+                            "enum": [
+                              "script",
+                              "swarm-tasks"
+                            ]
+                          },
+                          "pulled": {
+                            "type": "number"
+                          },
+                          "created": {
+                            "type": "number"
+                          },
+                          "updated": {
+                            "type": "number"
+                          },
+                          "refreshed": {
+                            "type": "number"
+                          },
+                          "unchanged": {
+                            "type": "number"
+                          },
+                          "markedStale": {
+                            "type": "number"
+                          },
+                          "staleSweepSkipped": {
+                            "type": "boolean"
+                          },
+                          "warnings": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "durationMs": {
+                            "type": "number"
+                          },
+                          "invokedBy": {
+                            "type": "string"
+                          },
+                          "error": {
+                            "type": "string"
+                          },
+                          "skipped": {
+                            "type": "boolean",
+                            "enum": [
+                              true
+                            ]
+                          },
+                          "alreadyRunning": {
+                            "type": "boolean",
+                            "enum": [
+                              true
+                            ]
+                          }
+                        },
+                        "required": [
+                          "model",
+                          "source",
+                          "connector",
+                          "pulled",
+                          "created",
+                          "updated",
+                          "refreshed",
+                          "unchanged",
+                          "markedStale",
+                          "warnings",
+                          "durationMs"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "passes"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown model or source, or no model declares a source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "App not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -33647,6 +33999,16 @@
           },
           "403": {
             "description": "Global delete requires lead agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Script is referenced by an app definition",
             "content": {
               "application/json": {
                 "schema": {

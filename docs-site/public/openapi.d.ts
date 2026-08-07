@@ -816,6 +816,7 @@ export interface paths {
                                 elsed: number;
                                 purgedValues: number;
                                 idxRebuilt: number;
+                                detachedRows: number;
                                 orphanFields: string[];
                                 userConfigChanged: string[];
                             };
@@ -896,6 +897,18 @@ export interface paths {
                                 }[];
                                 createdAt: string;
                                 updatedAt: string;
+                            };
+                            syncStatus?: {
+                                [key: string]: {
+                                    lastStartedAt: string;
+                                    lastFinishedAt: string;
+                                    ok: boolean;
+                                    created: number;
+                                    updated: number;
+                                    refreshed: number;
+                                    markedStale: number;
+                                    error?: string;
+                                };
                             };
                         };
                     };
@@ -988,6 +1001,7 @@ export interface paths {
                                 elsed: number;
                                 purgedValues: number;
                                 idxRebuilt: number;
+                                detachedRows: number;
                                 orphanFields: string[];
                                 userConfigChanged: string[];
                             };
@@ -1143,6 +1157,7 @@ export interface paths {
                                 elsed: number;
                                 purgedValues: number;
                                 idxRebuilt: number;
+                                detachedRows: number;
                                 orphanFields: string[];
                                 userConfigChanged: string[];
                             };
@@ -1732,6 +1747,33 @@ export interface paths {
                             taskId: string;
                             /** @enum {string} */
                             status: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                        } | {
+                            ok: boolean;
+                            result: {
+                                passes: {
+                                    model: string;
+                                    source: string;
+                                    /** @enum {string} */
+                                    connector: "script" | "swarm-tasks";
+                                    pulled: number;
+                                    created: number;
+                                    updated: number;
+                                    refreshed: number;
+                                    unchanged: number;
+                                    markedStale: number;
+                                    staleSweepSkipped?: boolean;
+                                    warnings: string[];
+                                    durationMs: number;
+                                    invokedBy?: string;
+                                    error?: string;
+                                    /** @enum {boolean} */
+                                    skipped?: true;
+                                    /** @enum {boolean} */
+                                    alreadyRunning?: true;
+                                }[];
+                            };
+                            error?: string;
+                            durationMs: number;
                         };
                     };
                 };
@@ -1754,6 +1796,113 @@ export interface paths {
                     };
                 };
                 /** @description App or action not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description App definition needs repair */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sync an app's declared sources
+         * @description Runs every (model x source) pair the body selects. Each pass pulls outside the row mutation lock and reconciles inside it.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        model?: string;
+                        source?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Sync passes */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            ok: boolean;
+                            passes: {
+                                model: string;
+                                source: string;
+                                /** @enum {string} */
+                                connector: "script" | "swarm-tasks";
+                                pulled: number;
+                                created: number;
+                                updated: number;
+                                refreshed: number;
+                                unchanged: number;
+                                markedStale: number;
+                                staleSweepSkipped?: boolean;
+                                warnings: string[];
+                                durationMs: number;
+                                invokedBy?: string;
+                                error?: string;
+                                /** @enum {boolean} */
+                                skipped?: true;
+                                /** @enum {boolean} */
+                                alreadyRunning?: true;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Unknown model or source, or no model declares a source */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Permission denied */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description App not found */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -22619,6 +22768,15 @@ export interface operations {
             };
             /** @description Global delete requires lead agent */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Script is referenced by an app definition */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

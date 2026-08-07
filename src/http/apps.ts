@@ -10,6 +10,7 @@ import {
   isIso8601Date,
   type ModelDef,
   parseAppDefinition,
+  SORTABLE_SYSTEM_DATE_COLUMNS,
   SYSTEM_COLUMN_KINDS,
 } from "../apps/definition";
 import {
@@ -42,6 +43,7 @@ import {
   listApps,
   updateApp,
 } from "../apps/store";
+import { collectAppSyncStatus, runAppSync } from "../apps/sync";
 import {
   getAppUserConfigValues,
   isReservedUserConfigKey,
@@ -57,6 +59,7 @@ import {
   rollbackApp,
   snapshotApp,
 } from "../apps/version";
+import { normalizeAssetKey } from "../assets/key";
 import { getAgentById, getAppVersion, getAppVersions, getLeadAgent } from "../be/db";
 import { getScriptById } from "../be/scripts/db";
 import { getSavedScriptOwnerAgentId, runSavedScriptAsAgent } from "../be/scripts/run-saved";
@@ -165,6 +168,38 @@ const AppRowSchema = z.looseObject({
   updatedAt: z.string(),
   createdBy: z.string().optional(),
   updatedBy: z.string().optional(),
+});
+
+/** Mirrors `SyncPassResult` (src/apps/sync.ts): one (model x source) sync pass outcome. */
+const SyncPassResultSchema = z.object({
+  model: z.string(),
+  source: z.string(),
+  connector: z.enum(["script", "swarm-tasks"]),
+  pulled: z.number(),
+  created: z.number(),
+  updated: z.number(),
+  refreshed: z.number(),
+  unchanged: z.number(),
+  markedStale: z.number(),
+  staleSweepSkipped: z.boolean().optional(),
+  warnings: z.array(z.string()),
+  durationMs: z.number(),
+  invokedBy: z.string().optional(),
+  error: z.string().optional(),
+  skipped: z.literal(true).optional(),
+  alreadyRunning: z.literal(true).optional(),
+});
+
+/** Mirrors `AppSyncStatus` (src/apps/sync.ts): per-(model:source) pass freshness. */
+const AppSyncStatusSchema = z.object({
+  lastStartedAt: z.string(),
+  lastFinishedAt: z.string(),
+  ok: z.boolean(),
+  created: z.number(),
+  updated: z.number(),
+  refreshed: z.number(),
+  markedStale: z.number(),
+  error: z.string().optional(),
 });
 
 /** Mirrors `UserConfigValues` (src/apps/user-config.ts). */
@@ -343,7 +378,11 @@ const getAppRoute = route({
   responses: {
     200: {
       description: "App including its definition",
-      schema: z.object({ app: AppRecordSchema }),
+      schema: z.object({
+        app: AppRecordSchema,
+        // Present only once at least one declared source has completed a pass.
+        syncStatus: z.record(z.string(), AppSyncStatusSchema).optional(),
+      }),
     },
     403: { description: "Permission denied" },
     404: { description: "App not found" },
@@ -552,7 +591,22 @@ const runActionTaskResultSchema = z.object({
   taskId: z.string(),
   status: AgentTaskStatusSchema,
 });
-const runActionResultSchema = z.union([runActionScriptResultSchema, runActionTaskResultSchema]);
+/**
+ * Sync actions deliberately reuse the SCRIPT-action shape minus `stdout`/
+ * `taskId` (see the handler comment): `result` carries the pass list instead
+ * of a script's return value.
+ */
+const runActionSyncResultSchema = z.object({
+  ok: z.boolean(),
+  result: z.object({ passes: z.array(SyncPassResultSchema) }),
+  error: z.string().optional(),
+  durationMs: z.number(),
+});
+const runActionResultSchema = z.union([
+  runActionScriptResultSchema,
+  runActionTaskResultSchema,
+  runActionSyncResultSchema,
+]);
 
 const runActionRoute = route({
   method: "post",
@@ -569,6 +623,29 @@ const runActionRoute = route({
     403: { description: "Permission denied" },
     409: { description: "App definition needs repair" },
     404: { description: "App or action not found" },
+  },
+  rbac: { permission: "app.use" },
+});
+
+const syncAppRoute = route({
+  method: "post",
+  path: "/api/apps/{id}/sync",
+  pattern: ["api", "apps", null, "sync"],
+  summary: "Sync an app's declared sources",
+  description:
+    "Runs every (model x source) pair the body selects. Each pass pulls outside the row mutation lock and reconciles inside it.",
+  tags: ["Apps"],
+  params: appParamsSchema,
+  body: z.object({ model: AppNameSchema.optional(), source: AppNameSchema.optional() }),
+  responses: {
+    200: {
+      description: "Sync passes",
+      schema: z.object({ ok: z.boolean(), passes: z.array(SyncPassResultSchema) }),
+    },
+    400: { description: "Unknown model or source, or no model declares a source" },
+    403: { description: "Permission denied" },
+    409: { description: "App definition needs repair" },
+    404: { description: "App not found" },
   },
   rbac: { permission: "app.use" },
 });
@@ -642,6 +719,17 @@ function definitionNeedsRepair(res: ServerResponse, app: ReturnType<typeof getAp
   if (!app || !appDefinitionNeedsRepair(app)) return false;
   json(res, { error: "definition needs repair", issues: app.definitionError }, 409);
   return true;
+}
+
+/**
+ * One `error` string for a sync result, or undefined when every pass succeeded.
+ * Each failed pair is named so a multi-pair sync says which one broke; the pass
+ * list in `result.passes` carries the rest.
+ */
+function syncPassError(sync: Awaited<ReturnType<typeof runAppSync>>): string | undefined {
+  const failed = sync.passes.filter((pass) => pass.error !== undefined);
+  if (failed.length === 0) return undefined;
+  return failed.map((pass) => `${pass.model}.${pass.source}: ${pass.error}`).join("; ");
 }
 
 function snapshotFailure(res: ServerResponse): void {
@@ -813,6 +901,12 @@ interface RowFilter {
   value: unknown;
 }
 
+/**
+ * Ad-hoc REST `filter.<col>` stays model-columns-only on purpose: system fields
+ * (including the sync envelope) are filterable through named queries, which
+ * validate kinds at definition-write time. Widening this loosely-typed
+ * query-string path would give two filter vocabularies with different rules.
+ */
 function filtersFromQuery(
   queryParams: URLSearchParams,
   model: ModelDef,
@@ -880,8 +974,7 @@ export function applyQuery(
         rowValue(a, sort.column),
         rowValue(b, sort.column),
         sort.dir,
-        sort.column === "createdAt" ||
-          sort.column === "updatedAt" ||
+        SORTABLE_SYSTEM_DATE_COLUMNS.has(sort.column) ||
           (Object.hasOwn(model.columns, sort.column) &&
             model.columns[sort.column]!.kind === "date"),
       );
@@ -915,6 +1008,7 @@ export async function handleApps(
     const definition = parseAppDefinition(parsed.body.definition, {
       resolveApp: getApp,
       writerAgentId: myAgentId ?? null,
+      writerIsUser: getRequestAuth(req)?.kind === "user",
     });
     if (!definition.success) {
       invalidDefinition(res, definition.issues);
@@ -978,6 +1072,8 @@ export async function handleApps(
         migration: parsed.body.migration,
         forceElementBreak: parsed.body.forceElementBreak,
         changedByAgentId: myAgentId,
+        writerAgentId: myAgentId ?? null,
+        writerIsUser: getRequestAuth(req)?.kind === "user",
       });
       rollbackAppRoute.respond(res, 200, { app: rolledBack.app, migration: rolledBack.migration });
     } catch (error) {
@@ -1066,8 +1162,7 @@ export async function handleApps(
         extra !== undefined ||
         !column ||
         (dir !== "asc" && dir !== "desc") ||
-        (column !== "createdAt" &&
-          column !== "updatedAt" &&
+        (!SORTABLE_SYSTEM_DATE_COLUMNS.has(column) &&
           (!Object.hasOwn(resolved.model.columns, column) ||
             resolved.model.columns[column]!.hidden === true))
       ) {
@@ -1086,8 +1181,7 @@ export async function handleApps(
           rowValue(a, column),
           rowValue(b, column),
           dir,
-          column === "createdAt" ||
-            column === "updatedAt" ||
+          SORTABLE_SYSTEM_DATE_COLUMNS.has(column) ||
             (Object.hasOwn(resolved.model.columns, column) &&
               resolved.model.columns[column]!.kind === "date"),
         );
@@ -1276,6 +1370,36 @@ export async function handleApps(
       return true;
     }
 
+    if (action.kind === "sync") {
+      const startedAt = Date.now();
+      const sync = await runAppSync({
+        appId: app.id,
+        ...(action.model === undefined ? {} : { model: action.model }),
+        ...(action.source === undefined ? {} : { source: action.source }),
+        invokedBy: actor,
+      });
+      const durationMs = Date.now() - startedAt;
+      if (sync.issues && sync.issues.length > 0) {
+        json(res, { error: "invalid sync action", issues: sync.issues }, 400);
+        return true;
+      }
+      // Deliberately the SCRIPT-action response shape, minus `taskId`:
+      // app-surface.tsx branches on `taskId` first, so omitting it gives the
+      // dashboard running -> ok/error + refetchAll() with zero UI changes.
+      const error = syncPassError(sync);
+      runActionRoute.respond(
+        res,
+        200,
+        scrubObject({
+          ok: sync.ok,
+          result: { passes: sync.passes },
+          ...(error === undefined ? {} : { error }),
+          durationMs,
+        }),
+      );
+      return true;
+    }
+
     const lead = action.agentId ? null : getLeadAgent();
     const taskPrompt = resolveTemplate("task.app.action", {
       prompt: action.prompt,
@@ -1286,9 +1410,40 @@ export async function handleApps(
     const task = createTaskWithSiblingAwareness(taskPrompt.text, {
       source: "api",
       agentId: action.agentId ?? lead?.id,
+      // App-spawned tasks group under the app's asset namespace so a
+      // swarm-tasks source can pull them back via config.assetKey.
+      key: normalizeAssetKey(`shared/app:${app.id}/action:${parsed.params.name}/`),
       ...(actor.startsWith("user:") ? { requestedByUserId: actor.slice("user:".length) } : {}),
     });
     runActionRoute.respond(res, 200, { ok: true, taskId: task.id, status: task.status });
+    return true;
+  }
+
+  if (syncAppRoute.match(req.method, pathSegments)) {
+    if (enforceContentLengthCap(req, res, MAX_APP_ROW_BODY_BYTES) === BODY_TOO_LARGE) return true;
+    const parsed = await syncAppRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    const actor = authorizeAppUse(req, res, myAgentId, parsed.params.id);
+    if (!actor) return true;
+
+    const app = getApp(parsed.params.id);
+    if (!app) {
+      jsonError(res, "app not found", 404);
+      return true;
+    }
+    if (definitionNeedsRepair(res, app)) return true;
+
+    const sync = await runAppSync({
+      appId: app.id,
+      ...(parsed.body.model === undefined ? {} : { model: parsed.body.model }),
+      ...(parsed.body.source === undefined ? {} : { source: parsed.body.source }),
+      invokedBy: actor,
+    });
+    if (sync.issues && sync.issues.length > 0) {
+      json(res, { error: "nothing to sync", issues: sync.issues }, 400);
+      return true;
+    }
+    syncAppRoute.respond(res, 200, scrubObject({ ok: sync.ok, passes: sync.passes }));
     return true;
   }
 
@@ -1327,6 +1482,7 @@ export async function handleApps(
           currentAppId: parsed.params.id,
           resolveApp: getApp,
           writerAgentId: myAgentId ?? null,
+          writerIsUser: getRequestAuth(req)?.kind === "user",
           existingDefinition: existing.definition,
         });
         if (!definition.success) {
@@ -1404,6 +1560,7 @@ export async function handleApps(
             currentAppId: parsed.params.id,
             resolveApp: getApp,
             writerAgentId: myAgentId ?? null,
+            writerIsUser: getRequestAuth(req)?.kind === "user",
             existingDefinition: existing.definition,
           });
           if (!parsedDefinition.success) {
@@ -1497,7 +1654,13 @@ export async function handleApps(
       jsonError(res, "app not found", 404);
       return true;
     }
-    getAppRoute.respond(res, 200, { app });
+    // Per-source freshness for the runtime payload — present only once a
+    // declared source has completed at least one pass.
+    const syncStatus = collectAppSyncStatus(app.id);
+    getAppRoute.respond(res, 200, {
+      app,
+      ...(Object.keys(syncStatus).length > 0 ? { syncStatus } : {}),
+    });
     return true;
   }
 
