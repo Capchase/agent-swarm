@@ -44,8 +44,8 @@ function userInitials(name: string): string {
 
 export function UserSwitcher() {
   const gate = useFeatureGate("1.76.0");
-  const { user, userId, setUserId, clearUser } = useCurrentUser();
-  const { data: users } = useUsers();
+  const { user, userId, setUserId, clearUser, locked } = useCurrentUser();
+  const { data: users } = useUsers({ enabled: !locked });
   const createUser = useCreateUser();
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -53,6 +53,31 @@ export function UserSwitcher() {
 
   // Older API servers (no /api/users) — hide entirely.
   if (!gate.supported) return null;
+
+  // Token-bound identity (DES-771): attribution is fixed server-side, so the
+  // chip still shows who you are but offers no switching — no dropdown, no
+  // create, nothing clickable.
+  if (locked) {
+    if (!user) return null;
+    return (
+      <SidebarMenu>
+        <SidebarMenuItem>
+          <div className="flex w-full items-center gap-2 overflow-hidden rounded-md p-2 text-left text-sm">
+            <span
+              aria-hidden="true"
+              className="inline-flex size-6 shrink-0 items-center justify-center rounded-full bg-primary font-mono text-[10px] font-semibold text-primary-foreground shadow-sm"
+            >
+              {userInitials(user.name)}
+            </span>
+            <span className="grid flex-1 text-left text-sm leading-tight text-foreground">
+              <span className="sr-only">Signed in as </span>
+              <span className="truncate font-medium">{user.name}</span>
+            </span>
+          </div>
+        </SidebarMenuItem>
+      </SidebarMenu>
+    );
+  }
 
   const handleCreate = async () => {
     const trimmed = newName.trim();

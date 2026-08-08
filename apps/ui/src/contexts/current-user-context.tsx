@@ -18,6 +18,16 @@
  * re-enter `needs-pick`.
  *
  * Storage failures (privacy mode, etc.) degrade to in-memory state.
+ *
+ * DES-771 (embedded dashboards): when the configured API key is a user-bound
+ * `aswt_` token, the server already forces requester/audit attribution to
+ * that user — a localStorage picker would only misrepresent it. The provider
+ * resolves identity from `GET /api/whoami` instead and exposes `locked: true`
+ * for EVERY token-bound tab, so no switching affordance (switcher, identity
+ * modal, ?email= auto-bind, localStorage) ever engages under a user token.
+ * Older servers (no /api/whoami) land in `needs-pick` with the picker
+ * suppressed: the tab simply has no client-side identity claim, while the
+ * server keeps attributing writes from the token.
  */
 
 import {
@@ -31,9 +41,11 @@ import {
 } from "react";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
 import { useUsers } from "@/api/hooks/use-users";
+import { useWhoami } from "@/api/hooks/use-whoami";
 import type { User } from "@/api/types";
 import { useConfig } from "@/hooks/use-config";
 import { deriveStorageKey } from "@/hooks/use-dismissible-card-key";
+import { isUserTokenApiKey } from "@/lib/config";
 
 const CARD_KEY = "current-user";
 
@@ -45,6 +57,14 @@ export interface CurrentUserContextValue {
   user: User | null;
   setUserId: (id: string) => void;
   clearUser: () => void;
+  /**
+   * The tab authenticates with a user-bound `aswt_` token (DES-771). Switching
+   * is blocked — `setUserId`/`clearUser` are no-ops and the switcher/identity
+   * modal must not render — while whoami is pending, erroring, or resolved to
+   * a user. The single unlock is whoami answering `kind: "operator"` (an
+   * operator key that merely starts with `aswt_`).
+   */
+  locked: boolean;
 }
 
 const CurrentUserContext = createContext<CurrentUserContextValue | null>(null);
@@ -63,7 +83,20 @@ export function CurrentUserProvider({ children }: { children: ReactNode }) {
   const { supported: identitySupported } = useFeatureGate("1.76.0");
   const storageKey = useMemo(() => deriveStorageKey(config.apiUrl, CARD_KEY), [config.apiUrl]);
 
-  const usersQuery = useUsers();
+  // DES-771: a user-bound `aswt_` bearer fixes the tab's identity server-side
+  // — resolve it from /api/whoami instead of localStorage. `locked` is true
+  // for every token-bound tab, including while whoami is in flight, on
+  // transient errors, and against older servers (whoami resolves null):
+  // user switching must never be available under a user token, so there is
+  // deliberately NO picker fallback. The single unlock is an explicit
+  // `kind: "operator"` answer — an operator key that merely looks like a
+  // token (`aswt_`-prefixed) is not user-bound and keeps the picker flow.
+  const tokenBound = isUserTokenApiKey(config.apiKey);
+  const whoamiQuery = useWhoami(tokenBound);
+  const locked = tokenBound && whoamiQuery.data?.kind !== "operator";
+
+  // Locked tabs never need the full user directory — skip the poll.
+  const usersQuery = useUsers({ enabled: !locked });
   const [storedUserId, setStoredUserId] = useState<string | null>(() =>
     readStoredUserId(storageKey),
   );
@@ -88,6 +121,7 @@ export function CurrentUserProvider({ children }: { children: ReactNode }) {
 
   const setUserId = useCallback(
     (id: string) => {
+      if (locked) return; // Token-bound identity — switching is blocked.
       try {
         localStorage.setItem(storageKey, id);
       } catch {
@@ -96,17 +130,18 @@ export function CurrentUserProvider({ children }: { children: ReactNode }) {
       }
       setStoredUserId(id);
     },
-    [storageKey],
+    [storageKey, locked],
   );
 
   const clearUser = useCallback(() => {
+    if (locked) return; // See setUserId.
     try {
       localStorage.removeItem(storageKey);
     } catch {
       // See setUserId comment.
     }
     setStoredUserId(null);
-  }, [storageKey]);
+  }, [storageKey, locked]);
 
   // Auto-bind identity from ?email= / ?name= URL params (parsed in useConfig).
   // Match strategy: email-only, case-insensitive, against User.email and
@@ -118,6 +153,9 @@ export function CurrentUserProvider({ children }: { children: ReactNode }) {
   // really is unsupported, IdentityGate never renders the modal, so the
   // leftover in-memory state is harmless.
   useEffect(() => {
+    // Token-derived identity ignores ?email=/?name= hints entirely — a hint
+    // must never plant a localStorage claim under a user token.
+    if (locked) return;
     if (!pendingIdentity) return;
     if (!identitySupported) return;
     if (usersQuery.isLoading) return;
@@ -134,6 +172,7 @@ export function CurrentUserProvider({ children }: { children: ReactNode }) {
       }
     }
   }, [
+    locked,
     pendingIdentity,
     identitySupported,
     usersQuery.isLoading,
@@ -142,22 +181,39 @@ export function CurrentUserProvider({ children }: { children: ReactNode }) {
     clearPendingIdentity,
   ]);
 
-  // Derive state + matched user from (storedUserId, users list).
+  // Derive state + matched user. Locked tabs never touch the
+  // localStorage/users-list flow; on an older server (whoami resolves null)
+  // or a failing/retrying whoami they land in `needs-pick` with the picker
+  // suppressed via `locked`.
   const { state, user } = useMemo<{ state: CurrentUserState; user: User | null }>(() => {
+    if (locked) {
+      if (whoamiQuery.isPending) return { state: "pending", user: null };
+      const tokenUser = whoamiQuery.data?.kind === "user" ? (whoamiQuery.data.user ?? null) : null;
+      if (tokenUser) return { state: "ready", user: tokenUser };
+      return { state: "needs-pick", user: null };
+    }
     if (usersQuery.isLoading) return { state: "pending", user: null };
     const users = usersQuery.data ?? [];
     if (!storedUserId) return { state: "needs-pick", user: null };
     const match = users.find((u) => u.id === storedUserId) ?? null;
     if (!match) return { state: "needs-pick", user: null };
     return { state: "ready", user: match };
-  }, [usersQuery.isLoading, usersQuery.data, storedUserId]);
+  }, [
+    locked,
+    whoamiQuery.isPending,
+    whoamiQuery.data,
+    usersQuery.isLoading,
+    usersQuery.data,
+    storedUserId,
+  ]);
 
   const value: CurrentUserContextValue = {
     state,
-    userId: state === "ready" ? storedUserId : null,
+    userId: state === "ready" ? (user?.id ?? null) : null,
     user,
     setUserId,
     clearUser,
+    locked,
   };
 
   return <CurrentUserContext.Provider value={value}>{children}</CurrentUserContext.Provider>;
