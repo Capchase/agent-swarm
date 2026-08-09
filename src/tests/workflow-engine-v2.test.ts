@@ -786,6 +786,81 @@ describe("Workflow Engine v2 (Phase 3)", () => {
       const nodeIds = steps.map((s) => s.nodeId);
       expect(nodeIds).not.toContain("after");
     });
+
+    test("unresolved inline script-body tokens fail with the node and token named", async () => {
+      const registry = createTestRegistry();
+      registry.register(new ScriptExecutor(mockDeps));
+      const workflow = makeWorkflow({
+        nodes: [
+          {
+            id: "unsafe-script",
+            type: "script",
+            config: { runtime: "bash", script: "echo {{trigger.payload}}" },
+          },
+        ],
+      });
+
+      const runId = await startWorkflowExecution(workflow, { payload: "attacker-data" }, registry);
+      const run = getWorkflowRun(runId);
+      const [step] = getWorkflowRunStepsByRunId(runId);
+
+      expect(run?.status).toBe("failed");
+      expect(run?.error).toContain('node "unsafe-script"');
+      expect(run?.error).toContain("{{trigger.payload}}");
+      expect(run?.error).toContain("config.args");
+      expect(step?.status).toBe("failed");
+      expect(step?.error).toContain("{{trigger.payload}}");
+      expect(step?.retryCount).toBe(0);
+      expect(step?.output).toBeUndefined();
+    });
+
+    test("bundled ralph-loop scripts execute with trigger and upstream values passed as args", async () => {
+      const receipt = (await Bun.file(
+        new URL("../../docs-site/public/receipts/workflows/ralph-loop.json", import.meta.url),
+      ).json()) as { definition: WorkflowDefinition };
+      const receiptNode = (id: string) => {
+        const node = receipt.definition.nodes.find((candidate) => candidate.id === id);
+        if (!node) throw new Error(`Missing ${id} in bundled ralph-loop receipt`);
+        return node;
+      };
+
+      const registry = createTestRegistry();
+      registry.register(new ScriptExecutor(mockDeps));
+      const workflow = makeWorkflow({
+        nodes: [
+          { ...receiptNode("validate-trigger"), next: "ralph-iteration" },
+          {
+            id: "ralph-iteration",
+            type: "script",
+            config: {
+              runtime: "bash",
+              script: `jq -n '{taskOutput:{iteration:1}}'`,
+            },
+            next: "max-check",
+          },
+          { ...receiptNode("max-check"), next: undefined },
+        ],
+      });
+
+      const runId = await startWorkflowExecution(
+        workflow,
+        { goal: "ship safely", maxIterations: 3 },
+        registry,
+      );
+      const run = getWorkflowRun(runId);
+      const steps = getWorkflowRunStepsByRunId(runId);
+
+      expect(run?.status).toBe("completed");
+      expect(steps.map((step) => [step.nodeId, step.status])).toEqual([
+        ["validate-trigger", "completed"],
+        ["ralph-iteration", "completed"],
+        ["max-check", "completed"],
+      ]);
+      expect(run?.context).toMatchObject({
+        "validate-trigger": { ok: true, goal: "ship safely", maxIterations: 3 },
+        "max-check": { atMax: false, iteration: 1, max: 3 },
+      });
+    });
   });
 
   // ─── Context Interpolation ────────────────────────────────
@@ -836,9 +911,7 @@ describe("interpolateNodeConfig — script node", () => {
 
     const script = (value as { script: string }).script;
     expect(script).not.toContain("curl attacker.example");
-    // Blanked to empty (existing deepInterpolate behavior for an unresolved
-    // token), not substituted with the attacker-controlled value.
-    expect(script).toBe("echo ");
+    expect(script).toBe("echo {{trigger.payload}}");
     expect(unresolved).toContain("trigger.payload");
   });
 
@@ -900,7 +973,7 @@ describe("interpolateNodeConfig — script node", () => {
 
     const script = (value as { script: string }).script;
     expect(script).not.toContain("curl attacker.example");
-    expect(script).toBe("echo ");
+    expect(script).toBe("echo {{payload}}");
     expect(unresolved).toContain("payload");
   });
 
@@ -914,7 +987,7 @@ describe("interpolateNodeConfig — script node", () => {
 
     const { value } = interpolateNodeConfig(node, ctx);
 
-    expect((value as { script: string }).script).toBe("echo ");
+    expect((value as { script: string }).script).toBe("echo {{input}}");
   });
 
   test("an inputs alias pointing at workflow input is still interpolated into the script", () => {
@@ -940,7 +1013,7 @@ describe("interpolateNodeConfig — script node", () => {
 
     const { value, unresolved } = interpolateNodeConfig(node, ctx);
 
-    expect((value as { script: string }).script).toBe("echo ");
+    expect((value as { script: string }).script).toBe("echo {{fetchStep.stdout}}");
     expect(unresolved).toContain("fetchStep.stdout");
   });
 
@@ -954,6 +1027,6 @@ describe("interpolateNodeConfig — script node", () => {
 
     const { value } = interpolateNodeConfig(node, ctx);
 
-    expect((value as { script: string }).script).toBe("echo ");
+    expect((value as { script: string }).script).toBe("echo {{prev}}");
   });
 });

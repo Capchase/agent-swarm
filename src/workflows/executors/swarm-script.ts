@@ -12,6 +12,7 @@ import {
 } from "../../scripts-runtime/executors/types";
 import { runScript } from "../../scripts-runtime/loader";
 import type { ExecutorMeta } from "../../types";
+import { findInterpolationTokens } from "../../utils/template";
 import { BaseExecutor, type ExecutorResult } from "./base";
 
 export const SWARM_SCRIPT_DEFAULT_TIMEOUT_MS = DEFAULT_SCRIPT_RESOURCES.wallClockMs;
@@ -47,6 +48,19 @@ export const SwarmScriptOutputSchema = z.object({
 type SwarmScriptConfig = z.infer<typeof SwarmScriptConfigSchema>;
 type SwarmScriptOutput = z.infer<typeof SwarmScriptOutputSchema>;
 
+const WORKFLOW_INTERPOLATION_ROOTS = new Set(["trigger", "input", "workflow", "swarm", "run"]);
+
+function findWorkflowSourceTokens(
+  source: string,
+  context: Readonly<Record<string, unknown>>,
+): string[] {
+  const roots = new Set([...WORKFLOW_INTERPOLATION_ROOTS, ...Object.keys(context)]);
+  return findInterpolationTokens(source).filter((token) => {
+    const root = token.split(".")[0];
+    return root !== undefined && roots.has(root);
+  });
+}
+
 export class SwarmScriptExecutor extends BaseExecutor<
   typeof SwarmScriptConfigSchema,
   typeof SwarmScriptOutputSchema
@@ -74,6 +88,20 @@ export class SwarmScriptExecutor extends BaseExecutor<
 
     if (!resolved.ok) {
       return { status: "failed", error: resolved.error };
+    }
+
+    // Catalog source is never workflow-interpolated. Only reject tokens whose
+    // root is a source available to this node (builtins, declared aliases, or
+    // completed upstream nodes); other mustache syntax is literal script data.
+    const sourceTokens = findWorkflowSourceTokens(resolved.source, context);
+    if (sourceTokens.length > 0) {
+      const renderedTokens = [...new Set(sourceTokens)].map((token) => `{{${token}}}`).join(", ");
+      return {
+        status: "failed",
+        error:
+          `swarm-script body interpolation failed for node "${meta.nodeId}": unresolved token(s): ${renderedTokens}. ` +
+          "Named script source is not workflow-interpolated; pass dynamic values through config.args and read them from args.",
+      };
     }
 
     const credentials = await buildScriptCredentialBindingsWithFailures({
