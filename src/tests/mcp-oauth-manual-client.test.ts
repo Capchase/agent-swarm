@@ -143,6 +143,59 @@ describe("MCP OAuth manual client flow", () => {
     else process.env.DASHBOARD_URL = originalDashboardUrl;
   });
 
+  test("a manual client created without an explicit method records body-post, not Basic", async () => {
+    // Both endpoints are supplied, so discovery never runs and never selects a
+    // method. The dashboard posts no tokenEndpointAuthMethod either, so
+    // defaulting to Basic here would break every UI-created manual client that
+    // works today on body-post.
+    const mcpServer = createMcpServer({
+      name: "manual-no-method",
+      transport: "http",
+      url: "https://api.example.com/mcp",
+      scope: "swarm",
+    });
+
+    const res = await dispatch(`/api/mcp-oauth/${mcpServer.id}/manual-client`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({
+        clientId: "manual-client-id",
+        clientSecret: "manual-client-secret",
+        authorizationServerIssuer: "https://as.example.com",
+        authorizeUrl: "https://as.example.com/authorize",
+        tokenUrl: "https://as.example.com/token",
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_post");
+  });
+
+  test("an explicit method on the manual-client route still wins", async () => {
+    const mcpServer = createMcpServer({
+      name: "manual-explicit-method",
+      transport: "http",
+      url: "https://api.example.com/mcp2",
+      scope: "swarm",
+    });
+
+    const res = await dispatch(`/api/mcp-oauth/${mcpServer.id}/manual-client`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({
+        clientId: "manual-client-id",
+        clientSecret: "manual-client-secret",
+        authorizationServerIssuer: "https://as.example.com",
+        authorizeUrl: "https://as.example.com/authorize",
+        tokenUrl: "https://as.example.com/token",
+        tokenEndpointAuthMethod: "client_secret_basic",
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+  });
+
   test("a legacy manual client re-authorizes with body-post authentication", async () => {
     const mcpServer = createMcpServer({
       name: "salesforce-sobjects",

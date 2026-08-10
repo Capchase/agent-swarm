@@ -96,6 +96,8 @@ describe("MCP OAuth DCR client reuse", () => {
   let issuerHost = "as-1.example.test";
   let registrationPath = "/register-1";
   let tokenShouldFail: "" | "invalid_client" = "";
+  let capturedTokenBody = "";
+  let capturedTokenHeaders: Record<string, string> = {};
   let asScopesSupported: string[] = [];
 
   const MCP_URL = "https://mcp.example.test/mcp";
@@ -150,6 +152,8 @@ describe("MCP OAuth DCR client reuse", () => {
         );
       }
       if (href === `https://${issuerHost}/token` && init?.method === "POST") {
+        capturedTokenBody = (init?.body as string) ?? "";
+        capturedTokenHeaders = (init?.headers as Record<string, string>) ?? {};
         if (tokenShouldFail === "invalid_client") {
           return Response.json(
             { error: "invalid_client", error_description: "client no longer recognized" },
@@ -644,5 +648,40 @@ describe("MCP OAuth DCR client reuse", () => {
     const second = await authorizeUrl(server.id);
     expect(dcrCallCount).toBe(1);
     expect(second.searchParams.get("client_id")).toBe(clientId);
+  });
+
+  test("a callback in flight across the deploy exchanges with body-post, not Basic", async () => {
+    const server = createMcpServer({
+      name: "inflight-legacy-pending",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    const state = first.searchParams.get("state")!;
+
+    // Simulate a pending row written before tokenEndpointAuthMethod existed:
+    // the user started consent on the old build and the callback lands on the
+    // new one. Its client was registered under the old body-post behavior.
+    getDb()
+      .query(
+        "UPDATE oauth_pending SET contextJson = json_remove(contextJson, '$.tokenEndpointAuthMethod') WHERE state = ?",
+      )
+      .run(state);
+
+    const callbackRes = await dispatch(
+      `/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`,
+    );
+    expect(callbackRes.status).toBe(302);
+    expect(getMcpOAuthToken(server.id)?.status).toBe("connected");
+
+    const body = new URLSearchParams(capturedTokenBody);
+    expect(capturedTokenHeaders.Authorization).toBeUndefined();
+    expect(body.get("client_id")).toBe("client-as-1.example.test-1");
+    expect(body.get("client_secret")).toBe("secret-as-1.example.test-1");
+
+    // And the resolution is persisted, so later refreshes stay consistent.
+    expect(getMcpOAuthToken(server.id)?.tokenEndpointAuthMethod).toBe("client_secret_post");
   });
 });

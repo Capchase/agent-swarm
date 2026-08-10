@@ -27,6 +27,7 @@ import {
   normalizeTokenEndpointAuthMethod,
   refreshMcpToken,
   registerClient,
+  resolveAdvertisedTokenEndpointAuthMethod,
   revokeMcpToken,
   selectDcrTokenEndpointAuthMethod,
 } from "../oauth/mcp-wrapper";
@@ -576,9 +577,10 @@ async function runAuthorizeFlow(
       scope: scopes.join(" ") || undefined,
     });
     // The AS's response is authoritative when present (it may differ from
-    // what we asked for); otherwise trust what we requested.
+    // what we asked for); otherwise trust what we requested. An explicit but
+    // unsupported value raises rather than silently downgrading to Basic.
     const registeredAuthMethod = dcr.token_endpoint_auth_method
-      ? normalizeTokenEndpointAuthMethod(dcr.token_endpoint_auth_method)
+      ? resolveAdvertisedTokenEndpointAuthMethod(dcr.token_endpoint_auth_method, "returned")
       : requestedAuthMethod;
 
     registeredScopes = scopes;
@@ -703,7 +705,10 @@ export async function completeMcpOAuthCallback(
       tokenUrl: pending.tokenUrl,
       clientId: pending.dcrClientId ?? "",
       clientSecret: pending.dcrClientSecret ?? undefined,
-      tokenEndpointAuthMethod: pending.tokenEndpointAuthMethod,
+      // A pending row created before this change carries no method. Its client
+      // was registered under the old body-post behavior, so an in-flight
+      // callback spanning the deploy must not be upgraded to Basic.
+      tokenEndpointAuthMethod: authMethodForStoredClient(pending.tokenEndpointAuthMethod),
       redirectUri: pending.redirectUri,
       code: query.code,
       codeVerifier: pending.codeVerifier,
@@ -735,7 +740,9 @@ export async function completeMcpOAuthCallback(
       registeredScopes: pending.registeredScopes ?? undefined,
       dcrClientId: pending.dcrClientId,
       dcrClientSecret: pending.dcrClientSecret,
-      tokenEndpointAuthMethod: pending.tokenEndpointAuthMethod,
+      // Persist what actually authenticated, not the raw (possibly absent)
+      // pending value, so later refreshes reuse the same resolution.
+      tokenEndpointAuthMethod: authMethodForStoredClient(pending.tokenEndpointAuthMethod),
       clientSource,
       lastRefreshedAt: new Date().toISOString(),
     });
@@ -1038,7 +1045,12 @@ export async function handleMcpOAuth(
             discovery.tokenEndpointAuthMethodsSupported ?? undefined,
           );
       }
-      tokenEndpointAuthMethod = normalizeTokenEndpointAuthMethod(tokenEndpointAuthMethod);
+      // Still unset means the caller omitted it AND discovery never ran (both
+      // endpoints were supplied). The dashboard posts no method, so defaulting
+      // to Basic here would break every UI-created manual client that works
+      // today on body-post. Keep the legacy behavior; an explicit request or a
+      // discovered value both still win.
+      tokenEndpointAuthMethod = authMethodForStoredClient(tokenEndpointAuthMethod);
 
       if (!authorizationServerIssuer) {
         jsonError(

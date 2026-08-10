@@ -641,8 +641,11 @@ describe("selectDcrTokenEndpointAuthMethod", () => {
     expect(selectDcrTokenEndpointAuthMethod(["none"])).toBe("none");
   });
 
-  test("defaults to client_secret_basic when the AS advertises nothing we recognize", () => {
-    expect(selectDcrTokenEndpointAuthMethod(["private_key_jwt"])).toBe("client_secret_basic");
+  test("throws when the AS advertises only methods we cannot perform", () => {
+    // Silently registering a Basic client against an AS that offers only
+    // private_key_jwt produces a client we can never authenticate, surfacing
+    // later as an opaque invalid_client. Fail early and actionably instead.
+    expect(() => selectDcrTokenEndpointAuthMethod(["private_key_jwt"])).toThrow(/cannot perform/);
   });
 
   test("defaults to client_secret_basic when metadata is absent (RFC 7591 §2)", () => {
@@ -680,7 +683,10 @@ describe("token-endpoint client authentication is applied per the registered met
     globalThis.fetch = original;
   });
 
-  async function captureExchange(tokenEndpointAuthMethod: string | null | undefined) {
+  async function captureExchange(
+    tokenEndpointAuthMethod: string | null | undefined,
+    creds: { clientId?: string; clientSecret?: string } = {},
+  ) {
     let capturedBody = "";
     let capturedHeaders: Record<string, string> = {};
     globalThis.fetch = async (_url: string | URL | Request, init?: RequestInit) => {
@@ -693,8 +699,8 @@ describe("token-endpoint client authentication is applied per the registered met
     };
     await exchangeCodeForTokens({
       tokenUrl: "https://as.example.com/token",
-      clientId: "client-xyz",
-      clientSecret: "secret-xyz",
+      clientId: creds.clientId ?? "client-xyz",
+      clientSecret: creds.clientSecret ?? "secret-xyz",
       tokenEndpointAuthMethod,
       redirectUri: "https://swarm.example.com/callback",
       code: "authcode-1",
@@ -725,6 +731,76 @@ describe("token-endpoint client authentication is applied per the registered met
     expect(headers.Authorization).toBeUndefined();
     expect(params.get("client_id")).toBe("client-xyz");
     expect(params.get("client_secret")).toBeNull();
+  });
+
+  test("Basic credentials are form-urlencoded per RFC 6749 §2.3.1, not encodeURIComponent", async () => {
+    // A space form-encodes to "+", not "%20", and !'()* must be escaped.
+    // Getting this wrong sends a different secret than the AS stored, which
+    // surfaces as an opaque invalid_client at exchange, refresh and revoke.
+    const clientId = "client id!";
+    const clientSecret = "se cret*(a)";
+    const { headers } = await captureExchange("client_secret_basic", { clientId, clientSecret });
+
+    const decoded = Buffer.from(
+      (headers.Authorization ?? "").replace(/^Basic /, ""),
+      "base64",
+    ).toString();
+    // `*` is intentionally literal: the urlencoded serializer preserves
+    // alphanumerics plus *-._ and encodes everything else.
+    expect(decoded).toBe("client+id%21:se+cret*%28a%29");
+    expect(decoded).not.toContain("%20");
+  });
+
+  test("an upstream error body echoing the client secret is scrubbed before it is thrown", async () => {
+    // The callback logs this message AND reflects it into the dashboard
+    // redirect as error_description, so an echoed credential would escape.
+    const secret = "sk-echoed-secret-value-1234567890";
+    globalThis.fetch = async () =>
+      new Response(`{"error":"invalid_client","detail":"bad client_secret: ${secret}"}`, {
+        status: 401,
+      });
+
+    await expect(
+      exchangeCodeForTokens({
+        tokenUrl: "https://as.example.com/token",
+        clientId: "client-xyz",
+        clientSecret: secret,
+        tokenEndpointAuthMethod: "client_secret_basic",
+        redirectUri: "https://swarm.example.com/callback",
+        code: "authcode-1",
+        codeVerifier: "verifier-1",
+        resource: "https://mcp.example.com/",
+      }),
+    ).rejects.toThrow(/Token exchange failed \(401\)/);
+
+    await exchangeCodeForTokens({
+      tokenUrl: "https://as.example.com/token",
+      clientId: "client-xyz",
+      clientSecret: secret,
+      tokenEndpointAuthMethod: "client_secret_basic",
+      redirectUri: "https://swarm.example.com/callback",
+      code: "authcode-1",
+      codeVerifier: "verifier-1",
+      resource: "https://mcp.example.com/",
+    }).catch((err: Error) => {
+      expect(err.message).not.toContain(secret);
+    });
+  });
+
+  test("a revocation error body echoing the token is scrubbed before it is thrown", async () => {
+    const token = "rt-echoed-refresh-token-0987654321";
+    globalThis.fetch = async () => new Response(`{"error":"bad token: ${token}"}`, { status: 400 });
+
+    await revokeMcpToken({
+      revocationUrl: "https://as.example.com/revoke",
+      token,
+      clientId: "client-xyz",
+      clientSecret: "secret-xyz",
+      tokenEndpointAuthMethod: "client_secret_post",
+    }).catch((err: Error) => {
+      expect(err.message).toContain("Token revocation failed (400)");
+      expect(err.message).not.toContain(token);
+    });
   });
 
   test("missing/unknown value defaults to client_secret_basic, never the old body-post behavior", async () => {
