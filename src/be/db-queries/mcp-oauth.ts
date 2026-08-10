@@ -57,6 +57,7 @@ export interface McpOAuthToken {
   revocationUrl: string | null;
   dcrClientId: string | null;
   dcrClientSecret: string | null;
+  tokenEndpointAuthMethod: string | null;
   clientSource: McpOAuthClientSource;
   status: McpOAuthStatus;
   lastErrorMessage: string | null;
@@ -82,6 +83,7 @@ export interface McpOAuthPendingRow {
   registeredScopes: string[] | null;
   dcrClientId: string | null;
   dcrClientSecret: string | null;
+  tokenEndpointAuthMethod: string | null;
   redirectUri: string;
   finalRedirect: string | null;
   createdAt: string;
@@ -174,6 +176,10 @@ function decryptTokenRow(row: UnifiedMcpTokenRow): McpOAuthToken {
         : clientKey
           ? decryptSecret(row.clientSecret, clientKey)
           : row.clientSecret,
+    tokenEndpointAuthMethod:
+      typeof metadata.tokenEndpointAuthMethod === "string"
+        ? metadata.tokenEndpointAuthMethod
+        : null,
     clientSource,
     status: statusFromUnified(row.status),
     lastErrorMessage: row.lastErrorMessage,
@@ -215,6 +221,7 @@ function upsertMcpApp(input: {
   registeredScopes?: string[];
   dcrClientId?: string | null;
   dcrClientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   clientSource: McpOAuthClientSource;
   redirectUri?: string;
 }): string {
@@ -245,6 +252,9 @@ function upsertMcpApp(input: {
     authorizationServerIssuer: input.authorizationServerIssuer,
     registrationEndpoint: input.registrationEndpoint ?? null,
     clientSource: input.clientSource,
+    ...(input.tokenEndpointAuthMethod !== undefined
+      ? { tokenEndpointAuthMethod: input.tokenEndpointAuthMethod }
+      : {}),
     registeredScopes:
       input.registeredScopes !== undefined
         ? input.registeredScopes
@@ -350,6 +360,9 @@ export interface StoredMcpOAuthClient {
   resourceUrl: string;
   authorizationServerIssuer: string;
   registrationEndpoint: string | null;
+  // Null means unknown — a row written before this field was recorded. Callers
+  // must resolve it through authMethodForStoredClient, not the RFC default.
+  tokenEndpointAuthMethod: string | null;
   clientSource: McpOAuthClientSource;
 }
 
@@ -421,6 +434,10 @@ function readMcpOAuthApp(appId: string): StoredMcpOAuthClient | null {
     registeredScopes: Array.isArray(metadata.registeredScopes)
       ? (metadata.registeredScopes as string[])
       : null,
+    tokenEndpointAuthMethod:
+      typeof metadata.tokenEndpointAuthMethod === "string"
+        ? metadata.tokenEndpointAuthMethod
+        : null,
     clientSource,
   };
 }
@@ -524,6 +541,7 @@ export interface UpsertMcpOAuthTokenInput {
   registeredScopes?: string[];
   dcrClientId?: string | null;
   dcrClientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   clientSource: McpOAuthClientSource;
   status?: McpOAuthStatus;
   lastErrorMessage?: string | null;
@@ -550,6 +568,7 @@ export function upsertMcpOAuthToken(input: UpsertMcpOAuthTokenInput): void {
       registeredScopes: input.registeredScopes,
       dcrClientId: input.dcrClientId,
       dcrClientSecret: input.dcrClientSecret,
+      tokenEndpointAuthMethod: input.tokenEndpointAuthMethod,
       clientSource: input.clientSource,
     });
     upsertAuthorization({
@@ -660,6 +679,7 @@ export interface InsertMcpOAuthPendingInput {
   registeredScopes?: string[];
   dcrClientId?: string | null;
   dcrClientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   redirectUri: string;
   finalRedirect?: string | null;
 }
@@ -708,6 +728,7 @@ export function insertMcpOAuthPending(input: InsertMcpOAuthPendingInput): void {
             registeredScopes: input.registeredScopes,
             dcrClientId: input.dcrClientId,
             dcrClientSecret: input.dcrClientSecret,
+            tokenEndpointAuthMethod: input.tokenEndpointAuthMethod,
             clientSource,
             redirectUri: input.redirectUri,
           });
@@ -731,6 +752,7 @@ export function insertMcpOAuthPending(input: InsertMcpOAuthPendingInput): void {
         input.dcrClientSecret == null
           ? null
           : encryptSecret(input.dcrClientSecret, getEncryptionKey()),
+      tokenEndpointAuthMethod: input.tokenEndpointAuthMethod ?? null,
       clientSource,
     });
     getDb()
@@ -824,6 +846,10 @@ export function consumeMcpOAuthPending(state: string): McpOAuthPendingRow | null
       dcrClientSecret: encryptedClientSecret
         ? decryptSecret(encryptedClientSecret, getEncryptionKey())
         : null,
+      tokenEndpointAuthMethod:
+        typeof context.tokenEndpointAuthMethod === "string"
+          ? context.tokenEndpointAuthMethod
+          : null,
       redirectUri: row.redirectUri,
       finalRedirect: row.finalRedirect,
       createdAt: normalizeDateRequired(row.createdAt),

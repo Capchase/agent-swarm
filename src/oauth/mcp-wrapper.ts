@@ -249,6 +249,179 @@ export async function discoverAuthorizationServerMetadata(
   throw lastError ?? new Error(`Authorization server metadata not found at ${issuer}`);
 }
 
+// ─── Token endpoint client authentication (RFC 6749 §2.3.1 / RFC 7591 §2) ────
+
+/**
+ * The three `token_endpoint_auth_method` values agent-swarm knows how to
+ * apply at the token endpoint. Other RFC 7591 values (e.g. `private_key_jwt`)
+ * are not supported by any MCP provider we've integrated with; they fall
+ * back to the RFC 7591 §2 default below.
+ */
+export type TokenEndpointAuthMethod = "client_secret_basic" | "client_secret_post" | "none";
+
+const KNOWN_TOKEN_ENDPOINT_AUTH_METHODS: readonly TokenEndpointAuthMethod[] = [
+  "client_secret_basic",
+  "client_secret_post",
+  "none",
+];
+
+/** RFC 7591 §2: "client_secret_basic" is the default when unspecified. */
+export const DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD: TokenEndpointAuthMethod = "client_secret_basic";
+
+/** Coerce a value we read back from a provider (or our own storage) to a known method, defaulting per RFC 7591 §2. */
+export function normalizeTokenEndpointAuthMethod(
+  value: string | null | undefined,
+): TokenEndpointAuthMethod {
+  return (KNOWN_TOKEN_ENDPOINT_AUTH_METHODS as readonly string[]).includes(value ?? "")
+    ? (value as TokenEndpointAuthMethod)
+    : DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD;
+}
+
+export class UnsupportedTokenEndpointAuthMethodError extends Error {
+  constructor(value: string, source: string) {
+    super(
+      `Authorization server ${source} token_endpoint_auth_method "${value}", which agent-swarm cannot perform. ` +
+        `Supported methods: ${KNOWN_TOKEN_ENDPOINT_AUTH_METHODS.join(", ")}. ` +
+        `Register a client manually via POST /api/mcp-oauth/:id/manual-client with a supported method.`,
+    );
+    this.name = "UnsupportedTokenEndpointAuthMethodError";
+  }
+}
+
+/**
+ * Resolve a method the authorization server stated EXPLICITLY. An omitted
+ * value falls back to the RFC 7591 §2 default, but a present-and-unsupported
+ * value (e.g. `private_key_jwt`) is an error rather than a silent downgrade:
+ * coercing it to Basic would send credentials in a scheme the AS did not
+ * select, contradicting "server wins" and failing later as invalid_client.
+ */
+export function resolveAdvertisedTokenEndpointAuthMethod(
+  value: string | null | undefined,
+  source: string,
+): TokenEndpointAuthMethod {
+  // An empty string is treated as "not stated", not as an unsupported method.
+  // A provider that serializes the field empty has told us nothing, and the
+  // DCR caller falls back to the method it requested (which the AS advertised)
+  // rather than erroring. Failing here would break such a provider outright
+  // for no safety gain, since we still authenticate the way it advertised.
+  if (value == null || value === "") return DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD;
+  if (!(KNOWN_TOKEN_ENDPOINT_AUTH_METHODS as readonly string[]).includes(value)) {
+    throw new UnsupportedTokenEndpointAuthMethodError(value, source);
+  }
+  return value as TokenEndpointAuthMethod;
+}
+
+/**
+ * Read the method from a persisted client. Older rows predate this field and
+ * used client_secret_post, so preserve that known-working behavior.
+ */
+export function authMethodForStoredClient(
+  value: string | null | undefined,
+): TokenEndpointAuthMethod {
+  if (value == null || value === "") return "client_secret_post";
+  return normalizeTokenEndpointAuthMethod(value);
+}
+
+/**
+ * Pick the method to REQUEST during DCR from the AS's advertised
+ * `token_endpoint_auth_methods_supported`. Prefers the RFC-preferred Basic
+ * form, then body-post, then public (`none`); falls back to the RFC 7591 §2
+ * default when the AS didn't advertise anything we recognize.
+ */
+export function selectDcrTokenEndpointAuthMethod(
+  supportedMethods: string[] | undefined,
+): TokenEndpointAuthMethod {
+  // An empty advertised list is degenerate rather than a claim to support
+  // nothing, so it takes the RFC 8414 omitted-value default. Only a non-empty
+  // list containing nothing we can perform is a genuine incompatibility.
+  if (!supportedMethods || supportedMethods.length === 0) {
+    return DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD;
+  }
+  for (const method of KNOWN_TOKEN_ENDPOINT_AUTH_METHODS) {
+    if (supportedMethods.includes(method)) return method;
+  }
+  // The AS advertised a list and none of it is something we can perform.
+  // Defaulting to Basic here would register a client we can never authenticate.
+  throw new UnsupportedTokenEndpointAuthMethodError(supportedMethods.join(", "), "advertises only");
+}
+
+/**
+ * Serialize one credential component per `application/x-www-form-urlencoded`,
+ * which RFC 6749 §2.3.1 requires before Base64-encoding the Basic header.
+ * `encodeURIComponent` is NOT that algorithm: it emits `%20` for a space where
+ * form encoding emits `+`, and it leaves `!'()*` unescaped.
+ */
+function formUrlEncodeComponent(value: string): string {
+  return new URLSearchParams({ v: value }).toString().slice(2);
+}
+
+/**
+ * Redact every credential representation we actually transmitted from an
+ * upstream error body before it can be logged, persisted, or reflected into a
+ * redirect.
+ *
+ * `scrubSecrets` alone is not enough here: `registerVolatileSecret` ignores
+ * values shorter than its minimum length, and RFC 7591 sets no floor on a
+ * `client_secret`. A provider echoing a short secret, or the form-encoded
+ * form of a longer one, would otherwise pass straight through.
+ *
+ * Every value is redacted in BOTH its raw and its form-encoded shape. Anything
+ * we put in a `URLSearchParams` body travels percent-encoded (a token like
+ * `a+b/c=` is sent as `a%2Bb%2Fc%3D`), so a provider that echoes its received
+ * body back would otherwise leak the encoded form. Doing it here rather than
+ * at each call site means a new sensitive field cannot forget one shape.
+ */
+function redactSentCredentials(text: string, sent: Array<string | null | undefined>): string {
+  let out = scrubSecrets(text);
+  for (const value of sent) {
+    if (!value) continue;
+    for (const shape of new Set([value, formUrlEncodeComponent(value)])) {
+      out = out.split(shape).join("[REDACTED]");
+    }
+  }
+  return out;
+}
+
+/**
+ * Apply the client's registered auth method to a token-endpoint request.
+ * Mutates `body` and `headers` in place so callers can build the rest of the
+ * grant-specific params around it.
+ *
+ *   - client_secret_basic → Authorization: Basic header; no creds in body.
+ *   - client_secret_post  → client_id/client_secret in the body; no header.
+ *   - none (public client) → client_id only in the body; no secret anywhere.
+ *
+ * Returns every credential representation it put on the wire so the caller can
+ * redact exactly what it sent, whatever the encoding or length.
+ */
+function applyClientAuthentication(
+  method: TokenEndpointAuthMethod,
+  clientId: string,
+  clientSecret: string | null | undefined,
+  body: URLSearchParams,
+  headers: Record<string, string>,
+): string[] {
+  if (method === "client_secret_basic" && clientSecret) {
+    const encodedSecret = formUrlEncodeComponent(clientSecret);
+    const credentials = `${formUrlEncodeComponent(clientId)}:${encodedSecret}`;
+    const encoded = Buffer.from(credentials).toString("base64");
+    // The Base64 blob is itself a credential. Register it so a provider that
+    // echoes the Authorization header back in an error body gets scrubbed.
+    registerVolatileSecret(encoded, "mcp_oauth_basic_credential");
+    headers.Authorization = `Basic ${encoded}`;
+    return [clientSecret, encodedSecret, encoded, credentials];
+  }
+
+  // A public client must identify itself in the body, whatever method was
+  // recorded for a client with no secret.
+  body.set("client_id", clientId);
+  if (method === "client_secret_post" && clientSecret) {
+    body.set("client_secret", clientSecret);
+    return [clientSecret, formUrlEncodeComponent(clientSecret)];
+  }
+  return [];
+}
+
 // ─── Dynamic Client Registration (RFC 7591) ──────────────────────────────────
 
 export interface DcrRequest {
@@ -353,6 +526,7 @@ export interface ExchangeCodeInput {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   redirectUri: string;
   code: string;
   codeVerifier: string;
@@ -368,27 +542,48 @@ export interface TokenResponse {
 }
 
 export async function exchangeCodeForTokens(input: ExchangeCodeInput): Promise<TokenResponse> {
+  // A provider can echo a submitted credential back verbatim in an error body.
+  // The thrown message is logged by the callback AND reflected into the
+  // dashboard redirect as error_description, so redact before it can escape.
+  if (input.clientSecret) registerVolatileSecret(input.clientSecret, "mcp_oauth_client_secret");
+
+  const method = normalizeTokenEndpointAuthMethod(input.tokenEndpointAuthMethod);
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code: input.code,
     redirect_uri: input.redirectUri,
-    client_id: input.clientId,
     code_verifier: input.codeVerifier,
     resource: input.resource,
   });
-  if (input.clientSecret) body.set("client_secret", input.clientSecret);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  const sentCredentials = applyClientAuthentication(
+    method,
+    input.clientId,
+    input.clientSecret,
+    body,
+    headers,
+  );
 
   const res = await safeFetch(input.tokenUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Token exchange failed (${res.status}): ${text}`);
+    // The code and verifier are single-use but the exchange just failed, so
+    // treat them as live. Both callback sinks (console.error and the dashboard
+    // redirect's error_description) receive this message verbatim.
+    throw new Error(
+      `Token exchange failed (${res.status}): ${redactSentCredentials(text, [
+        ...sentCredentials,
+        input.code,
+        input.codeVerifier,
+      ])}`,
+    );
   }
   return (await res.json()) as TokenResponse;
 }
@@ -397,6 +592,7 @@ export interface RefreshTokenInput {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
   refreshToken: string;
   resource: string;
   scopes?: string[];
@@ -411,26 +607,38 @@ export async function refreshMcpToken(input: RefreshTokenInput): Promise<TokenRe
   if (input.clientSecret) registerVolatileSecret(input.clientSecret, "mcp_oauth_client_secret");
   registerVolatileSecret(input.refreshToken, "mcp_oauth_refresh_token");
 
+  const method = normalizeTokenEndpointAuthMethod(input.tokenEndpointAuthMethod);
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: input.refreshToken,
-    client_id: input.clientId,
     resource: input.resource,
   });
-  if (input.clientSecret) body.set("client_secret", input.clientSecret);
   if (input.scopes && input.scopes.length > 0) body.set("scope", input.scopes.join(" "));
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  const sentCredentials = applyClientAuthentication(
+    method,
+    input.clientId,
+    input.clientSecret,
+    body,
+    headers,
+  );
 
   const res = await safeFetch(input.tokenUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Token refresh failed (${res.status}): ${scrubSecrets(text)}`);
+    throw new Error(
+      `Token refresh failed (${res.status}): ${redactSentCredentials(text, [
+        ...sentCredentials,
+        input.refreshToken,
+      ])}`,
+    );
   }
   return (await res.json()) as TokenResponse;
 }
@@ -441,28 +649,43 @@ export interface RevokeInput {
   tokenTypeHint?: "access_token" | "refresh_token";
   clientId: string;
   clientSecret?: string | null;
+  tokenEndpointAuthMethod?: string | null;
 }
 
 export async function revokeMcpToken(input: RevokeInput): Promise<void> {
-  const body = new URLSearchParams({
-    token: input.token,
-    client_id: input.clientId,
-  });
+  // Same exposure as the exchange path: the caller logs this error verbatim.
+  if (input.clientSecret) registerVolatileSecret(input.clientSecret, "mcp_oauth_client_secret");
+  registerVolatileSecret(input.token, "mcp_oauth_revoked_token");
+
+  const method = normalizeTokenEndpointAuthMethod(input.tokenEndpointAuthMethod);
+  const body = new URLSearchParams({ token: input.token });
   if (input.tokenTypeHint) body.set("token_type_hint", input.tokenTypeHint);
-  if (input.clientSecret) body.set("client_secret", input.clientSecret);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  const sentCredentials = applyClientAuthentication(
+    method,
+    input.clientId,
+    input.clientSecret,
+    body,
+    headers,
+  );
 
   const res = await safeFetch(input.revocationUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   if (!res.ok && res.status !== 200 && res.status !== 204) {
     // RFC 7009: 200 even for already-revoked. Treat any non-2xx as informational only.
     const text = await res.text().catch(() => "");
-    throw new Error(`Token revocation failed (${res.status}): ${text}`);
+    throw new Error(
+      `Token revocation failed (${res.status}): ${redactSentCredentials(text, [
+        ...sentCredentials,
+        input.token,
+      ])}`,
+    );
   }
 }
 

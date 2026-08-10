@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { closeDb, createMcpServer, initDb } from "../be/db";
+import { closeDb, createMcpServer, getDb, initDb } from "../be/db";
 import { getMcpOAuthToken } from "../be/db-queries/mcp-oauth";
 import { handleCore } from "../http/core";
 import { handleMcpOAuth } from "../http/mcp-oauth";
@@ -89,14 +89,17 @@ async function dispatch(path: string, init: RequestInit = {}): Promise<TestRespo
 describe("MCP OAuth manual client flow", () => {
   let originalFetch: typeof fetch;
   let capturedTokenBody: string | null;
+  let capturedTokenHeaders: Record<string, string> | null;
   let originalPublicMcpBaseUrl: string | undefined;
   let originalAppUrl: string | undefined;
   let originalDashboardUrl: string | undefined;
   let includeRefreshToken: boolean;
+  let asAuthMethodsSupported: string[] | null = null;
 
   beforeEach(async () => {
     originalFetch = globalThis.fetch;
     capturedTokenBody = null;
+    capturedTokenHeaders = null;
     originalPublicMcpBaseUrl = process.env.PUBLIC_MCP_BASE_URL;
     originalAppUrl = process.env.APP_URL;
     originalDashboardUrl = process.env.DASHBOARD_URL;
@@ -111,8 +114,27 @@ describe("MCP OAuth manual client flow", () => {
 
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const href = input.toString();
+      // Discovery fixture for manual clients that omit an endpoint, so the
+      // route falls through to discoverForMcp.
+      if (href === "https://disc.example.test/.well-known/oauth-protected-resource") {
+        return Response.json({
+          resource: "https://disc.example.test/mcp",
+          authorization_servers: ["https://as-disc.example.test"],
+        });
+      }
+      if (href === "https://as-disc.example.test/.well-known/oauth-authorization-server") {
+        return Response.json({
+          issuer: "https://as-disc.example.test",
+          authorization_endpoint: "https://as-disc.example.test/authorize",
+          token_endpoint: "https://as-disc.example.test/token",
+          ...(asAuthMethodsSupported === null
+            ? {}
+            : { token_endpoint_auth_methods_supported: asAuthMethodsSupported }),
+        });
+      }
       if (href === "https://login.salesforce.com/services/oauth2/token") {
         capturedTokenBody = init?.body?.toString() ?? null;
+        capturedTokenHeaders = (init?.headers as Record<string, string> | undefined) ?? null;
         return new Response(
           JSON.stringify({
             access_token: "sf-access-token",
@@ -140,7 +162,107 @@ describe("MCP OAuth manual client flow", () => {
     else process.env.DASHBOARD_URL = originalDashboardUrl;
   });
 
-  test("authorize-url uses a stored manual client when DCR is not available", async () => {
+  async function registerDiscoveredManualClient(name: string, body: Record<string, unknown> = {}) {
+    const mcpServer = createMcpServer({
+      name,
+      transport: "http",
+      url: "https://disc.example.test/mcp",
+      scope: "swarm",
+    });
+    // No authorizeUrl/tokenUrl, so the route runs discovery.
+    const res = await dispatch(`/api/mcp-oauth/${mcpServer.id}/manual-client`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({ clientId: "disc-client", clientSecret: "disc-secret", ...body }),
+    });
+    expect(res.status).toBe(200);
+    return mcpServer;
+  }
+
+  test("discovery does not switch an omitted manual method to Basic", async () => {
+    // AS metadata describes what the SERVER accepts, not the method assigned
+    // to this out-of-band client. A pre-registered client working on body-post
+    // must not be flipped just because the AS also supports Basic.
+    asAuthMethodsSupported = ["client_secret_basic", "client_secret_post"];
+    const mcpServer = await registerDiscoveredManualClient("manual-disc-both");
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_post");
+  });
+
+  test("an AS advertising no methods still leaves an omitted manual method on body-post", async () => {
+    asAuthMethodsSupported = null;
+    const mcpServer = await registerDiscoveredManualClient("manual-disc-absent");
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_post");
+  });
+
+  test("an AS that excludes body-post does switch the omitted manual method", async () => {
+    // Here the legacy default is knowably broken, so defer to the server.
+    asAuthMethodsSupported = ["client_secret_basic"];
+    const mcpServer = await registerDiscoveredManualClient("manual-disc-basic-only");
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+  });
+
+  test("an explicit method still wins over discovery", async () => {
+    asAuthMethodsSupported = ["client_secret_basic"];
+    const mcpServer = await registerDiscoveredManualClient("manual-disc-explicit", {
+      tokenEndpointAuthMethod: "client_secret_post",
+    });
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_post");
+  });
+
+  test("a manual client created without an explicit method records body-post, not Basic", async () => {
+    // Both endpoints are supplied, so discovery never runs and never selects a
+    // method. The dashboard posts no tokenEndpointAuthMethod either, so
+    // defaulting to Basic here would break every UI-created manual client that
+    // works today on body-post.
+    const mcpServer = createMcpServer({
+      name: "manual-no-method",
+      transport: "http",
+      url: "https://api.example.com/mcp",
+      scope: "swarm",
+    });
+
+    const res = await dispatch(`/api/mcp-oauth/${mcpServer.id}/manual-client`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({
+        clientId: "manual-client-id",
+        clientSecret: "manual-client-secret",
+        authorizationServerIssuer: "https://as.example.com",
+        authorizeUrl: "https://as.example.com/authorize",
+        tokenUrl: "https://as.example.com/token",
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_post");
+  });
+
+  test("an explicit method on the manual-client route still wins", async () => {
+    const mcpServer = createMcpServer({
+      name: "manual-explicit-method",
+      transport: "http",
+      url: "https://api.example.com/mcp2",
+      scope: "swarm",
+    });
+
+    const res = await dispatch(`/api/mcp-oauth/${mcpServer.id}/manual-client`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({
+        clientId: "manual-client-id",
+        clientSecret: "manual-client-secret",
+        authorizationServerIssuer: "https://as.example.com",
+        authorizeUrl: "https://as.example.com/authorize",
+        tokenUrl: "https://as.example.com/token",
+        tokenEndpointAuthMethod: "client_secret_basic",
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    expect(getMcpOAuthToken(mcpServer.id)?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+  });
+
+  test("a legacy manual client re-authorizes with body-post authentication", async () => {
     const mcpServer = createMcpServer({
       name: "salesforce-sobjects",
       transport: "http",
@@ -167,6 +289,14 @@ describe("MCP OAuth manual client flow", () => {
     const provisionalToken = getMcpOAuthToken(mcpServer.id);
     expect(provisionalToken?.clientSource).toBe("manual");
     expect(provisionalToken?.status).toBe("error");
+
+    // Simulate a manual client that was stored before tokenEndpointAuthMethod
+    // existed. Reauthorization must preserve its historical body-post method.
+    getDb()
+      .query(
+        "UPDATE oauth_apps SET metadata = json_remove(metadata, '$.tokenEndpointAuthMethod') WHERE provider = ?",
+      )
+      .run(`mcp-${mcpServer.id}`);
 
     const authorizeRes = await dispatch(`/api/mcp-oauth/${mcpServer.id}/authorize-url`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
@@ -196,6 +326,8 @@ describe("MCP OAuth manual client flow", () => {
       `${process.env.APP_URL}/mcp-servers/${mcpServer.id}?oauth=success`,
     );
 
+    // The stored method is absent, so this legacy manual client must retain
+    // the body-post behavior that worked before the auth-method field existed.
     const tokenRequest = new URLSearchParams(capturedTokenBody ?? "");
     expect(tokenRequest.get("client_id")).toBe("sf-client-id");
     expect(tokenRequest.get("client_secret")).toBe("sf-client-secret");
@@ -203,6 +335,7 @@ describe("MCP OAuth manual client flow", () => {
     expect(tokenRequest.get("redirect_uri")).toBe(
       "https://swarm.example.test/api/mcp-oauth/callback",
     );
+    expect(capturedTokenHeaders?.Authorization).toBeUndefined();
 
     const connectedToken = getMcpOAuthToken(mcpServer.id);
     expect(connectedToken?.clientSource).toBe("manual");

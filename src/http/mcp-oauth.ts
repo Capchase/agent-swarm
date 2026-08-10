@@ -17,15 +17,19 @@ import {
 import { ensureMcpToken } from "../oauth/ensure-mcp-token";
 import {
   assertUrlSafe,
+  authMethodForStoredClient,
   buildAuthorizeUrl,
   computeExpiresAt,
   discoverAuthorizationServerMetadata,
   discoverProtectedResourceMetadata,
   exchangeCodeForTokens,
   isInvalidClientError,
+  normalizeTokenEndpointAuthMethod,
   refreshMcpToken,
   registerClient,
+  resolveAdvertisedTokenEndpointAuthMethod,
   revokeMcpToken,
+  selectDcrTokenEndpointAuthMethod,
 } from "../oauth/mcp-wrapper";
 import { McpAuthMethodSchema } from "../types";
 import { getAppUrl, getPublicMcpBaseUrl } from "../utils/constants";
@@ -68,6 +72,7 @@ interface DiscoveryResult {
   requiresOAuth: boolean;
   dcrSupported: boolean;
   bearerMethodsSupported: string[] | null;
+  tokenEndpointAuthMethodsSupported: string[] | null;
 }
 
 interface OAuthClientForAuthorize {
@@ -79,6 +84,7 @@ interface OAuthClientForAuthorize {
   tokenUrl: string;
   revocationUrl: string | null;
   scopes: string[];
+  tokenEndpointAuthMethod: string;
 }
 
 // ─── Response schemas ────────────────────────────────────────────────────────
@@ -96,6 +102,7 @@ const DiscoveryResultSchema = z.object({
   requiresOAuth: z.literal(true),
   dcrSupported: z.boolean(),
   bearerMethodsSupported: z.array(z.string()).nullable(),
+  tokenEndpointAuthMethodsSupported: z.array(z.string()).nullable(),
 });
 
 const MetadataResponseSchema = z.union([
@@ -172,6 +179,7 @@ function manualClientFromToken(token: McpOAuthToken | null): OAuthClientForAutho
     tokenUrl: token.tokenUrl,
     revocationUrl: token.revocationUrl,
     scopes: splitScopes(token.scope),
+    tokenEndpointAuthMethod: authMethodForStoredClient(token.tokenEndpointAuthMethod),
   };
 }
 
@@ -197,6 +205,7 @@ async function discoverForMcp(resourceUrl: string): Promise<DiscoveryResult | nu
     requiresOAuth: true,
     dcrSupported: !!as.registration_endpoint,
     bearerMethodsSupported: prmd.bearer_methods_supported ?? null,
+    tokenEndpointAuthMethodsSupported: as.token_endpoint_auth_methods_supported ?? null,
   };
 }
 
@@ -371,6 +380,9 @@ const manualClientRoute = route({
     tokenUrl: z.string().url().optional(),
     revocationUrl: z.string().url().optional(),
     scopes: z.array(z.string()).optional(),
+    tokenEndpointAuthMethod: z
+      .enum(["client_secret_basic", "client_secret_post", "none"])
+      .optional(),
   }),
   responses: {
     200: {
@@ -527,6 +539,10 @@ async function runAuthorizeFlow(
         tokenUrl: discovery.tokenUrl,
         revocationUrl: discovery.revocationUrl,
         scopes: reusable.scopes.length > 0 ? reusable.scopes : discovery.scopes,
+        // Reusing the client means reusing how it authenticates. A stored null
+        // predates the field, so resolve it the same way every other stored
+        // read does rather than falling back to the RFC default.
+        tokenEndpointAuthMethod: authMethodForStoredClient(reusable.tokenEndpointAuthMethod),
       };
     }
   }
@@ -547,15 +563,26 @@ async function runAuthorizeFlow(
     }
 
     const scopes = q.scopes ? splitScopes(q.scopes) : discovery.scopes;
+    // RFC 7591 §2: request the method the AS actually advertises support for
+    // (preferring Basic), rather than assuming every provider accepts Basic.
+    const requestedAuthMethod = selectDcrTokenEndpointAuthMethod(
+      discovery.tokenEndpointAuthMethodsSupported ?? undefined,
+    );
     const dcr = await registerClient(discovery.registrationEndpoint, {
       client_name: `agent-swarm (${server.name})`,
       redirect_uris: [callbackRedirectUri()],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      token_endpoint_auth_method: "client_secret_basic",
+      token_endpoint_auth_method: requestedAuthMethod,
       application_type: "web",
       scope: scopes.join(" ") || undefined,
     });
+    // The AS's response is authoritative when present (it may differ from
+    // what we asked for); otherwise trust what we requested. An explicit but
+    // unsupported value raises rather than silently downgrading to Basic.
+    const registeredAuthMethod = dcr.token_endpoint_auth_method
+      ? resolveAdvertisedTokenEndpointAuthMethod(dcr.token_endpoint_auth_method, "returned")
+      : requestedAuthMethod;
 
     registeredScopes = scopes;
     client = {
@@ -567,6 +594,7 @@ async function runAuthorizeFlow(
       tokenUrl: discovery.tokenUrl,
       revocationUrl: discovery.revocationUrl,
       scopes,
+      tokenEndpointAuthMethod: registeredAuthMethod,
     };
   }
 
@@ -610,6 +638,7 @@ async function runAuthorizeFlow(
     registeredScopes,
     dcrClientId: client.clientId,
     dcrClientSecret: client.clientSecret,
+    tokenEndpointAuthMethod: client.tokenEndpointAuthMethod,
     redirectUri: callbackRedirectUri(),
     finalRedirect: q.redirect ?? null,
   });
@@ -677,6 +706,10 @@ export async function completeMcpOAuthCallback(
       tokenUrl: pending.tokenUrl,
       clientId: pending.dcrClientId ?? "",
       clientSecret: pending.dcrClientSecret ?? undefined,
+      // A pending row created before this change carries no method. Its client
+      // was registered under the old body-post behavior, so an in-flight
+      // callback spanning the deploy must not be upgraded to Basic.
+      tokenEndpointAuthMethod: authMethodForStoredClient(pending.tokenEndpointAuthMethod),
       redirectUri: pending.redirectUri,
       code: query.code,
       codeVerifier: pending.codeVerifier,
@@ -708,6 +741,9 @@ export async function completeMcpOAuthCallback(
       registeredScopes: pending.registeredScopes ?? undefined,
       dcrClientId: pending.dcrClientId,
       dcrClientSecret: pending.dcrClientSecret,
+      // Persist what actually authenticated, not the raw (possibly absent)
+      // pending value, so later refreshes reuse the same resolution.
+      tokenEndpointAuthMethod: authMethodForStoredClient(pending.tokenEndpointAuthMethod),
       clientSource,
       lastRefreshedAt: new Date().toISOString(),
     });
@@ -896,6 +932,7 @@ export async function handleMcpOAuth(
         tokenUrl: existing.tokenUrl,
         clientId: existing.dcrClientId ?? "",
         clientSecret: existing.dcrClientSecret ?? undefined,
+        tokenEndpointAuthMethod: authMethodForStoredClient(existing.tokenEndpointAuthMethod),
         refreshToken: existing.refreshToken,
         resource: existing.resourceUrl,
       });
@@ -945,6 +982,7 @@ export async function handleMcpOAuth(
           tokenTypeHint: "access_token",
           clientId: token.dcrClientId ?? "",
           clientSecret: token.dcrClientSecret ?? undefined,
+          tokenEndpointAuthMethod: authMethodForStoredClient(token.tokenEndpointAuthMethod),
         });
       } catch (err) {
         console.warn(
@@ -978,6 +1016,14 @@ export async function handleMcpOAuth(
       let authorizationServerIssuer = overrides.authorizationServerIssuer ?? null;
       let resourceUrl = server.url!;
       let scopes = overrides.scopes ?? [];
+      // Only an explicit value from the caller is authoritative here. Unlike
+      // DCR, we never register this client, so the AS's advertised list says
+      // what the SERVER accepts, not which method THIS out-of-band client was
+      // assigned. See the fallback below.
+      let tokenEndpointAuthMethod = overrides.tokenEndpointAuthMethod
+        ? normalizeTokenEndpointAuthMethod(overrides.tokenEndpointAuthMethod)
+        : undefined;
+      let advertisedAuthMethods: string[] | null = null;
 
       if (!authorizeUrl || !tokenUrl) {
         const discovery = await discoverForMcp(server.url!);
@@ -996,6 +1042,27 @@ export async function handleMcpOAuth(
           authorizationServerIssuer ?? discovery.authorizationServerIssuer;
         resourceUrl = discovery.resourceUrl;
         if (scopes.length === 0) scopes = discovery.scopes;
+        advertisedAuthMethods = discovery.tokenEndpointAuthMethodsSupported;
+      }
+
+      if (!tokenEndpointAuthMethod) {
+        // The caller stated no method. A manual client is registered out of
+        // band, so nothing here tells us which method the provider assigned to
+        // it, and the dashboard still submits no method while allowing the
+        // endpoints to be omitted. Inferring from AS metadata would switch a
+        // pre-registered client that works on body-post over to Basic purely
+        // because the server also supports Basic, so keep the legacy default.
+        //
+        // The one exception is an AS that advertises a non-empty list without
+        // body-post: there the legacy default is knowably broken, so defer to
+        // what the server says it accepts.
+        const postUnsupported =
+          advertisedAuthMethods !== null &&
+          advertisedAuthMethods.length > 0 &&
+          !advertisedAuthMethods.includes("client_secret_post");
+        tokenEndpointAuthMethod = postUnsupported
+          ? selectDcrTokenEndpointAuthMethod(advertisedAuthMethods ?? undefined)
+          : authMethodForStoredClient(undefined);
       }
 
       if (!authorizationServerIssuer) {
@@ -1022,6 +1089,7 @@ export async function handleMcpOAuth(
         revocationUrl,
         dcrClientId: overrides.clientId,
         dcrClientSecret: overrides.clientSecret ?? null,
+        tokenEndpointAuthMethod,
         clientSource: "manual",
         status: "error",
         lastErrorMessage: "Manual client pre-registered; awaiting authorize flow.",
