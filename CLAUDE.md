@@ -28,7 +28,7 @@ FS modes: `'none'` = per-run tmpdir (v1 only); `'workspace-rw'` returns 501 in v
 
 SDK surface: derived from MCP tool registry at build time via `scripts/bundle-script-types.ts`. Curated allowlist in `src/scripts-runtime/sdk-allowlist.ts`.
 
-Typecheck: `script_upsert` runs `tsc --noEmit` against the generated `.d.ts`; rejects on diagnostics. Inline `script_run` skips typecheck (scratch hot path).
+Typecheck: `script_upsert` runs `tsc --noEmit` against the generated `.d.ts`; rejects on diagnostics. Inline `script_run` skips typecheck (scratch hot path). The ambient `.d.ts` is assembled per call from a static base plus N **type contributors** (`src/be/scripts/type-contributors.ts` — connections API, MCP tools, per-app types); adding one is a parameter on `scriptSdkTypesWithGeneratedApis` / `scriptStdlibTypesWithGeneratedApis`, never a compiler-host change. Staleness posture: stored scripts are **not** re-typechecked when an app or connection changes.
 
 Boundaries: `src/scripts-runtime/` is on both `check-db-boundary.sh` (no `src/be/db` imports) and `check-api-key-boundary.sh` (must use `getApiKey()`) allowlists.
 
@@ -160,6 +160,8 @@ CLI help lives in `src/cli.tsx` — plain `console.log`, not Ink. To add/modify:
 Always use the `route()` factory from `src/http/route-def.ts` — auto-registers in OpenAPI. Do **not** use raw `matchRoute`.
 
 Every **non-GET** route must declare its RBAC posture on the def: `rbac: { permission: "<verb>" }` (handler gates via `can()`) or `rbac: { ungated: "<reason>" }`. Enforced by `bun run check:rbac-coverage` (CI); new verbs register in `src/rbac/permissions.ts` + `src/rbac/legacy-policy.ts`.
+
+Every **2xx** response (except bodiless 204/205) must declare `schema: <zod>` — sent via the handle's typed `<route>.respond(res, 200, data)`, never `json()` — or `unstructured: "<reason>"` for non-JSON bodies (SSE, binary, redirects, proxied payloads). Enforced by `bun run check:openapi-response-coverage` (CI). Reuse the named entity schemas from `src/types.ts` (they emit `$ref`s); untyped 4xx/5xx default to the shared `ErrorResponse` envelope automatically.
 
 After adding a handler FILE: also add the import to `src/http/all-routes.ts`, then run `bun run docs:openapi` and commit `openapi.json`.
 

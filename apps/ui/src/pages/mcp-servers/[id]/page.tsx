@@ -53,9 +53,9 @@ function TransportBadge({ transport }: { transport: string }) {
 
 function ScopeBadge({ scope }: { scope: string }) {
   const colors: Record<string, string> = {
-    global: "border-status-success/30 text-status-success",
-    swarm: "border-status-active/30 text-status-active",
-    agent: "border-status-neutral/30 text-status-neutral",
+    global: "border-status-success/30 text-status-success-strong",
+    swarm: "border-status-active/30 text-status-active-strong",
+    agent: "border-status-neutral/30 text-status-neutral-strong",
   };
   return (
     <Badge variant="outline" size="tag" className={`${colors[scope] || ""}`}>
@@ -136,8 +136,8 @@ export default function McpServerDetailPage() {
       <PageHeader
         className="shrink-0"
         title={
+          /* Server name lives in the breadcrumb — badges only here. */
           <div className="flex items-center gap-3">
-            <h1 className="text-xl font-semibold">{server.name}</h1>
             <TransportBadge transport={server.transport} />
             <ScopeBadge scope={server.scope} />
             {server.authMethod === "oauth" && (
@@ -154,8 +154,8 @@ export default function McpServerDetailPage() {
               size="tag"
               className={`${
                 server.isEnabled
-                  ? "border-status-success/30 text-status-success"
-                  : "border-status-error/30 text-status-error"
+                  ? "border-status-success/30 text-status-success-strong"
+                  : "border-status-error/30 text-status-error-strong"
               }`}
             >
               {server.isEnabled ? "Enabled" : "Disabled"}

@@ -294,7 +294,7 @@ export default function OAuthAppDetailPage() {
               </CardHeader>
               <CardContent>
                 {authorizations.length ? (
-                  <div className="divide-y rounded-md border">
+                  <div className="divide-y divide-border-subtle rounded-md border">
                     {authorizations.map((authorization) => (
                       <div
                         key={authorization.id}
@@ -308,7 +308,7 @@ export default function OAuthAppDetailPage() {
                             authorization.lastErrorMessage ? (
                               <Tooltip>
                                 <TooltipTrigger asChild>
-                                  <AlertTriangle className="size-3.5 shrink-0 text-status-error" />
+                                  <AlertTriangle className="size-3.5 shrink-0 text-status-error-strong" />
                                 </TooltipTrigger>
                                 <TooltipContent className="max-w-xs whitespace-normal">
                                   {authorization.lastErrorMessage}
@@ -415,7 +415,7 @@ export default function OAuthAppDetailPage() {
               <CardHeader>
                 <CardTitle className="text-base">OAuth App</CardTitle>
               </CardHeader>
-              <CardContent className="divide-y">
+              <CardContent className="divide-y divide-border-subtle">
                 <InfoRow label="Source" value={<OAuthSourceBadge source={app.source} />} />
                 <InfoRow
                   label="Client ID"

@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { unlink } from "node:fs/promises";
 import { closeDb, createMcpServer, initDb } from "../be/db";
 import {
+  findReusableMcpOAuthClient,
   getMcpOAuthToken,
   type UpsertMcpOAuthTokenInput,
   upsertMcpOAuthToken,
@@ -181,6 +182,27 @@ describe("ensureMcpToken", () => {
 
     const reread = getMcpOAuthToken(input.mcpServerId);
     expect(reread!.status).toBe("error");
+  });
+
+  test("invalidates the stored DCR client on an invalid_client refresh failure (automatic path)", async () => {
+    const input = makeToken({
+      expiresAt: new Date(Date.now() + 30_000).toISOString(), // within 5-min buffer
+    });
+    upsertMcpOAuthToken(input);
+
+    // The automatic refresh path (ensureMcpToken, used by the proxy/server
+    // resolution) must invalidate the stored client on invalid_client just
+    // like the explicit POST /refresh route does — otherwise a client the
+    // provider has disowned stays "reusable" forever.
+    expect(findReusableMcpOAuthClient(input.mcpServerId)).not.toBeNull();
+
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ error: "invalid_client" }), { status: 401 });
+
+    const token = await ensureMcpToken(input.mcpServerId);
+    expect(token!.status).toBe("error");
+
+    expect(findReusableMcpOAuthClient(input.mcpServerId)).toBeNull();
   });
 
   test("concurrent calls dedupe via per-key inflight mutex", async () => {

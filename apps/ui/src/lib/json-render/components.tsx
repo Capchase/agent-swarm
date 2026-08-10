@@ -28,11 +28,25 @@
 import { getByPath, type InferComponentProps } from "@json-render/core";
 import type { Components } from "@json-render/react";
 import { useActions, useStateStore } from "@json-render/react";
-import type { ColDef, ICellRendererParams } from "ag-grid-community";
-import { AlertCircle, AlertTriangle, ArrowRight, CheckCircle, Info, X } from "lucide-react";
+import type {
+  CellKeyDownEvent,
+  ColDef,
+  FullWidthCellKeyDownEvent,
+  ICellRendererParams,
+} from "ag-grid-community";
+import {
+  AlertCircle,
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle,
+  Info,
+  Loader2,
+  X,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { Children, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
 import { Streamdown } from "streamdown";
 import { DataGrid } from "@/components/shared/data-grid";
 import { SearchBox } from "@/components/shared/search-box";
@@ -75,6 +89,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
@@ -96,6 +111,7 @@ import type {
   TableRowActionConfirm,
   TabsTab,
 } from "./catalog";
+import { useJsonRenderThemeAttr } from "./theme-scope";
 
 // ─── Style maps (moved verbatim from json-page-renderer.tsx) ────────────────
 
@@ -106,10 +122,15 @@ const gapClass: Record<"none" | "sm" | "md" | "lg", string> = {
   lg: "gap-6",
 };
 
+/**
+ * Aligned with the product chrome, not louder than it: h1 matches
+ * `PageHeader`'s title (text-xl/600) so an app page never shouts over the
+ * dashboard, and h2/h3 step down from there.
+ */
 const headingClass: Record<"h1" | "h2" | "h3", string> = {
-  h1: "text-2xl font-bold tracking-tight",
-  h2: "text-xl font-semibold tracking-tight",
-  h3: "text-lg font-semibold",
+  h1: "text-xl font-semibold tracking-tight",
+  h2: "text-lg font-semibold tracking-tight",
+  h3: "text-base font-semibold",
 };
 
 const alertTone: Record<
@@ -122,22 +143,38 @@ const alertTone: Record<
   error: { tone: "error", icon: AlertCircle },
 };
 
-/** Badge tone → semantic status-token classes (see apps/ui/CLAUDE.md theming). */
-const badgeToneClass: Record<BadgeTone, string> = {
-  neutral: "border-status-neutral/40 bg-status-neutral/10 text-status-neutral",
-  success: "border-status-success/40 bg-status-success/10 text-status-success-strong",
-  active: "border-status-active/40 bg-status-active/10 text-status-active-strong",
-  error: "border-status-error/40 bg-status-error/10 text-status-error-strong",
-  info: "border-status-info/40 bg-status-info/10 text-status-info-strong",
-  pending: "border-status-pending/40 bg-status-pending/10 text-status-pending-strong",
-  warning: "border-status-warning/40 bg-status-warning/10 text-status-warning-strong",
-  paused: "border-status-paused/40 bg-status-paused/10 text-status-paused-strong",
+/**
+ * Badge tone → the `StatusBadge` convention (neutral outline chip + status
+ * dot + `-strong` text), so app pills are pixel-identical to the native
+ * status chips instead of a third colored-border/tinted-fill vocabulary.
+ */
+const badgeToneDot: Record<BadgeTone, string> = {
+  neutral: "bg-status-neutral",
+  success: "bg-status-success",
+  active: "bg-status-active",
+  error: "bg-status-error",
+  info: "bg-status-info",
+  pending: "bg-status-pending",
+  warning: "bg-status-warning",
+  paused: "bg-status-paused",
+};
+
+const badgeToneText: Record<BadgeTone, string> = {
+  neutral: "text-status-neutral-strong",
+  success: "text-status-success-strong",
+  active: "text-status-active-strong",
+  error: "text-status-error-strong",
+  info: "text-status-info-strong",
+  pending: "text-status-pending-strong",
+  warning: "text-status-warning-strong",
+  paused: "text-status-paused-strong",
 };
 
 function StatusPill({ text, tone }: { text: string; tone: BadgeTone }) {
   return (
-    <Badge variant="outline" size="tag" className={badgeToneClass[tone]}>
-      {text}
+    <Badge variant="outline" size="tag" className="gap-1.5">
+      <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", badgeToneDot[tone])} />
+      <span className={badgeToneText[tone]}>{text}</span>
     </Badge>
   );
 }
@@ -290,6 +327,8 @@ function positionalChildren(children: ReactNode): ReactNode[] {
   return Children.toArray(children);
 }
 
+type ButtonComponentProps = InferComponentProps<typeof swarmCatalog, "Button">;
+type MetricComponentProps = InferComponentProps<typeof swarmCatalog, "Metric">;
 type StackProps = InferComponentProps<typeof swarmCatalog, "Stack">;
 type GridProps = InferComponentProps<typeof swarmCatalog, "Grid">;
 type SplitProps = InferComponentProps<typeof swarmCatalog, "Split">;
@@ -297,13 +336,26 @@ type TabsComponentProps = InferComponentProps<typeof swarmCatalog, "Tabs">;
 type SearchInputProps = InferComponentProps<typeof swarmCatalog, "SearchInput">;
 type SelectFilterProps = InferComponentProps<typeof swarmCatalog, "Select">;
 
+/** `collapseBelow` → the breakpoint the row un-stacks at (full class names). */
+const stackRowFromClass: Record<"sm" | "md" | "lg", string> = {
+  sm: "sm:flex-row",
+  md: "md:flex-row",
+  lg: "lg:flex-row",
+};
+
 function StackComponent({ props, children }: { props: StackProps; children: ReactNode }) {
   const direction = props.direction ?? "column";
+  // A collapsible row is a column below its breakpoint (Split semantics).
+  const collapse = direction === "row" ? props.collapseBelow : undefined;
   return (
     <div
       className={cn(
         "flex min-w-0",
-        direction === "row" ? "flex-row" : "flex-col",
+        direction === "row"
+          ? collapse
+            ? cn("flex-col", stackRowFromClass[collapse])
+            : "flex-row"
+          : "flex-col",
         stackGapClass[props.gap ?? "md"],
         props.align ? alignClass[props.align] : undefined,
         props.justify ? justifyClass[props.justify] : undefined,
@@ -324,11 +376,12 @@ function clampColumns(value: unknown): number | undefined {
 function GridComponent({ props, children }: { props: GridProps; children: ReactNode }) {
   const columns = props.columns as GridColumns;
   const single = clampColumns(columns);
-  // A bare count applies at every breakpoint; the object form falls back to the
+  // A bare count is responsive shorthand — 1 column on phones, 2 from `sm`,
+  // the declared count from `md` — and the object form falls back to the
   // "cards reflow" default so a sparse `{ lg: 4 }` still stacks on a phone.
   const perBreakpoint =
     single !== undefined
-      ? { base: single, sm: undefined, md: undefined, lg: undefined }
+      ? { base: 1, sm: Math.min(2, single), md: single, lg: undefined }
       : {
           base: clampColumns((columns as { base?: number } | undefined)?.base) ?? 1,
           sm: clampColumns((columns as { sm?: number } | undefined)?.sm),
@@ -347,6 +400,7 @@ function GridComponent({ props, children }: { props: GridProps; children: ReactN
         perBreakpoint.md ? gridColsMdClass[perBreakpoint.md] : undefined,
         perBreakpoint.lg ? gridColsLgClass[perBreakpoint.lg] : undefined,
         stackGapClass[props.gap ?? "md"],
+        props.padding ? paddingClass[props.padding] : undefined,
       )}
     >
       {children}
@@ -363,7 +417,14 @@ function SplitComponent({ props, children }: { props: SplitProps; children: Reac
   const reverse = props.reverse === true;
 
   return (
-    <div className={cn("grid min-w-0 grid-cols-1", splitTrackClass[breakpoint][tracks], gap)}>
+    <div
+      className={cn(
+        "grid min-w-0 grid-cols-1",
+        splitTrackClass[breakpoint][tracks],
+        gap,
+        props.padding ? paddingClass[props.padding] : undefined,
+      )}
+    >
       <div
         className={cn(
           "flex min-w-0 flex-col",
@@ -532,6 +593,7 @@ function normalizeSelectOptions(options: SelectOption[]): { value: string; label
 
 function SelectFilterComponent({ props }: { props: SelectFilterProps }) {
   const { state, get, set } = useStateStore();
+  const themeAttr = useJsonRenderThemeAttr();
   const path = `/ui/${props.id}/value`;
   const triggerId = `ui-${props.id}`;
   const options = normalizeSelectOptions((props.options ?? []) as SelectOption[]);
@@ -566,6 +628,9 @@ function SelectFilterComponent({ props }: { props: SelectFilterProps }) {
         <Select value={value} onValueChange={(next) => set(path, next)}>
           <SelectTrigger
             id={triggerId}
+            // A standalone Select (no `label`) has no accessible name — fall
+            // back to the placeholder, mirroring `SearchBox`'s ariaLabel chain.
+            aria-label={props.label ? undefined : (props.placeholder ?? "Select an option")}
             className={cn(
               "w-full min-w-0",
               clearable && value ? "*:data-[slot=select-value]:mr-7" : undefined,
@@ -573,7 +638,7 @@ function SelectFilterComponent({ props }: { props: SelectFilterProps }) {
           >
             <SelectValue placeholder={props.placeholder ?? "All"} />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent {...themeAttr}>
             {options.map((option) => (
               <SelectItem key={option.value} value={option.value}>
                 {option.label}
@@ -757,6 +822,7 @@ function rowMatchesFilters(
 function TableComponent({ props }: { props: TableProps }) {
   const { execute } = useActions();
   const { getSnapshot } = useStateStore();
+  const themeAttr = useJsonRenderThemeAttr();
   const [pendingRowAction, setPendingRowAction] = useState<PendingRowAction | null>(null);
 
   const propsRef = useRef(props);
@@ -800,6 +866,29 @@ function TableComponent({ props }: { props: TableProps }) {
     [runRowAction],
   );
 
+  // Keyboard path to the row-action buttons. The buttons are natively
+  // tabbable, but AG Grid's arrow-key navigation moves CELL focus — landing on
+  // the actions cell must hand focus into it, or arrow-key users dead-end on
+  // a cell whose buttons they can see but not press. Enter drills in; Tab
+  // then walks the buttons as before.
+  const onCellKeyDown = useCallback(
+    (
+      event:
+        | CellKeyDownEvent<Record<string, unknown>>
+        | FullWidthCellKeyDownEvent<Record<string, unknown>>,
+    ) => {
+      if (!("column" in event) || event.column.getColId() !== "__rowActions") return;
+      const browserEvent = event.event as KeyboardEvent | undefined;
+      if (!browserEvent || browserEvent.key !== "Enter") return;
+      const target = browserEvent.target as HTMLElement | null;
+      // Only when the CELL itself is focused — a button inside the cell
+      // handles its own Enter as a click.
+      if (!target || !target.classList.contains("ag-cell")) return;
+      target.querySelector<HTMLButtonElement>("button")?.focus();
+    },
+    [],
+  );
+
   const columns = (props.columns ?? []) as TableColumn[];
   const rowActions = (props.rowActions ?? []) as TableRowAction[];
   const allRows = Array.isArray(props.data) ? (props.data as Record<string, unknown>[]) : [];
@@ -841,6 +930,9 @@ function TableComponent({ props }: { props: TableProps }) {
     width: column.width,
     flex: column.width ? undefined : flexForKind(column.kind),
     minWidth: column.width ? undefined : minWidthForKind(column.kind),
+    // Pinned columns survive horizontal scroll (id on the left, status on the
+    // right) — the mobile answer for wide tables.
+    pinned: column.pinned,
     // AG Grid's cell-data-type inference turns a boolean column into a disabled
     // checkbox renderer, which contradicts the documented `formatCell` contract
     // (yes / no text) and reads as a broken toggle. Opt every app column out of
@@ -910,6 +1002,8 @@ function TableComponent({ props }: { props: TableProps }) {
 
   const columnDefs = useStableBySignature(builtColumnDefs, JSON.stringify([columns, rowActions]));
   const hugsContent = rows.length <= AUTO_HEIGHT_MAX_ROWS;
+  // Endless-scroll guard: unless the author decided, big row sets paginate.
+  const paginated = props.pagination ?? rows.length > 200;
 
   const confirmingAction = pendingRowAction
     ? rowActions[pendingRowAction.rowActionIndex]
@@ -940,7 +1034,10 @@ function TableComponent({ props }: { props: TableProps }) {
           !hugsContent && "h-[520px] flex-none",
         )}
         columnSizing="flex"
-        pagination={false}
+        pagination={paginated}
+        rowHeight={props.density === "compact" ? 34 : undefined}
+        cellFocus={rowActions.length > 0}
+        onCellKeyDown={rowActions.length > 0 ? onCellKeyDown : undefined}
       />
       <AlertDialog
         open={pendingRowAction !== null}
@@ -948,7 +1045,7 @@ function TableComponent({ props }: { props: TableProps }) {
           if (!open) setPendingRowAction(null);
         }}
       >
-        <AlertDialogContent>
+        <AlertDialogContent {...themeAttr}>
           <AlertDialogHeader>
             <AlertDialogTitle>
               {confirmCopy?.title ?? `${confirmingAction?.label ?? "Confirm"}?`}
@@ -978,6 +1075,69 @@ function TableComponent({ props }: { props: TableProps }) {
   );
 }
 
+// ─── Button / Metric ────────────────────────────────────────────────────────
+
+/**
+ * Standalone action button. `emit` is fire-and-forget (the renderer runs the
+ * `on.press` chain detached), so the busy affordance reads the runtime's
+ * `/actions/<busyWith>/status` slot instead of awaiting the dispatch — the
+ * same state the `app.action` handler already maintains. Inside a BORROWED
+ * bound element the assembler rewrites `busyWith` to the defining app's full
+ * `/refs/<app>/actions/<name>` path (where the `$app`-tagged dispatch
+ * actually writes), so a path-shaped value is used as-is.
+ */
+function ActionButtonComponent({
+  props,
+  emit,
+}: {
+  props: ButtonComponentProps;
+  emit: (event: string) => void;
+}) {
+  const { state } = useStateStore();
+  const busySlot =
+    props.busyWith === undefined
+      ? null
+      : props.busyWith.startsWith("/")
+        ? props.busyWith
+        : `/actions/${props.busyWith}`;
+  const busy = busySlot !== null && getByPath(state, `${busySlot}/status`) === "running";
+  return (
+    <Button
+      variant={props.variant ?? "default"}
+      disabled={props.disabled === true || busy}
+      onClick={() => emit("press")}
+    >
+      {props.label}
+      {busy ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : (
+        <ArrowRight className="h-3.5 w-3.5" />
+      )}
+    </Button>
+  );
+}
+
+/**
+ * Label/value stat tile, sized to `StatPanel`'s value type (text-lg/600) so an
+ * app metric strip matches the native stat cards. A bound value is undefined
+ * while its query loads — `loading` turns that window into a skeleton, and a
+ * genuinely absent value renders an em dash, never the string "undefined".
+ */
+function MetricComponent({ props }: { props: MetricComponentProps }) {
+  const value = props.value as unknown;
+  const empty = value === undefined || value === null || value === "";
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs uppercase tracking-wide text-muted-foreground">{props.label}</span>
+      {props.loading && empty ? (
+        <Skeleton className="h-7 w-16" />
+      ) : (
+        <span className="text-lg font-semibold text-foreground">{empty ? "—" : String(value)}</span>
+      )}
+    </div>
+  );
+}
+
 // ─── Form ───────────────────────────────────────────────────────────────────
 
 function coerceFieldValue(field: FormField, raw: unknown): unknown {
@@ -995,6 +1155,7 @@ function coerceFieldValue(field: FormField, raw: unknown): unknown {
 function FormComponent({ props }: { props: FormProps }) {
   const { state, get, set, getSnapshot } = useStateStore();
   const { execute } = useActions();
+  const themeAttr = useJsonRenderThemeAttr();
   const [submitting, setSubmitting] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
 
@@ -1003,6 +1164,12 @@ function FormComponent({ props }: { props: FormProps }) {
   // Read through the reactive `state` snapshot (not `get()`) so a cleared form
   // — `app.mutate` sets `/forms/<id>` to `{}` after a create — re-renders.
   const readField = (name: string): unknown => getByPath(state, `${basePath}/${name}`);
+
+  // Mutate failures scoped to THIS form: the `app.mutate` handler writes them
+  // to `/forms/<id>/$error` (keyed by the injected `formId`) instead of the
+  // page-level banner. `$` keeps the slot out of the field-value namespace.
+  const storedError = readField("$error");
+  const submitError = typeof storedError === "string" && storedError !== "" ? storedError : null;
 
   const submit = async () => {
     const values: Record<string, unknown> = {};
@@ -1015,17 +1182,37 @@ function FormComponent({ props }: { props: FormProps }) {
       if (value !== undefined) values[field.name] = value;
     }
     setValidationError(null);
+    set(`${basePath}/$error`, null);
     setSubmitting(true);
     try {
       const scope = { form: values, state: getSnapshot() };
+      let mutated = false;
       for (const binding of props.onSubmit as ActionChain) {
         const params = resolveScopedParams(binding.params, scope);
-        // The originating form clears itself on a successful create — the
-        // `app.mutate` handler needs to know which form that is.
-        if (binding.action === "app.mutate" && params.op === "create" && !params.formId) {
+        // Every mutate in the chain carries the originating form's id: a
+        // successful create clears the form, and a failure lands inline at
+        // `/forms/<id>/$error` instead of the page banner.
+        if (binding.action === "app.mutate" && !params.formId) {
           params.formId = props.id;
         }
+        if (binding.action === "app.mutate") mutated = true;
         await execute({ ...binding, params });
+        // A failed mutate resolves normally (its error lands in the form's
+        // `$error` slot, not a throw) — stop the chain here, or a following
+        // `app.navigate` would tear down the form that is displaying the
+        // failure and later side effects would run against a failed save.
+        if (binding.action === "app.mutate") {
+          const failure = get(`${basePath}/$error`);
+          if (typeof failure === "string" && failure !== "") return;
+        }
+      }
+      // Positive feedback for a successful save: the form clearing itself is
+      // too easy to miss. Only for chains that actually wrote data (a
+      // filter/state form has nothing to announce), and only when no mutate
+      // in the chain reported a failure into the `$error` slot.
+      const failed = get(`${basePath}/$error`);
+      if (mutated && (failed === null || failed === undefined || failed === "")) {
+        toast.success(props.title ? `${props.title} — saved` : "Saved");
       }
     } finally {
       setSubmitting(false);
@@ -1071,10 +1258,10 @@ function FormComponent({ props }: { props: FormProps }) {
                 value={value === undefined || value === null ? "" : String(value)}
                 onValueChange={(next) => set(`${basePath}/${field.name}`, next)}
               >
-                <SelectTrigger id={inputId}>
+                <SelectTrigger id={inputId} className="w-full">
                   <SelectValue placeholder={field.placeholder ?? "Select…"} />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent {...themeAttr}>
                   {(field.options ?? []).map((option) => (
                     <SelectItem key={option} value={option}>
                       {option}
@@ -1094,13 +1281,14 @@ function FormComponent({ props }: { props: FormProps }) {
           </SettingsRow>
         );
       })}
-      {validationError ? (
+      {validationError || submitError ? (
         <AlertCallout tone="error" icon={AlertCircle}>
-          {validationError}
+          {validationError ?? submitError}
         </AlertCallout>
       ) : null}
       <div>
         <Button type="submit" disabled={submitting}>
+          {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.submitLabel ?? "Submit"}
         </Button>
       </div>
@@ -1143,6 +1331,7 @@ function DrawerComponent({
 }) {
   const { state } = useStateStore();
   const [, setSearchParams] = useSearchParams();
+  const themeAttr = useJsonRenderThemeAttr();
 
   const value = getByPath(state, `/route/params/${props.param}`);
   const open = value !== undefined && value !== null && value !== "";
@@ -1171,6 +1360,7 @@ function DrawerComponent({
           drawerSizeClass[props.size ?? "md"],
         )}
         data-testid="json-render-drawer"
+        {...themeAttr}
       >
         <SheetHeader className="shrink-0 border-b border-border py-3 pl-4 pr-12">
           <SheetTitle className="min-w-0 truncate text-sm font-medium">
@@ -1178,7 +1368,14 @@ function DrawerComponent({
           </SheetTitle>
           {props.description ? (
             <SheetDescription className="text-xs">{props.description}</SheetDescription>
-          ) : null}
+          ) : (
+            // Radix warns (and screen readers lose context) when a dialog has
+            // no description — keep an sr-only fallback when the app author
+            // didn't provide one.
+            <SheetDescription className="sr-only">
+              {`${props.title ?? "Details"} panel`}
+            </SheetDescription>
+          )}
         </SheetHeader>
         <div className="flex min-w-0 flex-1 flex-col gap-4 overflow-y-auto p-4">{children}</div>
       </SheetContent>
@@ -1226,6 +1423,20 @@ function DetailListComponent({ props }: { props: DetailListComponentProps }) {
   // An array means the binding forgot the trailing `/0` (a whole query result
   // instead of one record) — treat it as "no record", not as a field source.
   if (!data || typeof data !== "object" || Array.isArray(data)) {
+    // While the backing query is still loading, the record isn't missing yet —
+    // sketch the declared fields instead of flashing the empty message.
+    if (props.loading) {
+      return (
+        <div className="flex flex-col gap-3" data-testid="json-render-detail-list">
+          {fields.slice(0, 6).map((field) => (
+            <div key={field.key} className="flex flex-col gap-1.5">
+              <Skeleton className="h-3 w-20" />
+              <Skeleton className="h-4 w-40" />
+            </div>
+          ))}
+        </div>
+      );
+    }
     return (
       <p className="text-sm text-muted-foreground" data-testid="json-render-detail-list">
         {props.emptyMessage ?? "No record to show yet"}
@@ -1299,18 +1510,8 @@ export const swarmComponents: Components<typeof swarmCatalog> = {
       {props.content}
     </p>
   ),
-  Button: ({ props, emit }) => (
-    <Button variant={props.variant ?? "default"} onClick={() => emit("press")}>
-      {props.label}
-      <ArrowRight className="h-3.5 w-3.5" />
-    </Button>
-  ),
-  Metric: ({ props }) => (
-    <div className="flex flex-col gap-1">
-      <span className="text-xs uppercase tracking-wide text-muted-foreground">{props.label}</span>
-      <span className="text-2xl font-semibold text-foreground">{String(props.value)}</span>
-    </div>
-  ),
+  Button: ({ props, emit }) => <ActionButtonComponent props={props} emit={emit} />,
+  Metric: ({ props }) => <MetricComponent props={props} />,
   Alert: ({ props }) => {
     const tone = alertTone[props.tone ?? "info"];
     return (

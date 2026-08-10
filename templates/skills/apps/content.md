@@ -21,6 +21,10 @@ For every edit: `app-get` -> modify the smallest coherent subtree -> `app-patch`
 
 `app-patch` can also change `name`; omit `description` to preserve it or pass `description: null` to clear it.
 
+### Reading an app's callable surface
+
+One `app-get` returns everything needed to drive an app you did not write: `definition.queries` are runnable with `app-query` (supply every `$param` the query references), and `definition.actions` are invocable with `POST /api/apps/<id>/actions/<name>` (a `script` action runs its script, a `task` action spawns a task, a `sync` action refreshes sources). Read a query's `$param` placeholders and an action's kind/args from the definition before calling — do not guess parameter names.
+
 ## Safe schema evolution and rollback
 
 Prefer **hiding** a column over deleting it. A hidden column's values stay on every existing row, so an unhide or rollback can make it visible again. Hiding is metadata-only: hidden columns cannot be used in queries, page bindings, `app.mutate` values, or new row writes, and `required` is ignored while hidden. Row GETs still expose the historical value for backward compatibility.
@@ -42,6 +46,10 @@ Schema-changing writes can carry this sibling `migration` object:
 ```
 
 Use `set` to backfill a changed column, `from` with optional `map`/`else` to derive it from one existing (including hidden) column, `coerce` for a kind change, and `purge` only for explicit destruction. Non-purge directives target a column changed in that same write. The server fails loudly before writing when a lossy change needs a directive: inspect every returned `issues[]` item, including its per-value row counts, then choose an explicit policy and retry. Never guess a migration just to get a 200.
+
+**Source lifecycle** rides the same engine with the same all-or-nothing guarantees. Free: adding a source, adding a NEW column with a `source` binding, binding an existing column that holds zero values, changing a binding's `field`/`transform`, and changing a source's `args`/`config`/`connection`/`scriptId` (window changes churn staleness on the next pass — expect `stale` flips when narrowing). Rejected with a path-bearing issue: changing `joinKey` (immutable — remove the source and add it again), changing `connector` while the source owns rows (row count in the message), and binding an existing column that already holds values (purge it — or add a fresh column — and bind that instead; a sync pass would otherwise overwrite the data). Removing a source **detaches** its rows: values survive as ordinary columns, the `source`/`syncedAt`/`stale` envelope is stripped, and the report counts them in `detachedRows`. A patch removing a source must drop its column bindings in the same call — a dangling `source.of` is rejected before anything is written.
+
+Sync never adopts rows it does not own: a pulled record whose join key matches an unowned row creates a second, source-owned row. Adding a source over a join-key column that already holds values therefore duplicates those records on the first pass — and remove-source → re-add duplicates for the same reason, because detached rows keep their values. To convert a hand-maintained model into a synced one, purge the old rows first or use a fresh join-key column.
 
 For example, split a legacy `flag` into `priority` and `status` without losing data in one patch: add the two columns, map both from `flag`, update every affected query/page binding, then hide `flag`.
 
@@ -66,7 +74,7 @@ For example, split a legacy `flag` into `priority` and `status` without losing d
 }
 ```
 
-Every schema migration returns `{ scanned, backfilled, coerced, mapped, elsed, purgedValues, idxRebuilt, orphanFields }`. Read `orphanFields`: it reports extra row fields that predate or no longer appear in the definition; they are preserved until an explicit purge. `schemaVersion` is server-managed: never set it in an input patch or try to use it as application data.
+Every schema migration returns `{ scanned, backfilled, coerced, mapped, elsed, purgedValues, idxRebuilt, detachedRows, orphanFields }`. Read `orphanFields`: it reports extra row fields that predate or no longer appear in the definition; they are preserved until an explicit purge. `schemaVersion` is server-managed: never set it in an input patch or try to use it as application data.
 
 Every successful definition write snapshots the previous definition. Use `app-history` to select a version, `app-diff({ appId, from: <version> })` to inspect it against CURRENT, then `app-rollback({ appId, version: <version>, migration? })` to restore it. Rollback is a forward migration over live rows, not row-level time travel: it creates a new pre-rollback snapshot and may reject a lossy restore with the same migration directives and counts. A rejected rollback changes nothing.
 
@@ -75,6 +83,12 @@ Every successful definition write snapshots the previous definition. Use `app-hi
 `userConfig` declares up to 20 typed settings in the versioned definition; its values are deliberately stored outside the definition, separately for each user (and the operator dashboard). Each field is `{ "kind": "string" | "number" | "boolean" | "date" | "enum", "default"?: ..., "enum"?: [...], "label"?: "..." }`. Defaults follow column rules, including enum membership; `required` is not allowed. A missing or obsolete stored value reads as its default, or `null` when no default is declared.
 
 Use `{ "$state": "/user/<field>" }` on a page for the read-only current-user binding; the field must be declared and the path cannot continue below it. Pure and bound reusable elements cannot bind `/user` directly — pass the value through an element prop from the consuming page. An agent acting on an owned user-requested task reads and edits that requester's preferences. `userConfig` schema changes are always migration-compatible and appear in migration reports; no migration directives are needed. Rollback restores the historical schema but never alters saved per-user values, so values can resurface when a field returns.
+
+### Theming
+
+An optional top-level `"theme"` sets the preset the dashboard applies to the app's rendered canvas — a lowercase slug validated by shape only. The preset catalog ships with the dashboard (`apps/ui/src/lib/themes.ts` + `theme-classics.ts` — update this list and the `app-upsert` tool description when it changes); current ids: `hive` (the stock look), the accent/field presets `meadow`, `iris`, `rose`, `cobalt`, `ember`, `carbon`, and the classic editor/platform presets `github`, `vscode`, `material`, `solarized`, `tokyo`, `monokai`, `gruvbox`. Action and destructive tones are never themed; status tones are themed ONLY by the classic presets (their identity includes a status palette — hue semantics stay fixed, success reads green and error reads red everywhere). An id the viewer's dashboard build does not know degrades to the dashboard's own theme, so unknown slugs are safe but pointless. Omit `theme` to inherit whatever theme the viewer runs; `"hive"` is an explicit reset to the stock look even inside a themed dashboard.
+
+Viewers can override the preset per app from the app's settings drawer; the override rides the reserved `$theme` key of the user-config values (accepted on every app, even without a declared `userConfig` schema, and never visible at `/user/...`). A present override always beats the definition's `theme` — even an unrecognized one, which degrades to the dashboard theme — so treat `theme` as the app's default styling, not a guarantee.
 
 Distinguish the two rollback 400s. A lossy-migration 400 is fixable: copy the required `migration` entries from the message and retry. A target-snapshot validation 400 explicitly says that directives cannot repair that historical definition; use `app-history` and choose a different version.
 
@@ -100,7 +114,8 @@ When a schema patch reports stale page/query bindings, repair them in that same 
       "elements": { "root": { "type": "Container", "props": {} } }
     }
   },
-  "defaultPage": "main"
+  "defaultPage": "main",
+  "theme": "ember"
 }
 ```
 
@@ -164,7 +179,87 @@ Each column is `{ "kind": ..., "required"?: boolean, "default"?: ..., "index"?: 
 | `date` | ISO-8601 string; never indexed. |
 | `enum` | String from the non-empty unique `enum` list; always indexed, without `index: true`. |
 
-`default` must match the column kind (and be one of the enum values). `required: true` rejects missing/null values unless a default supplies the value. `id`, `createdAt`, `updatedAt`, `createdBy`, and `updatedBy` are system columns and reserved names. Rows always expose `id`/`createdAt`/`updatedAt`; `createdBy`/`updatedBy` record the acting principal (`user:<id>`, `agent:<id>`, or `operator`) and are system-managed on every row write.
+`default` must match the column kind (and be one of the enum values). `required: true` rejects missing/null values unless a default supplies the value. `id`, `createdAt`, `updatedAt`, `createdBy`, `updatedBy` — and the sync envelope `source`, `syncedAt`, `stale` — are system columns and reserved names. An app created before the sync envelope that declared ordinary columns with these names surfaces `definitionError` after upgrade until they are renamed: patch in a fresh column with a `{from}` migration directive, then purge the old one. Rows always expose `id`/`createdAt`/`updatedAt`; `createdBy`/`updatedBy` record the acting principal (`user:<id>`, `agent:<id>`, `operator`, or `sync:<source>` for engine writes) and are system-managed on every row write.
+
+### Sources and sync
+
+A model may declare up to 4 named `sources` — one-way inbound projections of an external system into its rows. The `script` connector is THE way to bring external data in (GitHub, Linear, any API): a saved script owns the fetch, its auth placeholders, and its paging. `swarm-tasks` is the one native connector, projecting this swarm's own task pool (`config`: `status`/`tags` comma-lists, `agentId`, `assetKey` namespace prefix, `limit` up to 200 — default 100, `includeHeartbeat`). Synced rows are readable by EVERY principal with `app.use` on the app; an unscoped `swarm-tasks` source publishes task prompts (truncated, secret-scrubbed) to all of them, so scope it with `config.assetKey`/`config.agentId` unless that exposure is intended. A user-invoked sync only ever pulls the invoking user's own requested tasks. Script sources run with their run-as identity's credentials — an agent-owned script runs as its owner and only the owner may wire it; an owner-less catalog (global) script runs as the LEAD, so only the lead or the operator can wire or alter such a source (stored references stay valid with their args and connection pinned).
+
+```json
+{
+  "models": {
+    "issue": {
+      "columns": {
+        "issueKey": { "kind": "string" },
+        "title": { "kind": "string", "source": { "of": "gh", "field": "title" } },
+        "openedAt": { "kind": "date", "source": { "of": "gh", "field": "created_at", "transform": "date-parse" } },
+        "note": { "kind": "string" }
+      },
+      "sources": {
+        "gh": { "connector": "script", "scriptId": "<script-uuid>", "joinKey": "issueKey", "args": { "repo": "owner/name" }, "connection": "github" }
+      }
+    }
+  }
+}
+```
+
+- **Join key**: each source names a `joinKey` — an owned, non-hidden `string` column carrying the external identity. It must not be `required`, must not declare a `default`, and cannot itself be source-bound. A row belongs to at most ONE source (`row.source`).
+- **Column bindings**: `{ "of": "<sourceName>", "field": "user.login", "transform"? }` projects a (dotted-path) field of the pulled record into the column on every pass. Transforms and their required column kinds: `slug`/`lower`/`upper` → `string`, `cents` → `number` (×100, rounded), `date-parse` → `date` (ISO). A failed transform nulls that one column and warns; it never fails the pass.
+- **Read-only contract**: source-bound columns and the join key reject every direct write (row create/patch/bulk) with a path-bearing issue — mutate them via the source or a sync refresh. Owned columns on the same model stay writable. Every `required` owned column on a sourced model must declare a `default`, because sync-created rows cannot supply it.
+- **Provenance**: synced rows carry `source` (owner), `syncedAt` (last confirmed presence — sortable), and `stale` (true when a complete pull no longer returned the record; clears on reappearance). `syncedAt` advances on every confirmed row WITHOUT touching `updatedAt`; `updatedAt` moves only when projected data actually changed.
+- **`connection`** (optional, script sources): names a connections-system slug the source depends on. It buys write-time validation plus a preflight before every pull; it does not by itself gate egress. Credentials resolve for the sync run-as identity — the script's owner when it has one, else the lead agent — so global connections always work and agent-scoped ones need matching script ownership. The slug is injected into the script's args as `connection`, letting one generic script serve N connections.
+
+**The canonical sync-script contract** (every sync script, always):
+
+```ts
+export default async function run(args, ctx) {
+  // args = { ...source.args, app: { id }, model: "<model>", source: "<sourceName>", connection?: "<slug>" }
+  const records = [{ key: "42", fields: { title: "…", created_at: "…" } }];
+  return { records, complete: true }; // or return the bare array — a bare array IS a complete snapshot
+}
+```
+
+Return `Array<{ key, fields }>` or `{ records, complete? }`. `key` is the external identity the engine joins on `joinKey` (numbers are coerced to strings); `fields` is the bag bindings project from. Return `complete: false` whenever the pull window may have missed records — a paged fetch, a hit `limit`, or client-side filtering of a full page. An incomplete pull skips the stale sweep, so rows outside a narrow window are not falsely marked stale; compute `complete` BEFORE any client-side filtering. Hard cap 500 records per pull (over-cap pulls truncate and count as incomplete). An invalid return shape, thrown error, or non-zero exit fails the pass with zero row churn.
+
+The seeded catalog script `github-issues-pull` is the worked example (placeholder auth via `[REDACTED:GITHUB_TOKEN]`, PR filtering, `complete` computed before filtering). For scheduled refreshes, point a `targetType: "script"` schedule at the seeded `app-sync-run` with `scriptArgs: { "appId": "<id>", "model"?, "source"? }`.
+
+**Three refresh doors, one engine**: `POST /api/apps/<id>/sync` (body `{ "model"?, "source"? }`), a `sync` action kind, and the `app-sync` MCP tool (`ctx.swarm.app_sync` from scripts). `{model?, source?}` fans out to every matching (model × source) pair; each pass reports `{ pulled, created, updated, refreshed, unchanged, markedStale, warnings }`. A pair already syncing in this API process short-circuits with `alreadyRunning: true` instead of pulling twice. Each pair's last-pass status (`lastFinishedAt`, counts, `error?`) comes back as `syncStatus` — keyed `"<model>:<source>"` — on `GET /api/apps/<id>` and in `app-get` data, so UI and agents can render "last synced / last error" without extra calls.
+
+### Freshness and the refresh button
+
+Freshness renders with the existing column kinds — no special components. Give the table `{ "key": "syncedAt", "kind": "date" }` and `{ "key": "stale", "kind": "badge", "tones": { "true": "warning" } }` columns, declare a `sync` action, and wire a Button to it:
+
+```json
+{
+  "actions": { "refresh": { "kind": "sync" } },
+  "pages": {
+    "main": {
+      "root": "root",
+      "elements": {
+        "root": { "type": "Container", "props": {}, "children": ["refreshBtn", "issuesTable"] },
+        "refreshBtn": {
+          "type": "Button",
+          "props": { "label": "Refresh" },
+          "on": { "press": [{ "action": "app.action", "params": { "name": "refresh" } }] }
+        },
+        "issuesTable": {
+          "type": "Table",
+          "props": {
+            "data": { "$state": "/queries/allIssues/data" },
+            "columns": [
+              { "key": "title", "label": "Issue" },
+              { "key": "syncedAt", "label": "Synced", "kind": "date" },
+              { "key": "stale", "label": "Stale", "kind": "badge", "tones": { "true": "warning" } }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+A `sync` action answers the script-action state shape (`/actions/refresh` → `running` → `ok`/`error`, result under `result.passes`), so the page's queries refetch when it completes. Use `app-query` to READ rows (named queries may filter on `stale`/`source` and sort by `syncedAt`); use `app-sync` to REFRESH sources; never poll a sync door in a loop — schedule it or give people the button.
 
 ### Queries
 
@@ -179,7 +274,7 @@ A named query is:
 }
 ```
 
-`filter` is a strict AND of equality checks. A filter may target a declared model column or a system column (`id`, `createdAt`, `updatedAt`, `createdBy`, `updatedBy`) — filtering on `id` is the universal way to select one row for a detail view. A literal value must match the column's kind; date filters compare the stored raw ISO string, not parsed instants. Omit `limit` for the default 200 rows, or set an integer from 1 through 1000. `sort.column` is a model column, `createdAt`, or `updatedAt`; `dir` is `asc` or `desc`. Query runtime state is `{ data, loading, error }` under `/queries/<queryName>`.
+`filter` is a strict AND of equality checks. A filter may target a declared model column or a system column (`id`, `createdAt`, `updatedAt`, `createdBy`, `updatedBy`, and on synced models `source`, `syncedAt`, `stale`) — filtering on `id` is the universal way to select one row for a detail view, and `{ "stale": true }` selects rows a complete pull stopped confirming. A literal value must match the column's kind; date filters compare the stored raw ISO string, not parsed instants. Omit `limit` for the default 200 rows, or set an integer from 1 through 1000. `sort.column` is a model column, `createdAt`, `updatedAt`, or `syncedAt`; `dir` is `asc` or `desc`. Query runtime state is `{ data, loading, error }` under `/queries/<queryName>`.
 
 A filter value may instead be exactly `{ "$param": "<name>" }`. At execution, the caller supplies that name and the server coerces its value to the filtered column's kind before equality matching:
 
@@ -216,7 +311,8 @@ Actions are optional (maximum 20) and are invoked from the page with the `app.ac
 | Kind | Contract |
 |---|---|
 | `script` | `scriptId` must identify an existing script; optional `args` are defaults. Invocation input overrides same-named defaults, and the runtime also supplies `app: { id }`. |
-| `task` | `prompt` must be non-empty; omit `agentId` to use default (lead) assignment. Only set `agentId` to a real agent UUID. Invocation `input` is included as context for the task prompt. |
+| `task` | `prompt` must be non-empty; omit `agentId` to use default (lead) assignment. Only set `agentId` to a real agent UUID. Invocation `input` is included as context for the task prompt. Spawned tasks carry asset key `shared/app:<appId>/action:<name>/`, so a `swarm-tasks` source with `config.assetKey: "shared/app:<appId>/"` pulls back the tasks this app spawned. |
+| `sync` | Optional `model` and `source` narrow which (model × source) pairs refresh; omitting both syncs every pair the app declares. At least one pair must exist. Answers the script-kind state shape with per-pass results under `result.passes`. |
 
 - Invocation state lands at `/actions/<name>` as `{ status, result?, error?, taskId?, taskStatus? }`, where `status` is `"running"`, `"ok"`, or `"error"`.
 
@@ -254,7 +350,7 @@ Use a task action named Tackle when a person should hand one issue row to the sw
 
 For direct MCP calls, `app-query` accepts `{ appId, query, params? }` and returns rows from that declared named query; every supplied param must be referenced by a `$param` filter in that query. Use it when an agent needs to read app state without scraping the UI.
 
-Saved scripts use the generated SDK name `ctx.swarm.app_query({ appId, query, params? })`. Use `app_query` in scripts or workflows that turn current app rows into reports, digests, or follow-up work.
+Saved scripts use the generated SDK name `ctx.swarm.app_query({ appId, query, params? })`. Use `app_query` in scripts or workflows that turn current app rows into reports, digests, or follow-up work. Saved scripts also get generated per-app types automatically: each app contributes an `App_<Name>` namespace with one row interface per model (enum columns as literal unions) and a typed `app_query` overload per named query, all visible via `script-query-types`. Actions stay REST-only from scripts — there is no SDK method to invoke them.
 
 ### Pages, routes, and page trees
 
@@ -349,18 +445,19 @@ Props reject unknown keys. A `{"$state":"..."}` binding may replace a literal pr
 | `Markdown` | `content` | Rendered Markdown for help, instructions, and rich prose; no children. |
 | `SearchInput` | `id` | `placeholder`, `label`; writes debounced text to `/ui/<id>/value`; no children. |
 | `Select` | `id`, `options` | `options` are strings or `{ value, label? }`; `placeholder`, `label`, `clearable`; writes a string or null to `/ui/<id>/value`; no children. |
-| `Button` | `label` | `variant: "default", "secondary", "outline", "ghost", or "destructive"`; dispatch with element-level `on.press`. |
-| `Metric` | `label`, `value` | `value` is string or number. |
+| `Button` | `label` | `variant: "default", "secondary", "outline", "ghost", "destructive", or "destructive-outline"` (use `destructive-outline` for standalone deletes); `disabled` (constant or bound boolean); `busyWith: "<actionName>"` disables and spins while that custom action's `/actions/<name>/status` is `"running"`; dispatch with element-level `on.press`. |
+| `Metric` | `label`, `value` | `value` is string or number; bind `loading` to `/queries/<name>/loading` for a skeleton while the query loads. |
 | `Alert` | `message` | `title`, `tone: "info", "success", "warning", or "error"`. |
 | `Badge` | `text` | `text` is string or number; `tone: "neutral", "success", "active", "error", "info", "pending", "warning", or "paused"`. |
 | `Table` | `columns` | `data`, `loading`, `error`, `emptyMessage`, `rowActions`, `search`, `filters`; see below. |
 | `Form` | `id`, `fields`, `onSubmit` | `title`, `submitLabel`; see below. |
 | `Drawer` | `param` | `title`, `description`, `side: "right" or "left"`, `size: "sm", "md", "lg", or "xl"`; has the `default` child slot. |
-| `DetailList` | `fields` | `data`, `emptyMessage`, `columns: 1 or 2`; renders one record without edit controls. |
+| `DetailList` | `fields` | `data`, `emptyMessage`, `columns: 1 or 2`, `loading` (bind `/queries/<name>/loading` for skeleton fields while loading); renders one record without edit controls. |
 
 Table details:
 
-- `columns[]`: `{ key, label?, kind?, tones?: {value: badgeTone}, width?: number }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, or `badge`; `string` and `enum` render as text.
+- `columns[]`: `{ key, label?, kind?, tones?: {value: badgeTone}, width?: number, pinned?: "left" or "right" }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, or `badge`; `string` and `enum` render as text. Pin id/actions columns so they survive horizontal scroll on narrow viewports.
+- `pagination`: boolean; defaults to auto-enabling past 200 rows (set `false` to force one scroll region). `density: "compact"` tightens row height for dense readouts.
 - `rowActions[]`: `{ label, variant?, confirm?, actions }`. Variants add `destructive-outline` to the Button variants. `destructive` and `destructive-outline` confirm by default; customize with `{ "title": ..., "description": ..., "confirmLabel": ... }`, or use a bare `confirm` string as the dialog description (use `confirm: false` only for a reversible action).
 - `search`: optional string; case-insensitive substring matching across the listed string and number columns. Bind a SearchInput value for client-side search.
 - `filters`: optional record of per-column string, number, boolean, or null values. Null, empty, or absent values disable one filter. Bind Select values for client-side equality filters.
@@ -369,6 +466,7 @@ Form details:
 
 - `fields[]`: `{ name, label?, kind?, options?: string[], placeholder?, required? }`; `kind` is `string`, `text`, `number`, `boolean`, `date`, or `enum`, and enum fields need `options`.
 - Values live at `/forms/<formId>/<fieldName>`. `onSubmit` is an action chain.
+- The submit button shows a pending spinner while the chain runs, and `app.mutate` failures in the chain render inline under the fields (not the page banner) — no extra wiring needed.
 
 Drawer details:
 
@@ -380,7 +478,7 @@ DetailList details:
 
 ## Layout & interactivity
 
-Use `Stack` as the primary page and section layout; `Container` is the legacy two-prop primitive retained for existing pages. Stack supports vertical or horizontal flow, shared spacing, alignment, justification, wrapping, and padding. Use `Grid` for responsive card or metric strips: set one column count or breakpoint counts such as `{ "base": 1, "md": 2, "lg": 3 }`.
+Use `Stack` as the primary page and section layout; `Container` is the legacy two-prop primitive retained for existing pages. Stack supports vertical or horizontal flow, shared spacing, alignment, justification, wrapping, and padding; row Stacks (filter bars, button rows) should set `collapseBelow: "sm"|"md"|"lg"` so they stack vertically on phones. Use `Grid` for responsive card or metric strips: a bare column count is responsive shorthand (1 column on phones, 2 from `sm`, the count from `md` up), or pin breakpoints explicitly with `{ "base": 1, "md": 2, "lg": 3 }`. `Grid` and `Split` also accept `padding` on the shared spacing scale.
 
 `Split` and `Tabs` children are positional. For Split, `children[0]` is the first pane, `children[1]` is the second, and extra children append inside the second pane. Below `collapseBelow`, panes stack; `reverse` changes only that narrow-layout stacking order. For Tabs, `children[i]` is the body for `tabs[i]`; keep both arrays in the same order and with the same count. Inactive tab children stay mounted but hidden, so Tables keep polling. Use `Divider` to separate sections and `Markdown` for richer explanatory content.
 
@@ -471,7 +569,7 @@ An action-chain step is `{ "action": "<type>", "params": {...} }`. Available act
 - arrays and scalar values replace;
 - `null` deletes a key;
 - reusable-element disambiguation: a patch value for `elements.<name>` containing ONLY the `elements` key merges node-by-node; any other key present (`mode`, `root`, `props`, or `export`) makes it a full element replace — restate every field you want kept. In that node-by-node form, `elements.<name>.elements.<id>: null` deletes one node. Literal null nodes are rejected in a full element replace so they cannot be mistaken for deletions.
-- otherwise every supplied `pages.<page>.elements.<id>`, `pages.<page>.params.<param>`, `actions.<name>`, and `models.<name>.columns.<col>` value is atomic and replaces that complete declaration; `null` deletes it.
+- otherwise every supplied `pages.<page>.elements.<id>`, `pages.<page>.params.<param>`, `actions.<name>`, `models.<name>.columns.<col>`, and `models.<name>.sources.<src>` value is atomic and replaces that complete declaration; `null` deletes it (deleting a source detaches its rows — see the source lifecycle above).
 
 `pages.<page>: null` deletes a page, except the current `defaultPage` cannot be deleted. `root`, `title`, and top-level `defaultPage` use ordinary merge semantics. A top-level `page` patch is rejected with guidance to patch `pages.<name>` instead.
 

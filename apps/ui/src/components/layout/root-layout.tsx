@@ -3,10 +3,12 @@ import { Outlet, useLocation } from "react-router-dom";
 import { StatusProvider } from "@/app/status-context";
 import { CommandMenu } from "@/components/shared/command-menu";
 import { ErrorBoundary } from "@/components/shared/error-boundary";
+import { HiveLoadingScreen } from "@/components/shared/hive-loading-screen";
 import { NameConnectionModal } from "@/components/shared/name-connection-modal";
-import { PageSkeleton } from "@/components/shared/page-skeleton";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { useConfig } from "@/hooks/use-config";
 import { cn } from "@/lib/utils";
+import { WelcomeCard } from "@/pages/config/components/welcome-card";
 import { AppFooter } from "./app-footer";
 import { AppHeader } from "./app-header";
 import { AppSidebar } from "./app-sidebar";
@@ -14,10 +16,21 @@ import { ConfigGuard } from "./config-guard";
 
 export function RootLayout() {
   const { pathname } = useLocation();
+  const { isConfigured } = useConfig();
   // The unified Home (`/`) owns its own internal padding so the full-bleed
   // canvas can reach the content-area edges; every other route gets the
   // standard gutter.
   const mainPadding = pathname === "/" ? "p-0" : "p-4 md:p-6";
+
+  // No connection yet: full-page connect takeover instead of the app shell —
+  // no sidebar/header/footer behind, just the centered onboarding card.
+  if (!isConfigured) {
+    return (
+      <div className="flex min-h-svh w-full items-center justify-center bg-background p-4">
+        <WelcomeCard />
+      </div>
+    );
+  }
 
   return (
     <ConfigGuard>
@@ -37,7 +50,7 @@ export function RootLayout() {
               )}
             >
               <ErrorBoundary>
-                <Suspense fallback={<PageSkeleton />}>
+                <Suspense fallback={<HiveLoadingScreen />}>
                   <Outlet />
                 </Suspense>
               </ErrorBoundary>

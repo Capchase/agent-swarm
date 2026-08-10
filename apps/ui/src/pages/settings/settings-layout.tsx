@@ -4,6 +4,7 @@ import {
   Key,
   KeyRound,
   type LucideIcon,
+  Palette,
   PanelLeftClose,
   PanelLeftOpen,
   Plug,
@@ -12,6 +13,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { AnimatedReveal } from "@/components/shared/animated-reveal";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -32,6 +34,7 @@ interface SettingsNavItem {
 
 const SETTINGS_NAV: SettingsNavItem[] = [
   { title: "Connections", path: "/settings/connections", icon: Cable },
+  { title: "Appearance", path: "/settings/appearance", icon: Palette },
   { title: "Secrets", path: "/settings/secrets", icon: KeyRound },
   { title: "API Keys", path: "/settings/api-keys", icon: Key },
   { title: "Integrations", path: "/settings/integrations", icon: Plug },
@@ -101,12 +104,10 @@ export function SettingsLayout() {
         </Select>
       </div>
 
-      {/* Desktop: left rail. */}
-      {!collapsed ? (
-        <nav
-          aria-label="Settings"
-          className="hidden md:flex md:flex-col md:gap-0.5 md:w-48 shrink-0"
-        >
+      {/* Desktop: left rail. Width + fade on collapse/expand (DESIGN.md
+          § Motion collapse pattern). */}
+      <AnimatedReveal open={!collapsed} axis="x" className="hidden md:block shrink-0">
+        <nav aria-label="Settings" className="flex flex-col gap-0.5 w-48">
           <div className="flex items-center justify-between px-3 pb-1">
             <span className="text-[11px] font-mono uppercase tracking-[0.12em] text-muted-foreground">
               Settings
@@ -144,7 +145,7 @@ export function SettingsLayout() {
             </NavLink>
           ))}
         </nav>
-      ) : null}
+      </AnimatedReveal>
 
       {/* Content area owns the scroll container. */}
       <div

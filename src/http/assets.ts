@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
+import { getApp } from "../apps/store";
 import { auditAssetKeys } from "../be/asset-key-audit";
 import { AssetKeyAuthorizationError, authorizeAssetKeyWrite } from "../be/asset-key-auth";
 import { resolveHttpAuditUserId } from "../be/audit-user";
@@ -11,11 +12,41 @@ import {
   moveAssetKey,
   upsertAssetKeyMapping,
 } from "../be/db";
+import { getScriptById } from "../be/scripts/db";
 import { can, type RbacPrincipal, type RbacResource } from "../rbac";
-import { type AssetEntityType, AssetEntityTypeSchema, AssetKeySchema } from "../types";
+import {
+  type AssetEntityType,
+  AssetEntityTypeSchema,
+  AssetKeyMappingSchema,
+  AssetKeySchema,
+  AssetSummarySchema,
+} from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { route } from "./route-def";
-import { json, jsonError } from "./utils";
+import { jsonError } from "./utils";
+
+const AssetKeyAuditIssueSchema = z.object({
+  severity: z.enum(["fatal", "warning"]),
+  code: z.enum([
+    "missing-key",
+    "noncanonical-key",
+    "unknown-personal-user",
+    "missing-provider-mapping",
+    "provider-mapping-drift",
+  ]),
+  entityType: AssetEntityTypeSchema,
+  entityId: z.string(),
+  message: z.string(),
+});
+
+const AssetKeyAuditResultSchema = z.object({
+  ok: z.boolean(),
+  structuralValid: z.boolean(),
+  checked: z.number().int().min(0),
+  fatalCount: z.number().int().min(0),
+  warningCount: z.number().int().min(0),
+  issues: z.array(AssetKeyAuditIssueSchema),
+});
 
 const keyAuditRoute = route({
   method: "get",
@@ -26,7 +57,7 @@ const keyAuditRoute = route({
     "Operator-only check for structural key validity, personal-user references, and logical provider mapping drift. Repeated logical keys are valid and are never reported as conflicts.",
   tags: ["Assets"],
   responses: {
-    200: { description: "Asset namespace audit result" },
+    200: { description: "Asset namespace audit result", schema: AssetKeyAuditResultSchema },
     403: { description: "Operator access required" },
   },
 });
@@ -41,11 +72,17 @@ const listAssetsRoute = route({
   tags: ["Assets"],
   query: z.object({
     keyPrefix: AssetKeySchema.optional(),
-    types: z.string().optional().describe("Comma-separated task,workflow,schedule,page,file list"),
+    types: z
+      .string()
+      .optional()
+      .describe("Comma-separated task,workflow,schedule,page,app,script,file list"),
     limit: z.coerce.number().int().min(1).max(1000).optional(),
   }),
   responses: {
-    200: { description: "Lightweight asset summary list" },
+    200: {
+      description: "Lightweight asset summary list",
+      schema: z.object({ assets: z.array(AssetSummarySchema), count: z.number().int() }),
+    },
     400: { description: "Invalid entity type" },
   },
 });
@@ -66,7 +103,7 @@ const registerMappingRoute = route({
     key: AssetKeySchema.optional(),
   }),
   responses: {
-    200: { description: "Mapping registered" },
+    200: { description: "Mapping registered", schema: AssetKeyMappingSchema },
     400: { description: "Invalid provider tuple or namespace" },
     403: { description: "Operator access required or personal namespace not authorized" },
   },
@@ -81,6 +118,46 @@ function ensureOperator(req: IncomingMessage, res: ServerResponse): boolean {
   return false;
 }
 
+const moveAssetBodySchema = z.object({ key: AssetKeySchema });
+const moveAssetSuccessSchema = z.object({
+  entityType: AssetEntityTypeSchema,
+  id: z.string(),
+  key: AssetKeySchema,
+});
+const moveAssetResponses = {
+  200: { description: "Asset namespace updated", schema: moveAssetSuccessSchema },
+  400: { description: "Invalid namespace" },
+  403: { description: "Move not authorized" },
+  404: { description: "Asset not found" },
+  409: { description: "Moves blocked until audit warnings are repaired" },
+} as const;
+
+// Register permission-specific paths before the polymorphic fallback so RBAC
+// admission can preserve each resource's mutation posture for scoped roles.
+const moveAppAssetRoute = route({
+  method: "patch",
+  path: "/api/assets/app/{id}/key",
+  pattern: ["api", "assets", "app", null, "key"],
+  summary: "Move an app to another logical namespace",
+  tags: ["Assets"],
+  params: z.object({ id: z.string().min(1) }),
+  body: moveAssetBodySchema,
+  responses: moveAssetResponses,
+  rbac: { permission: "app.manage" },
+});
+
+const moveScriptAssetRoute = route({
+  method: "patch",
+  path: "/api/assets/script/{id}/key",
+  pattern: ["api", "assets", "script", null, "key"],
+  summary: "Move a script to another logical namespace",
+  tags: ["Assets"],
+  params: z.object({ id: z.string().min(1) }),
+  body: moveAssetBodySchema,
+  responses: moveAssetResponses,
+  rbac: { permission: "script.global.write" },
+});
+
 const moveAssetRoute = route({
   method: "patch",
   path: "/api/assets/{entityType}/{id}/key",
@@ -90,19 +167,25 @@ const moveAssetRoute = route({
     "Updates namespace metadata only. Provider-backed files keep the same provider key, org, and drive; no remote move occurs. Personal keys are labels, not a privacy guarantee.",
   tags: ["Assets"],
   params: z.object({ entityType: AssetEntityTypeSchema, id: z.string().min(1) }),
-  body: z.object({ key: AssetKeySchema }),
-  responses: {
-    200: { description: "Asset namespace updated" },
-    400: { description: "Invalid namespace" },
-    403: { description: "Move not authorized" },
-    404: { description: "Asset not found" },
-    409: { description: "Moves blocked until audit warnings are repaired" },
-  },
+  body: moveAssetBodySchema,
+  responses: moveAssetResponses,
   rbac: {
     ungated:
-      "preserves each entity's current mutation posture; task moves additionally use task.fs.mutate, file moves require operator authentication, and personal destinations require a matching trusted user",
+      "preserves each entity's current mutation posture; task moves use task.fs.mutate, app moves use app.manage, scripts preserve agent ownership/global-lead rules, file moves require operator authentication, and personal destinations require a matching trusted user",
   },
 });
+
+function assetMovePrincipal(
+  req: IncomingMessage,
+  myAgentId: string | undefined,
+): RbacPrincipal | null {
+  const auth = getRequestAuth(req);
+  if (auth?.kind === "operator") return { kind: "operator" };
+  if (auth?.kind === "user") return { kind: "user", userId: auth.userId };
+  if (!myAgentId) return null;
+  const agent = getAgentById(myAgentId);
+  return { kind: "agent", agentId: myAgentId, isLead: agent?.isLead ?? false };
+}
 
 function canMutateTaskNamespace(
   task: { id: string; agentId: string | null; creatorAgentId?: string },
@@ -115,18 +198,40 @@ function canMutateTaskNamespace(
     agentId: task.agentId,
     creatorAgentId: task.creatorAgentId,
   };
-  const auth = getRequestAuth(req);
-  let principal: RbacPrincipal;
-  if (auth?.kind === "operator") {
-    principal = { kind: "operator" };
-  } else if (auth?.kind === "user") {
-    principal = { kind: "user", userId: auth.userId };
-  } else {
-    if (!myAgentId) return false;
-    const agent = getAgentById(myAgentId);
-    principal = { kind: "agent", agentId: myAgentId, isLead: agent?.isLead ?? false };
-  }
+  const principal = assetMovePrincipal(req, myAgentId);
+  if (!principal) return false;
   return can({ principal, verb: "task.fs.mutate", resource, source: "http" }).allow;
+}
+
+function canManageAppNamespace(
+  id: string,
+  req: IncomingMessage,
+  myAgentId: string | undefined,
+): boolean {
+  const principal = assetMovePrincipal(req, myAgentId);
+  return (
+    !!principal &&
+    can({ principal, verb: "app.manage", resource: { kind: "app", appId: id }, source: "http" })
+      .allow
+  );
+}
+
+function canManageScriptNamespace(
+  script: NonNullable<ReturnType<typeof getScriptById>>,
+  req: IncomingMessage,
+  myAgentId: string | undefined,
+): boolean {
+  const principal = assetMovePrincipal(req, myAgentId);
+  if (!principal) return false;
+  if (principal.kind === "operator") return true;
+  if (principal.kind !== "agent") return false;
+  if (script.scope === "agent") return script.scopeId === principal.agentId;
+  return can({
+    principal,
+    verb: "script.global.write",
+    resource: { kind: "owned", scope: "global" },
+    source: "http",
+  }).allow;
 }
 
 export async function handleAssets(
@@ -140,7 +245,7 @@ export async function handleAssets(
     const parsed = await keyAuditRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     if (!ensureOperator(req, res)) return true;
-    json(res, auditAssetKeys(getDb()));
+    keyAuditRoute.respond(res, 200, auditAssetKeys(getDb()));
     return true;
   }
 
@@ -162,7 +267,7 @@ export async function handleAssets(
       types: types.length > 0 ? types : undefined,
       limit: parsed.query.limit,
     });
-    json(res, { assets, count: assets.length });
+    listAssetsRoute.respond(res, 200, { assets, count: assets.length });
     return true;
   }
 
@@ -182,7 +287,7 @@ export async function handleAssets(
         createdBy: actor ?? undefined,
         updatedBy: actor ?? undefined,
       });
-      json(res, mapping);
+      registerMappingRoute.respond(res, 200, mapping);
     } catch (error) {
       if (error instanceof AssetKeyAuthorizationError) {
         jsonError(res, error.message, error.statusCode);
@@ -193,7 +298,11 @@ export async function handleAssets(
     return true;
   }
 
-  if (moveAssetRoute.match(req.method, pathSegments)) {
+  if (
+    moveAppAssetRoute.match(req.method, pathSegments) ||
+    moveScriptAssetRoute.match(req.method, pathSegments) ||
+    moveAssetRoute.match(req.method, pathSegments)
+  ) {
     const parsed = await moveAssetRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     if (parsed.params.entityType === "file" && !ensureOperator(req, res)) return true;
@@ -205,6 +314,27 @@ export async function handleAssets(
       }
       if (!canMutateTaskNamespace(task, myAgentId, req)) {
         jsonError(res, "Not authorized to move this task namespace", 403);
+        return true;
+      }
+    }
+    if (parsed.params.entityType === "app") {
+      if (!getApp(parsed.params.id)) {
+        jsonError(res, "Asset not found", 404);
+        return true;
+      }
+      if (!canManageAppNamespace(parsed.params.id, req, myAgentId)) {
+        jsonError(res, "Not authorized to move this app namespace", 403);
+        return true;
+      }
+    }
+    if (parsed.params.entityType === "script") {
+      const script = getScriptById(parsed.params.id);
+      if (!script) {
+        jsonError(res, "Asset not found", 404);
+        return true;
+      }
+      if (!canManageScriptNamespace(script, req, myAgentId)) {
+        jsonError(res, "Not authorized to move this script namespace", 403);
         return true;
       }
     }
@@ -222,7 +352,11 @@ export async function handleAssets(
         jsonError(res, "Asset not found", 404);
         return true;
       }
-      json(res, { entityType: parsed.params.entityType, id: parsed.params.id, key });
+      moveAssetRoute.respond(res, 200, {
+        entityType: parsed.params.entityType,
+        id: parsed.params.id,
+        key,
+      });
     } catch (error) {
       if (error instanceof AssetKeyAuthorizationError) {
         jsonError(res, error.message, error.statusCode);

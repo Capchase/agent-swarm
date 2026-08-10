@@ -1,6 +1,7 @@
 import { createSyncStoragePersister } from "@tanstack/query-sync-storage-persister";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
+import { MotionConfig } from "motion/react";
 import type { ReactNode } from "react";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
 import { IdentityModal } from "@/components/identity/identity-modal";
@@ -41,25 +42,33 @@ function ConfigProvider({ children }: { children: ReactNode }) {
  *     return 404 from `/api/users` and would render an empty modal).
  */
 function IdentityGate() {
-  const { state } = useCurrentUser();
+  const { state, locked } = useCurrentUser();
   const { supported } = useFeatureGate("1.76.0");
   if (!supported) return null;
+  // Token-bound identity (DES-771) never needs picking — belt-and-braces on
+  // top of the provider never entering `needs-pick` while locked.
+  if (locked) return null;
   if (state !== "needs-pick") return null;
   return <IdentityModal />;
 }
 
 export function Providers({ children }: { children: ReactNode }) {
   const content = (
-    <ThemeProvider>
-      <ConfigProvider>
-        <CurrentUserProvider>
-          <TooltipProvider>
-            {children}
-            <IdentityGate />
-          </TooltipProvider>
-        </CurrentUserProvider>
-      </ConfigProvider>
-    </ThemeProvider>
+    // `reducedMotion="user"`: every motion/react animation (animated icons
+    // included) drops transform/movement for prefers-reduced-motion users
+    // while keeping opacity fades — "gentler, not zero" (DESIGN.md § Motion).
+    <MotionConfig reducedMotion="user">
+      <ThemeProvider>
+        <ConfigProvider>
+          <CurrentUserProvider>
+            <TooltipProvider>
+              {children}
+              <IdentityGate />
+            </TooltipProvider>
+          </CurrentUserProvider>
+        </ConfigProvider>
+      </ThemeProvider>
+    </MotionConfig>
   );
 
   if (!localStoragePersister) {

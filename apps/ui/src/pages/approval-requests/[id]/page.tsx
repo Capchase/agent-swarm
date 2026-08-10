@@ -194,6 +194,7 @@ export default function ApprovalRequestDetailPage() {
     <div className="flex-1 min-h-0 overflow-y-auto space-y-4">
       <PageHeader
         title={
+          /* Request title lives in the breadcrumb — back arrow + status here. */
           <div className="flex items-center gap-3 min-w-0">
             <Link
               to="/approval-requests"
@@ -201,7 +202,6 @@ export default function ApprovalRequestDetailPage() {
             >
               <ArrowLeft className="h-4 w-4" />
             </Link>
-            <h1 className="text-xl font-semibold">{request.title}</h1>
             <StatusBadge status={request.status} />
           </div>
         }
@@ -222,7 +222,7 @@ export default function ApprovalRequestDetailPage() {
                         <Streamdown>{normalizeNewlines(question.label)}</Streamdown>
                       </span>
                       {question.required && (
-                        <span className="text-status-error text-xs shrink-0">*</span>
+                        <span className="text-status-error-strong text-xs shrink-0">*</span>
                       )}
                       <Badge variant="outline" size="tag" className="ml-auto shrink-0">
                         {question.type}
@@ -261,7 +261,7 @@ export default function ApprovalRequestDetailPage() {
 
             {isPending && (
               <div className="space-y-2">
-                {error && <p className="text-sm text-status-error">{error}</p>}
+                {error && <p className="text-sm text-status-error-strong">{error}</p>}
                 <Button onClick={handleSubmit} disabled={respondMutation.isPending}>
                   {respondMutation.isPending ? "Submitting..." : "Submit Response"}
                 </Button>

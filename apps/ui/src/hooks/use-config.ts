@@ -7,10 +7,12 @@ import {
   getActiveConnection,
   getConnections,
   getDefaultConfig,
+  isUserTokenApiKey,
   removeConnection as removeStoredConnection,
   resetConfig as resetStoredConfig,
   saveConfig,
   setActiveConnection,
+  setEmbedConnection,
   updateConnection as updateStoredConnection,
 } from "@/lib/config";
 
@@ -103,6 +105,24 @@ function extractUrlParams(
   );
   if (existing) {
     activateFn(existing.id);
+    return { pendingConnection: null, pendingIdentity };
+  }
+
+  // DES-771: a user-bound `aswt_` token arriving via URL params is the embed
+  // handshake. Store it as the tab-local embed connection (sessionStorage) —
+  // the ApiClient authenticates from stored connections and an embedded
+  // iframe must not be interrupted by the "Name This Connection" modal.
+  // Tab-local storage means two embeds on this origin holding different
+  // tokens can never clobber each other, and the shared localStorage
+  // connection list is never touched.
+  if (isUserTokenApiKey(apiKey)) {
+    let host = normalizedUrl;
+    try {
+      host = new URL(normalizedUrl).host;
+    } catch {
+      // Keep the raw URL as the label if it doesn't parse.
+    }
+    setEmbedConnection({ name: `embed:${host}`, apiUrl: normalizedUrl, apiKey });
     return { pendingConnection: null, pendingIdentity };
   }
 

@@ -13,6 +13,7 @@ import {
   type ScheduleTargetFormValue,
 } from "@/components/schedules/schedule-target-fields";
 import { DataGrid } from "@/components/shared/data-grid";
+import { EmptyState } from "@/components/shared/empty-state";
 import { FavoriteButton } from "@/components/shared/favorite-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -394,8 +395,8 @@ export default function SchedulesPage() {
             size="tag"
             className={`${
               params.value === "one_time"
-                ? "border-status-active/30 text-status-active"
-                : "border-status-success/30 text-status-success"
+                ? "border-status-active/30 text-status-active-strong"
+                : "border-status-success/30 text-status-success-strong"
             }`}
           >
             {params.value === "one_time" ? "One-time" : "Recurring"}
@@ -567,11 +568,15 @@ export default function SchedulesPage() {
   if (!isLoading && scheduleRows.length === 0) {
     return (
       <div className="flex flex-col flex-1 min-h-0 gap-4">
-        <PageHeader title="Schedules" action={createButton} />
-        <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-          <Clock className="h-8 w-8 mb-2" />
-          <p className="text-sm">No scheduled tasks</p>
-        </div>
+        <PageHeader title="Schedules" />
+        <EmptyState
+          icon={Clock}
+          title="No scheduled tasks"
+          description="Schedules run a task on a cron cadence — reports, syncs, sweeps."
+          entity="scheduled task"
+          fullPage
+          action={createButton}
+        />
         <ScheduleDialog
           open={dialogOpen}
           onOpenChange={setDialogOpen}
@@ -583,7 +588,7 @@ export default function SchedulesPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
-      <PageHeader title="Schedules" action={createButton} />
+      <PageHeader title="Schedules" />
 
       <div className="flex items-center gap-3">
         <div className="relative flex-1 max-w-sm">
@@ -595,6 +600,20 @@ export default function SchedulesPage() {
             className="pl-9"
           />
         </div>
+        {/* Create lives in the toolbar as a bare "+" — no lone header action row. */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="icon"
+              className="size-8 ml-auto"
+              onClick={() => setDialogOpen(true)}
+              aria-label="Create schedule"
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Create schedule</TooltipContent>
+        </Tooltip>
       </div>
 
       <DataGrid

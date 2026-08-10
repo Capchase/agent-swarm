@@ -13,12 +13,71 @@ import {
   getSessionLogsByTaskId,
   getTaskById,
 } from "../be/db";
-import { normalizeModelKey } from "../be/pricing-normalize";
 import { recordSessionCost } from "../otel";
 import { incrementServerSessionsProcessed } from "../server-runtime-counters";
-import type { SessionCost, SessionCostSource } from "../types";
+import type { SessionCost } from "../types";
+import { SessionCostModelBreakdownSchema, SessionCostSchema, SessionLogSchema } from "../types";
 import { route } from "./route-def";
-import { json, jsonError } from "./utils";
+import { recomputeSessionCost } from "./session-cost-recompute";
+import { jsonError } from "./utils";
+
+// ─── Response Schemas ────────────────────────────────────────────────────────
+
+/** Mirrors `SessionCostSummaryTotals` in src/be/db.ts. */
+const SessionCostSummaryTotalsSchema = z.object({
+  totalCostUsd: z.number(),
+  totalInputTokens: z.number().int(),
+  totalOutputTokens: z.number().int(),
+  totalCacheReadTokens: z.number().int(),
+  totalCacheWriteTokens: z.number().int(),
+  totalDurationMs: z.number().int(),
+  totalSessions: z.number().int(),
+  avgCostPerSession: z.number(),
+  attributedCostUsd: z.number(),
+});
+
+/** Mirrors `SessionCostDailyRow` in src/be/db.ts. */
+const SessionCostDailyRowSchema = z.object({
+  date: z.string(),
+  costUsd: z.number(),
+  inputTokens: z.number().int(),
+  outputTokens: z.number().int(),
+  sessions: z.number().int(),
+});
+
+/** Mirrors `SessionCostByAgentRow` in src/be/db.ts. */
+const SessionCostByAgentRowSchema = z.object({
+  agentId: z.string(),
+  costUsd: z.number(),
+  inputTokens: z.number().int(),
+  outputTokens: z.number().int(),
+  sessions: z.number().int(),
+  durationMs: z.number().int(),
+});
+
+/** Mirrors `SessionCostByUserRow` in src/be/db.ts. */
+const SessionCostByUserRowSchema = z.object({
+  userId: z.string().nullable(),
+  costUsd: z.number(),
+  inputTokens: z.number().int(),
+  outputTokens: z.number().int(),
+  tasks: z.number().int(),
+  durationMs: z.number().int(),
+});
+
+/** Mirrors the return type of `getSessionCostSummary` in src/be/db.ts. */
+const SessionCostSummarySchema = z.object({
+  totals: SessionCostSummaryTotalsSchema,
+  daily: z.array(SessionCostDailyRowSchema),
+  byAgent: z.array(SessionCostByAgentRowSchema),
+  byUser: z.array(SessionCostByUserRowSchema),
+});
+
+/** Mirrors `DashboardCostSummary` in src/be/db.ts. */
+const DashboardCostSummarySchema = z.object({
+  costToday: z.number(),
+  costMtd: z.number(),
+});
 
 // ─── Route Definitions ───────────────────────────────────────────────────────
 
@@ -36,7 +95,10 @@ const createSessionLogsRoute = route({
     cli: z.string().optional(),
   }),
   responses: {
-    201: { description: "Logs stored" },
+    201: {
+      description: "Logs stored",
+      schema: z.object({ success: z.literal(true), count: z.number().int().nonnegative() }),
+    },
     400: { description: "Validation error" },
   },
 });
@@ -56,7 +118,10 @@ const getSessionLogsByTask = route({
     limit: z.coerce.number().int().min(1).max(1000).optional(),
   }),
   responses: {
-    200: { description: "Session logs" },
+    200: {
+      description: "Session logs",
+      schema: z.object({ logs: z.array(SessionLogSchema) }),
+    },
     404: { description: "Task not found" },
   },
 });
@@ -72,12 +137,18 @@ const createSessionCostRoute = route({
     agentId: z.string().min(1),
     totalCostUsd: z.number(),
     taskId: z.string().optional(),
-    inputTokens: z.number().int().optional(),
-    outputTokens: z.number().int().optional(),
-    cacheReadTokens: z.number().int().optional(),
+    // Phase 3: non-negative — the recompute no longer clamps, so negative
+    // token counts must be rejected at the wire instead of pricing below $0.
+    inputTokens: z.number().int().nonnegative().optional(),
+    outputTokens: z.number().int().nonnegative().optional(),
+    cacheReadTokens: z.number().int().nonnegative().optional(),
     // Migration 063: nullable — adapters that can't honestly report cache writes
     // (e.g. Codex SDK) prefer null over a faked 0.
-    cacheWriteTokens: z.number().int().nullable().optional(),
+    cacheWriteTokens: z.number().int().nonnegative().nullable().optional(),
+    // Same nullable rationale as cacheWriteTokens: adapters that can't report
+    // the TTL split send null/omit rather than a faked 0.
+    cacheWrite5mTokens: z.number().int().nonnegative().nullable().optional(),
+    cacheWrite1hTokens: z.number().int().nonnegative().nullable().optional(),
     // Migration 063: new token classes previously dropped on the floor.
     reasoningOutputTokens: z.number().int().nonnegative().optional(),
     thinkingTokens: z.number().int().nonnegative().optional(),
@@ -85,6 +156,9 @@ const createSessionCostRoute = route({
     // Migration 063: nullable for adapters that can't honestly report numTurns.
     numTurns: z.number().int().nullable().optional(),
     model: z.string().optional(),
+    // Reuses the canonical breakdown schema minus costUsd (server-computed,
+    // never accepted from the wire).
+    models: z.array(SessionCostModelBreakdownSchema.omit({ costUsd: true })).optional(),
     isError: z.boolean().optional(),
     /**
      * Phase 6 (extended migration 063): drives the API recompute path. After
@@ -101,7 +175,10 @@ const createSessionCostRoute = route({
     createdAt: z.number().int().nonnegative().optional(),
   }),
   responses: {
-    201: { description: "Cost record stored" },
+    201: {
+      description: "Cost record stored",
+      schema: z.object({ success: z.literal(true), cost: SessionCostSchema }),
+    },
     400: { description: "Validation error" },
   },
 });
@@ -121,7 +198,7 @@ const getSessionCostSummaryRoute = route({
     userId: z.string().optional(),
   }),
   responses: {
-    200: { description: "Cost summary" },
+    200: { description: "Cost summary", schema: SessionCostSummarySchema },
     400: { description: "Invalid groupBy" },
   },
 });
@@ -133,7 +210,7 @@ const getDashboardCosts = route({
   summary: "Cost today and month-to-date for dashboard",
   tags: ["Session Data"],
   responses: {
-    200: { description: "Dashboard cost data" },
+    200: { description: "Dashboard cost data", schema: DashboardCostSummarySchema },
   },
 });
 
@@ -151,7 +228,10 @@ const listSessionCosts = route({
     limit: z.coerce.number().int().min(1).optional(),
   }),
   responses: {
-    200: { description: "Session costs" },
+    200: {
+      description: "Session costs",
+      schema: z.object({ costs: z.array(SessionCostSchema) }),
+    },
   },
 });
 
@@ -176,7 +256,10 @@ export async function handleSessionData(
         cli: parsed.body.cli || "claude",
         lines: parsed.body.lines,
       });
-      json(res, { success: true, count: parsed.body.lines.length }, 201);
+      createSessionLogsRoute.respond(res, 201, {
+        success: true,
+        count: parsed.body.lines.length,
+      });
     } catch (error) {
       console.error("[HTTP] Failed to create session logs:", error);
       jsonError(res, "Failed to store session logs", 500);
@@ -193,7 +276,7 @@ export async function handleSessionData(
       return true;
     }
     const logs = getSessionLogsByTaskId(parsed.params.taskId, parsed.query?.limit);
-    json(res, { logs });
+    getSessionLogsByTask.respond(res, 200, { logs });
     return true;
   }
 
@@ -212,79 +295,56 @@ export async function handleSessionData(
       // explode.
       const model = parsed.body.model || (parsed.body.provider ? "" : "opus");
 
-      // Phase 2: widen the recompute branch beyond codex. For any provider
-      // with a known model and seeded pricing rows, recompute `totalCostUsd`
-      // from tokens × DB prices and tag the row 'pricing-table'. When the
-      // (provider, model) pair has no pricing rows at all, tag 'unpriced' so
-      // the UI can flag it. When the provider isn't set, fall through with
-      // 'harness' (back-compat for older callers).
-      let totalCostUsd = parsed.body.totalCostUsd;
-      let costSource: SessionCostSource = "harness";
+      // Phase 3: when a per-model breakdown is present, the row's token totals
+      // come from it — the top-level usage block covers the main thread only
+      // (claude sidechain/subagent tokens live exclusively in models[]).
+      const bodyModels = parsed.body.models?.length ? parsed.body.models : null;
+      const rowInputTokens = bodyModels
+        ? bodyModels.reduce((sum, m) => sum + m.inputTokens, 0)
+        : inputTokens;
+      const rowOutputTokens = bodyModels
+        ? bodyModels.reduce((sum, m) => sum + m.outputTokens, 0)
+        : outputTokens;
+      const rowCacheReadTokens = bodyModels
+        ? bodyModels.reduce((sum, m) => sum + m.cacheReadTokens, 0)
+        : cachedInputTokens;
+      const rowCacheWriteTokens = bodyModels
+        ? bodyModels.reduce((sum, m) => sum + m.cacheWriteTokens, 0)
+        : (parsed.body.cacheWriteTokens ?? 0);
 
-      if (parsed.body.provider && model) {
-        const lookupTime = parsed.body.createdAt ?? Date.now();
-        // Phase 2 fix — different harnesses prepend routing prefixes
-        // (`openrouter/`, `github-copilot/`, …) to the same underlying model
-        // id. The pricing seed stores canonical (un-prefixed) keys, so we
-        // strip the prefix here before lookup. The original adapter-emitted
-        // string is still persisted to `session_costs.model` for debugging.
-        const lookupModel = normalizeModelKey(parsed.body.provider, model);
-        const inputRow = getActivePricingRow(
-          parsed.body.provider,
-          lookupModel,
-          "input",
-          lookupTime,
-        );
-        const cachedRow = getActivePricingRow(
-          parsed.body.provider,
-          lookupModel,
-          "cached_input",
-          lookupTime,
-        );
-        const outputRow = getActivePricingRow(
-          parsed.body.provider,
-          lookupModel,
-          "output",
-          lookupTime,
-        );
-        const cacheWriteRow = getActivePricingRow(
-          parsed.body.provider,
-          lookupModel,
-          "cache_write",
-          lookupTime,
-        );
-
-        if (inputRow && outputRow) {
-          // Mirror the legacy codex semantic: uncached input is billed at the
-          // full rate, cached input at the discounted rate. Cache writes are
-          // billed separately when the provider's pricing table carries that
-          // class (anthropic) and the adapter reports a non-zero value.
-          const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
-          const cachedRate = cachedRow?.pricePerMillionUsd ?? 0;
-          const cacheWriteRate = cacheWriteRow?.pricePerMillionUsd ?? 0;
-          totalCostUsd =
-            (uncachedInputTokens * inputRow.pricePerMillionUsd +
-              cachedInputTokens * cachedRate +
-              cacheWriteTokens * cacheWriteRate +
-              outputTokens * outputRow.pricePerMillionUsd) /
-            1_000_000;
-          costSource = "pricing-table";
-        } else {
-          // Provider was tagged but we have no pricing rows for it; flag the
-          // row so the UI can show an "unpriced" badge instead of pretending.
-          costSource = "unpriced";
-        }
-      }
+      // Keep the adapter's report even when the pricing-table branch replaces
+      // totalCostUsd with the server's canonical recomputation.
+      const harnessCostUsd = parsed.body.totalCostUsd;
+      const recomputed = recomputeSessionCost(
+        {
+          provider: parsed.body.provider,
+          model,
+          harnessCostUsd,
+          inputTokens,
+          outputTokens,
+          cacheReadTokens: cachedInputTokens,
+          cacheWriteTokens,
+          cacheWrite5mTokens: parsed.body.cacheWrite5mTokens,
+          cacheWrite1hTokens: parsed.body.cacheWrite1hTokens,
+          models: parsed.body.models,
+          durationMs: parsed.body.durationMs,
+          atEpochMs: parsed.body.createdAt ?? Date.now(),
+        },
+        (provider, lookupModel, tokenClass, atEpochMs) =>
+          getActivePricingRow(provider, lookupModel, tokenClass, atEpochMs)?.pricePerMillionUsd ??
+          null,
+      );
+      const { totalCostUsd, costSource } = recomputed;
 
       const cost = createSessionCost({
         sessionId: parsed.body.sessionId,
         taskId: parsed.body.taskId || undefined,
         agentId: parsed.body.agentId,
         totalCostUsd,
-        inputTokens,
-        outputTokens,
-        cacheReadTokens: cachedInputTokens,
-        cacheWriteTokens: parsed.body.cacheWriteTokens ?? 0,
+        inputTokens: rowInputTokens,
+        outputTokens: rowOutputTokens,
+        cacheReadTokens: rowCacheReadTokens,
+        cacheWriteTokens: rowCacheWriteTokens,
         reasoningOutputTokens: parsed.body.reasoningOutputTokens ?? 0,
         thinkingTokens: parsed.body.thinkingTokens ?? 0,
         durationMs: parsed.body.durationMs ?? 0,
@@ -293,24 +353,29 @@ export async function handleSessionData(
         model,
         isError: parsed.body.isError ?? false,
         costSource,
+        harnessCostUsd,
+        cacheWrite5mTokens: parsed.body.cacheWrite5mTokens,
+        cacheWrite1hTokens: parsed.body.cacheWrite1hTokens,
+        modelBreakdown: recomputed.modelBreakdown,
       });
       recordSessionCost({
         totalCostUsd,
+        harnessCostUsd,
         harness: parsed.body.provider ?? "unknown",
         model,
         costSource,
         isError: parsed.body.isError ?? false,
         tokens: {
-          input: inputTokens,
-          output: outputTokens,
-          cacheRead: cachedInputTokens,
-          cacheWrite: parsed.body.cacheWriteTokens ?? 0,
+          input: rowInputTokens,
+          output: rowOutputTokens,
+          cacheRead: rowCacheReadTokens,
+          cacheWrite: rowCacheWriteTokens,
           reasoning: parsed.body.reasoningOutputTokens ?? 0,
           thinking: parsed.body.thinkingTokens ?? 0,
         },
       });
       incrementServerSessionsProcessed();
-      json(res, { success: true, cost }, 201);
+      createSessionCostRoute.respond(res, 201, { success: true, cost });
     } catch (error) {
       console.error("[HTTP] Failed to create session cost:", error);
       jsonError(res, "Failed to store session cost", 500);
@@ -328,13 +393,13 @@ export async function handleSessionData(
       userId: parsed.query.userId || undefined,
       groupBy: parsed.query.groupBy || "both",
     });
-    json(res, summary);
+    getSessionCostSummaryRoute.respond(res, 200, summary);
     return true;
   }
 
   if (getDashboardCosts.match(req.method, pathSegments)) {
     const dashboardCosts = getDashboardCostSummary();
-    json(res, dashboardCosts);
+    getDashboardCosts.respond(res, 200, dashboardCosts);
     return true;
   }
 
@@ -360,7 +425,7 @@ export async function handleSessionData(
       costs = getAllSessionCosts(limit);
     }
 
-    json(res, { costs });
+    listSessionCosts.respond(res, 200, { costs });
     return true;
   }
 

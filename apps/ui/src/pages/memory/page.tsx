@@ -362,17 +362,7 @@ export default function MemoryPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
-      <PageHeader
-        icon={Brain}
-        title={
-          <>
-            <h1 className="text-xl font-semibold">Memory</h1>
-            <span className="text-sm text-muted-foreground ml-2">
-              Inspect and search the agent memory store
-            </span>
-          </>
-        }
-      />
+      <PageHeader title="Memory" />
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 min-w-[260px] max-w-md">
@@ -472,7 +462,7 @@ export default function MemoryPage() {
             </>
           )}
           {error && (
-            <span className="text-sm text-status-error truncate max-w-[280px]">
+            <span className="text-sm text-status-error-strong truncate max-w-[280px]">
               {error instanceof Error ? error.message : "Search failed"}
             </span>
           )}

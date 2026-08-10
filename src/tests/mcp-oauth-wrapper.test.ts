@@ -420,6 +420,26 @@ describe("registerClient (RFC 7591 DCR)", () => {
       }),
     ).rejects.toThrow(/Dynamic client registration failed/);
   });
+
+  test("attaches a bounded AbortSignal so a non-responding registration endpoint can't hang the caller forever", async () => {
+    let capturedSignal: AbortSignal | null | undefined;
+    globalThis.fetch = async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedSignal = init?.signal;
+      return new Response(JSON.stringify({ client_id: "x" }), { status: 201 });
+    };
+
+    await registerClient("https://as.example.com/register", {
+      client_name: "x",
+      redirect_uris: ["https://swarm.example.com/cb"],
+    });
+
+    // Every safeFetch call (metadata discovery, DCR, token exchange,
+    // refresh, revocation) gets a default timeout — without it, a provider
+    // that accepts the connection and never responds would hold the
+    // per-connector authorize-flow lock indefinitely.
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
+  });
 });
 
 // ─── Token exchange + refresh + revoke ───────────────────────────────────────
@@ -528,6 +548,38 @@ describe("refreshMcpToken", () => {
         resource: "https://mcp.example.com/",
       }),
     ).rejects.toThrow(/Token refresh failed \(400\)/);
+  });
+
+  test("scrubs an echoed client_secret/refresh_token from the thrown error body", async () => {
+    const clientSecret = "super-secret-client-value-123456";
+    const refreshToken = "super-secret-refresh-value-654321";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: "invalid_client",
+          error_description: `client_secret ${clientSecret} rejected for refresh_token ${refreshToken}`,
+        }),
+        { status: 401 },
+      );
+
+    let thrown: Error | undefined;
+    try {
+      await refreshMcpToken({
+        tokenUrl: "https://as.example.com/token",
+        clientId: "c",
+        clientSecret,
+        refreshToken,
+        resource: "https://mcp.example.com/",
+      });
+    } catch (err) {
+      thrown = err as Error;
+    }
+
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).not.toContain(clientSecret);
+    expect(thrown!.message).not.toContain(refreshToken);
+    expect(thrown!.message).toMatch(/\[REDACTED:mcp_oauth_client_secret]/);
+    expect(thrown!.message).toMatch(/\[REDACTED:mcp_oauth_refresh_token]/);
   });
 });
 

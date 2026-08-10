@@ -561,6 +561,221 @@ describe("ScriptExecutor", () => {
     expect(out.stdout).toBe("");
     expect(out.stderr).toContain("Script timed out after 1000ms");
   });
+
+  test("a timed-out script is TERMINATED, not just abandoned (Promise.race regression)", async () => {
+    // A `sleep` is not bounded by the CPU ulimit, so before this fix the
+    // wall-clock timeout only abandoned the promise and the child kept
+    // running — long enough to finish its side effect after the step failed.
+    const dir = `${process.env.TMPDIR ?? "/tmp"}/script-kill-${crypto.randomUUID()}`;
+    await Bun.$`mkdir -p ${dir}`;
+    const marker = `${dir}/still-alive`;
+    try {
+      const startedAt = Date.now();
+      const result = await executor.run(
+        input({ runtime: "bash", script: `sleep 6; touch ${marker}`, timeout: 1000, cwd: dir }, {}),
+      );
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("Script timed out after 1000ms");
+      // The executor must not return until the child has actually been reaped.
+      expect(Date.now() - startedAt).toBeLessThan(6_000);
+
+      // Wait past when the abandoned child would have created its marker.
+      await Bun.sleep(6_500);
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally {
+      await Bun.$`rm -rf ${dir}`.catch(() => {});
+    }
+  }, 20_000);
+
+  // ─── Sandbox regression tests (superagent.sh c27edfd7, finding b132d7c5) ──
+
+  test("child process never inherits the server's secrets — env is scrubbed, not passed through", async () => {
+    const savedKey = process.env.AGENT_SWARM_API_KEY;
+    process.env.AGENT_SWARM_API_KEY = "super-secret-operator-bearer";
+    process.env.SOME_OTHER_SERVER_SECRET = "also-should-not-leak";
+    try {
+      const result = await executor.run(
+        input(
+          {
+            runtime: "bash",
+            script: 'printf \'[%s][%s]\' "$AGENT_SWARM_API_KEY" "$SOME_OTHER_SERVER_SECRET"',
+          },
+          {},
+        ),
+      );
+      expect(result.status).toBe("success");
+      const out = result.output as { stdout: string };
+      // Neither var exists in the child's env at all — bash prints empty strings.
+      expect(out.stdout).toBe("[][]");
+    } finally {
+      if (savedKey === undefined) delete process.env.AGENT_SWARM_API_KEY;
+      else process.env.AGENT_SWARM_API_KEY = savedKey;
+      delete process.env.SOME_OTHER_SERVER_SECRET;
+    }
+  });
+
+  test("resource ulimits actually apply to the spawned process (not just documented)", async () => {
+    const result = await executor.run(input({ runtime: "bash", script: "ulimit -v" }, {}));
+    expect(result.status).toBe("success");
+    const out = result.output as { stdout: string };
+    // "unlimited" means no cap took effect; any other value is a real (finite) ulimit.
+    expect(out.stdout).not.toBe("unlimited");
+    expect(Number(out.stdout)).toBeGreaterThan(0);
+  });
+
+  test("no explicit cwd: runs in a scoped tmpdir, not the server's working directory", async () => {
+    const result = await executor.run(input({ runtime: "bash", script: "pwd" }, {}));
+    expect(result.status).toBe("success");
+    const out = result.output as { stdout: string };
+    expect(out.stdout).not.toBe(process.cwd());
+    expect(out.stdout).toContain("workflow-script-");
+  });
+
+  // ─── Codex review follow-ups (PR #1112, review 4876200033) ──────────────
+
+  test("truncated stdout carries an explicit marker instead of silently presenting a partial result as complete (PRRT_kwDOQr3Tmc6XCRu1)", async () => {
+    const result = await executor.run(
+      input({ runtime: "bash", script: "head -c 2000000 /dev/zero | tr '\\0' 'a'" }, {}),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain("…[stdout truncated]");
+    // Capped at MAX_OUTPUT_BYTES (1 MiB), well short of the 2,000,000 'a's emitted.
+    expect(out.stdout.length).toBeGreaterThan(1_000_000);
+    expect(out.stdout.length).toBeLessThan(1_100_000);
+  });
+
+  test("drain-deadline snapshot keeps the partial output already read instead of discarding it as empty (PRRT_kwDOQr3Tmc6XCRuy)", async () => {
+    // The direct child prints known output, backgrounds a descendant that
+    // inherits its stdout pipe, then exits. `proc.exited` resolves
+    // immediately, but the descendant keeps the pipe's write end open past
+    // STREAM_DRAIN_GRACE_MS (5s) — the exact "successful script + surviving
+    // descendant holding the pipe" scenario the review comment described.
+    const result = await executor.run(
+      input({ runtime: "bash", script: "printf 'kept-output'; sleep 8 & disown; exit 0" }, {}),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    expect(out.exitCode).toBe(0);
+    // The bytes read before the deadline fired must survive — not an empty string.
+    expect(out.stdout).toContain("kept-output");
+    expect(out.stdout).toContain("…[stdout truncated]");
+  }, 10_000);
+
+  // ─── argv-injection regression (Codex review, PR #1112 comment 3732205426,
+  // thread PRRT_kwDOQr3Tmc6XH7VS) ───────────────────────────────────────
+  //
+  // engine.ts's interpolateNodeConfig deliberately routes dynamic/untrusted
+  // per-run values (webhook trigger.*, upstream node stdout) into `args`
+  // rather than the script body, on the stated assumption that args are
+  // "passed as separate argv elements (data), not spliced into source text."
+  // That assumption held for bash -c and python3 -c (both stop option
+  // parsing after the -c operand — confirmed empirically below) but NOT for
+  // `bun -e`, which kept parsing recognized flags out of trailing argv and
+  // running them: an interpolated arg literally named `--eval=<code>` was a
+  // second, attacker-controlled script.
+
+  test("bun runtime: an arg shaped like --eval=<code> is inert data, not executed", async () => {
+    const result = await executor.run(
+      input(
+        {
+          runtime: "ts",
+          script: "console.log(JSON.stringify(process.argv.slice(1)))",
+          args: ["--eval=console.log('INJECTED')"],
+        },
+        {},
+      ),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    expect(out.exitCode).toBe(0);
+    // If `--eval=...` had executed as a second script, its own console.log
+    // would print "INJECTED" on its own line BEFORE the JSON.stringify line
+    // below runs, making stdout two lines and JSON.parse fail outright.
+    // A single clean JSON array — the literal string, unexecuted — is proof.
+    expect(JSON.parse(out.stdout)).toEqual(["--eval=console.log('INJECTED')"]);
+  });
+
+  test("bun runtime: an arg shaped like --preload=<path> is inert data, not loaded", async () => {
+    const result = await executor.run(
+      input(
+        {
+          runtime: "ts",
+          script: "console.log(JSON.stringify(process.argv.slice(1)))",
+          args: ["--preload=/tmp/should-not-be-loaded-as-a-module.js", "-r"],
+        },
+        {},
+      ),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    // A real --preload would fail the process (module not found) before this
+    // script body ever ran — success + the literal args back is proof both
+    // "flags" were treated as plain strings.
+    expect(out.exitCode).toBe(0);
+    expect(JSON.parse(out.stdout)).toEqual([
+      "--preload=/tmp/should-not-be-loaded-as-a-module.js",
+      "-r",
+    ]);
+  });
+
+  test("bun runtime: normal args keep their previous argv indexing after the -- fix", async () => {
+    const result = await executor.run(
+      input(
+        {
+          runtime: "ts",
+          script: "console.log(JSON.stringify(process.argv.slice(1)))",
+          args: ["hello", "world"],
+        },
+        {},
+      ),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    expect(out.exitCode).toBe(0);
+    expect(JSON.parse(out.stdout)).toEqual(["hello", "world"]);
+  });
+
+  test("bash runtime: an arg shaped like --eval=<code> was already inert (documents why -- is not added)", async () => {
+    // bash -c script [$0 [$1 ...]] binds the first trailing arg to $0, not to
+    // an option — there is no flag-reparsing surface to close here, and
+    // adding `--` would shift $0 into args[0], breaking existing workflows.
+    const result = await executor.run(
+      input(
+        {
+          runtime: "bash",
+          script: 'printf \'[%s][%s]\' "$0" "$1"',
+          args: ["--eval=INJECTED", "second"],
+        },
+        {},
+      ),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    expect(out.stdout).toBe("[--eval=INJECTED][second]");
+  });
+
+  test("python runtime: an arg shaped like -c <code> was already inert (documents why -- is not added)", async () => {
+    // python3 -c code also stops option parsing after the -c operand —
+    // trailing args (even another literal -c) land verbatim in sys.argv.
+    const result = await executor.run(
+      input(
+        {
+          runtime: "python",
+          script: "import sys; print(sys.argv[1:])",
+          args: ["-c", "print('INJECTED')"],
+        },
+        {},
+      ),
+    );
+    expect(result.status).toBe("success");
+    const out = result.output as { exitCode: number; stdout: string };
+    // Both trailing args land verbatim in sys.argv as data — if `-c
+    // "print('INJECTED')"` had been re-parsed as a second -c invocation, its
+    // print would appear as a separate line rather than inside this repr.
+    expect(out.stdout).toBe("['-c', \"print('INJECTED')\"]");
+  });
 });
 
 // ─── VCS Executor ────────────────────────────────────────────

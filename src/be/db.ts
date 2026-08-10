@@ -79,6 +79,7 @@ import type {
   Service,
   ServiceStatus,
   SessionCost,
+  SessionCostModelBreakdown,
   SessionCostSource,
   SessionLog,
   Skill,
@@ -121,6 +122,7 @@ import {
   parseModelTier,
   ReasoningEffortSchema,
   RoutingAffinitySchema,
+  SessionCostModelBreakdownSchema,
 } from "../types";
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import { isEnvFlagEnabled } from "../utils/env-flag";
@@ -3934,6 +3936,22 @@ function assetSummaryQueries(types: Set<AssetEntityType>): string[] {
        FROM pages`,
     );
   }
+  if (types.has("app")) {
+    queries.push(
+      `SELECT 'app' AS entityType, id, "key", name AS label,
+              updated_at AS updatedAt, NULL AS providerId, NULL AS providerOrgId,
+              NULL AS providerDriveId, NULL AS providerKey
+       FROM apps`,
+    );
+  }
+  if (types.has("script")) {
+    queries.push(
+      `SELECT 'script' AS entityType, id, "key", name AS label,
+              updatedAt, NULL AS providerId, NULL AS providerOrgId,
+              NULL AS providerDriveId, NULL AS providerKey
+       FROM scripts`,
+    );
+  }
   if (types.has("file")) {
     queries.push(
       `SELECT 'file' AS entityType, id, "key", provider_key AS label,
@@ -3949,7 +3967,9 @@ function assetSummaryQueries(types: Set<AssetEntityType>): string[] {
 
 export function listAssetSummaries(filters?: AssetSummaryFilters): AssetSummary[] {
   const requestedTypes = new Set<AssetEntityType>(
-    filters?.types?.length ? filters.types : ["task", "workflow", "schedule", "page", "file"],
+    filters?.types?.length
+      ? filters.types
+      : ["task", "workflow", "schedule", "page", "app", "script", "file"],
   );
   const queries = assetSummaryQueries(requestedTypes);
   if (queries.length === 0) return [];
@@ -4010,6 +4030,18 @@ function currentAssetKey(entityType: AssetEntityType, id: string): string | null
       return (
         getDb()
           .prepare<{ key: string }, [string]>('SELECT "key" AS key FROM pages WHERE id = ?')
+          .get(id)?.key ?? null
+      );
+    case "app":
+      return (
+        getDb()
+          .prepare<{ key: string }, [string]>('SELECT "key" AS key FROM apps WHERE id = ?')
+          .get(id)?.key ?? null
+      );
+    case "script":
+      return (
+        getDb()
+          .prepare<{ key: string }, [string]>('SELECT "key" AS key FROM scripts WHERE id = ?')
           .get(id)?.key ?? null
       );
     case "file":
@@ -4101,6 +4133,17 @@ export function moveAssetKey(input: {
         break;
       case "page":
         getDb().run('UPDATE pages SET "key" = ?, updatedAt = ?, updated_by = ? WHERE id = ?', [
+          key,
+          now,
+          input.changedBy ?? null,
+          input.id,
+        ]);
+        break;
+      case "app":
+        getDb().run('UPDATE apps SET "key" = ?, updated_at = ? WHERE id = ?', [key, now, input.id]);
+        break;
+      case "script":
+        getDb().run('UPDATE scripts SET "key" = ?, updatedAt = ?, updated_by = ? WHERE id = ?', [
           key,
           now,
           input.changedBy ?? null,
@@ -6583,10 +6626,26 @@ type SessionCostRow = {
   model: string;
   isError: number;
   costSource: string;
+  harnessCostUsd: number | null;
+  cacheWrite5mTokens: number | null;
+  cacheWrite1hTokens: number | null;
+  modelBreakdown: string | null;
   createdAt: string;
 };
 
 function rowToSessionCost(row: SessionCostRow): SessionCost {
+  let modelBreakdown: SessionCostModelBreakdown[] | null = null;
+  if (row.modelBreakdown) {
+    try {
+      const parsed = SessionCostModelBreakdownSchema.array().safeParse(
+        JSON.parse(row.modelBreakdown),
+      );
+      if (parsed.success) modelBreakdown = parsed.data;
+    } catch {
+      // Corrupt JSON (manual edits, partial writes) must not fail the listing.
+    }
+  }
+
   return {
     id: row.id,
     sessionId: row.sessionId,
@@ -6604,6 +6663,10 @@ function rowToSessionCost(row: SessionCostRow): SessionCost {
     model: row.model,
     isError: row.isError === 1,
     costSource: (row.costSource as SessionCostSource) ?? "harness",
+    harnessCostUsd: row.harnessCostUsd,
+    cacheWrite5mTokens: row.cacheWrite5mTokens,
+    cacheWrite1hTokens: row.cacheWrite1hTokens,
+    modelBreakdown,
     createdAt: row.createdAt,
   };
 }
@@ -6629,6 +6692,10 @@ const sessionCostQueries = {
         string, // model
         number, // isError
         string, // costSource
+        number | null, // harnessCostUsd
+        number | null, // cacheWrite5mTokens
+        number | null, // cacheWrite1hTokens
+        string | null, // modelBreakdown
       ]
     >(
       `INSERT INTO session_costs (
@@ -6637,9 +6704,10 @@ const sessionCostQueries = {
          cacheReadTokens, cacheWriteTokens,
          reasoningOutputTokens, thinkingTokens,
          durationMs, numTurns, model, isError,
-         costSource, createdAt
+         costSource, harnessCostUsd, cacheWrite5mTokens, cacheWrite1hTokens,
+         modelBreakdown, createdAt
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
     ),
 
   getByTaskId: () =>
@@ -6685,6 +6753,10 @@ export interface CreateSessionCostInput {
    *                       `totalCostUsd` is whatever the worker submitted.
    */
   costSource?: SessionCostSource;
+  harnessCostUsd?: number | null;
+  cacheWrite5mTokens?: number | null;
+  cacheWrite1hTokens?: number | null;
+  modelBreakdown?: SessionCostModelBreakdown[] | null;
 }
 
 export function createSessionCost(input: CreateSessionCostInput): SessionCost {
@@ -6711,6 +6783,10 @@ export function createSessionCost(input: CreateSessionCostInput): SessionCost {
       input.model,
       input.isError ? 1 : 0,
       costSource,
+      input.harnessCostUsd ?? null,
+      input.cacheWrite5mTokens ?? null,
+      input.cacheWrite1hTokens ?? null,
+      input.modelBreakdown ? JSON.stringify(input.modelBreakdown) : null,
     );
 
   return {
@@ -6730,6 +6806,10 @@ export function createSessionCost(input: CreateSessionCostInput): SessionCost {
     model: input.model,
     isError: input.isError ?? false,
     costSource,
+    harnessCostUsd: input.harnessCostUsd ?? null,
+    cacheWrite5mTokens: input.cacheWrite5mTokens ?? null,
+    cacheWrite1hTokens: input.cacheWrite1hTokens ?? null,
+    modelBreakdown: input.modelBreakdown ?? null,
     createdAt: new Date().toISOString(),
   };
 }

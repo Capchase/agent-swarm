@@ -1,6 +1,6 @@
 {
   "name": "@desplega.ai/agent-swarm",
-  "version": "1.128.0",
+  "version": "1.130.0",
   "description": "agent-swarm.dev — an open-source operating system for AI work: a lead agent breaks goals into tasks, routes them to specialized workers such as Claude Code or Codex, runs each worker in an isolated container, and preserves shared memory, tools, schedules, and review gates so delegated work compounds across sessions.",
   "keywords": [
     "agent-swarm.dev",
@@ -30,6 +30,7 @@
     "url": "https://github.com/desplega-ai/agent-swarm/issues"
   },
   "homepage": "https://agent-swarm.dev",
+  "mcpName": "io.github.desplega-ai/agent-swarm",
   "publishConfig": {
     "access": "public"
   },
@@ -91,6 +92,7 @@
     "check:api-key-boundary": "bash scripts/check-api-key-boundary.sh",
     "check:vendored-openapi": "bun scripts/check-vendored-openapi.ts",
     "check:rbac-coverage": "bun scripts/check-rbac-coverage.ts",
+    "check:openapi-response-coverage": "bun scripts/check-openapi-response-coverage.ts",
     "check:script-types": "bash scripts/check-script-types-freshness.sh",
     "check:audit-columns": "bash scripts/check-audit-columns.sh",
     "lint:structure": "konsistent check",
@@ -150,6 +152,7 @@
     "@types/bun": "latest",
     "dependency-cruiser": "^18.0.0",
     "konsistent": "1.0.0-beta.1",
+    "openapi-typescript": "^7",
     "ts-morph": "^28.0.0",
     "turbo": "^2.10.0"
   },
@@ -172,8 +175,8 @@
     "@inkjs/ui": "^2.0.0",
     "@linear/sdk": "^77.0.0",
     "@modelcontextprotocol/sdk": "^1.25.1",
-    "@openai/codex-sdk": "^0.146.0",
-    "@opencode-ai/sdk": "^1.18.13",
+    "@openai/codex-sdk": "^0.147.0",
+    "@opencode-ai/sdk": "^1.18.15",
     "@openfort/openfort-node": "^0.9.1",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/exporter-metrics-otlp-http": "^0.218.0",

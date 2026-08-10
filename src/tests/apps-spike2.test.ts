@@ -1064,7 +1064,7 @@ describe("custom app actions", () => {
     );
     expect(started.status).toBe(200);
     expect(started.body).toMatchObject({ ok: true, status: "pending" });
-    const observed = await request<{ id: string; agentId: string; task: string }>(
+    const observed = await request<{ id: string; agentId: string; task: string; key: string }>(
       `/api/tasks/${started.body.taskId}`,
     );
     expect(observed.status).toBe(200);
@@ -1072,6 +1072,9 @@ describe("custom app actions", () => {
     expect(observed.body.agentId).toBe(LEAD_ID);
     expect(observed.body.task).toContain(`[App action] app=${appId}`);
     expect(observed.body.task).toContain('input={"idea":"42"}');
+    // The app-namespaced asset key lets a swarm-tasks source pull these back
+    // via config.assetKey.
+    expect(observed.body.key).toBe(`shared/app:${appId}/action:investigate/`);
   });
 });
 
@@ -1162,5 +1165,70 @@ describe("app MCP iteration tools", () => {
         count: number;
       },
     ).toEqual({ count: 0 });
+  });
+});
+
+describe("page-validator guards", () => {
+  test("cross-checks busyWith against declared actions and reserves $-prefixed form field names", () => {
+    const withButton = (busyWith: string) =>
+      parseAppDefinition({
+        ...baseDefinition,
+        actions: { notify: { kind: "task", prompt: "Ping the owner" } },
+        pages: {
+          main: {
+            root: "root",
+            elements: {
+              root: {
+                type: "Button",
+                props: { label: "Notify", busyWith },
+                on: { press: [{ action: "app.action", params: { name: "notify" } }] },
+              },
+            },
+          },
+        },
+        defaultPage: "main",
+      });
+
+    // A typo'd busyWith watches a slot nothing writes — rejected like an
+    // unknown app.action name.
+    const typo = withButton("notfy");
+    expect(typo.success).toBe(false);
+    if (!typo.success) {
+      expect(typo.issues).toContainEqual({
+        path: "pages.main.elements.root.props.busyWith",
+        message: 'unknown app action "notfy"',
+      });
+    }
+    expect(withButton("notify").success).toBe(true);
+
+    // `$`-prefixed form field names collide with reserved runtime slots
+    // (`/forms/<id>/$error` carries the inline mutate failure).
+    const reservedField = parseAppDefinition({
+      ...baseDefinition,
+      pages: {
+        main: {
+          root: "root",
+          elements: {
+            root: {
+              type: "Form",
+              props: {
+                id: "f",
+                fields: [{ name: "$error" }],
+                onSubmit: [{ action: "app.mutate", params: { op: "create", model: "idea" } }],
+              },
+            },
+          },
+        },
+      },
+      defaultPage: "main",
+    });
+    expect(reservedField.success).toBe(false);
+    if (!reservedField.success) {
+      expect(
+        reservedField.issues.some(
+          (issue) => issue.path === "pages.main.elements.root.props.fields.0.name",
+        ),
+      ).toBe(true);
+    }
   });
 });

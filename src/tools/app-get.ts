@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { type AppRow, listAppRows } from "@/apps/row-store";
 import { getApp } from "@/apps/store";
+import { collectAppSyncStatus } from "@/apps/sync";
 import { getAgentById } from "@/be/db";
 import { AppQueryParamsError, applyQuery } from "@/http/apps";
 import { can } from "@/rbac";
@@ -55,9 +56,16 @@ export const registerAppGetTool = (server: McpServer) => {
       const app = getApp(appId);
       if (!app) return toolErr(`App ${appId} not found.`);
 
+      const syncStatus = collectAppSyncStatus(app.id);
+      const hasSyncStatus = Object.keys(syncStatus).length > 0;
+      // Supplying `details` suppresses the registrar's JSON-data fallback, so
+      // text-only harnesses must get the sync freshness surface here too.
+      const details = hasSyncStatus
+        ? `${JSON.stringify(app, null, 2)}\n\nSync status (model:source):\n${JSON.stringify(syncStatus, null, 2)}`
+        : JSON.stringify(app, null, 2);
       return toolOk(`App "${app.name}" (${app.id}).`, {
-        details: JSON.stringify(app, null, 2),
-        data: { app },
+        details,
+        data: { app, ...(hasSyncStatus ? { syncStatus } : {}) },
       });
     },
   );
