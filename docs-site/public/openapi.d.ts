@@ -8164,6 +8164,7 @@ export interface paths {
                             requiresOAuth: true;
                             dcrSupported: boolean;
                             bearerMethodsSupported: string[] | null;
+                            tokenEndpointAuthMethodsSupported: string[] | null;
                         };
                     };
                 };

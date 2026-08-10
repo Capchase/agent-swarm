@@ -650,6 +650,62 @@ describe("MCP OAuth DCR client reuse", () => {
     expect(second.searchParams.get("client_id")).toBe(clientId);
   });
 
+  test("a failing exchange leaks no credential into the dashboard redirect or the log", async () => {
+    const server = createMcpServer({
+      name: "callback-redaction",
+      transport: "http",
+      url: MCP_URL,
+      scope: "swarm",
+    });
+
+    const first = await authorizeUrl(server.id);
+    const state = first.searchParams.get("state")!;
+
+    // The provider echoes every credential the exchange transmitted. Both
+    // callback sinks (console.error and error_description on the redirect)
+    // receive the thrown message verbatim, so none of these may survive.
+    const clientSecret = "secret-as-1.example.test-1";
+    const encodedSecret = new URLSearchParams({ v: clientSecret }).toString().slice(2);
+    const basicBlob = Buffer.from(
+      `${new URLSearchParams({ v: "client-as-1.example.test-1" }).toString().slice(2)}:${encodedSecret}`,
+    ).toString("base64");
+    const echoed = `${clientSecret} ${encodedSecret} ${basicBlob} auth-code`;
+
+    const priorFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const href = input.toString();
+      if (href === `https://${issuerHost}/token` && init?.method === "POST") {
+        return new Response(`{"error":"invalid_request","detail":"${echoed}"}`, { status: 400 });
+      }
+      return priorFetch(input as string, init);
+    }) as typeof fetch;
+
+    const errors: string[] = [];
+    const priorError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+
+    try {
+      const callbackRes = await dispatch(
+        `/api/mcp-oauth/callback?state=${encodeURIComponent(state)}&code=auth-code`,
+      );
+      expect(callbackRes.status).toBe(302);
+
+      const location = callbackRes.headers.location ?? "";
+      const description = new URL(location).searchParams.get("error_description") ?? "";
+      expect(description).toContain("Token exchange failed (400)");
+
+      for (const leak of [clientSecret, encodedSecret, basicBlob]) {
+        expect(description).not.toContain(leak);
+        expect(errors.join("\n")).not.toContain(leak);
+      }
+    } finally {
+      console.error = priorError;
+      globalThis.fetch = priorFetch;
+    }
+  });
+
   test("a callback in flight across the deploy exchanges with body-post, not Basic", async () => {
     const server = createMcpServer({
       name: "inflight-legacy-pending",

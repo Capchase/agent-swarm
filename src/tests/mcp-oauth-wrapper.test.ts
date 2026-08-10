@@ -641,6 +641,12 @@ describe("selectDcrTokenEndpointAuthMethod", () => {
     expect(selectDcrTokenEndpointAuthMethod(["none"])).toBe("none");
   });
 
+  test("an explicitly empty advertised list takes the RFC 8414 default, it is not an incompatibility", () => {
+    // Degenerate serialization, not a claim to support nothing. Erroring here
+    // would break such a provider outright for no safety gain.
+    expect(selectDcrTokenEndpointAuthMethod([])).toBe("client_secret_basic");
+  });
+
   test("throws when the AS advertises only methods we cannot perform", () => {
     // Silently registering a Basic client against an AS that offers only
     // private_key_jwt produces a client we can never authenticate, surfacing
@@ -749,6 +755,55 @@ describe("token-endpoint client authentication is applied per the registered met
     // alphanumerics plus *-._ and encodes everything else.
     expect(decoded).toBe("client+id%21:se+cret*%28a%29");
     expect(decoded).not.toContain("%20");
+  });
+
+  test("a SHORT client secret is redacted even though registerVolatileSecret ignores it", async () => {
+    // registerVolatileSecret drops values under its minimum length, and RFC
+    // 7591 sets no floor on a client_secret, so redaction cannot rely on it.
+    const shortSecret = "s3cr3t";
+    globalThis.fetch = async () =>
+      new Response(`{"error":"invalid_client","detail":"bad secret ${shortSecret}"}`, {
+        status: 401,
+      });
+
+    await exchangeCodeForTokens({
+      tokenUrl: "https://as.example.com/token",
+      clientId: "client-xyz",
+      clientSecret: shortSecret,
+      tokenEndpointAuthMethod: "client_secret_post",
+      redirectUri: "https://swarm.example.com/callback",
+      code: "authcode-1",
+      codeVerifier: "verifier-1",
+      resource: "https://mcp.example.com/",
+    }).catch((err: Error) => {
+      expect(err.message).toContain("Token exchange failed (401)");
+      expect(err.message).not.toContain(shortSecret);
+    });
+  });
+
+  test("the code, verifier and encoded credential forms are redacted too", async () => {
+    const secret = "se cret with spaces";
+    const encodedSecret = new URLSearchParams({ v: secret }).toString().slice(2);
+    const code = "authcode-echoed";
+    const verifier = "verifier-echoed";
+    globalThis.fetch = async () =>
+      new Response(`{"detail":"${encodedSecret} ${code} ${verifier}"}`, { status: 400 });
+
+    await exchangeCodeForTokens({
+      tokenUrl: "https://as.example.com/token",
+      clientId: "client-xyz",
+      clientSecret: secret,
+      tokenEndpointAuthMethod: "client_secret_basic",
+      redirectUri: "https://swarm.example.com/callback",
+      code,
+      codeVerifier: verifier,
+      resource: "https://mcp.example.com/",
+    }).catch((err: Error) => {
+      expect(err.message).not.toContain(encodedSecret);
+      expect(err.message).not.toContain(code);
+      expect(err.message).not.toContain(verifier);
+      expect(err.message).not.toContain(secret);
+    });
   });
 
   test("an upstream error body echoing the client secret is scrubbed before it is thrown", async () => {

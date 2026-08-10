@@ -19439,6 +19439,15 @@
                           "items": {
                             "type": "string"
                           }
+                        },
+                        "tokenEndpointAuthMethodsSupported": {
+                          "type": [
+                            "array",
+                            "null"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
                         }
                       },
                       "required": [
@@ -19451,7 +19460,8 @@
                         "scopes",
                         "requiresOAuth",
                         "dcrSupported",
-                        "bearerMethodsSupported"
+                        "bearerMethodsSupported",
+                        "tokenEndpointAuthMethodsSupported"
                       ]
                     }
                   ]

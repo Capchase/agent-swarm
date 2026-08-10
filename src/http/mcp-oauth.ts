@@ -102,6 +102,7 @@ const DiscoveryResultSchema = z.object({
   requiresOAuth: z.literal(true),
   dcrSupported: z.boolean(),
   bearerMethodsSupported: z.array(z.string()).nullable(),
+  tokenEndpointAuthMethodsSupported: z.array(z.string()).nullable(),
 });
 
 const MetadataResponseSchema = z.union([
