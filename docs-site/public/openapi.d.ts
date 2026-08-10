@@ -8586,6 +8586,8 @@ export interface paths {
                         /** Format: uri */
                         revocationUrl?: string;
                         scopes?: string[];
+                        /** @enum {string} */
+                        tokenEndpointAuthMethod?: "client_secret_basic" | "client_secret_post" | "none";
                     };
                 };
             };
