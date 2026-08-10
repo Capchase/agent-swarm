@@ -364,12 +364,20 @@ function formUrlEncodeComponent(value: string): string {
  * values shorter than its minimum length, and RFC 7591 sets no floor on a
  * `client_secret`. A provider echoing a short secret, or the form-encoded
  * form of a longer one, would otherwise pass straight through.
+ *
+ * Every value is redacted in BOTH its raw and its form-encoded shape. Anything
+ * we put in a `URLSearchParams` body travels percent-encoded (a token like
+ * `a+b/c=` is sent as `a%2Bb%2Fc%3D`), so a provider that echoes its received
+ * body back would otherwise leak the encoded form. Doing it here rather than
+ * at each call site means a new sensitive field cannot forget one shape.
  */
 function redactSentCredentials(text: string, sent: Array<string | null | undefined>): string {
   let out = scrubSecrets(text);
   for (const value of sent) {
     if (!value) continue;
-    out = out.split(value).join("[REDACTED]");
+    for (const shape of new Set([value, formUrlEncodeComponent(value)])) {
+      out = out.split(shape).join("[REDACTED]");
+    }
   }
   return out;
 }

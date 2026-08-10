@@ -806,6 +806,73 @@ describe("token-endpoint client authentication is applied per the registered met
     });
   });
 
+  test("form-encoded code and verifier are redacted when they contain reserved characters", async () => {
+    // A base64ish code like "a+b/c=" travels as "a%2Bb%2Fc%3D". Redacting only
+    // the raw value leaves the echoed body untouched. Earlier tests used
+    // URL-safe values, so they could not catch this.
+    const code = "a+b/c=";
+    const verifier = "v+e/r=";
+    const encode = (v: string) => new URLSearchParams({ v }).toString().slice(2);
+    globalThis.fetch = async () =>
+      new Response(`{"detail":"code=${encode(code)}&code_verifier=${encode(verifier)}"}`, {
+        status: 400,
+      });
+
+    await exchangeCodeForTokens({
+      tokenUrl: "https://as.example.com/token",
+      clientId: "client-xyz",
+      clientSecret: "secret-xyz",
+      tokenEndpointAuthMethod: "client_secret_post",
+      redirectUri: "https://swarm.example.com/callback",
+      code,
+      codeVerifier: verifier,
+      resource: "https://mcp.example.com/",
+    }).catch((err: Error) => {
+      expect(err.message).not.toContain(encode(code));
+      expect(err.message).not.toContain(encode(verifier));
+      expect(err.message).not.toContain(code);
+      expect(err.message).not.toContain(verifier);
+    });
+  });
+
+  test("a form-encoded refresh token is redacted on a failed refresh", async () => {
+    const refreshToken = "rt+slash/eq=";
+    const encoded = new URLSearchParams({ v: refreshToken }).toString().slice(2);
+    globalThis.fetch = async () =>
+      new Response(`{"detail":"refresh_token=${encoded}"}`, { status: 400 });
+
+    await refreshMcpToken({
+      tokenUrl: "https://as.example.com/token",
+      clientId: "client-xyz",
+      clientSecret: "secret-xyz",
+      tokenEndpointAuthMethod: "client_secret_post",
+      refreshToken,
+      resource: "https://mcp.example.com/",
+    }).catch((err: Error) => {
+      expect(err.message).toContain("Token refresh failed (400)");
+      expect(err.message).not.toContain(encoded);
+      expect(err.message).not.toContain(refreshToken);
+    });
+  });
+
+  test("a form-encoded revoked token is redacted on a failed revocation", async () => {
+    const token = "tok+slash/eq=";
+    const encoded = new URLSearchParams({ v: token }).toString().slice(2);
+    globalThis.fetch = async () => new Response(`{"detail":"token=${encoded}"}`, { status: 400 });
+
+    await revokeMcpToken({
+      revocationUrl: "https://as.example.com/revoke",
+      token,
+      clientId: "client-xyz",
+      clientSecret: "secret-xyz",
+      tokenEndpointAuthMethod: "client_secret_post",
+    }).catch((err: Error) => {
+      expect(err.message).toContain("Token revocation failed (400)");
+      expect(err.message).not.toContain(encoded);
+      expect(err.message).not.toContain(token);
+    });
+  });
+
   test("an upstream error body echoing the client secret is scrubbed before it is thrown", async () => {
     // The callback logs this message AND reflects it into the dashboard
     // redirect as error_description, so an echoed credential would escape.
