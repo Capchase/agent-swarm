@@ -1016,12 +1016,14 @@ export async function handleMcpOAuth(
       let authorizationServerIssuer = overrides.authorizationServerIssuer ?? null;
       let resourceUrl = server.url!;
       let scopes = overrides.scopes ?? [];
-      // Same rule as DCR: an explicit value from the caller wins; otherwise
-      // infer from discovered AS metadata; otherwise fall back to the RFC
-      // 7591 §2 default (client_secret_basic) rather than assuming body-post.
+      // Only an explicit value from the caller is authoritative here. Unlike
+      // DCR, we never register this client, so the AS's advertised list says
+      // what the SERVER accepts, not which method THIS out-of-band client was
+      // assigned. See the fallback below.
       let tokenEndpointAuthMethod = overrides.tokenEndpointAuthMethod
         ? normalizeTokenEndpointAuthMethod(overrides.tokenEndpointAuthMethod)
         : undefined;
+      let advertisedAuthMethods: string[] | null = null;
 
       if (!authorizeUrl || !tokenUrl) {
         const discovery = await discoverForMcp(server.url!);
@@ -1040,18 +1042,28 @@ export async function handleMcpOAuth(
           authorizationServerIssuer ?? discovery.authorizationServerIssuer;
         resourceUrl = discovery.resourceUrl;
         if (scopes.length === 0) scopes = discovery.scopes;
-        tokenEndpointAuthMethod =
-          tokenEndpointAuthMethod ??
-          selectDcrTokenEndpointAuthMethod(
-            discovery.tokenEndpointAuthMethodsSupported ?? undefined,
-          );
+        advertisedAuthMethods = discovery.tokenEndpointAuthMethodsSupported;
       }
-      // Still unset means the caller omitted it AND discovery never ran (both
-      // endpoints were supplied). The dashboard posts no method, so defaulting
-      // to Basic here would break every UI-created manual client that works
-      // today on body-post. Keep the legacy behavior; an explicit request or a
-      // discovered value both still win.
-      tokenEndpointAuthMethod = authMethodForStoredClient(tokenEndpointAuthMethod);
+
+      if (!tokenEndpointAuthMethod) {
+        // The caller stated no method. A manual client is registered out of
+        // band, so nothing here tells us which method the provider assigned to
+        // it, and the dashboard still submits no method while allowing the
+        // endpoints to be omitted. Inferring from AS metadata would switch a
+        // pre-registered client that works on body-post over to Basic purely
+        // because the server also supports Basic, so keep the legacy default.
+        //
+        // The one exception is an AS that advertises a non-empty list without
+        // body-post: there the legacy default is knowably broken, so defer to
+        // what the server says it accepts.
+        const postUnsupported =
+          advertisedAuthMethods !== null &&
+          advertisedAuthMethods.length > 0 &&
+          !advertisedAuthMethods.includes("client_secret_post");
+        tokenEndpointAuthMethod = postUnsupported
+          ? selectDcrTokenEndpointAuthMethod(advertisedAuthMethods ?? undefined)
+          : authMethodForStoredClient(undefined);
+      }
 
       if (!authorizationServerIssuer) {
         jsonError(
