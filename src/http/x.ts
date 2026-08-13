@@ -12,6 +12,8 @@ import {
   getScriptApiSecret,
   getScriptById,
   recordScriptApiUsage,
+  restoreScratchScriptLastUsedIfUnchanged,
+  touchScratchScriptLastUsed,
 } from "../be/scripts/db";
 import {
   MAX_SCRIPT_WALL_CLOCK_MS,
@@ -228,6 +230,10 @@ export async function handleX(
   const timeoutMs = resolveTimeoutMs(req);
   const startedAt = new Date().toISOString();
 
+  // Touch before executing so an already-stale scratch script isn't reaped by
+  // the retention sweep while this run is still in flight.
+  const runStartTouch = script.isScratch ? touchScratchScriptLastUsed(script.id) : null;
+
   const credentials = await buildScriptCredentialBindingsWithFailures({
     agentId: endpoint.agentId,
   });
@@ -250,6 +256,14 @@ export async function handleX(
 
   const ok = output.exitCode === 0 && !output.error && !output.runtimeError;
   const error = ok ? null : buildExecutionError(output);
+  if (ok) {
+    touchScratchScriptLastUsed(script.id);
+  } else if (script.isScratch && runStartTouch) {
+    // Failed run — restore the pre-run timestamp so it doesn't buy the
+    // script another retention window, unless a concurrent run already
+    // touched it since.
+    restoreScratchScriptLastUsedIfUnchanged(script.id, script.updatedAt, runStartTouch);
+  }
 
   // Usage + observability — best-effort, must never fail the response.
   try {

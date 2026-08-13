@@ -226,11 +226,17 @@ export async function upsertScriptByName(args: ScriptWriteArgs): Promise<UpsertS
       args.signatureJson !== existing.signatureJson ||
       argsJsonSchema !== existing.argsJsonSchema;
     const promotedFromScratch = existing.isScratch && !isScratch;
+    const refreshScratchLastUsed =
+      existing.scope === "agent" &&
+      existing.name.startsWith("scratch-") &&
+      existing.isScratch &&
+      isScratch;
     if (
       fsMode !== existing.fsMode ||
       isScratch !== existing.isScratch ||
       typeChecked !== existing.typeChecked ||
-      trackedMetadataChanged
+      trackedMetadataChanged ||
+      refreshScratchLastUsed
     ) {
       const row = getDb()
         .prepare<
@@ -464,6 +470,42 @@ export function deleteScript(args: ScriptIdentity): boolean {
 
   const result = getDb().run("DELETE FROM scripts WHERE id = ?", [existing.id]);
   return result.changes > 0;
+}
+
+/** Bumps updatedAt and returns the timestamp actually written, or null if the row didn't match. */
+export function touchScratchScriptLastUsed(
+  id: string,
+  at: string = new Date().toISOString(),
+): string | null {
+  const result = getDb()
+    .prepare(
+      `UPDATE scripts SET updatedAt = ?
+       WHERE id = ? AND scope = 'agent' AND isScratch = 1 AND name GLOB 'scratch-*'`,
+    )
+    .run(at, id);
+  return result.changes > 0 ? at : null;
+}
+
+/**
+ * Rolls back an in-flight run-start touch after the run turns out to have
+ * failed, so a failed invocation doesn't extend the retention window the way
+ * a successful one does. Only applies if nothing has touched the row since
+ * (CAS on updatedAt) — a concurrent run's touch, in-flight or successful,
+ * always wins over this rollback.
+ */
+export function restoreScratchScriptLastUsedIfUnchanged(
+  id: string,
+  priorUpdatedAt: string,
+  expectedUpdatedAt: string,
+): boolean {
+  return (
+    getDb()
+      .prepare(
+        `UPDATE scripts SET updatedAt = ?
+         WHERE id = ? AND scope = 'agent' AND isScratch = 1 AND name GLOB 'scratch-*' AND updatedAt = ?`,
+      )
+      .run(priorUpdatedAt, id, expectedUpdatedAt).changes > 0
+  );
 }
 
 // ─── External script APIs (script_apis) ──────────────────────────────────────
