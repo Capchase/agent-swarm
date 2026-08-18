@@ -1,8 +1,15 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { unlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { closeDb, createAgent, getAgentById, getLatestContextVersion, initDb } from "../be/db";
+import {
+  closeDb,
+  createAgent,
+  deleteAgent,
+  getAgentById,
+  getLatestContextVersion,
+  initDb,
+} from "../be/db";
 import { registerUpdateProfileTool } from "../tools/update-profile";
+import { SOUL_MD_MAX_CHARS } from "../utils/identity-field-budget";
 
 const TEST_DB_PATH = "./test-update-profile-auth.sqlite";
 
@@ -54,7 +61,7 @@ describe("update-profile authorization", () => {
   beforeAll(async () => {
     for (const suffix of ["", "-wal", "-shm"]) {
       try {
-        await unlink(TEST_DB_PATH + suffix);
+        await Bun.file(TEST_DB_PATH + suffix).delete();
       } catch {
         // File doesn't exist
       }
@@ -75,7 +82,7 @@ describe("update-profile authorization", () => {
     closeDb();
     for (const suffix of ["", "-wal", "-shm"]) {
       try {
-        await unlink(TEST_DB_PATH + suffix);
+        await Bun.file(TEST_DB_PATH + suffix).delete();
       } catch {
         // ignore
       }
@@ -208,6 +215,21 @@ describe("update-profile authorization", () => {
     expect(agent?.setupScript).toBe(before);
   });
 
+  test("rejected combined name and identity update leaves the name unchanged", async () => {
+    const before = getAgentById(WORKER_ID);
+
+    const result = await callUpdateProfile(server, WORKER_ID, {
+      name: "Partially Renamed Worker",
+      soulMd: "x".repeat(SOUL_MD_MAX_CHARS + 1),
+    });
+
+    expect(result.structuredContent.success).toBe(false);
+    expect(result.structuredContent.message).toContain("Update rejected for soulMd");
+    const after = getAgentById(WORKER_ID);
+    expect(after?.name).toBe(before?.name);
+    expect(after?.soulMd).toBe(before?.soulMd);
+  });
+
   test("logs setupScript audit diff for accepted updates", async () => {
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
 
@@ -225,6 +247,28 @@ describe("update-profile authorization", () => {
       expect(log).toContain("+echo audit-test");
     } finally {
       warnSpy.mockRestore();
+    }
+  });
+
+  test("missing self agent does not write supplied profile files", async () => {
+    const originalAgentId = process.env.AGENT_ID;
+    const writeSpy = spyOn(Bun, "write").mockImplementation(async () => 0);
+
+    try {
+      process.env.AGENT_ID = WORKER_ID;
+      expect(deleteAgent(WORKER_ID)).toBe(true);
+
+      const result = await callUpdateProfile(server, WORKER_ID, {
+        soulMd: "must not reach the workspace",
+      });
+
+      expect(result.structuredContent.success).toBe(false);
+      expect(result.structuredContent.message).toContain("Agent not found");
+      expect(writeSpy).not.toHaveBeenCalled();
+    } finally {
+      writeSpy.mockRestore();
+      if (originalAgentId === undefined) delete process.env.AGENT_ID;
+      else process.env.AGENT_ID = originalAgentId;
     }
   });
 });

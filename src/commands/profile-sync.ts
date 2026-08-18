@@ -2,7 +2,7 @@
  * Harness-agnostic FS → DB profile sync (worker-side, HTTP-only).
  *
  * Persists an agent's self-editable identity / config files back to the API:
- *   - SOUL.md / IDENTITY.md / TOOLS.md / HEARTBEAT.md  (bundled identity POST)
+ *   - SOUL.md / IDENTITY.md / TOOLS.md / HEARTBEAT.md  (independent POSTs)
  *   - ~/.claude/CLAUDE.md                              (claude POST)
  *   - /workspace/start-up.sh (agent-managed section)   (setup POST)
  *
@@ -168,9 +168,23 @@ export function resolveClaudeMdPath(completedProviders: readonly string[]): stri
 }
 
 /** A single profile-update POST body, tagged with a label for logging. */
-interface ProfilePayload {
+export interface ProfilePayload {
   label: string;
-  body: Record<string, unknown>;
+  body: Record<string, string>;
+}
+
+/**
+ * Keep identity-file sync independent: one rejected ratcheting-budget write
+ * must not discard valid edits to other files from the same session.
+ */
+export function buildIndependentIdentityPayloads(
+  updates: Record<string, string>,
+  changeSource: ProfileChangeSource,
+): ProfilePayload[] {
+  return Object.entries(updates).map(([field, value]) => ({
+    label: `identity.${field}`,
+    body: { [field]: value, changeSource },
+  }));
 }
 
 /**
@@ -229,8 +243,6 @@ export function buildIdentityPayload(
     const content = files.soulMd;
     if (baselines?.soulMd && contentSha256(content) === baselines.soulMd) {
       // File unchanged during session — skip to preserve Lead's DB edits
-    } else if (content.length > MAX_PROFILE_FILE_LENGTH) {
-      warnProfileFileTooLarge(agentId, "soulMd", content.length);
     } else if (content.trim()) {
       if (content.length < IDENTITY_FILE_MIN_LENGTH) {
         console.error(
@@ -246,8 +258,6 @@ export function buildIdentityPayload(
     const content = files.identityMd;
     if (baselines?.identityMd && contentSha256(content) === baselines.identityMd) {
       // File unchanged during session — skip to preserve Lead's DB edits
-    } else if (content.length > MAX_PROFILE_FILE_LENGTH) {
-      warnProfileFileTooLarge(agentId, "identityMd", content.length);
     } else if (content.trim()) {
       if (content.length < IDENTITY_FILE_MIN_LENGTH) {
         console.error(
@@ -263,8 +273,6 @@ export function buildIdentityPayload(
     const content = files.toolsMd;
     if (baselines?.toolsMd && contentSha256(content) === baselines.toolsMd) {
       // File unchanged during session — skip
-    } else if (content.length > MAX_PROFILE_FILE_LENGTH) {
-      warnProfileFileTooLarge(agentId, "toolsMd", content.length);
     } else if (content.trim()) {
       updates.toolsMd = content;
     }
@@ -331,16 +339,12 @@ export async function collectProfilePayloads(
       baselines,
       agentId,
     );
-    if (Object.keys(updates).length > 0) {
-      payloads.push({ label: "identity", body: { ...updates, changeSource } });
-    }
+    payloads.push(...buildIndependentIdentityPayloads(updates, changeSource));
   }
 
   if (fields.includes("claude")) {
     const raw = await readFile(claudeMdPath);
-    if (raw && raw.length > MAX_PROFILE_FILE_LENGTH) {
-      warnProfileFileTooLarge(agentId, "claudeMd", raw.length);
-    } else if (raw?.trim()) {
+    if (raw?.trim()) {
       if (baselines?.claudeMd && contentSha256(raw) === baselines.claudeMd) {
         // CLAUDE.md unchanged during session — skip to preserve Lead's DB edits
       } else {

@@ -127,6 +127,11 @@ import {
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
+import {
+  type BudgetedIdentityField,
+  checkIdentityFieldBudget,
+  IdentityFieldBudgetError,
+} from "../utils/identity-field-budget";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { auditAssetKeys, enforceAssetKeyStartupAudit } from "./asset-key-audit";
@@ -430,6 +435,13 @@ const VERSIONABLE_FIELDS: VersionableField[] = [
   "claudeMd",
   "setupScript",
   "heartbeatMd",
+];
+
+const BUDGETED_IDENTITY_FIELDS: BudgetedIdentityField[] = [
+  "soulMd",
+  "identityMd",
+  "claudeMd",
+  "toolsMd",
 ];
 
 function ensureAgentProfileColumns(database: Database): void {
@@ -5586,6 +5598,7 @@ export {
 export function updateAgentProfile(
   id: string,
   updates: {
+    name?: string;
     description?: string;
     role?: string;
     capabilities?: string[];
@@ -5608,6 +5621,25 @@ export function updateAgentProfile(
       .prepare<AgentRow, [string]>("SELECT * FROM agents WHERE id = ?")
       .get(id);
     if (!current) return null;
+
+    for (const field of BUDGETED_IDENTITY_FIELDS) {
+      const nextValue = updates[field];
+      if (nextValue === undefined) continue;
+
+      const result = checkIdentityFieldBudget({
+        field,
+        currentValue: current[field] ?? "",
+        nextValue,
+      });
+      if (!result.ok) throw new IdentityFieldBudgetError(result.reason);
+    }
+
+    if (updates.name !== undefined) {
+      const existingAgent = database
+        .prepare<AgentRow, [string, string]>("SELECT * FROM agents WHERE name = ? AND id != ?")
+        .get(updates.name, id);
+      if (existingAgent) throw new Error("Agent name already exists");
+    }
 
     // Create context versions for changed fields
     for (const field of VERSIONABLE_FIELDS) {
@@ -5661,6 +5693,7 @@ export function updateAgentProfile(
           string | null,
           string | null,
           string | null,
+          string | null,
           number,
           string | null,
           string,
@@ -5668,6 +5701,7 @@ export function updateAgentProfile(
         ]
       >(
         `UPDATE agents SET
+          name = COALESCE(?, name),
           description = COALESCE(?, description),
           role = COALESCE(?, role),
           capabilities = COALESCE(?, capabilities),
@@ -5682,6 +5716,7 @@ export function updateAgentProfile(
          WHERE id = ? RETURNING *`,
       )
       .get(
+        updates.name ?? null,
         updates.description ?? null,
         updates.role ?? null,
         updates.capabilities ? JSON.stringify(updates.capabilities) : null,
@@ -5702,23 +5737,7 @@ export function updateAgentProfile(
 }
 
 export function updateAgentName(id: string, newName: string): Agent | null {
-  // Check if another agent already has this name
-  const existingAgent = getDb()
-    .prepare<AgentRow, [string, string]>("SELECT * FROM agents WHERE name = ? AND id != ?")
-    .get(newName, id);
-
-  if (existingAgent) {
-    throw new Error("Agent name already exists");
-  }
-
-  const now = new Date().toISOString();
-  const row = getDb()
-    .prepare<AgentRow, [string, string, string]>(
-      "UPDATE agents SET name = ?, lastUpdatedAt = ? WHERE id = ? RETURNING *",
-    )
-    .get(newName, now, id);
-
-  return row ? rowToAgent(row) : null;
+  return updateAgentProfile(id, { name: newName });
 }
 
 // ============================================================================
