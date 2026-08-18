@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { ensure } from "@desplega.ai/business-use";
 import { z } from "zod";
 import {
+  computeContentHash,
   createAgent,
   deleteSwarmConfigByKey,
   getAgentById,
@@ -22,6 +23,7 @@ import {
   updateAgentStatus,
   upsertSwarmConfig,
 } from "../be/db";
+import { createEvent } from "../be/events";
 import { reasoningCapability } from "../providers/reasoning-effort";
 import { ALL_CAPABILITIES, getEnabledCapabilities } from "../server";
 import { telemetry } from "../telemetry";
@@ -38,7 +40,12 @@ import {
   ReasoningEffortSchema,
 } from "../types";
 import { MAX_PROFILE_FILE_LENGTH } from "../utils/constants";
-import { IdentityFieldBudgetError } from "../utils/identity-field-budget";
+import {
+  type BudgetedIdentityField,
+  IDENTITY_FIELD_BUDGETS,
+  IdentityFieldBudgetError,
+} from "../utils/identity-field-budget";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { route } from "./route-def";
 import { agentWithCapacity, json, jsonError } from "./utils";
 
@@ -218,6 +225,15 @@ const getAgentSetupScript = route({
   },
 });
 
+const ProfileSyncRejectionSchema = z.object({
+  field: z.enum(["soulMd", "identityMd", "claudeMd", "toolsMd"]),
+  diskSize: z.number().int(),
+  dbSize: z.number().int(),
+  budget: z.number().int(),
+  delta: z.number().int(),
+  reason: z.string(),
+});
+
 const updateAgentProfileRoute = route({
   method: "put",
   path: "/api/agents/{id}/profile",
@@ -243,7 +259,13 @@ const updateAgentProfileRoute = route({
   }),
   responses: {
     200: { description: "Profile updated", schema: AgentWithCapacitySchema },
-    400: { description: "Validation error" },
+    400: {
+      description: "Validation or identity-field budget error",
+      schema: z.object({
+        error: z.string(),
+        profileSyncRejection: ProfileSyncRejectionSchema.optional(),
+      }),
+    },
     404: { description: "Agent not found" },
   },
 });
@@ -569,7 +591,35 @@ export async function handleAgentsRest(
       );
     } catch (error) {
       if (error instanceof IdentityFieldBudgetError) {
-        jsonError(res, error.message, 400);
+        if (
+          versionMeta?.changeSource === "self_edit" ||
+          versionMeta?.changeSource === "session_sync"
+        ) {
+          try {
+            createEvent({
+              category: "system",
+              event: "system.profile_sync_rejected",
+              status: "error",
+              source: "api",
+              agentId: parsed.params.id,
+              data: {
+                ...error.rejection,
+                dbHash: error.dbHash,
+                diskHash: error.diskHash,
+                changeSource: versionMeta.changeSource,
+              },
+            });
+          } catch (eventError) {
+            const message = eventError instanceof Error ? eventError.message : String(eventError);
+            console.error(
+              scrubSecrets(`[profile-sync] Failed to persist budget rejection event: ${message}`),
+            );
+          }
+        }
+        updateAgentProfileRoute.respond(res, 400, {
+          error: error.message,
+          profileSyncRejection: error.rejection,
+        });
         return true;
       }
       throw error;
@@ -578,6 +628,31 @@ export async function handleAgentsRest(
     if (!agent) {
       jsonError(res, "Agent not found", 404);
       return true;
+    }
+
+    if (versionMeta?.changeSource === "self_edit" || versionMeta?.changeSource === "session_sync") {
+      try {
+        for (const field of Object.keys(IDENTITY_FIELD_BUDGETS) as BudgetedIdentityField[]) {
+          if (body[field] === undefined) continue;
+          createEvent({
+            category: "system",
+            event: "system.profile_sync_reconciled",
+            status: "ok",
+            source: "api",
+            agentId: parsed.params.id,
+            data: {
+              field,
+              dbHash: computeContentHash(agent[field] ?? ""),
+              changeSource: versionMeta.changeSource,
+            },
+          });
+        }
+      } catch (eventError) {
+        const message = eventError instanceof Error ? eventError.message : String(eventError);
+        console.error(
+          scrubSecrets(`[profile-sync] Failed to persist reconciliation event: ${message}`),
+        );
+      }
     }
 
     updateAgentProfileRoute.respond(res, 200, agentWithCapacity(agent));

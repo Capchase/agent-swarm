@@ -7,6 +7,8 @@ import {
   contentSha256,
   extractSetupScriptContent,
   type FileReader,
+  findProfileDivergences,
+  HEARTBEAT_MD_PATH,
   IDENTITY_BASELINES_PATH,
   IDENTITY_MD_PATH,
   type IdentityBaselines,
@@ -18,13 +20,191 @@ import {
   TOOLS_MD_PATH,
   WORKSPACE_CLAUDE_MD_PATH,
 } from "../commands/profile-sync";
+import { profileSyncAuditExitCode, runProfileSyncAudit } from "../commands/profile-sync-audit";
 import { MAX_PROFILE_FILE_LENGTH } from "../utils/constants";
+import { IDENTITY_FIELD_BUDGETS } from "../utils/identity-field-budget";
 
 const MARKER_START = "# === Agent-managed setup (from DB) ===";
 const MARKER_END = "# === End agent-managed setup ===";
 
 // A SOUL/IDENTITY body long enough to clear the 500-char min-length guard.
 const LONG = "x".repeat(600);
+
+describe("profile divergence audit", () => {
+  test("compares all four budgeted fields plus ungated heartbeatMd", () => {
+    const divergences = findProfileDivergences(
+      {
+        soulMd: "disk soul",
+        identityMd: "disk identity",
+        claudeMd: "disk claude",
+        toolsMd: "disk tools",
+        heartbeatMd: "disk heartbeat",
+      },
+      {
+        soulMd: "db soul",
+        identityMd: "db identity",
+        claudeMd: "db claude",
+        toolsMd: "db tools",
+        heartbeatMd: "db heartbeat",
+      },
+    );
+
+    expect(divergences.map((entry) => entry.field)).toEqual([
+      "soulMd",
+      "identityMd",
+      "claudeMd",
+      "toolsMd",
+      "heartbeatMd",
+    ]);
+    expect(divergences[0]?.budget).toBe(IDENTITY_FIELD_BUDGETS.soulMd);
+    expect(divergences[2]?.budget).toBe(IDENTITY_FIELD_BUDGETS.claudeMd);
+    expect(divergences[4]?.budget).toBeNull();
+    expect(divergences[4]?.diskSize).toBe("disk heartbeat".length);
+    expect(divergences[4]?.dbSize).toBe("db heartbeat".length);
+  });
+
+  test("fetches the DB profile and reads the canonical local paths", async () => {
+    const local = {
+      [SOUL_MD_PATH]: "same soul",
+      [IDENTITY_MD_PATH]: "disk identity",
+      [WORKSPACE_CLAUDE_MD_PATH]: "same claude",
+      [TOOLS_MD_PATH]: "same tools",
+      [HEARTBEAT_MD_PATH]: "disk heartbeat",
+    };
+    const readFile: FileReader = async (path) => local[path as keyof typeof local];
+    let request: Request | null = null;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      request = new Request(input, init);
+      return new Response(
+        JSON.stringify({
+          soulMd: "same soul",
+          identityMd: "db identity",
+          claudeMd: "same claude",
+          toolsMd: "same tools",
+          heartbeatMd: "db heartbeat",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await runProfileSyncAudit(
+      {
+        agentId: "agent-1",
+        apiUrl: "https://api.example.test",
+        apiKey: "secret-key",
+        claudeMdPath: WORKSPACE_CLAUDE_MD_PATH,
+      },
+      { fetchImpl, readFile },
+    );
+
+    expect(request?.url).toBe("https://api.example.test/me");
+    expect(request?.headers.get("X-Agent-ID")).toBe("agent-1");
+    expect(result.divergences.map((entry) => entry.field)).toEqual(["identityMd", "heartbeatMd"]);
+  });
+
+  test("uses the registered effective provider to select the Claude profile path", async () => {
+    const readPaths: string[] = [];
+    const readFile: FileReader = async (path) => {
+      readPaths.push(path);
+      return "same";
+    };
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({
+          harnessProvider: "codex",
+          soulMd: "same",
+          identityMd: "same",
+          claudeMd: "same",
+          toolsMd: "same",
+          heartbeatMd: "same",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+
+    const result = await runProfileSyncAudit(
+      {
+        agentId: "agent-codex",
+        apiUrl: "https://api.example.test",
+        apiKey: "secret-key",
+      },
+      { fetchImpl, readFile },
+    );
+
+    expect(result.divergences).toEqual([]);
+    expect(readPaths).toContain(WORKSPACE_CLAUDE_MD_PATH);
+    expect(readPaths).not.toContain(CLAUDE_MD_PATH);
+  });
+
+  test("refuses to guess the audit path when no effective provider is registered", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+
+    expect(
+      runProfileSyncAudit(
+        {
+          agentId: "agent-unregistered",
+          apiUrl: "https://api.example.test",
+          apiKey: "secret-key",
+        },
+        { fetchImpl, readFile: async () => undefined },
+      ),
+    ).rejects.toThrow("registered harness provider");
+  });
+
+  test("treats profile fields absent on disk and empty in the DB as equal", async () => {
+    const readFile: FileReader = async () => undefined;
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ soulMd: "" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+
+    const result = await runProfileSyncAudit(
+      {
+        agentId: "agent-unset",
+        apiUrl: "https://api.example.test",
+        apiKey: "secret-key",
+        claudeMdPath: WORKSPACE_CLAUDE_MD_PATH,
+      },
+      { fetchImpl, readFile },
+    );
+
+    expect(result.divergences).toEqual([]);
+    expect(profileSyncAuditExitCode(result.divergences)).toBe(0);
+  });
+
+  test("reports a missing local file when the DB value is non-empty", () => {
+    const divergences = findProfileDivergences(
+      {
+        soulMd: undefined,
+        identityMd: "same identity",
+        claudeMd: "same claude",
+        toolsMd: "same tools",
+        heartbeatMd: "same heartbeat",
+      },
+      {
+        soulMd: "stored soul",
+        identityMd: "same identity",
+        claudeMd: "same claude",
+        toolsMd: "same tools",
+        heartbeatMd: "same heartbeat",
+      },
+    );
+
+    expect(divergences).toHaveLength(1);
+    expect(divergences[0]).toMatchObject({
+      field: "soulMd",
+      diskMissing: true,
+      diskSize: null,
+      diskHash: null,
+      dbSize: "stored soul".length,
+      delta: null,
+    });
+  });
+});
 
 describe("extractSetupScriptContent (marker extraction)", () => {
   test("extracts ONLY the content between the agent-managed markers", () => {
