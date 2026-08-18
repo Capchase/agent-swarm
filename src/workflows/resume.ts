@@ -13,6 +13,7 @@ import {
   updateWorkflowRun,
   updateWorkflowRunStep,
 } from "../be/db";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { checkpointStep } from "./checkpoint";
 import { FAILED_TASK_OUTPUT_PREFIX } from "./constants";
 import { getSuccessors } from "./definition";
@@ -51,9 +52,9 @@ export function setupWorkflowResumeListener(
   registry: ExecutorRegistry,
 ): void {
   eventBus.on("task.completed", async (data: unknown) => {
-    const event = data as TaskEvent;
-    if (!event.workflowRunId || !event.workflowRunStepId) return;
     try {
+      const event = data as TaskEvent;
+      if (!event.workflowRunId || !event.workflowRunStepId) return;
       await resumeFromTaskCompletion(event, registry);
     } catch (err) {
       console.error("[workflows] Resume from task completion failed:", err);
@@ -61,9 +62,9 @@ export function setupWorkflowResumeListener(
   });
 
   eventBus.on("task.failed", async (data: unknown) => {
-    const event = data as TaskEvent;
-    if (!event.workflowRunId || !event.workflowRunStepId) return;
     try {
+      const event = data as TaskEvent;
+      if (!event.workflowRunId || !event.workflowRunStepId) return;
       await handleTaskFailure(event, event.failureReason ?? "Task failed", registry);
     } catch (err) {
       console.error("[workflows] Handle task failure error:", err);
@@ -71,9 +72,9 @@ export function setupWorkflowResumeListener(
   });
 
   eventBus.on("task.cancelled", async (data: unknown) => {
-    const event = data as TaskEvent;
-    if (!event.workflowRunId || !event.workflowRunStepId) return;
     try {
+      const event = data as TaskEvent;
+      if (!event.workflowRunId || !event.workflowRunStepId) return;
       await handleTaskFailure(event, "Task was cancelled", registry);
     } catch (err) {
       console.error("[workflows] Handle task cancellation error:", err);
@@ -81,9 +82,9 @@ export function setupWorkflowResumeListener(
   });
 
   eventBus.on("approval.resolved", async (data: unknown) => {
-    const event = data as ApprovalEvent;
-    if (!event.workflowRunId || !event.workflowRunStepId) return;
     try {
+      const event = data as ApprovalEvent;
+      if (!event.workflowRunId || !event.workflowRunStepId) return;
       await resumeFromApprovalResolution(event, registry);
     } catch (err) {
       console.error("[workflows] Resume from approval resolution failed:", err);
@@ -589,9 +590,16 @@ function registerWait(waitId: string, eventName: string): void {
 
   if (!listenersByEvent.has(eventName)) {
     const listener = (data: unknown) => {
-      // Fire-and-forget: don't block the bus thread. Errors are logged
-      // per-wait inside processBusEvent.
-      void processBusEvent(eventName, data);
+      // Fire-and-forget: don't block the bus thread. Per-wait errors are
+      // logged inside processBusEvent's loop, but the code around that loop
+      // is not covered by it — and the emitter cannot observe this promise,
+      // since EventEmitter discards whatever a listener returns.
+      processBusEvent(eventName, data).catch((err) => {
+        console.error(
+          `[workflows] Wait bus listener failed for event=${eventName}:`,
+          scrubSecrets(err instanceof Error ? err.message : String(err)),
+        );
+      });
     };
     listenersByEvent.set(eventName, listener);
     workflowEventBus.on(eventName, listener);

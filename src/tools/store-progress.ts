@@ -24,6 +24,7 @@ import {
 import { createWorkerTaskFollowUp } from "@/tasks/worker-follow-up";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import { AgentTaskStatusSchema, AttachmentInputSchema, isTerminalTaskStatus } from "@/types";
+import { scrubSecrets } from "../utils/secret-scrubber";
 
 // Phase 11: the `cost` / `costData` field was removed from this tool's input
 // schema. Adapters (claude/codex/pi/opencode/devin/claude-managed) are the
@@ -400,7 +401,12 @@ export const registerStoreProgressTool = (server: McpServer) => {
           } catch {
             // Non-blocking — task completion memory failure should not affect task status
           }
-        })();
+        })().catch((err) =>
+          console.error(
+            "[store-progress] task completion memory write failed:",
+            scrubSecrets(err instanceof Error ? err.message : String(err)),
+          ),
+        );
       }
 
       if (shouldRunTerminalSideEffects) {
@@ -436,7 +442,12 @@ export const registerStoreProgressTool = (server: McpServer) => {
               err instanceof Error ? err.message : String(err),
             );
           }
-        })();
+        })().catch((err) =>
+          console.error(
+            "[store-progress] server rater run failed:",
+            scrubSecrets(err instanceof Error ? err.message : String(err)),
+          ),
+        );
       }
 
       // Create follow-up task for the lead when a worker task finishes.
