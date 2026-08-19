@@ -41,6 +41,7 @@ import { getApiKey } from "../utils/api-key";
 import { getMcpBaseUrl } from "../utils/constants";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { toValidationError, validationErrorBody } from "../utils/validation-error";
 import { initWorkflows } from "../workflows";
 import { handleActiveSessions } from "./active-sessions";
 import { handleAgentRegister, handleAgentsRest } from "./agents";
@@ -374,6 +375,26 @@ const httpServer = createHttpServer(async (req, res) => {
         res.writeHead(404);
         res.end("Not Found");
       } catch (err) {
+        // A validation failure is a client mistake, not a server fault. Any
+        // `.parse()` that throws INSIDE a handler — the `createTaskExtended`
+        // choke point, `MetricDefinitionSchema.parse`, `CredentialBindingSchema
+        // .parse`, a webhook building a task — used to land here and be
+        // reported as a 500 with no field information, so a consumer could not
+        // self-correct. Reclassifying at THIS boundary covers every current and
+        // future handler-internal parse without touching the handlers.
+        const validation = toValidationError(err);
+        if (validation && !res.headersSent) {
+          // Span EVENT, not error status: a 400 is a healthy outcome for the
+          // server, so it must not pollute the endpoint's error rate.
+          span?.addEvent("validation.rejected", {
+            "agentswarm.validation.context": validation.context,
+            "agentswarm.validation.field_count": validation.issues.length,
+            "agentswarm.validation.fields": validation.issues.map((i) => i.path),
+          });
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(validationErrorBody(validation)));
+          return;
+        }
         if (span) {
           span.recordException(err);
           span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
