@@ -9224,6 +9224,7 @@ type WorkflowRunRow = {
   triggerData: string | null;
   context: string | null;
   error: string | null;
+  created_by: string | null;
   startedAt: string;
   lastUpdatedAt: string;
   finishedAt: string | null;
@@ -9237,6 +9238,7 @@ function rowToWorkflowRun(row: WorkflowRunRow): WorkflowRun {
     triggerData: row.triggerData ? JSON.parse(row.triggerData) : undefined,
     context: row.context ? (JSON.parse(row.context) as Record<string, unknown>) : undefined,
     error: row.error ?? undefined,
+    createdBy: row.created_by ?? undefined,
     startedAt: normalizeDateRequired(row.startedAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
     finishedAt: normalizeDate(row.finishedAt) ?? undefined,
@@ -9247,13 +9249,20 @@ export function createWorkflowRun(data: {
   id: string;
   workflowId: string;
   triggerData?: unknown;
+  createdBy?: string;
 }): WorkflowRun {
   const now = new Date().toISOString();
   const row = getDb()
-    .prepare<WorkflowRunRow, [string, string, string, string | null]>(
-      `INSERT INTO workflow_runs (id, workflowId, startedAt, triggerData) VALUES (?, ?, ?, ?) RETURNING *`,
+    .prepare<WorkflowRunRow, [string, string, string, string | null, string | null]>(
+      `INSERT INTO workflow_runs (id, workflowId, startedAt, triggerData, created_by) VALUES (?, ?, ?, ?, ?) RETURNING *`,
     )
-    .get(data.id, data.workflowId, now, data.triggerData ? JSON.stringify(data.triggerData) : null);
+    .get(
+      data.id,
+      data.workflowId,
+      now,
+      data.triggerData ? JSON.stringify(data.triggerData) : null,
+      data.createdBy ?? null,
+    );
   if (!row) throw new Error("Failed to create workflow run");
   return rowToWorkflowRun(row);
 }
@@ -13174,13 +13183,104 @@ export function updateUser(
   return row ? rowToUser(row) : null;
 }
 
-export function deleteUser(id: string): boolean {
-  // Clear any task references before deleting
-  getDb()
-    .prepare("UPDATE agent_tasks SET requestedByUserId = NULL WHERE requestedByUserId = ?")
-    .run(id);
-  const result = getDb().prepare("DELETE FROM users WHERE id = ?").run(id);
-  return result.changes > 0;
+type UserReferenceRow = {
+  tableName: string;
+  columnName: string;
+};
+
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+export function deleteUser(id: string, replacementUserId?: string): boolean {
+  if (replacementUserId === id) {
+    throw new Error("Replacement user must differ from deleted user");
+  }
+
+  const database = getDb();
+  return database.transaction(() => {
+    const userExists = database
+      .prepare<{ present: number }, [string]>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?) AS present",
+      )
+      .get(id)?.present;
+    if (!userExists) return false;
+
+    if (replacementUserId) {
+      const replacementExists = database
+        .prepare<{ present: number }, [string]>(
+          "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?) AS present",
+        )
+        .get(replacementUserId)?.present;
+      if (!replacementExists) throw new Error("Replacement user not found");
+    }
+
+    // Preserve rows that carry user attribution but lack ON DELETE semantics.
+    // Schema discovery keeps this correct as new nullable user audit columns are added.
+    // Migration 103 accidentally dropped the scheduled_tasks audit FKs while
+    // recreating that table, so discover those two known logical references as
+    // well until the table is next rebuilt with its original constraints.
+    const references = database
+      .prepare<UserReferenceRow, []>(
+        `SELECT tables.name AS tableName, foreign_keys."from" AS columnName
+         FROM sqlite_schema AS tables
+         JOIN pragma_foreign_key_list(tables.name) AS foreign_keys
+         JOIN pragma_table_info(tables.name) AS columns
+           ON columns.name = foreign_keys."from"
+         WHERE tables.type = 'table'
+           AND foreign_keys."table" = 'users'
+           AND foreign_keys.on_delete IN ('NO ACTION', 'RESTRICT')
+           AND columns."notnull" = 0
+         UNION ALL
+         SELECT 'scheduled_tasks' AS tableName, columns.name AS columnName
+         FROM pragma_table_info('scheduled_tasks') AS columns
+         WHERE columns.name IN ('created_by', 'updated_by')
+           AND columns."notnull" = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pragma_foreign_key_list('scheduled_tasks') AS foreign_keys
+             WHERE foreign_keys."from" = columns.name
+               AND foreign_keys."table" = 'users'
+           )`,
+      )
+      .all();
+    const replacement = replacementUserId ?? null;
+    for (const reference of references) {
+      const table = quoteSqlIdentifier(reference.tableName);
+      const column = quoteSqlIdentifier(reference.columnName);
+      database
+        .prepare<unknown, [string | null, string]>(
+          `UPDATE ${table} SET ${column} = ? WHERE ${column} = ?`,
+        )
+        .run(replacement, id);
+    }
+
+    // Workflow context is persisted JSON rather than a relational column, but
+    // it exposes the same requester identity to downstream interpolation. Keep
+    // it consistent with workflow_runs.created_by inside this transaction.
+    if (replacementUserId) {
+      database
+        .prepare<unknown, [string, string]>(
+          `UPDATE workflow_runs
+           SET context = json_set(context, '$.swarm.requestedByUserId', ?)
+           WHERE json_valid(context)
+             AND json_extract(context, '$.swarm.requestedByUserId') = ?`,
+        )
+        .run(replacementUserId, id);
+    } else {
+      database
+        .prepare<unknown, [string]>(
+          `UPDATE workflow_runs
+           SET context = json_remove(context, '$.swarm.requestedByUserId')
+           WHERE json_valid(context)
+             AND json_extract(context, '$.swarm.requestedByUserId') = ?`,
+        )
+        .run(id);
+    }
+
+    const result = database.prepare("DELETE FROM users WHERE id = ?").run(id);
+    return result.changes > 0;
+  })();
 }
 
 // ============================================================================

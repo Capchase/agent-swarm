@@ -20622,6 +20622,7 @@ export interface components {
                 [key: string]: unknown;
             };
             error?: string;
+            createdBy?: string;
             startedAt: string;
             lastUpdatedAt: string;
             finishedAt?: string;

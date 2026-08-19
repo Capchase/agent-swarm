@@ -2377,6 +2377,7 @@ export const WorkflowRunSchema = z
     triggerData: z.unknown().optional(),
     context: z.record(z.string(), z.unknown()).optional(),
     error: z.string().optional(),
+    createdBy: z.string().optional(),
     startedAt: z.string(),
     lastUpdatedAt: z.string(),
     finishedAt: z.string().optional(),

@@ -4297,6 +4297,9 @@
           "error": {
             "type": "string"
           },
+          "createdBy": {
+            "type": "string"
+          },
           "startedAt": {
             "type": "string"
           },
