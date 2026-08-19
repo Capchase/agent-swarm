@@ -49,6 +49,16 @@ const GATE_HELPER_SPECIFIERS = [
 ];
 
 /**
+ * Gate helpers that live in a module also exporting non-auth symbols (so an
+ * import-path match on GATE_HELPER_SPECIFIERS would false-positive on other
+ * importers — e.g. create-metric.ts imports assertSelectOnlyQuery from the
+ * same src/http/db-query.ts module). Matched by call expression instead.
+ */
+const GATE_HELPER_CALL_PATTERNS: RegExp[] = [
+  /\bcheckDbQueryAccess\(/, // src/http/db-query.ts → can("db-query.execute") on behalf of callers
+];
+
+/**
  * Tool-registration files with NO principal gate, pinned at the slice-1
  * inventory (plan Appendix A: every HARD authorization site at HEAD got a
  * verb; everything else was ungated by design — read-only, own-scoped, or
@@ -62,7 +72,6 @@ const UNGATED_TOOL_FILES: Record<string, string> = {
   "src/tools/create-channel.ts": PIN_REASON,
   "src/tools/create-metric.ts": PIN_REASON,
   "src/tools/create-page.ts": PIN_REASON,
-  "src/tools/db-query.ts": PIN_REASON,
   "src/tools/get-metrics.ts": PIN_REASON,
   "src/tools/get-swarm.ts": PIN_REASON,
   "src/tools/join-swarm.ts": PIN_REASON,
@@ -77,7 +86,6 @@ const UNGATED_TOOL_FILES: Record<string, string> = {
   "src/tools/memory-rate.ts": PIN_REASON,
   "src/tools/memory-search.ts": PIN_REASON,
   "src/tools/my-agent-info.ts": PIN_REASON,
-  "src/tools/oauth-access-token.ts": PIN_REASON,
   "src/tools/poll-task.ts": PIN_REASON,
   "src/tools/post-message.ts": PIN_REASON,
   "src/tools/prompt-templates/delete.ts": PIN_REASON,
@@ -162,7 +170,10 @@ function checkTools(): string[] {
     const src = readFileSync(file, "utf8");
     // Helper detection matches the import specifier's basename, so both
     // same-dir (./kv-write-auth) and aliased (@/tools/task-tool-ctx) imports count.
-    const gated = /\bcan\(/.test(src) || GATE_HELPER_SPECIFIERS.some((h) => src.includes(`${h}"`));
+    const gated =
+      /\bcan\(/.test(src) ||
+      GATE_HELPER_SPECIFIERS.some((h) => src.includes(`${h}"`)) ||
+      GATE_HELPER_CALL_PATTERNS.some((p) => p.test(src));
     const allowlisted = rel in UNGATED_TOOL_FILES;
 
     if (gated && allowlisted) {
@@ -256,7 +267,6 @@ const ROUTE_RBAC_BACKLOG: Record<string, string> = {
   "POST /api/approval-requests/{id}/respond": BACKLOG_REASON,
   "POST /api/channel-activity/commit-cursors": BACKLOG_REASON,
   "POST /api/config/reload": BACKLOG_REASON,
-  "POST /api/db-query": BACKLOG_REASON,
   "POST /api/events": BACKLOG_REASON,
   "POST /api/events/batch": BACKLOG_REASON,
   "POST /api/fs/agent-credentials": BACKLOG_REASON,

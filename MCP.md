@@ -366,7 +366,7 @@ Create, update, delete, or list user profiles in the user registry. Identities a
 
 **Execute database query**
 
-Execute a read-only SQL query against the swarm database. Available to all authenticated agents — be aware results may include secrets (oauth_tokens, configs). Results capped at 100 rows.
+Execute a read-only SQL query against the swarm database. Lead agents, or agents explicitly granted db-query access, only. The database is SQLite inside the API process, and the query runs to completion before the API answers anything else — there is no query timeout yet, so a large query stops the whole API for its full duration. Do NOT use COUNT(*), SUM(...) or typeof() across `session_logs`, `agent_log`, `events` or `task_context_snapshots`. Each holds millions of rows. A `rowid` range does NOT make such a query cheap: it still reads every row in the range. Filter on an indexed column and add LIMIT 1000 or less. Results capped at 100 rows. Results may include sensitive data: `session_logs`/`agent_log` hold plaintext agent transcripts; secret config/OAuth columns return ciphertext, not plaintext.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -378,7 +378,7 @@ Execute a read-only SQL query against the swarm database. Available to all authe
 
 **Get OAuth access token**
 
-Return a valid plaintext OAuth access token for an integrated tracker. The token is refreshed first when it is near expiry. Returns access_token only; never returns refresh_token.
+Return a valid plaintext OAuth access token for an integrated tracker. The token is refreshed first when it is near expiry. Returns access_token only; never returns refresh_token. Lead-only: this hands over a live credential to whatever third-party system the token authorizes.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

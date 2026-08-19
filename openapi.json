@@ -8388,6 +8388,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Only the lead agent, or an agent explicitly granted db-query access, may query",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }

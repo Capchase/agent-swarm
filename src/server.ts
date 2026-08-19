@@ -344,7 +344,11 @@ export function createServer(opts: { scriptsOnly?: boolean; fullSurface?: boolea
     registerResolveUserTool(server);
     registerManageUserTool(server); // self-guards with lead check
 
-    // Debug tools (self-guard with lead check)
+    // Debug tools. get-oauth-access-token self-guards lead-only
+    // (oauth-token.read). db-query self-guards lead OR an explicit
+    // per-agent grant (db-query.execute) — see src/rbac/legacy-policy.ts and
+    // src/tools/db-query.ts for why a plain lead check would break the
+    // script-SDK bridge's non-lead callers.
     registerDbQueryTool(server);
     registerGetOauthAccessTokenTool(server);
 

@@ -1,8 +1,71 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { getDb } from "../be/db";
+import { getAgentById, getDb, getSwarmConfigs } from "../be/db";
+import { can, type RbacDecision, type RbacPrincipal } from "../rbac";
+import { getRequestAuth } from "../utils/request-auth-context";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
+
+/** Agent-scoped swarm_config key that grants a non-lead agent db-query access. */
+export const DB_QUERY_ALLOWED_KEY = "DB_QUERY_ALLOWED";
+
+export function isDbQueryGranted(agentId: string): boolean {
+  return (
+    getSwarmConfigs({ scope: "agent", scopeId: agentId, key: DB_QUERY_ALLOWED_KEY })[0]?.value ===
+    "true"
+  );
+}
+
+function singleHeader(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name];
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+
+/**
+ * Resolve the calling principal for db-query.execute, preferring an explicit
+ * X-Agent-ID over the shared API key — same pattern as
+ * src/http/mcp-servers.ts's mcpServerPrincipal — so an agent cannot use that
+ * key to bypass its own lead-or-grant check.
+ */
+function dbQueryPrincipal(req: IncomingMessage): RbacPrincipal {
+  const agentId = singleHeader(req, "x-agent-id");
+  if (agentId) {
+    const agent = getAgentById(agentId);
+    return { kind: "agent", agentId, isLead: agent?.isLead ?? false };
+  }
+
+  const auth = getRequestAuth(req);
+  if (auth?.kind === "operator") return { kind: "operator" };
+  if (auth?.kind === "user") return { kind: "user", userId: auth.userId };
+  return { kind: "agent", agentId: "", isLead: false };
+}
+
+/**
+ * Shared db-query.execute authorization gate used by both the MCP tool
+ * (src/tools/db-query.ts) and the direct HTTP route below, so the two paths
+ * can never drift. Lead is always allowed. A non-lead agent needs an
+ * explicit DB_QUERY_ALLOWED grant. The bare shared API key with no
+ * X-Agent-ID (dashboard/operator or authenticated-user context, e.g. the
+ * dashboard Debug page) is trusted admin access and stays allowed — same
+ * "operator bypasses, agent identity is gated" boundary already used by
+ * config.ts's ensureConfigAdmin and mcp-servers.ts's
+ * ensureMcpServerPermission. The MCP tool always resolves an agent
+ * principal, so this never loosens that path.
+ */
+export function checkDbQueryAccess(principal: RbacPrincipal, source: "mcp" | "http"): RbacDecision {
+  if (principal.kind !== "agent") return { allow: true };
+
+  // Lead-vs-grant is decided entirely by can()'s leadOrCapabilityGrant policy
+  // (src/rbac/legacy-policy.ts), which already inspects the principal's lead
+  // status — so this always resolves the grant and defers the lead
+  // short-circuit to that policy.
+  return can({
+    principal,
+    verb: "db-query.execute",
+    resource: { kind: "capability-grant", granted: isDbQueryGranted(principal.agentId) },
+    source,
+  });
+}
 
 export interface DbQueryResult {
   columns: string[];
@@ -85,6 +148,7 @@ const dbQueryRoute = route({
   pattern: ["api", "db-query"],
   summary: "Execute a read-only SQL query",
   tags: ["Debug"],
+  rbac: { permission: "db-query.execute" },
   body: DbQueryInputSchema,
   responses: {
     200: {
@@ -97,6 +161,9 @@ const dbQueryRoute = route({
       }),
     },
     400: { description: "Invalid or disallowed SQL" },
+    403: {
+      description: "Only the lead agent, or an agent explicitly granted db-query access, may query",
+    },
   },
   auth: { apiKey: true },
 });
@@ -113,6 +180,16 @@ export async function handleDbQuery(
 
   const parsed = await dbQueryRoute.parse(req, res, pathSegments, queryParams);
   if (!parsed) return true;
+
+  const decision = checkDbQueryAccess(dbQueryPrincipal(req), "http");
+  if (!decision.allow) {
+    jsonError(
+      res,
+      "Only the lead agent, or an agent explicitly granted db-query access, can run this query.",
+      403,
+    );
+    return true;
+  }
 
   try {
     const result = executeReadOnlyQuery(resolveDbQuerySql(parsed.body), parsed.body.params);
