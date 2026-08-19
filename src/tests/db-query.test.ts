@@ -1,5 +1,30 @@
-import { describe, expect, test } from "bun:test";
-import { DbQueryInputSchema, resolveDbQuerySql } from "../http/db-query";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { createServer as createHttpServer, type Server } from "node:http";
+import {
+  __resetSqliteVecExtensionPathCacheForTests,
+  closeDb,
+  getDb,
+  initDb,
+  resolveSqliteVecExtensionPath,
+} from "../be/db";
+import {
+  DbQueryInputSchema,
+  executeReadOnlyQueryGated,
+  handleDbQuery,
+  resolveDbQuerySql,
+} from "../http/db-query";
+import {
+  DB_QUERY_CONCURRENCY_CAP,
+  executeReadOnlyQueryBounded,
+  isReportableTimeout,
+} from "../http/db-query-bounded";
+import {
+  getDbQueryHttpBudgetMs,
+  getDbQueryHttpMaxRows,
+  getDbQueryMcpBudgetMs,
+  resetDbQueryBoundedWarningForTests,
+} from "../http/db-query-shared";
+import { getPathSegments, parseQueryParams } from "../http/utils";
 
 describe("db-query input compatibility", () => {
   test("canonical sql input resolves to sql", () => {
@@ -24,5 +49,408 @@ describe("db-query input compatibility", () => {
     const parsed = DbQueryInputSchema.safeParse({});
 
     expect(parsed.success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 1 — bounded child-process execution (proposal §5.1, Tests A-F).
+// Needs a real on-disk database: the bounded path spawns a separate `bun -e`
+// process that opens its own connection, so an in-memory/deserialized test
+// template (invisible outside this process) won't work. This swaps out the
+// fast in-memory `__testMigrationTemplate` for a real file for the duration
+// of this describe block, following the pattern in asset-key-migration.test.ts.
+// ---------------------------------------------------------------------------
+
+const BOUNDED_TEST_DB_PATH = "./test-db-query-bounded.sqlite";
+const HTTP_TEST_PORT = 13097;
+
+// A CPU-bound query with near-zero fixture setup cost (no table/data needed)
+// and deterministic timing that doesn't depend on disk cache state, unlike
+// the proposal's own I/O-bound synthetic table. Reliably takes >1s in this
+// environment; must stay a SELECT so the read-only guard lets it through.
+const SLOW_QUERY = `
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x + 1 FROM cnt WHERE x < 6000000
+  )
+  SELECT COUNT(*) AS c FROM cnt WHERE (x * x) % 998244353 = 12345
+`;
+
+const boundedTestGlobals = globalThis as typeof globalThis & {
+  __testMigrationTemplate?: Uint8Array;
+  __savedDbQueryBoundedTemplate?: Uint8Array;
+};
+
+/** Starts handleDbQuery on HTTP_TEST_PORT for the duration of `fn`, exposing a small `post` helper. */
+async function withDbQueryHttpServer<T>(
+  fn: (post: (body: unknown) => Promise<{ status: number; body: DbQueryHttpBody }>) => Promise<T>,
+): Promise<T> {
+  let server: Server | undefined;
+  try {
+    server = createHttpServer(async (req, res) => {
+      const pathSegments = getPathSegments(req.url || "");
+      const queryParams = parseQueryParams(req.url || "");
+      const handled = await handleDbQuery(req, res, pathSegments, queryParams);
+      if (!handled) {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => server?.listen(HTTP_TEST_PORT, () => resolve()));
+
+    const post = async (body: unknown) => {
+      const res = await fetch(`http://localhost:${HTTP_TEST_PORT}/api/db-query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: (await res.json()) as DbQueryHttpBody };
+    };
+    return await fn(post);
+  } finally {
+    await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+  }
+}
+
+interface DbQueryHttpBody {
+  rows?: unknown[][];
+  total?: number;
+  error?: string;
+}
+
+/** Env keys the flag/budget-override tests touch — reset after each so tests don't leak into each other. */
+const DB_QUERY_OVERRIDE_ENV_KEYS = [
+  "DB_QUERY_BOUNDED_ENABLED",
+  "DB_QUERY_HTTP_BUDGET_MS",
+  "DB_QUERY_HTTP_MAX_ROWS",
+  "DB_QUERY_MCP_BUDGET_MS",
+] as const;
+
+async function removeBoundedTestDb(): Promise<void> {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      await Bun.file(`${BOUNDED_TEST_DB_PATH}${suffix}`).delete();
+    } catch {}
+  }
+}
+
+describe("db-query bounded execution (Fix 1)", () => {
+  beforeAll(async () => {
+    boundedTestGlobals.__savedDbQueryBoundedTemplate = boundedTestGlobals.__testMigrationTemplate;
+    boundedTestGlobals.__testMigrationTemplate = undefined;
+    closeDb();
+    await removeBoundedTestDb();
+    initDb(BOUNDED_TEST_DB_PATH);
+  });
+
+  afterAll(async () => {
+    closeDb();
+    boundedTestGlobals.__testMigrationTemplate = boundedTestGlobals.__savedDbQueryBoundedTemplate;
+    boundedTestGlobals.__savedDbQueryBoundedTemplate = undefined;
+    await removeBoundedTestDb();
+  });
+
+  afterEach(() => {
+    for (const key of DB_QUERY_OVERRIDE_ENV_KEYS) delete process.env[key];
+    resetDbQueryBoundedWarningForTests();
+  });
+
+  // Test A: budget is enforced — fails today because there is no budget
+  // parameter or timeout path; the synchronous call only returns after the
+  // full scan.
+  test("A: rejects with a timeout error once the budget expires, well under 1s wall time", async () => {
+    const start = performance.now();
+    await expect(executeReadOnlyQueryBounded(SLOW_QUERY, [], 200)).rejects.toThrow(/budget/i);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  // Test B: the event loop stays responsive — fails today because the
+  // interval fires about once regardless of query duration. This is the
+  // assertion that encodes the actual defect.
+  test("B: keeps a 50ms heartbeat ticking at close to its expected rate while the child runs", async () => {
+    const heartbeatMs = 50;
+    let ticks = 0;
+    const heartbeat = setInterval(() => {
+      ticks++;
+    }, heartbeatMs);
+
+    const start = performance.now();
+    await executeReadOnlyQueryBounded(SLOW_QUERY, [], 10_000);
+    const elapsed = performance.now() - start;
+    clearInterval(heartbeat);
+
+    const expectedTicks = elapsed / heartbeatMs;
+    expect(ticks).toBeGreaterThanOrEqual(expectedTicks * 0.6);
+  });
+
+  // The concurrency cap (acquireBoundedQuerySlot/releaseBoundedQuerySlot in
+  // db-query-bounded.ts) had no coverage. acquireBoundedQuerySlot() runs
+  // synchronously, before the child process is even spawned, so firing
+  // DB_QUERY_CONCURRENCY_CAP + 1 calls back-to-back (no await between them)
+  // guarantees all cap checks run in one JS tick, in order — no real query
+  // slowness is needed to keep every slot "occupied" at the moment of the
+  // check, so a cheap query keeps this deterministic instead of racing 9
+  // concurrent CPU-heavy child processes against the test runner's resources
+  // (a SLOW_QUERY-based version of this test was flaky here: concurrent
+  // recursive-CTE children intermittently hit "database is locked" or got
+  // signal-killed under load). Exactly one call must be rejected with the
+  // cap error, the other DB_QUERY_CONCURRENCY_CAP must resolve. The
+  // regression this guards against is subtle — swap acquire/try ordering, or
+  // drop the finally, and the cap silently becomes a permanent lockout after
+  // one rejection instead of a transient one, which the final assertion
+  // below catches.
+  test("O: concurrency cap rejects exactly one caller past the limit, and releases slots once all settle", async () => {
+    const calls = Array.from({ length: DB_QUERY_CONCURRENCY_CAP + 1 }, () =>
+      executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
+    );
+    const settled = await Promise.allSettled(calls);
+
+    const rejected = settled.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    const fulfilled = settled.filter((outcome) => outcome.status === "fulfilled");
+    expect(rejected.length).toBe(1);
+    expect(fulfilled.length).toBe(DB_QUERY_CONCURRENCY_CAP);
+    expect((rejected[0].reason as Error).message).toMatch(/Too many concurrent/);
+
+    // Asserts slots are released, not permanently consumed by the earlier
+    // rejection — this is what catches a dropped `finally`. A caller landing
+    // here after the batch settles must succeed normally.
+    const result = await executeReadOnlyQueryBounded("SELECT 1", [], 10_000);
+    expect(result.rows.length).toBe(1);
+  });
+
+  // Neither half of `isReportableTimeout`'s `timedOut && !(exitCode === 0 &&
+  // stdout.length > 0)` was pinned. Test A already asserts the /budget/i
+  // message for a genuinely killed child (timedOut=true, non-zero exit) —
+  // that case is covered without duplicating it here. Unit-test the
+  // extracted predicate directly rather than racing real process timing (the
+  // completion-vs-kill race is not reproducible on demand): this pins both
+  // branches deterministically, including the exact boundary — a fired
+  // timer whose child still produced a clean, non-empty result must not be
+  // reported as a timeout.
+  describe("isReportableTimeout (src/http/db-query-bounded.ts)", () => {
+    test("a fired timer with a clean, non-empty result is not a timeout", () => {
+      expect(isReportableTimeout(true, 0, '{"columns":[],"rows":[]}')).toBe(false);
+    });
+
+    test("a fired timer with no successful output is a timeout", () => {
+      expect(isReportableTimeout(true, 1, "")).toBe(true);
+    });
+
+    test("a fired timer with exit code 0 but empty stdout is still a timeout", () => {
+      expect(isReportableTimeout(true, 0, "")).toBe(true);
+    });
+
+    test("the timer never firing is never a timeout, regardless of exit code", () => {
+      expect(isReportableTimeout(false, 1, "")).toBe(false);
+    });
+  });
+
+  // Test C: `total` semantics do not move — this is the regression guard for
+  // src/tools/db-query.ts:41 and src/http/metrics.ts:168, which compare
+  // `total` against the delivered row count to compute `truncated`. Must
+  // keep passing: the bounded path materializes fully before capping, same
+  // as the synchronous path.
+  test("C: total reflects rows returned, not rows delivered, when capped", async () => {
+    const db = getDb();
+    db.run("CREATE TABLE cap_test (id INTEGER PRIMARY KEY)");
+    const insert = db.prepare("INSERT INTO cap_test DEFAULT VALUES");
+    for (let i = 0; i < 250; i++) insert.run();
+
+    const result = await executeReadOnlyQueryBounded("SELECT id FROM cap_test", [], 5000, 100);
+    expect(result.total).toBe(250);
+    expect(result.rows.length).toBe(100);
+  });
+
+  // Test E: the read-only guard survives the new path — passes today via a
+  // different code path (the synchronous columnNames check); must keep
+  // passing with the exact same error message through the child process.
+  test("E: rejects a write with the exact pre-existing error message", async () => {
+    const db = getDb();
+    db.run("CREATE TABLE guard_test (id INTEGER PRIMARY KEY)");
+
+    await expect(executeReadOnlyQueryBounded("DELETE FROM guard_test", [], 5000)).rejects.toThrow(
+      "Only read-only queries are allowed",
+    );
+  });
+
+  // Test F: the HTTP route is capped — fails today because
+  // src/http/db-query.ts's handler passes no cap at all, so every row comes
+  // back.
+  test("F: /api/db-query caps rows at the new default and still reports the true total", async () => {
+    const db = getDb();
+    db.run("CREATE TABLE http_cap_test (id INTEGER PRIMARY KEY)");
+    const insert = db.prepare("INSERT INTO http_cap_test DEFAULT VALUES");
+    for (let i = 0; i < 1500; i++) insert.run();
+
+    let server: Server | undefined;
+    try {
+      server = createHttpServer(async (req, res) => {
+        const pathSegments = getPathSegments(req.url || "");
+        const queryParams = parseQueryParams(req.url || "");
+        const handled = await handleDbQuery(req, res, pathSegments, queryParams);
+        if (!handled) {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+      await new Promise<void>((resolve) => server?.listen(HTTP_TEST_PORT, () => resolve()));
+
+      const res = await fetch(`http://localhost:${HTTP_TEST_PORT}/api/db-query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sql: "SELECT id FROM http_cap_test", params: [] }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { rows: unknown[][]; total: number };
+      expect(body.rows.length).toBe(1000);
+      expect(body.total).toBeGreaterThan(1000);
+    } finally {
+      await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+    }
+  });
+
+  // Regression guard for src/http/db-query-bounded.ts:148-150 — a non-write
+  // error must propagate the child's stderr as-is, not just the
+  // WRITE_REJECTED_EXIT_CODE path (Test E already covers that one).
+  test("N: propagates the child's stderr on a non-write, non-zero exit (a SQL error)", async () => {
+    await expect(
+      executeReadOnlyQueryBounded("SELECT * FROM this_table_does_not_exist_xyz", [], 5000),
+    ).rejects.toThrow(/no such table/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature-flag addendum (follow-up to Fix 1): DB_QUERY_BOUNDED_ENABLED
+  // kill switch + DB_QUERY_HTTP_BUDGET_MS / DB_QUERY_HTTP_MAX_ROWS /
+  // DB_QUERY_MCP_BUDGET_MS overrides. See the plan doc addendum for the design.
+  // -------------------------------------------------------------------------
+
+  test("defaults apply when unset, and an invalid override falls back to the default", () => {
+    expect(getDbQueryHttpBudgetMs()).toBe(10_000);
+    expect(getDbQueryHttpMaxRows()).toBe(1000);
+    expect(getDbQueryMcpBudgetMs()).toBe(5_000);
+
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "-5";
+    expect(getDbQueryHttpBudgetMs()).toBe(10_000);
+
+    process.env.DB_QUERY_HTTP_MAX_ROWS = "not-a-number";
+    expect(getDbQueryHttpMaxRows()).toBe(1000);
+  });
+
+  // G: flag ON (default, unset) — the gate still runs the bounded path and
+  // enforces the budget, same as calling executeReadOnlyQueryBounded directly.
+  test("G: gated executor runs the bounded path by default and still enforces the budget", async () => {
+    await expect(executeReadOnlyQueryGated(SLOW_QUERY, [], 200)).rejects.toThrow(/budget/i);
+  });
+
+  // H: flag explicitly "true" behaves the same as unset.
+  test("H: DB_QUERY_BOUNDED_ENABLED=true behaves the same as unset", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "true";
+    await expect(executeReadOnlyQueryGated(SLOW_QUERY, [], 200)).rejects.toThrow(/budget/i);
+  });
+
+  // I: flag OFF — the gate must fall back to the legacy, unbounded in-process
+  // path. A budget that would trip the bounded path must be ignored entirely,
+  // not just extended, and the query must complete normally.
+  test("I: DB_QUERY_BOUNDED_ENABLED=false runs the legacy in-process path, ignoring the budget", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "false";
+    const result = await executeReadOnlyQueryGated(SLOW_QUERY, [], 200);
+    expect(result.rows.length).toBe(1);
+  });
+
+  // J: HTTP route, flag OFF — still caps rows via the legacy path (the cap is
+  // applied by executeReadOnlyQuery too, not just the bounded executor), and
+  // must not throw despite a budget that would trip the bounded path.
+  test("J: /api/db-query with DB_QUERY_BOUNDED_ENABLED=false still caps rows via the legacy path", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "false";
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "1";
+
+    const { status, body } = await withDbQueryHttpServer((post) =>
+      post({ sql: "SELECT id FROM http_cap_test", params: [] }),
+    );
+    expect(status).toBe(200);
+    expect(body.rows?.length).toBe(1000);
+    expect(body.total).toBeGreaterThan(1000);
+  });
+
+  // K: DB_QUERY_HTTP_BUDGET_MS actually reaches the bounded executor via the
+  // HTTP route — a tightened budget trips the timeout on a query that would
+  // otherwise pass under the 10s default.
+  test("K: DB_QUERY_HTTP_BUDGET_MS overrides the bounded HTTP budget", async () => {
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "150";
+    expect(getDbQueryHttpBudgetMs()).toBe(150);
+
+    const { status, body } = await withDbQueryHttpServer((post) =>
+      post({ sql: SLOW_QUERY, params: [] }),
+    );
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/150ms budget/);
+  });
+
+  // L: DB_QUERY_HTTP_MAX_ROWS actually reaches the HTTP route's row cap.
+  test("L: DB_QUERY_HTTP_MAX_ROWS overrides the HTTP row cap", async () => {
+    process.env.DB_QUERY_HTTP_MAX_ROWS = "5";
+    expect(getDbQueryHttpMaxRows()).toBe(5);
+
+    const { status, body } = await withDbQueryHttpServer((post) =>
+      post({ sql: "SELECT id FROM http_cap_test", params: [] }),
+    );
+    expect(status).toBe(200);
+    expect(body.rows?.length).toBe(5);
+    expect(body.total).toBeGreaterThan(5);
+  });
+
+  // M: DB_QUERY_MCP_BUDGET_MS actually reaches the bounded executor on the
+  // MCP tool's path (same gated executor the HTTP route uses, with the MCP
+  // budget getter instead of the HTTP one).
+  test("M: DB_QUERY_MCP_BUDGET_MS overrides the MCP query budget", async () => {
+    process.env.DB_QUERY_MCP_BUDGET_MS = "150";
+    expect(getDbQueryMcpBudgetMs()).toBe(150);
+
+    await expect(
+      executeReadOnlyQueryGated(SLOW_QUERY, [], getDbQueryMcpBudgetMs()),
+    ).rejects.toThrow(/150ms budget/);
+  });
+});
+
+// __resetSqliteVecExtensionPathCacheForTests had no caller outside its own
+// definition. Write the test that needs the helper rather than drop it —
+// resolve once, mutate the env var, resolve again and assert the cached
+// value survives, then reset and assert the new value is picked up. This
+// also pins the "a resolved `undefined` is cached too" doc comment: the
+// mechanism is a `null`-sentinel check with no branching on the cached
+// value's type, so the same two assertions hold regardless of whether the
+// first resolution lands on a path string or `undefined`.
+describe("resolveSqliteVecExtensionPath memoization (src/be/db.ts)", () => {
+  const ORIGINAL_EXTENSION_PATH_ENV = process.env.SQLITE_VEC_EXTENSION_PATH;
+
+  afterEach(() => {
+    if (ORIGINAL_EXTENSION_PATH_ENV === undefined) {
+      delete process.env.SQLITE_VEC_EXTENSION_PATH;
+    } else {
+      process.env.SQLITE_VEC_EXTENSION_PATH = ORIGINAL_EXTENSION_PATH_ENV;
+    }
+    __resetSqliteVecExtensionPathCacheForTests();
+  });
+
+  test("caches the resolved path across calls, surviving a later env var change", () => {
+    __resetSqliteVecExtensionPathCacheForTests();
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/first-vec-path.so";
+    expect(resolveSqliteVecExtensionPath()).toBe("/tmp/first-vec-path.so");
+
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/second-vec-path.so";
+    expect(resolveSqliteVecExtensionPath()).toBe("/tmp/first-vec-path.so");
+  });
+
+  test("resetting the cache picks up the new env var value", () => {
+    __resetSqliteVecExtensionPathCacheForTests();
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/first-vec-path.so";
+    resolveSqliteVecExtensionPath();
+
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/second-vec-path.so";
+    __resetSqliteVecExtensionPathCacheForTests();
+    expect(resolveSqliteVecExtensionPath()).toBe("/tmp/second-vec-path.so");
   });
 });

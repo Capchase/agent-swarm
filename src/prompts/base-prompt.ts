@@ -194,6 +194,15 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
     prompt += messagingResult.text;
   }
 
+  // db-query guidance reaches every core-capability agent, not just named-tool
+  // callers: scripts call db_query through the SDK bridge under their own
+  // identity too (src/scripts-runtime/sdk-allowlist.ts), so this isn't gated
+  // behind !scriptsOnlyMode like the named-tool sections above.
+  if (hasMcp && serverHasCapability("core", true)) {
+    const dbQueryGuidanceResult = await resolveTemplateAsync("system.agent.db_query_guidance", {});
+    prompt += dbQueryGuidanceResult.text;
+  }
+
   if (
     hasMcp &&
     isSteeringEnabled() &&

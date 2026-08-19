@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
-import { DbQueryInputShape, executeReadOnlyQuery, resolveDbQuerySql } from "@/http/db-query";
+import { DbQueryInputShape, executeReadOnlyQueryGated, resolveDbQuerySql } from "@/http/db-query";
+import { getDbQueryMcpBudgetMs } from "@/http/db-query-shared";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 
 const MCP_MAX_ROWS = 100;
@@ -37,7 +38,12 @@ export const registerDbQueryTool = (server: McpServer) => {
       try {
         const sql = resolveDbQuerySql(input);
         const params = input.params ?? [];
-        const result = executeReadOnlyQuery(sql, params, MCP_MAX_ROWS);
+        const result = await executeReadOnlyQueryGated(
+          sql,
+          params,
+          getDbQueryMcpBudgetMs(),
+          MCP_MAX_ROWS,
+        );
         const truncated = result.total > MCP_MAX_ROWS;
 
         // Build a simple text table for Claude
