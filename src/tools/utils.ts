@@ -19,6 +19,7 @@ import { withSpan } from "../otel";
 import type { PermissionVerb } from "../rbac/permissions";
 import { SCRIPT_LONG_TIMEOUT_HINT_MS } from "../scripts-runtime/executors/types";
 import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
+import { toValidationError, type ValidationIssue } from "../utils/validation-error";
 
 type Meta = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -716,6 +717,47 @@ type ToolConfig<
   _meta?: Record<string, unknown>;
 };
 
+/** Render validation issues as the `details` payload a model can act on. */
+function renderValidationDetails(issues: ValidationIssue[]): string {
+  return issues
+    .map((i) => {
+      const parts = [`${i.path}: ${i.message}`];
+      if (i.expected) parts.push(`expected ${i.expected}`);
+      if (i.received) parts.push(`received ${i.received}`);
+      return `- ${parts.join(" — ")}`;
+    })
+    .join("\n");
+}
+
+/**
+ * Run a tool callback and surface a validation failure as an expressive
+ * `toolErr` instead of an anonymous throw.
+ *
+ * A tool handler rejecting its input is reporting a CALLER mistake. Without
+ * this, a `.parse()` deep inside a handler (the `createTaskExtended` choke
+ * point, for instance) propagated as a raw exception and the caller got a
+ * message with no field, no constraint, and no received value.
+ *
+ * `script-sdk` calls are deliberately rethrown: those arrive through
+ * `/api/mcp-bridge`, which maps a validation throw to a 400 carrying the same
+ * body shape as REST. Converting here would bury that behind a 200.
+ */
+async function surfaceValidationErrors(
+  toolName: string,
+  callOrigin: RequestInfo["callOrigin"],
+  run: () => Promise<SwarmToolResult>,
+): Promise<SwarmToolResult> {
+  try {
+    return await run();
+  } catch (err) {
+    const validation = toValidationError(err);
+    if (!validation || callOrigin === "script-sdk") throw err;
+    return toolErr(`Invalid arguments for '${toolName}': ${validation.message}`, {
+      details: renderValidationDetails(validation.issues),
+    });
+  }
+}
+
 /**
  * Creates a tool registration helper that automatically extracts request info
  * and passes it as the second parameter to the callback.
@@ -749,12 +791,14 @@ export const createToolRegistrar = (server: McpServer) => {
         return withSpan(
           "mcp.tool",
           async (span) => {
-            const outcome = await (
-              cb as (
-                requestInfo: RequestInfo,
-                meta: Meta,
-              ) => SwarmToolResult | Promise<SwarmToolResult>
-            )(requestInfo, meta);
+            const outcome = await surfaceValidationErrors(name, requestInfo.callOrigin, async () =>
+              (
+                cb as (
+                  requestInfo: RequestInfo,
+                  meta: Meta,
+                ) => SwarmToolResult | Promise<SwarmToolResult>
+              )(requestInfo, meta),
+            );
             const result = finalizeSwarmToolResult(name, outcome, requestInfo);
             span.setAttributes(toolResultAttributes(result));
             return result;
@@ -771,13 +815,15 @@ export const createToolRegistrar = (server: McpServer) => {
         // trace tree. Cardinality is bounded — tool names are a fixed enum.
         `mcp.tool ${name}`,
         async (span) => {
-          const outcome = await (
-            cb as (
-              args: InferInput<InputArgs>,
-              requestInfo: RequestInfo,
-              meta: Meta,
-            ) => SwarmToolResult | Promise<SwarmToolResult>
-          )(args, requestInfo, meta);
+          const outcome = await surfaceValidationErrors(name, requestInfo.callOrigin, async () =>
+            (
+              cb as (
+                args: InferInput<InputArgs>,
+                requestInfo: RequestInfo,
+                meta: Meta,
+              ) => SwarmToolResult | Promise<SwarmToolResult>
+            )(args, requestInfo, meta),
+          );
           const result = finalizeSwarmToolResult(name, outcome, requestInfo);
           span.setAttributes(toolResultAttributes(result));
           return result;

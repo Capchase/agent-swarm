@@ -10,6 +10,7 @@ import { z } from "zod";
 import { createServer } from "@/server";
 import { isMcpToolAllowedForScripts } from "../scripts-runtime/sdk-allowlist";
 import { markScriptSdkRequestOrigin } from "../tools/utils";
+import { toValidationError, ValidationError, validationErrorBody } from "../utils/validation-error";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
@@ -115,11 +116,23 @@ export async function handleMcpBridge(
     const parseResult = await safeParseAsync(inputObj ?? tool.inputSchema, args);
     if (!parseResult.success) {
       const parseError = "error" in parseResult ? parseResult.error : "Unknown error";
-      jsonError(
-        res,
-        `Invalid arguments for tool '${toolName}': ${getParseErrorMessage(parseError)}`,
-        400,
-      );
+      // Prefer the shared formatter so a bad tool argument carries the same
+      // field/constraint/received detail as every other entrypoint. The SDK's
+      // flat message is the fallback for a non-Zod schema.
+      const validation = toValidationError(parseError);
+      const body = validation
+        ? validationErrorBody(
+            new ValidationError(
+              `Invalid arguments for tool '${toolName}': ${validation.message}`,
+              validation.issues,
+            ),
+          )
+        : {
+            error: `Invalid arguments for tool '${toolName}': ${getParseErrorMessage(parseError)}`,
+            details: [],
+          };
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
       return true;
     }
     handlerArgs = parseResult.data;
@@ -147,6 +160,17 @@ export async function handleMcpBridge(
       json(res, result ?? {});
     }
   } catch (err) {
+    // A tool handler that rejects its input is reporting a caller mistake, not
+    // a bridge fault. Returning 500 here is what turned `send-task` with
+    // `task: "   "` into an opaque server error with no field information —
+    // the script SDK could not tell a bad argument from an outage. Same body
+    // shape as REST so one consumer can parse both.
+    const validation = toValidationError(err);
+    if (validation) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(validationErrorBody(validation)));
+      return true;
+    }
     const message = err instanceof Error ? err.message : String(err);
     jsonError(res, message, 500);
   }
