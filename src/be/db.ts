@@ -124,11 +124,13 @@ import {
   parseModelTier,
   ReasoningEffortSchema,
   RoutingAffinitySchema,
+  SERVER_GENERATED_ATTACHMENT_CAPABILITY,
   SessionCostModelBreakdownSchema,
 } from "../types";
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
+import { extractGitHubPullRequestUrls } from "../utils/github-pull-request";
 import {
   type BudgetedIdentityField,
   checkIdentityFieldBudget,
@@ -2180,13 +2182,29 @@ export function updateTaskVcs(
     vcsUrl: string;
   },
 ): AgentTask | null {
-  const row = getDb()
-    .prepare<AgentTaskRow, [string, string, number, string, string, string]>(
-      `UPDATE agent_tasks
-       SET vcsProvider = ?, vcsRepo = ?, vcsNumber = ?, vcsUrl = ?, lastUpdatedAt = ?
-       WHERE id = ? RETURNING *`,
-    )
-    .get(vcs.vcsProvider, vcs.vcsRepo, vcs.vcsNumber, vcs.vcsUrl, new Date().toISOString(), taskId);
+  const row = getDb().transaction(() => {
+    const updated = getDb()
+      .prepare<AgentTaskRow, [string, string, number, string, string, string]>(
+        `UPDATE agent_tasks
+         SET vcsProvider = ?, vcsRepo = ?, vcsNumber = ?, vcsUrl = ?, lastUpdatedAt = ?
+         WHERE id = ? RETURNING *`,
+      )
+      .get(
+        vcs.vcsProvider,
+        vcs.vcsRepo,
+        vcs.vcsNumber,
+        vcs.vcsUrl,
+        new Date().toISOString(),
+        taskId,
+      );
+    if (updated) {
+      reconcileTaskPullRequestAttachments(taskId, updated.agentId, [
+        updated.output,
+        vcs.vcsProvider === "github" ? vcs.vcsUrl : null,
+      ]);
+    }
+    return updated;
+  })();
   return row ? rowToAgentTask(row) : null;
 }
 
@@ -2968,13 +2986,23 @@ export function completeTask(id: string, output?: string): AgentTask | null {
     return null;
   }
 
-  const finishedAt = new Date().toISOString();
-  let row = taskQueries.updateStatus().get("completed", finishedAt, id);
-  if (!row) return null;
+  const row = getDb().transaction(() => {
+    const finishedAt = new Date().toISOString();
+    let completed = taskQueries.updateStatus().get("completed", finishedAt, id);
+    if (!completed) return null;
 
-  if (output) {
-    row = taskQueries.setOutput().get(scrubSecrets(output), id);
-  }
+    if (output) {
+      completed = taskQueries.setOutput().get(scrubSecrets(output), id);
+    }
+    if (completed) {
+      reconcileTaskPullRequestAttachments(id, completed.agentId, [
+        completed.output,
+        completed.vcsProvider === "github" ? completed.vcsUrl : null,
+      ]);
+    }
+    return completed;
+  })();
+  if (!row) return null;
 
   if (row && oldTask) {
     emitTaskLifecycleTelemetryAfterCommit(
@@ -3117,7 +3145,16 @@ export function overwriteTerminalTaskResultText(
     patch.failureReason !== undefined
       ? scrubSecrets(patch.failureReason)
       : (task.failureReason ?? null);
-  const row = taskQueries.setTerminalResultText().get(output, failureReason, id) ?? null;
+  const row = getDb().transaction(() => {
+    const updated = taskQueries.setTerminalResultText().get(output, failureReason, id) ?? null;
+    if (updated && patch.output !== undefined) {
+      reconcileTaskPullRequestAttachments(id, updated.agentId, [
+        updated.output,
+        updated.vcsProvider === "github" ? updated.vcsUrl : null,
+      ]);
+    }
+    return updated;
+  })();
 
   return row ? rowToAgentTask(row) : task;
 }
@@ -3652,6 +3689,101 @@ export function insertTaskAttachment(input: InsertTaskAttachmentInput): TaskAtta
     }
     return attachment;
   })();
+}
+
+const GENERATED_PULL_REQUEST_PROVIDER_ID = "github";
+const GENERATED_PULL_REQUEST_INTENT = "task-deliverable";
+const GENERATED_PULL_REQUEST_DESCRIPTION = "Pull request shipped by this task";
+const GENERATED_PULL_REQUEST_SOURCE = "task-pull-request-recorder";
+
+function pullRequestKey(pullRequest: { owner: string; repo: string; number: number }): string {
+  return `${pullRequest.owner.toLowerCase()}/${pullRequest.repo.toLowerCase()}#${pullRequest.number}`;
+}
+
+/**
+ * Persist PRs detected by server-owned task lifecycle paths. Existing URL
+ * attachments win regardless of display name, so an agent-authored row and an
+ * automatic row never duplicate the same task deliverable. A capability key
+ * rejected by AttachmentInputSchema marks server-generated rows so
+ * reconciliation cannot mistake caller-authored metadata for provenance.
+ */
+export function recordTaskPullRequestAttachments(
+  taskId: string,
+  agentId: string | null,
+  text: string | null | undefined,
+): TaskAttachment[] {
+  const pullRequests = extractGitHubPullRequestUrls(text);
+  if (pullRequests.length === 0) return [];
+
+  const existingPullRequests = new Set(
+    getDb()
+      .prepare<{ url: string }, [string]>(
+        "SELECT url FROM task_attachments WHERE task_id = ? AND kind = 'url' AND url IS NOT NULL",
+      )
+      .all(taskId)
+      .flatMap((row) => extractGitHubPullRequestUrls(row.url))
+      .map(pullRequestKey),
+  );
+  const stored: TaskAttachment[] = [];
+  for (const pullRequest of pullRequests) {
+    const dedupeKey = pullRequestKey(pullRequest);
+    if (existingPullRequests.has(dedupeKey)) continue;
+    stored.push(
+      insertTaskAttachment({
+        taskId,
+        agentId,
+        name: `GitHub pull request #${pullRequest.number}`,
+        kind: "url",
+        url: pullRequest.url,
+        providerId: GENERATED_PULL_REQUEST_PROVIDER_ID,
+        capabilities: {
+          [SERVER_GENERATED_ATTACHMENT_CAPABILITY]: GENERATED_PULL_REQUEST_SOURCE,
+        },
+        intent: GENERATED_PULL_REQUEST_INTENT,
+        description: GENERATED_PULL_REQUEST_DESCRIPTION,
+      }),
+    );
+    existingPullRequests.add(dedupeKey);
+  }
+  return stored;
+}
+
+/** Reconcile only lifecycle-generated PR rows against their current source text. */
+function reconcileTaskPullRequestAttachments(
+  taskId: string,
+  agentId: string | null,
+  sourceTexts: Array<string | null | undefined>,
+): TaskAttachment[] {
+  const desiredPullRequests = sourceTexts.flatMap(extractGitHubPullRequestUrls);
+  const desiredKeys = new Set(desiredPullRequests.map(pullRequestKey));
+  const generatedRows = getDb()
+    .prepare<{ id: string; name: string; url: string }, [string, string]>(
+      `SELECT id, name, url
+       FROM task_attachments
+       WHERE task_id = ?
+         AND kind = 'url'
+         AND url IS NOT NULL
+         AND json_extract(capabilities, '$.${SERVER_GENERATED_ATTACHMENT_CAPABILITY}') = ?`,
+    )
+    .all(taskId, GENERATED_PULL_REQUEST_SOURCE);
+
+  for (const row of generatedRows) {
+    const pullRequest = extractGitHubPullRequestUrls(row.url)[0];
+    const expectedName = pullRequest ? `GitHub pull request #${pullRequest.number}` : null;
+    if (
+      !pullRequest ||
+      row.name !== expectedName ||
+      !desiredKeys.has(pullRequestKey(pullRequest))
+    ) {
+      getDb().run("DELETE FROM task_attachments WHERE id = ?", [row.id]);
+    }
+  }
+
+  return recordTaskPullRequestAttachments(
+    taskId,
+    agentId,
+    desiredPullRequests.map((pullRequest) => pullRequest.url).join("\n"),
+  );
 }
 
 function insertTaskAttachmentRow(input: InsertTaskAttachmentInput): TaskAttachment {
