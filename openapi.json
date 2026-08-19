@@ -8502,6 +8502,26 @@
                 }
               }
             }
+          },
+          "408": {
+            "description": "Query exceeded its wall-clock budget and was terminated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many concurrent bounded db-query executions; retry shortly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
