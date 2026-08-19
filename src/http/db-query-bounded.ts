@@ -104,7 +104,7 @@ const { Database } = require("bun:sqlite");
  * "many children" to "many pending callers," and a caller that's told to
  * retry can back off, whereas a caller stuck in an in-process queue can't.
  */
-const DB_QUERY_CONCURRENCY_CAP = 8;
+export const DB_QUERY_CONCURRENCY_CAP = 8;
 
 let activeBoundedQueryCount = 0;
 
@@ -143,6 +143,20 @@ export async function executeReadOnlyQueryBounded(
   } finally {
     releaseBoundedQuerySlot();
   }
+}
+
+/**
+ * Whether a fired timer should be reported to the caller as a timeout.
+ *
+ * A complete, correct result can land in the same tick the budget timer
+ * fires — the SIGKILL is a no-op on an already-exited child, and its stdout
+ * is still the real answer. Only report a timeout when the kill genuinely
+ * prevented a clean result (no successful, non-empty stdout); pulled out as
+ * its own function so both halves of the condition can be pinned directly in
+ * tests instead of only through process-timing races.
+ */
+export function isReportableTimeout(timedOut: boolean, exitCode: number, stdout: string): boolean {
+  return timedOut && !(exitCode === 0 && stdout.length > 0);
 }
 
 async function runBoundedQueryChild(
@@ -186,11 +200,7 @@ async function runBoundedQueryChild(
     clearTimeout(timer);
   }
 
-  // A complete, correct result can land in the same tick the budget timer
-  // fires. Prefer it over reporting a timeout — only the kill genuinely
-  // preventing an answer (no successful, non-empty stdout) counts as a
-  // timeout to the caller.
-  if (timedOut && !(exitCode === 0 && stdout.length > 0)) {
+  if (isReportableTimeout(timedOut, exitCode, stdout)) {
     throw new Error(
       `Query exceeded the ${budgetMs}ms budget and was terminated. Filter on an indexed column and add a LIMIT. Aggregates such as COUNT(*), SUM(...) or typeof() over session_logs, agent_log, events or task_context_snapshots read every row in range and cannot be made cheap by chunking on rowid.`,
     );

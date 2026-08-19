@@ -1,13 +1,23 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { createServer as createHttpServer, type Server } from "node:http";
-import { closeDb, getDb, initDb } from "../be/db";
+import {
+  __resetSqliteVecExtensionPathCacheForTests,
+  closeDb,
+  getDb,
+  initDb,
+  resolveSqliteVecExtensionPath,
+} from "../be/db";
 import {
   DbQueryInputSchema,
   executeReadOnlyQueryGated,
   handleDbQuery,
   resolveDbQuerySql,
 } from "../http/db-query";
-import { executeReadOnlyQueryBounded } from "../http/db-query-bounded";
+import {
+  DB_QUERY_CONCURRENCY_CAP,
+  executeReadOnlyQueryBounded,
+  isReportableTimeout,
+} from "../http/db-query-bounded";
 import {
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
@@ -172,6 +182,71 @@ describe("db-query bounded execution (Fix 1)", () => {
 
     const expectedTicks = elapsed / heartbeatMs;
     expect(ticks).toBeGreaterThanOrEqual(expectedTicks * 0.6);
+  });
+
+  // Review round 3, thread 3814484703 (Oscar): the concurrency cap
+  // (acquireBoundedQuerySlot/releaseBoundedQuerySlot in db-query-bounded.ts)
+  // had no coverage. acquireBoundedQuerySlot() runs synchronously, before the
+  // child process is even spawned, so firing DB_QUERY_CONCURRENCY_CAP + 1
+  // calls back-to-back (no await between them) guarantees all cap checks run
+  // in one JS tick, in order — no real query slowness is needed to keep every
+  // slot "occupied" at the moment of the check, so a cheap query keeps this
+  // deterministic instead of racing 9 concurrent CPU-heavy child processes
+  // against the sandbox's resources (a SLOW_QUERY-based version of this test
+  // was flaky here: concurrent recursive-CTE children intermittently hit
+  // "database is locked" or got signal-killed under load). Exactly one call
+  // must be rejected with the cap error, the other DB_QUERY_CONCURRENCY_CAP
+  // must resolve. The regression this guards against is subtle — swap
+  // acquire/try ordering, or drop the finally, and the cap silently becomes a
+  // permanent lockout after one rejection instead of a transient one, which
+  // the final assertion below catches.
+  test("O: concurrency cap rejects exactly one caller past the limit, and releases slots once all settle", async () => {
+    const calls = Array.from({ length: DB_QUERY_CONCURRENCY_CAP + 1 }, () =>
+      executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
+    );
+    const settled = await Promise.allSettled(calls);
+
+    const rejected = settled.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    const fulfilled = settled.filter((outcome) => outcome.status === "fulfilled");
+    expect(rejected.length).toBe(1);
+    expect(fulfilled.length).toBe(DB_QUERY_CONCURRENCY_CAP);
+    expect((rejected[0].reason as Error).message).toMatch(/Too many concurrent/);
+
+    // The assertion Oscar said he'd insist on: slots are released, not
+    // permanently consumed by the rejection above. A caller landing here
+    // after the batch settles must succeed normally.
+    const result = await executeReadOnlyQueryBounded("SELECT 1", [], 10_000);
+    expect(result.rows.length).toBe(1);
+  });
+
+  // Review round 3, thread 3814484711 (Oscar): neither half of
+  // `isReportableTimeout`'s `timedOut && !(exitCode === 0 && stdout.length >
+  // 0)` was pinned. Test A already asserts the /budget/i message for a
+  // genuinely killed child (timedOut=true, non-zero exit) — that is the
+  // second case Oscar named, covered without duplicating it here. Unit-test
+  // the extracted predicate directly rather than racing real process timing
+  // (the completion-vs-kill race is not reproducible on demand): this pins
+  // both branches deterministically, including the exact boundary — a
+  // fired timer whose child still produced a clean, non-empty result must
+  // not be reported as a timeout.
+  describe("isReportableTimeout (src/http/db-query-bounded.ts)", () => {
+    test("a fired timer with a clean, non-empty result is not a timeout", () => {
+      expect(isReportableTimeout(true, 0, '{"columns":[],"rows":[]}')).toBe(false);
+    });
+
+    test("a fired timer with no successful output is a timeout", () => {
+      expect(isReportableTimeout(true, 1, "")).toBe(true);
+    });
+
+    test("a fired timer with exit code 0 but empty stdout is still a timeout", () => {
+      expect(isReportableTimeout(true, 0, "")).toBe(true);
+    });
+
+    test("the timer never firing is never a timeout, regardless of exit code", () => {
+      expect(isReportableTimeout(false, 1, "")).toBe(false);
+    });
   });
 
   // Test C: `total` semantics do not move — this is the regression guard for
@@ -339,5 +414,46 @@ describe("db-query bounded execution (Fix 1)", () => {
     await expect(
       executeReadOnlyQueryGated(SLOW_QUERY, [], getDbQueryMcpBudgetMs()),
     ).rejects.toThrow(/150ms budget/);
+  });
+});
+
+// Review round 3, thread 3814484715 (Oscar): __resetSqliteVecExtensionPathCacheForTests
+// had no caller outside its own definition. Oscar's preference, which we're
+// following: write the test that needs the helper rather than drop it —
+// resolve once, mutate the env var, resolve again and assert the cached
+// value survives, then reset and assert the new value is picked up. This
+// also pins the "a resolved `undefined` is cached too" doc comment: the
+// mechanism is a `null`-sentinel check with no branching on the cached
+// value's type, so the same two assertions hold regardless of whether the
+// first resolution lands on a path string or `undefined`.
+describe("resolveSqliteVecExtensionPath memoization (src/be/db.ts)", () => {
+  const ORIGINAL_EXTENSION_PATH_ENV = process.env.SQLITE_VEC_EXTENSION_PATH;
+
+  afterEach(() => {
+    if (ORIGINAL_EXTENSION_PATH_ENV === undefined) {
+      delete process.env.SQLITE_VEC_EXTENSION_PATH;
+    } else {
+      process.env.SQLITE_VEC_EXTENSION_PATH = ORIGINAL_EXTENSION_PATH_ENV;
+    }
+    __resetSqliteVecExtensionPathCacheForTests();
+  });
+
+  test("caches the resolved path across calls, surviving a later env var change", () => {
+    __resetSqliteVecExtensionPathCacheForTests();
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/first-vec-path.so";
+    expect(resolveSqliteVecExtensionPath()).toBe("/tmp/first-vec-path.so");
+
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/second-vec-path.so";
+    expect(resolveSqliteVecExtensionPath()).toBe("/tmp/first-vec-path.so");
+  });
+
+  test("resetting the cache picks up the new env var value", () => {
+    __resetSqliteVecExtensionPathCacheForTests();
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/first-vec-path.so";
+    resolveSqliteVecExtensionPath();
+
+    process.env.SQLITE_VEC_EXTENSION_PATH = "/tmp/second-vec-path.so";
+    __resetSqliteVecExtensionPathCacheForTests();
+    expect(resolveSqliteVecExtensionPath()).toBe("/tmp/second-vec-path.so");
   });
 });
