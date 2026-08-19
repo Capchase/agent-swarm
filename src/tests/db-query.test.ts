@@ -1,8 +1,19 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { closeDb, getDb, initDb } from "../be/db";
-import { DbQueryInputSchema, handleDbQuery, resolveDbQuerySql } from "../http/db-query";
+import {
+  DbQueryInputSchema,
+  executeReadOnlyQueryGated,
+  handleDbQuery,
+  resolveDbQuerySql,
+} from "../http/db-query";
 import { executeReadOnlyQueryBounded } from "../http/db-query-bounded";
+import {
+  getDbQueryHttpBudgetMs,
+  getDbQueryHttpMaxRows,
+  getDbQueryMcpBudgetMs,
+  resetDbQueryBoundedWarningForTests,
+} from "../http/db-query-shared";
 import { getPathSegments, parseQueryParams } from "../http/utils";
 
 describe("db-query input compatibility", () => {
@@ -61,6 +72,51 @@ const boundedTestGlobals = globalThis as typeof globalThis & {
   __savedDbQueryBoundedTemplate?: Uint8Array;
 };
 
+/** Starts handleDbQuery on HTTP_TEST_PORT for the duration of `fn`, exposing a small `post` helper. */
+async function withDbQueryHttpServer<T>(
+  fn: (post: (body: unknown) => Promise<{ status: number; body: DbQueryHttpBody }>) => Promise<T>,
+): Promise<T> {
+  let server: Server | undefined;
+  try {
+    server = createHttpServer(async (req, res) => {
+      const pathSegments = getPathSegments(req.url || "");
+      const queryParams = parseQueryParams(req.url || "");
+      const handled = await handleDbQuery(req, res, pathSegments, queryParams);
+      if (!handled) {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => server?.listen(HTTP_TEST_PORT, () => resolve()));
+
+    const post = async (body: unknown) => {
+      const res = await fetch(`http://localhost:${HTTP_TEST_PORT}/api/db-query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: (await res.json()) as DbQueryHttpBody };
+    };
+    return await fn(post);
+  } finally {
+    await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+  }
+}
+
+interface DbQueryHttpBody {
+  rows?: unknown[][];
+  total?: number;
+  error?: string;
+}
+
+/** Env keys the flag/budget-override tests touch — reset after each so tests don't leak into each other. */
+const DB_QUERY_OVERRIDE_ENV_KEYS = [
+  "DB_QUERY_BOUNDED_ENABLED",
+  "DB_QUERY_HTTP_BUDGET_MS",
+  "DB_QUERY_HTTP_MAX_ROWS",
+  "DB_QUERY_MCP_BUDGET_MS",
+] as const;
+
 async function removeBoundedTestDb(): Promise<void> {
   for (const suffix of ["", "-wal", "-shm"]) {
     try {
@@ -83,6 +139,11 @@ describe("db-query bounded execution (Fix 1)", () => {
     boundedTestGlobals.__testMigrationTemplate = boundedTestGlobals.__savedDbQueryBoundedTemplate;
     boundedTestGlobals.__savedDbQueryBoundedTemplate = undefined;
     await removeBoundedTestDb();
+  });
+
+  afterEach(() => {
+    for (const key of DB_QUERY_OVERRIDE_ENV_KEYS) delete process.env[key];
+    resetDbQueryBoundedWarningForTests();
   });
 
   // Test A: budget is enforced — fails today because there is no budget
@@ -175,5 +236,108 @@ describe("db-query bounded execution (Fix 1)", () => {
     } finally {
       await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
     }
+  });
+
+  // Regression guard for src/http/db-query-bounded.ts:148-150 — a non-write
+  // error must propagate the child's stderr as-is, not just the
+  // WRITE_REJECTED_EXIT_CODE path (Test E already covers that one).
+  // Reviewer 2's non-blocking suggestion on PR #87.
+  test("N: propagates the child's stderr on a non-write, non-zero exit (a SQL error)", async () => {
+    await expect(
+      executeReadOnlyQueryBounded("SELECT * FROM this_table_does_not_exist_xyz", [], 5000),
+    ).rejects.toThrow(/no such table/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature-flag addendum (follow-up to Fix 1, PR #87): DB_QUERY_BOUNDED_ENABLED
+  // kill switch + DB_QUERY_HTTP_BUDGET_MS / DB_QUERY_HTTP_MAX_ROWS /
+  // DB_QUERY_MCP_BUDGET_MS overrides. See the plan doc addendum for the design.
+  // -------------------------------------------------------------------------
+
+  test("defaults apply when unset, and an invalid override falls back to the default", () => {
+    expect(getDbQueryHttpBudgetMs()).toBe(10_000);
+    expect(getDbQueryHttpMaxRows()).toBe(1000);
+    expect(getDbQueryMcpBudgetMs()).toBe(5_000);
+
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "-5";
+    expect(getDbQueryHttpBudgetMs()).toBe(10_000);
+
+    process.env.DB_QUERY_HTTP_MAX_ROWS = "not-a-number";
+    expect(getDbQueryHttpMaxRows()).toBe(1000);
+  });
+
+  // G: flag ON (default, unset) — the gate still runs the bounded path and
+  // enforces the budget, same as calling executeReadOnlyQueryBounded directly.
+  test("G: gated executor runs the bounded path by default and still enforces the budget", async () => {
+    await expect(executeReadOnlyQueryGated(SLOW_QUERY, [], 200)).rejects.toThrow(/budget/i);
+  });
+
+  // H: flag explicitly "true" behaves the same as unset.
+  test("H: DB_QUERY_BOUNDED_ENABLED=true behaves the same as unset", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "true";
+    await expect(executeReadOnlyQueryGated(SLOW_QUERY, [], 200)).rejects.toThrow(/budget/i);
+  });
+
+  // I: flag OFF — the gate must fall back to the legacy, unbounded in-process
+  // path. A budget that would trip the bounded path must be ignored entirely,
+  // not just extended, and the query must complete normally.
+  test("I: DB_QUERY_BOUNDED_ENABLED=false runs the legacy in-process path, ignoring the budget", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "false";
+    const result = await executeReadOnlyQueryGated(SLOW_QUERY, [], 200);
+    expect(result.rows.length).toBe(1);
+  });
+
+  // J: HTTP route, flag OFF — still caps rows via the legacy path (the cap is
+  // applied by executeReadOnlyQuery too, not just the bounded executor), and
+  // must not throw despite a budget that would trip the bounded path.
+  test("J: /api/db-query with DB_QUERY_BOUNDED_ENABLED=false still caps rows via the legacy path", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "false";
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "1";
+
+    const { status, body } = await withDbQueryHttpServer((post) =>
+      post({ sql: "SELECT id FROM http_cap_test", params: [] }),
+    );
+    expect(status).toBe(200);
+    expect(body.rows?.length).toBe(1000);
+    expect(body.total).toBeGreaterThan(1000);
+  });
+
+  // K: DB_QUERY_HTTP_BUDGET_MS actually reaches the bounded executor via the
+  // HTTP route — a tightened budget trips the timeout on a query that would
+  // otherwise pass under the 10s default.
+  test("K: DB_QUERY_HTTP_BUDGET_MS overrides the bounded HTTP budget", async () => {
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "150";
+    expect(getDbQueryHttpBudgetMs()).toBe(150);
+
+    const { status, body } = await withDbQueryHttpServer((post) =>
+      post({ sql: SLOW_QUERY, params: [] }),
+    );
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/150ms budget/);
+  });
+
+  // L: DB_QUERY_HTTP_MAX_ROWS actually reaches the HTTP route's row cap.
+  test("L: DB_QUERY_HTTP_MAX_ROWS overrides the HTTP row cap", async () => {
+    process.env.DB_QUERY_HTTP_MAX_ROWS = "5";
+    expect(getDbQueryHttpMaxRows()).toBe(5);
+
+    const { status, body } = await withDbQueryHttpServer((post) =>
+      post({ sql: "SELECT id FROM http_cap_test", params: [] }),
+    );
+    expect(status).toBe(200);
+    expect(body.rows?.length).toBe(5);
+    expect(body.total).toBeGreaterThan(5);
+  });
+
+  // M: DB_QUERY_MCP_BUDGET_MS actually reaches the bounded executor on the
+  // MCP tool's path (same gated executor the HTTP route uses, with the MCP
+  // budget getter instead of the HTTP one).
+  test("M: DB_QUERY_MCP_BUDGET_MS overrides the MCP query budget", async () => {
+    process.env.DB_QUERY_MCP_BUDGET_MS = "150";
+    expect(getDbQueryMcpBudgetMs()).toBe(150);
+
+    await expect(
+      executeReadOnlyQueryGated(SLOW_QUERY, [], getDbQueryMcpBudgetMs()),
+    ).rejects.toThrow(/150ms budget/);
   });
 });
