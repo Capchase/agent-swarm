@@ -17,6 +17,7 @@ import {
   Brain,
   Compass,
   Cpu,
+  Database,
   HeartPulse,
   type LucideIcon,
   Palette,
@@ -298,6 +299,50 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         placeholder: "90",
         restartRequired: true,
         docsUrl: `${DOCS}ui/configuration`,
+      },
+    ],
+  },
+  {
+    id: "database",
+    title: "Database queries",
+    description:
+      "Safety controls for the shared db-query path (HTTP debug route and the MCP tool) — the bounded child-process kill switch and its per-path timeout/row budgets.",
+    icon: Database,
+    entries: [
+      {
+        key: "DB_QUERY_BOUNDED_ENABLED",
+        label: "Bounded query execution",
+        description:
+          "Run db-query in a short-lived child process with a hard wall-clock timeout, instead of in-process with no timeout. On by default — turning this off restores the pre-fix unbounded behaviour and logs a startup-class warning.",
+        kind: "boolean",
+        defaultValue: "true",
+      },
+      {
+        key: "DB_QUERY_HTTP_BUDGET_MS",
+        label: "HTTP query budget (ms)",
+        description:
+          "Wall-clock budget for a /api/db-query request before its child process is killed. Only applies while bounded execution is on.",
+        kind: "number",
+        defaultValue: "10000",
+        placeholder: "10000",
+      },
+      {
+        key: "DB_QUERY_HTTP_MAX_ROWS",
+        label: "HTTP row cap",
+        description:
+          "Maximum rows returned by /api/db-query, regardless of how many the query matched.",
+        kind: "number",
+        defaultValue: "1000",
+        placeholder: "1000",
+      },
+      {
+        key: "DB_QUERY_MCP_BUDGET_MS",
+        label: "MCP query budget (ms)",
+        description:
+          "Wall-clock budget for the MCP db-query tool before its child process is killed. Only applies while bounded execution is on.",
+        kind: "number",
+        defaultValue: "5000",
+        placeholder: "5000",
       },
     ],
   },
