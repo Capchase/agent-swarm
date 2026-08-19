@@ -23540,7 +23540,8 @@
                     "minLength": 1
                   },
                   "taskType": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "tags": {
                     "type": "array",
@@ -24732,10 +24733,12 @@
                     "exclusiveMinimum": 0
                   },
                   "taskTemplate": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   },
                   "taskType": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "tags": {
                     "type": "array",
@@ -25062,10 +25065,12 @@
                     "exclusiveMinimum": 0
                   },
                   "taskTemplate": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   },
                   "taskType": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "tags": {
                     "type": "array",
@@ -37489,7 +37494,8 @@
                     "type": "string"
                   },
                   "taskType": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "tags": {
                     "type": "array",

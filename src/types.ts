@@ -650,6 +650,11 @@ export const AgentTaskSchema = z
  */
 export const TaskDescriptionSchema = z
   .string()
+  // `.min(1)` is kept alongside the refine so the generated OpenAPI schema
+  // still advertises `minLength: 1` — a `.refine()` contributes no JSON-Schema
+  // keyword, and dropping the documented bound would make the published
+  // contract look LOOSER than it is.
+  .min(1)
   .refine((s) => s.trim().length > 0, { message: "must not be empty or whitespace-only" });
 
 /** Task type label. Bounded to the choke point's column contract. */

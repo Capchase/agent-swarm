@@ -64,6 +64,9 @@ import {
   SteerResultSchema,
   splitLegacyModelAlias,
   TaskAttachmentSchema,
+  TaskDescriptionSchema,
+  TaskPrioritySchema,
+  TaskTypeSchema,
 } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
@@ -216,11 +219,15 @@ const createTask = route({
   summary: "Create a new task",
   tags: ["Tasks"],
   body: z.object({
-    task: z.string().min(1),
+    // Shared field contracts (src/types.ts) — the SAME schemas the
+    // `createTaskExtended` choke point enforces. Restating them here is what
+    // let this route accept `task: "   "` and a 51-character `taskType` and
+    // then 500 inside the handler.
+    task: TaskDescriptionSchema,
     agentId: z.string().optional(),
-    taskType: z.string().optional(),
+    taskType: TaskTypeSchema.optional(),
     tags: z.array(z.string()).optional(),
-    priority: z.number().int().min(0).max(100).optional(),
+    priority: TaskPrioritySchema.optional(),
     dependsOn: z.array(z.string()).optional(),
     offeredTo: z.string().optional(),
     dir: z.string().optional(),

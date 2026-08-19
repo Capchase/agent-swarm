@@ -31,6 +31,9 @@ import {
   ModelTierSchema,
   ReasoningEffortSchema,
   splitLegacyModelAlias,
+  TaskDescriptionSchema,
+  TaskPrioritySchema,
+  TaskTypeSchema,
 } from "@/types";
 import { looseAgentTaskOutputSchema } from "./get-task-details";
 
@@ -42,7 +45,10 @@ export const sendTaskInputSchema = z
       .string()
       .optional()
       .describe("The agent to assign/offer task to. Omit to create unassigned task for pool."),
-    task: z.string().min(1).describe("The task description to send."),
+    // Shared field contract (src/types.ts) — the same schema the
+    // `createTaskExtended` choke point enforces. `z.string().min(1)` let
+    // `"   "` through here and fail deep inside the handler instead.
+    task: TaskDescriptionSchema.describe("The task description to send."),
     key: AssetKeySchema.optional().describe(
       "Logical namespace key. Child tasks inherit their parent namespace when provided.",
     ),
@@ -50,11 +56,7 @@ export const sendTaskInputSchema = z
       .boolean()
       .default(false)
       .describe("If true, offer the task instead of direct assign (agent must accept/reject)."),
-    taskType: z
-      .string()
-      .max(50)
-      .optional()
-      .describe("Task type (e.g., 'bug', 'feature', 'review')."),
+    taskType: TaskTypeSchema.optional().describe("Task type (e.g., 'bug', 'feature', 'review')."),
     tags: z
       .array(z.string())
       .optional()
@@ -65,7 +67,7 @@ export const sendTaskInputSchema = z
       .describe(
         "Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset — only enforced when the pool auto-claim/claim-tool paths check it). Most useful when omitting agentId (unassigned pool task); a no-op for a task with an explicit agentId, which bypasses the pool gate entirely.",
       ),
-    priority: z.number().int().min(0).max(100).optional().describe("Priority 0-100 (default: 50)."),
+    priority: TaskPrioritySchema.optional().describe("Priority 0-100 (default: 50)."),
     dependsOn: z.array(z.uuid()).optional().describe("Task IDs this task depends on."),
     parentTaskId: z
       .uuid()

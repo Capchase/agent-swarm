@@ -24,6 +24,9 @@ import {
   ScheduledTaskSchema,
   ScheduledTaskTargetTypeSchema,
   splitLegacyModelAlias,
+  TaskDescriptionSchema,
+  TaskPrioritySchema,
+  TaskTypeSchema,
 } from "../types";
 import { resolveHttpFavoriteOwner } from "./favorite-owner";
 import { route } from "./route-def";
@@ -37,10 +40,15 @@ const scheduleUpdateBodySchema = z.object({
   description: z.string().optional(),
   cronExpression: z.string().nullable().optional(),
   intervalMs: z.number().int().positive().nullable().optional(),
-  taskTemplate: z.string().optional(),
-  taskType: z.string().optional(),
+  // Shared field contracts (src/types.ts). A schedule's taskTemplate/taskType
+  // become a task's `task`/`taskType` when the scheduler fires, so they must
+  // be held to the choke point's contract at UPDATE time. Accepting a bad
+  // value here only defers the failure to fire time, where no caller is left
+  // to correct it.
+  taskTemplate: TaskDescriptionSchema.optional(),
+  taskType: TaskTypeSchema.optional(),
   tags: z.array(z.string()).optional(),
-  priority: z.number().int().min(0).max(100).optional(),
+  priority: TaskPrioritySchema.optional(),
   targetAgentId: z.string().nullable().optional(),
   enabled: z.boolean().optional(),
   timezone: z.string().optional(),
@@ -93,10 +101,13 @@ const createSchedule = route({
     description: z.string().optional(),
     cronExpression: z.string().optional(),
     intervalMs: z.number().int().optional(),
-    taskTemplate: z.string().min(1).optional(),
-    taskType: z.string().optional(),
+    // Shared field contracts — see the note on `scheduleUpdateBodySchema`.
+    // Rejecting here is what stops a schedule persisting a taskType the
+    // scheduler can only choke on later, with nobody left to tell.
+    taskTemplate: TaskDescriptionSchema.optional(),
+    taskType: TaskTypeSchema.optional(),
     tags: z.array(z.string()).optional(),
-    priority: z.number().int().min(0).max(100).optional(),
+    priority: TaskPrioritySchema.optional(),
     targetAgentId: z.string().optional(),
     enabled: z.boolean().optional(),
     timezone: z.string().optional(),
