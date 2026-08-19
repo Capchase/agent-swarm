@@ -78,6 +78,19 @@ const WRITE_REJECTED_EXIT_CODE = 2;
 // object per matched row just to discard almost all of them. `total` is
 // still incremented for every row visited, so truncation stays detectable
 // by comparing it against `rows.length`.
+//
+// BLOB columns (e.g. memories.embedding, script_embeddings.embedding) come
+// back from bun:sqlite as a Uint8Array — Codex review, PR #1192 thread
+// 3816302384. JSON.stringify on a Uint8Array serializes it as an indexed
+// object ({"0":1,"1":2,...}), not an array, because TypedArrays have no
+// toJSON and JSON.stringify only special-cases real Arrays. The parent's
+// JSON.parse then hands the MCP table renderer that indexed object, and its
+// `String(v)` prints "[object Object]" instead of the byte list "1,2,3" the
+// pre-child-process path produced. Converting to a plain Array here keeps
+// `String()` on the round-tripped value identical to `String()` on the
+// original Uint8Array (both join with commas) — the fix belongs in the
+// child, once, rather than every consumer of DbQueryResult guessing which
+// columns might be BLOBs.
 const CHILD_SCRIPT = `
 const { Database } = require("bun:sqlite");
 
@@ -118,7 +131,12 @@ const { Database } = require("bun:sqlite");
     for (const row of stmt.iterate(...(params || []))) {
       total++;
       if (!maxRows || rowArrays.length < maxRows) {
-        rowArrays.push(columns.map((col) => row[col]));
+        rowArrays.push(
+          columns.map((col) => {
+            const value = row[col];
+            return value instanceof Uint8Array ? Array.from(value) : value;
+          }),
+        );
       }
     }
     const elapsed = Math.round(performance.now() - start);

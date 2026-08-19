@@ -289,6 +289,31 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(result.rows).toEqual([[1], [2], [3]]);
   });
 
+  // Test T: Codex review, PR #1192 thread 3816302384 — bun:sqlite returns a
+  // BLOB column (e.g. memories.embedding) as a Uint8Array, but JSON.stringify
+  // on a Uint8Array serializes it as an indexed object ({"0":1,"1":2,...}),
+  // not a real array, since TypedArrays have no toJSON. Before the fix, the
+  // parent's JSON.parse handed the MCP table renderer that indexed object,
+  // and `String(v)` on it produced "[object Object]" instead of the
+  // comma-joined byte list a raw Uint8Array's own String() produces. The
+  // child now converts BLOB values to a plain Array before writing stdout, so
+  // `String()` on the round-tripped value matches `String()` on the original
+  // bytes.
+  test("T: BLOB columns round-trip as byte arrays, not JSON-object mush, across the child boundary", async () => {
+    const db = getDb();
+    db.run("CREATE TABLE blob_test (id INTEGER PRIMARY KEY, payload BLOB)");
+    const bytes = new Uint8Array([1, 2, 255, 0, 128]);
+    db.prepare("INSERT INTO blob_test (id, payload) VALUES (1, ?)").run(bytes);
+
+    const result = await executeReadOnlyQueryBounded("SELECT payload FROM blob_test", [], 5000);
+    const [payload] = result.rows[0] as [unknown];
+
+    expect(Array.isArray(payload)).toBe(true);
+    expect(payload).toEqual(Array.from(bytes));
+    expect(String(payload)).toBe(String(bytes));
+    expect(String(payload)).not.toBe("[object Object]");
+  });
+
   // Test E: the read-only guard survives the new path — passes today via a
   // different code path (the synchronous columnNames check); must keep
   // passing with the exact same error message through the child process.
