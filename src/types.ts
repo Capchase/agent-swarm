@@ -633,6 +633,31 @@ export const AgentTaskSchema = z
   })
   .openapi("AgentTask");
 
+// ─── Shared task-field contracts ─────────────────────────────────────────────
+//
+// ONE definition per field, imported by BOTH the public ingress schemas
+// (POST /api/tasks, POST/PUT /api/schedules, the `send-task` tool) and the
+// `createTaskExtended` choke point below. Declaring a field twice is what let
+// the ingress contract drift looser than the choke point: `task: "   "` and a
+// 51-character `taskType` passed the route schema and then threw inside the
+// handler, which the REST catch reported as a 500 with no field information.
+// Import these instead of restating the constraint.
+
+/**
+ * A task description. Rejects a whitespace-only body but does NOT trim: the
+ * choke point rejects without mutating, so ingress must not silently rewrite
+ * what the caller stores.
+ */
+export const TaskDescriptionSchema = z
+  .string()
+  .refine((s) => s.trim().length > 0, { message: "must not be empty or whitespace-only" });
+
+/** Task type label. Bounded to the choke point's column contract. */
+export const TaskTypeSchema = z.string().max(50);
+
+/** Task priority. 0 = highest, 100 = lowest; 50 is the bind-site default. */
+export const TaskPrioritySchema = z.number().int().min(0).max(100);
+
 // ─── Create-task input contract ──────────────────────────────────────────────
 //
 // Runtime schema for `createTaskExtended` options (src/be/db.ts). Every task
@@ -648,9 +673,9 @@ export const CreateTaskOptionsSchema = z.object({
   agentId: z.string().nullable().optional(),
   creatorAgentId: z.string().optional(),
   source: AgentTaskSourceSchema.optional(),
-  taskType: z.string().max(50).optional(),
+  taskType: TaskTypeSchema.optional(),
   tags: z.array(z.string()).optional(),
-  priority: z.number().int().min(0).max(100).optional(),
+  priority: TaskPrioritySchema.optional(),
   dependsOn: z.array(z.string()).optional(),
   offeredTo: z.string().optional(),
   /** Explicitly set initial status. */
