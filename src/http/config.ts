@@ -125,7 +125,13 @@ function ensureDbQueryGrantAdmin(req: IncomingMessage, res: ServerResponse): boo
   const agentId = singleHeader(req, "x-agent-id");
   if (!agentId) return true;
   const agent = getAgentById(agentId);
-  if (agent?.isLead) return true;
+  const decision = can({
+    principal: { kind: "agent", agentId, isLead: agent?.isLead ?? false },
+    verb: "db-query.grant",
+    resource: { kind: "none" },
+    source: "http",
+  });
+  if (decision.allow) return true;
   jsonError(res, `Writing ${DB_QUERY_ALLOWED_KEY} requires the lead agent`, 403);
   return false;
 }

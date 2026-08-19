@@ -246,6 +246,11 @@ export const PERMISSIONS = {
       "Run a read-only SQL query against the swarm database (lead, or an explicit grant).",
     namespace: "db-query",
   },
+  "db-query.grant": {
+    description:
+      "Write the agent-scoped DB_QUERY_ALLOWED config key that grants db-query.execute (lead only — an agent must not be able to mint its own grant).",
+    namespace: "db-query",
+  },
   "oauth-token.read": {
     description: "Resolve a live, decrypted OAuth access token for an integrated provider.",
     namespace: "oauth-token",

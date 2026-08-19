@@ -77,6 +77,7 @@ const LEAD_ONLY_VERBS: PermissionVerb[] = [
   "script.api.rotate",
   "script.api.delete",
   "oauth-token.read",
+  "db-query.grant",
 ];
 
 const LEAD_OR_RESOURCE_OWNER_VERBS: PermissionVerb[] = [

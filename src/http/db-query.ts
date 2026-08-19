@@ -55,11 +55,14 @@ function dbQueryPrincipal(req: IncomingMessage): RbacPrincipal {
 export function checkDbQueryAccess(principal: RbacPrincipal, source: "mcp" | "http"): RbacDecision {
   if (principal.kind !== "agent") return { allow: true };
 
-  const granted = principal.isLead ? false : isDbQueryGranted(principal.agentId);
+  // Lead-vs-grant is decided entirely by can()'s leadOrCapabilityGrant policy
+  // (src/rbac/legacy-policy.ts), which already inspects the principal's lead
+  // status — so this always resolves the grant and defers the lead
+  // short-circuit to that policy.
   return can({
     principal,
     verb: "db-query.execute",
-    resource: { kind: "capability-grant", granted },
+    resource: { kind: "capability-grant", granted: isDbQueryGranted(principal.agentId) },
     source,
   });
 }
