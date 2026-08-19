@@ -1,10 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { getDb } from "../be/db";
 import { executeReadOnlyQueryBounded } from "./db-query-bounded";
 import {
   assertSingleStatement,
   type DbQueryResult,
+  executeReadOnlyQuery,
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
   isDbQueryBoundedEnabled,
@@ -17,6 +17,7 @@ import { json, jsonError } from "./utils";
 export type { DbQueryResult } from "./db-query-shared";
 export {
   assertSingleStatement,
+  executeReadOnlyQuery,
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
   getDbQueryMcpBudgetMs,
@@ -47,37 +48,6 @@ export function assertSelectOnlyQuery(sql: string): void {
   if (!normalized.startsWith("select ") && !normalized.startsWith("with ")) {
     throw new Error("Metric queries must start with SELECT or WITH");
   }
-}
-
-/**
- * Execute a read-only SQL query against the swarm database.
- * Detects write statements via bun:sqlite's columnNames (empty for INSERT/UPDATE/DELETE/DROP).
- */
-export function executeReadOnlyQuery(
-  sql: string,
-  params: unknown[] = [],
-  maxRows?: number,
-): DbQueryResult {
-  assertSingleStatement(sql);
-  const stmt = getDb().prepare(sql);
-
-  // bun:sqlite: columnNames is empty for write statements, populated for SELECT/PRAGMA/EXPLAIN
-  if (stmt.columnNames.length === 0) {
-    throw new Error("Only read-only queries are allowed");
-  }
-
-  const columns = stmt.columnNames as string[];
-  const start = performance.now();
-  const rows = (params.length > 0 ? stmt.all(...(params as [string])) : stmt.all()) as Record<
-    string,
-    unknown
-  >[];
-  const elapsed = Math.round(performance.now() - start);
-
-  const capped = maxRows ? rows.slice(0, maxRows) : rows;
-  const rowArrays = capped.map((row) => columns.map((col) => row[col]));
-
-  return { columns, rows: rowArrays, elapsed, total: rows.length };
 }
 
 /**

@@ -9,6 +9,7 @@
  * (MCP) need to read them without importing each other.
  */
 
+import { getDb } from "../be/db";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 
 export interface DbQueryResult {
@@ -27,6 +28,43 @@ export function assertSingleStatement(sql: string): void {
   if (stripped.includes(";")) {
     throw new Error("Only one SQL statement is allowed");
   }
+}
+
+/**
+ * Execute a read-only SQL query against the swarm database, synchronously,
+ * on the caller's own thread.
+ *
+ * Lives here (not db-query.ts) so db-query-bounded.ts can fall back to it
+ * without a circular import — db-query.ts already imports the bounded
+ * executor. Two callers rely on this fallback path: the
+ * `DB_QUERY_BOUNDED_ENABLED=false` kill switch, and runBoundedQueryChild when
+ * no `bun` executable can be spawned (see warnDbQuerySpawnUnavailableOnce).
+ */
+export function executeReadOnlyQuery(
+  sql: string,
+  params: unknown[] = [],
+  maxRows?: number,
+): DbQueryResult {
+  assertSingleStatement(sql);
+  const stmt = getDb().prepare(sql);
+
+  // bun:sqlite: columnNames is empty for write statements, populated for SELECT/PRAGMA/EXPLAIN
+  if (stmt.columnNames.length === 0) {
+    throw new Error("Only read-only queries are allowed");
+  }
+
+  const columns = stmt.columnNames as string[];
+  const start = performance.now();
+  const rows = (params.length > 0 ? stmt.all(...(params as [string])) : stmt.all()) as Record<
+    string,
+    unknown
+  >[];
+  const elapsed = Math.round(performance.now() - start);
+
+  const capped = maxRows ? rows.slice(0, maxRows) : rows;
+  const rowArrays = capped.map((row) => columns.map((col) => row[col]));
+
+  return { columns, rows: rowArrays, elapsed, total: rows.length };
 }
 
 /** Hardcoded pre-flag defaults — kept equal to the values PR #87 shipped with, so adding the flag changes no behaviour out of the box. */
@@ -72,10 +110,16 @@ export function getDbQueryMcpBudgetMs(env: NodeJS.ProcessEnv = process.env): num
 }
 
 let hasWarnedBoundedDisabled = false;
+let hasWarnedSpawnUnavailable = false;
 
 /** Exposed for tests only — resets the one-time warning between cases. */
 export function resetDbQueryBoundedWarningForTests(): void {
   hasWarnedBoundedDisabled = false;
+}
+
+/** Exposed for tests only — resets the one-time warning between cases. */
+export function resetDbQuerySpawnUnavailableWarningForTests(): void {
+  hasWarnedSpawnUnavailable = false;
 }
 
 /**
@@ -91,5 +135,25 @@ export function warnDbQueryBoundedDisabledOnce(): void {
       "Queries now run in-process with no wall-clock budget and can freeze the API event loop " +
       "until they finish. Set DB_QUERY_BOUNDED_ENABLED=true (or delete the override) to restore " +
       "the bounded child-process path.",
+  );
+}
+
+/**
+ * Logs once per process the first time the bounded path can't spawn a `bun`
+ * executable at all (no separate Bun CLI on $PATH — e.g. the standalone
+ * `dist/agent-swarm` binary built by `bun run build:binary`, which embeds
+ * the Bun runtime for its own execution but does not bundle a
+ * spawnable `bun` binary alongside it). Every other documented deployment
+ * path (Docker images, npm/bunx, the systemd installer) ships or requires a
+ * separate `bun` CLI, so this is expected to be rare.
+ */
+export function warnDbQuerySpawnUnavailableOnce(): void {
+  if (hasWarnedSpawnUnavailable) return;
+  hasWarnedSpawnUnavailable = true;
+  console.warn(
+    "[db-query] No spawnable `bun` executable found on $PATH — db-query timeout protection is " +
+      "unavailable on this host. Falling back to the in-process path with no wall-clock budget; " +
+      "queries can freeze the API event loop until they finish. Install the `bun` CLI alongside " +
+      "this process to restore the bounded child-process path.",
   );
 }

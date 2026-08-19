@@ -16,17 +16,32 @@
  * sqlite-vec extension itself, from the same path the parent process uses
  * (env var first, npm resolver fallback in dev) — the child cannot see the
  * parent's already-loaded extension across the process boundary.
+ *
+ * `maxRows` travels in the same payload and is applied in the child, before
+ * `rowArrays` is built and written to stdout — a query against a huge table
+ * with a small `maxRows` transfers and parses a payload bounded by
+ * `maxRows`, not by the full match count. `total` still reports every row
+ * SQLite matched, so truncation is still detectable by comparing the two.
+ *
+ * If no `bun` executable can be spawned at all (no separate Bun CLI on
+ * $PATH), the query falls back to the synchronous in-process path instead
+ * of failing outright — see runBoundedQueryChild's catch around Bun.spawn.
  */
 
 import { getDb, resolveSqliteVecExtensionPath } from "../be/db";
 import type { DbQueryResult } from "./db-query-shared";
-import { assertSingleStatement } from "./db-query-shared";
+import {
+  assertSingleStatement,
+  executeReadOnlyQuery,
+  warnDbQuerySpawnUnavailableOnce,
+} from "./db-query-shared";
 
 interface ChildPayload {
   file: string;
   sql: string;
   params: unknown[];
   vecExtensionPath?: string;
+  maxRows?: number;
 }
 
 interface ChildSuccess {
@@ -43,6 +58,13 @@ const WRITE_REJECTED_EXIT_CODE = 2;
 // `bun -e`, not compiled first. Mirrors executeReadOnlyQuery's read-only
 // guard and materialize-then-cap shape exactly, so `total` keeps meaning
 // "rows SQLite actually returned" regardless of which path ran the query.
+//
+// `maxRows` is applied here, before `rowArrays` is built and serialized —
+// not after, in the parent. `stmt.all()` still visits every matching row
+// (that's how `total` stays the true match count), but only the first
+// `maxRows` of them are converted to arrays and written to stdout. A query
+// against a huge table with a small `maxRows` therefore transfers and
+// parses a payload bounded by `maxRows`, not by how many rows matched.
 const CHILD_SCRIPT = `
 const { Database } = require("bun:sqlite");
 
@@ -52,7 +74,7 @@ const { Database } = require("bun:sqlite");
     payload += Buffer.from(chunk).toString("utf8");
   }
 
-  const { file, sql, params, vecExtensionPath } = JSON.parse(payload);
+  const { file, sql, params, vecExtensionPath, maxRows } = JSON.parse(payload);
 
   try {
     const db = new Database(file, { readonly: true });
@@ -74,9 +96,11 @@ const { Database } = require("bun:sqlite");
     const start = performance.now();
     const rows = params && params.length > 0 ? stmt.all(...params) : stmt.all();
     const elapsed = Math.round(performance.now() - start);
-    const rowArrays = rows.map((row) => columns.map((col) => row[col]));
+    const total = rows.length;
+    const capped = maxRows ? rows.slice(0, maxRows) : rows;
+    const rowArrays = capped.map((row) => columns.map((col) => row[col]));
 
-    process.stdout.write(JSON.stringify({ columns, rows: rowArrays, elapsed, total: rows.length }));
+    process.stdout.write(JSON.stringify({ columns, rows: rowArrays, elapsed, total }));
   } catch (err) {
     process.stderr.write(err && err.message ? err.message : String(err));
     process.exit(1);
@@ -123,11 +147,12 @@ function releaseBoundedQuerySlot(): void {
 
 /**
  * Run one read-only query in a bounded `bun -e` child process, SIGKILLing it
- * if it runs past `budgetMs`. Semantics match executeReadOnlyQuery exactly:
- * the full result set is materialized before `maxRows` caps it, so `total`
- * still means "rows SQLite returned," not "rows delivered" (callers such as
- * src/tools/db-query.ts:41 and src/http/metrics.ts:168 compare the two to
- * decide whether a result was truncated).
+ * if it runs past `budgetMs`. `total` semantics match executeReadOnlyQuery
+ * exactly: SQLite materializes every matching row before `maxRows` caps how
+ * many get converted and serialized (in the child, see CHILD_SCRIPT), so
+ * `total` still means "rows SQLite returned," not "rows delivered" (callers
+ * such as src/tools/db-query.ts:41 and src/http/metrics.ts:168 compare the
+ * two to decide whether a result was truncated).
  */
 export async function executeReadOnlyQueryBounded(
   sql: string,
@@ -170,13 +195,31 @@ async function runBoundedQueryChild(
     sql,
     params,
     vecExtensionPath: resolveSqliteVecExtensionPath(),
+    maxRows,
   };
 
-  const proc = Bun.spawn(["bun", "-e", CHILD_SCRIPT], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  try {
+    proc = Bun.spawn(["bun", "-e", CHILD_SCRIPT], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (err) {
+    // No `bun` executable resolvable on $PATH to spawn as a child — e.g. the
+    // standalone `dist/agent-swarm` binary, which embeds the Bun runtime for
+    // its own execution but does not bundle a separate spawnable `bun`
+    // binary. Every other documented deployment surface (Docker, npm/bunx,
+    // the systemd installer) ships or requires `bun` on $PATH, so this is
+    // expected to be rare; fall back to the in-process path rather than
+    // failing every db-query outright.
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/executable not found/i.test(message) && !/enoent/i.test(message)) {
+      throw err;
+    }
+    warnDbQuerySpawnUnavailableOnce();
+    return executeReadOnlyQuery(sql, params, maxRows);
+  }
 
   proc.stdin.write(JSON.stringify(payload));
   await proc.stdin.end();
@@ -214,8 +257,14 @@ async function runBoundedQueryChild(
     throw new Error(stderr.trim() || `Query failed with exit code ${exitCode}`);
   }
 
+  // The child already applies maxRows before serializing (see CHILD_SCRIPT) —
+  // parsed.rows is already capped, so no second slice is needed here.
   const parsed = JSON.parse(stdout) as ChildSuccess;
-  const rows = maxRows ? parsed.rows.slice(0, maxRows) : parsed.rows;
 
-  return { columns: parsed.columns, rows, elapsed: parsed.elapsed, total: parsed.total };
+  return {
+    columns: parsed.columns,
+    rows: parsed.rows,
+    elapsed: parsed.elapsed,
+    total: parsed.total,
+  };
 }

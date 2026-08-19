@@ -23,6 +23,7 @@ import {
   getDbQueryHttpMaxRows,
   getDbQueryMcpBudgetMs,
   resetDbQueryBoundedWarningForTests,
+  resetDbQuerySpawnUnavailableWarningForTests,
 } from "../http/db-query-shared";
 import { getPathSegments, parseQueryParams } from "../http/utils";
 
@@ -154,6 +155,7 @@ describe("db-query bounded execution (Fix 1)", () => {
   afterEach(() => {
     for (const key of DB_QUERY_OVERRIDE_ENV_KEYS) delete process.env[key];
     resetDbQueryBoundedWarningForTests();
+    resetDbQuerySpawnUnavailableWarningForTests();
   });
 
   // Test A: budget is enforced — fails today because there is no budget
@@ -265,6 +267,27 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(result.rows.length).toBe(100);
   });
 
+  // Test D: Codex review, PR #1192 thread 3815732008 — before this fix, the
+  // child mapped and JSON.stringified every matched row before the parent
+  // ever saw `maxRows`, then the parent sliced the already-serialized array.
+  // A query against a large table transferred and parsed a payload sized by
+  // the full match count, not by maxRows, even though both callers always
+  // supply one. The child now caps `rowArrays` before serializing (see
+  // CHILD_SCRIPT in db-query-bounded.ts) — this pins that at a scale where
+  // the two behave differently: `total` keeps the full match count, but the
+  // array that actually crosses the child/parent boundary is bounded by
+  // maxRows.
+  test("D: caps the serialized payload at maxRows, not at the full match count, for a large result set", async () => {
+    const db = getDb();
+    db.run("CREATE TABLE codex_cap_test (id INTEGER PRIMARY KEY)");
+    const insert = db.prepare("INSERT INTO codex_cap_test DEFAULT VALUES");
+    for (let i = 0; i < 20_000; i++) insert.run();
+
+    const result = await executeReadOnlyQueryBounded("SELECT id FROM codex_cap_test", [], 5000, 3);
+    expect(result.total).toBe(20_000);
+    expect(result.rows).toEqual([[1], [2], [3]]);
+  });
+
   // Test E: the read-only guard survives the new path — passes today via a
   // different code path (the synchronous columnNames check); must keep
   // passing with the exact same error message through the child process.
@@ -321,6 +344,46 @@ describe("db-query bounded execution (Fix 1)", () => {
     await expect(
       executeReadOnlyQueryBounded("SELECT * FROM this_table_does_not_exist_xyz", [], 5000),
     ).rejects.toThrow(/no such table/i);
+  });
+
+  // Test P: Codex review, PR #1192 thread 3815732016 — the standalone
+  // `dist/agent-swarm` binary (`bun run build:binary`) embeds the Bun
+  // runtime for its own execution but does not bundle a separate spawnable
+  // `bun` binary, so Bun.spawn(["bun", ...]) throws "Executable not found in
+  // $PATH" on a host that lacks one. Falls back to the synchronous
+  // in-process path instead of failing every db-query outright.
+  test("P: falls back to the synchronous in-process path when no bun executable can be spawned", async () => {
+    const originalSpawn = Bun.spawn;
+    Bun.spawn = (() => {
+      throw new Error('Executable not found in $PATH: "bun"');
+    }) as typeof Bun.spawn;
+
+    try {
+      const result = await executeReadOnlyQueryBounded("SELECT 1 AS one", [], 5000);
+      expect(result.rows).toEqual([[1]]);
+      expect(result.total).toBe(1);
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
+  // Test Q: the spawn-failure fallback above must not swallow an unrelated
+  // spawn error (e.g. a resource-exhaustion condition) by silently routing
+  // it to the unbounded in-process path — only a missing-executable error
+  // should trigger the fallback.
+  test("Q: does not swallow a genuine spawn error unrelated to a missing executable", async () => {
+    const originalSpawn = Bun.spawn;
+    Bun.spawn = (() => {
+      throw new Error("EMFILE: too many open files");
+    }) as typeof Bun.spawn;
+
+    try {
+      await expect(executeReadOnlyQueryBounded("SELECT 1", [], 5000)).rejects.toThrow(
+        "EMFILE: too many open files",
+      );
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
   });
 
   // -------------------------------------------------------------------------
