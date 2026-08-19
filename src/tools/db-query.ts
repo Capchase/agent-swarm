@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
-import { executeReadOnlyQueryBounded } from "@/http/db-query-bounded";
 import { DbQueryInputShape, resolveDbQuerySql } from "@/http/db-query";
+import { executeReadOnlyQueryBounded } from "@/http/db-query-bounded";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 
 const MCP_MAX_ROWS = 100;

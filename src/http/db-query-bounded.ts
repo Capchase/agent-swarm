@@ -19,8 +19,8 @@
  */
 
 import { getDb, resolveSqliteVecExtensionPath } from "../be/db";
-import { assertSingleStatement } from "./db-query-shared";
 import type { DbQueryResult } from "./db-query-shared";
+import { assertSingleStatement } from "./db-query-shared";
 
 interface ChildPayload {
   file: string;
