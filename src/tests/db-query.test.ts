@@ -67,7 +67,7 @@ const HTTP_TEST_PORT = 13097;
 // A CPU-bound query with near-zero fixture setup cost (no table/data needed)
 // and deterministic timing that doesn't depend on disk cache state, unlike
 // the proposal's own I/O-bound synthetic table. Reliably takes >1s in this
-// sandbox; must stay a SELECT so the read-only guard lets it through.
+// environment; must stay a SELECT so the read-only guard lets it through.
 const SLOW_QUERY = `
   WITH RECURSIVE cnt(x) AS (
     SELECT 1
@@ -184,22 +184,22 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(ticks).toBeGreaterThanOrEqual(expectedTicks * 0.6);
   });
 
-  // Review round 3, thread 3814484703 (Oscar): the concurrency cap
-  // (acquireBoundedQuerySlot/releaseBoundedQuerySlot in db-query-bounded.ts)
-  // had no coverage. acquireBoundedQuerySlot() runs synchronously, before the
-  // child process is even spawned, so firing DB_QUERY_CONCURRENCY_CAP + 1
-  // calls back-to-back (no await between them) guarantees all cap checks run
-  // in one JS tick, in order — no real query slowness is needed to keep every
-  // slot "occupied" at the moment of the check, so a cheap query keeps this
-  // deterministic instead of racing 9 concurrent CPU-heavy child processes
-  // against the sandbox's resources (a SLOW_QUERY-based version of this test
-  // was flaky here: concurrent recursive-CTE children intermittently hit
-  // "database is locked" or got signal-killed under load). Exactly one call
-  // must be rejected with the cap error, the other DB_QUERY_CONCURRENCY_CAP
-  // must resolve. The regression this guards against is subtle — swap
-  // acquire/try ordering, or drop the finally, and the cap silently becomes a
-  // permanent lockout after one rejection instead of a transient one, which
-  // the final assertion below catches.
+  // The concurrency cap (acquireBoundedQuerySlot/releaseBoundedQuerySlot in
+  // db-query-bounded.ts) had no coverage. acquireBoundedQuerySlot() runs
+  // synchronously, before the child process is even spawned, so firing
+  // DB_QUERY_CONCURRENCY_CAP + 1 calls back-to-back (no await between them)
+  // guarantees all cap checks run in one JS tick, in order — no real query
+  // slowness is needed to keep every slot "occupied" at the moment of the
+  // check, so a cheap query keeps this deterministic instead of racing 9
+  // concurrent CPU-heavy child processes against the test runner's resources
+  // (a SLOW_QUERY-based version of this test was flaky here: concurrent
+  // recursive-CTE children intermittently hit "database is locked" or got
+  // signal-killed under load). Exactly one call must be rejected with the
+  // cap error, the other DB_QUERY_CONCURRENCY_CAP must resolve. The
+  // regression this guards against is subtle — swap acquire/try ordering, or
+  // drop the finally, and the cap silently becomes a permanent lockout after
+  // one rejection instead of a transient one, which the final assertion
+  // below catches.
   test("O: concurrency cap rejects exactly one caller past the limit, and releases slots once all settle", async () => {
     const calls = Array.from({ length: DB_QUERY_CONCURRENCY_CAP + 1 }, () =>
       executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
@@ -214,23 +214,22 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(fulfilled.length).toBe(DB_QUERY_CONCURRENCY_CAP);
     expect((rejected[0].reason as Error).message).toMatch(/Too many concurrent/);
 
-    // The assertion Oscar said he'd insist on: slots are released, not
-    // permanently consumed by the rejection above. A caller landing here
-    // after the batch settles must succeed normally.
+    // Asserts slots are released, not permanently consumed by the earlier
+    // rejection — this is what catches a dropped `finally`. A caller landing
+    // here after the batch settles must succeed normally.
     const result = await executeReadOnlyQueryBounded("SELECT 1", [], 10_000);
     expect(result.rows.length).toBe(1);
   });
 
-  // Review round 3, thread 3814484711 (Oscar): neither half of
-  // `isReportableTimeout`'s `timedOut && !(exitCode === 0 && stdout.length >
-  // 0)` was pinned. Test A already asserts the /budget/i message for a
-  // genuinely killed child (timedOut=true, non-zero exit) — that is the
-  // second case Oscar named, covered without duplicating it here. Unit-test
-  // the extracted predicate directly rather than racing real process timing
-  // (the completion-vs-kill race is not reproducible on demand): this pins
-  // both branches deterministically, including the exact boundary — a
-  // fired timer whose child still produced a clean, non-empty result must
-  // not be reported as a timeout.
+  // Neither half of `isReportableTimeout`'s `timedOut && !(exitCode === 0 &&
+  // stdout.length > 0)` was pinned. Test A already asserts the /budget/i
+  // message for a genuinely killed child (timedOut=true, non-zero exit) —
+  // that case is covered without duplicating it here. Unit-test the
+  // extracted predicate directly rather than racing real process timing (the
+  // completion-vs-kill race is not reproducible on demand): this pins both
+  // branches deterministically, including the exact boundary — a fired
+  // timer whose child still produced a clean, non-empty result must not be
+  // reported as a timeout.
   describe("isReportableTimeout (src/http/db-query-bounded.ts)", () => {
     test("a fired timer with a clean, non-empty result is not a timeout", () => {
       expect(isReportableTimeout(true, 0, '{"columns":[],"rows":[]}')).toBe(false);
@@ -316,7 +315,6 @@ describe("db-query bounded execution (Fix 1)", () => {
   // Regression guard for src/http/db-query-bounded.ts:148-150 — a non-write
   // error must propagate the child's stderr as-is, not just the
   // WRITE_REJECTED_EXIT_CODE path (Test E already covers that one).
-  // Reviewer 2's non-blocking suggestion on PR #87.
   test("N: propagates the child's stderr on a non-write, non-zero exit (a SQL error)", async () => {
     await expect(
       executeReadOnlyQueryBounded("SELECT * FROM this_table_does_not_exist_xyz", [], 5000),
@@ -324,7 +322,7 @@ describe("db-query bounded execution (Fix 1)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Feature-flag addendum (follow-up to Fix 1, PR #87): DB_QUERY_BOUNDED_ENABLED
+  // Feature-flag addendum (follow-up to Fix 1): DB_QUERY_BOUNDED_ENABLED
   // kill switch + DB_QUERY_HTTP_BUDGET_MS / DB_QUERY_HTTP_MAX_ROWS /
   // DB_QUERY_MCP_BUDGET_MS overrides. See the plan doc addendum for the design.
   // -------------------------------------------------------------------------
@@ -417,9 +415,8 @@ describe("db-query bounded execution (Fix 1)", () => {
   });
 });
 
-// Review round 3, thread 3814484715 (Oscar): __resetSqliteVecExtensionPathCacheForTests
-// had no caller outside its own definition. Oscar's preference, which we're
-// following: write the test that needs the helper rather than drop it —
+// __resetSqliteVecExtensionPathCacheForTests had no caller outside its own
+// definition. Write the test that needs the helper rather than drop it —
 // resolve once, mutate the env var, resolve again and assert the cached
 // value survives, then reset and assert the new value is picked up. This
 // also pins the "a resolved `undefined` is cached too" doc comment: the
