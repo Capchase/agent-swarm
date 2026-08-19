@@ -6,7 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { closeDb, type CreateTaskOptions, createTaskExtended, getDb, initDb } from "../be/db";
+import { type CreateTaskOptions, closeDb, createTaskExtended, getDb, initDb } from "../be/db";
 import { handleMcpBridge } from "../http/mcp-bridge";
 import { getPathSegments } from "../http/utils";
 
