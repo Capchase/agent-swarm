@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { PermissionVerb } from "../rbac";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { jsonError, matchRoute, parseBody } from "./utils";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -228,7 +229,7 @@ export function route<
             if (process.env.NODE_ENV === "test") {
               throw new Error(detail);
             }
-            console.error(`[route-def] ${detail}`);
+            console.error(`[route-def] ${scrubSecrets(detail)}`);
           }
         }
       }
