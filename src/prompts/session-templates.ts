@@ -197,29 +197,6 @@ registerTemplate({
 });
 
 registerTemplate({
-  eventType: "system.agent.db_query_guidance",
-  header: "",
-  defaultBody: `
-### Database queries (\`db-query\`)
-
-The swarm database is SQLite. By default a query runs in a short-lived child process with a wall-clock budget (around 10s over HTTP, 5s over MCP); the API itself keeps answering other requests while it runs, and a query that runs past its budget is killed. That budget protection can be off — an operator can disable it, or a host with no separate \`bun\` executable falls back to running the query in-process — so a query that reads millions of rows still wastes a full child process (or, on the fallback path, can stop the API long enough for Kubernetes to restart it, failing every task in flight) even when it does not crash anything.
-
-Four tables are too large to read whole: \`session_logs\`, \`agent_log\`, \`events\`, \`task_context_snapshots\`.
-
-For these four tables:
-
-- Filter on an indexed column. \`session_logs\`: \`taskId\`, \`sessionId\`. \`agent_log\`: \`agentId\`, \`taskId\`, \`eventType\`, \`createdAt\`.
-- Add \`LIMIT 1000\` or less.
-- Do not use \`COUNT(*)\`, \`SUM(...)\` or \`typeof()\` across the table.
-- Do not split a large read into \`rowid\` chunks. Each chunk still reads every row in its range. Chunking does not make a large read safe.
-
-If you need a row total or a column type census, ask the lead. Do not derive it yourself.
-`,
-  variables: [],
-  category: "system",
-});
-
-registerTemplate({
   eventType: "system.agent.steering",
   header: "",
   defaultBody: `

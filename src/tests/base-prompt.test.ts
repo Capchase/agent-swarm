@@ -971,38 +971,4 @@ describe("getBasePrompt — serverCapabilities gating", () => {
     });
     expect(result).toContain("slack-list-channels");
   });
-
-  // §9.2 of the db-query event-loop-freeze proposal — durable guidance that
-  // reaches every core-capability agent, not just named-tool callers.
-  test("db-query guidance kept when serverCapabilities is unknown (legacy servers registered core unconditionally)", async () => {
-    const result = await getBasePrompt(minimalArgs);
-    expect(result).toContain("### Database queries (`db-query`)");
-    expect(result).toContain("session_logs");
-    expect(result).toContain("Do not split a large read into `rowid` chunks");
-  });
-
-  test("db-query guidance omitted when server capabilities omit core", async () => {
-    const result = await getBasePrompt({
-      ...minimalArgs,
-      serverCapabilities: ["messaging"],
-    });
-    expect(result).not.toContain("### Database queries (`db-query`)");
-  });
-
-  test("db-query guidance included when the server enables core", async () => {
-    const result = await getBasePrompt({
-      ...minimalArgs,
-      serverCapabilities: ["core"],
-    });
-    expect(result).toContain("### Database queries (`db-query`)");
-  });
-
-  test("db-query guidance still reaches scripts-only agents (scripts call db_query through the SDK bridge too)", async () => {
-    const result = await getBasePrompt({
-      ...minimalArgs,
-      scriptsOnly: true,
-      serverCapabilities: ["core"],
-    });
-    expect(result).toContain("### Database queries (`db-query`)");
-  });
 });
