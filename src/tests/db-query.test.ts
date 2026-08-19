@@ -13,12 +13,9 @@ import {
   handleDbQuery,
   resolveDbQuerySql,
 } from "../http/db-query";
+import { executeReadOnlyQueryBounded, isReportableTimeout } from "../http/db-query-bounded";
 import {
-  DB_QUERY_CONCURRENCY_CAP,
-  executeReadOnlyQueryBounded,
-  isReportableTimeout,
-} from "../http/db-query-bounded";
-import {
+  getDbQueryConcurrencyCap,
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
   getDbQueryMcpBudgetMs,
@@ -127,6 +124,7 @@ const DB_QUERY_OVERRIDE_ENV_KEYS = [
   "DB_QUERY_HTTP_BUDGET_MS",
   "DB_QUERY_HTTP_MAX_ROWS",
   "DB_QUERY_MCP_BUDGET_MS",
+  "DB_QUERY_CONCURRENCY_CAP",
 ] as const;
 
 async function removeBoundedTestDb(): Promise<void> {
@@ -204,7 +202,8 @@ describe("db-query bounded execution (Fix 1)", () => {
   // permanent lockout after one rejection instead of a transient one, which
   // the final assertion below catches.
   test("O: concurrency cap rejects exactly one caller past the limit, and releases slots once all settle", async () => {
-    const calls = Array.from({ length: DB_QUERY_CONCURRENCY_CAP + 1 }, () =>
+    const cap = getDbQueryConcurrencyCap();
+    const calls = Array.from({ length: cap + 1 }, () =>
       executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
     );
     const settled = await Promise.allSettled(calls);
@@ -214,7 +213,7 @@ describe("db-query bounded execution (Fix 1)", () => {
     );
     const fulfilled = settled.filter((outcome) => outcome.status === "fulfilled");
     expect(rejected.length).toBe(1);
-    expect(fulfilled.length).toBe(DB_QUERY_CONCURRENCY_CAP);
+    expect(fulfilled.length).toBe(cap);
     expect((rejected[0].reason as Error).message).toMatch(/Too many concurrent/);
 
     // The assertion Oscar said he'd insist on: slots are released, not
@@ -517,7 +516,7 @@ describe("db-query bounded execution (Fix 1)", () => {
   // same technique as test O), then confirm the one HTTP call that lands on
   // top gets 429 with a stable code and a Retry-After header instead of 400.
   test("caps saturation via the HTTP route returns 429 with a stable code and Retry-After", async () => {
-    const fillers = Array.from({ length: DB_QUERY_CONCURRENCY_CAP }, () =>
+    const fillers = Array.from({ length: getDbQueryConcurrencyCap() }, () =>
       executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
     );
 
@@ -564,6 +563,22 @@ describe("db-query bounded execution (Fix 1)", () => {
     await expect(
       executeReadOnlyQueryGated(SLOW_QUERY, [], getDbQueryMcpBudgetMs()),
     ).rejects.toThrow(/150ms budget/);
+  });
+
+  // U: Codex review, PR #1192 thread 3816146995 — the concurrency cap must be
+  // an operator-tunable knob, not a hardcoded constant, so a deployment with
+  // more headroom than the 1 GiB default sizing assumes can raise it (and one
+  // with less can lower it) without a code change.
+  test("U: DB_QUERY_CONCURRENCY_CAP overrides the concurrency cap", async () => {
+    process.env.DB_QUERY_CONCURRENCY_CAP = "2";
+    expect(getDbQueryConcurrencyCap()).toBe(2);
+
+    const calls = Array.from({ length: 3 }, () =>
+      executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
+    );
+    const settled = await Promise.allSettled(calls);
+    const rejected = settled.filter((outcome) => outcome.status === "rejected");
+    expect(rejected.length).toBe(1);
   });
 
   // Review round 4 (desplega-bot, pullrequestreview-4975616777), non-blocking

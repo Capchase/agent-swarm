@@ -41,6 +41,7 @@ import {
   DbQueryConcurrencyCapError,
   DbQueryTimeoutError,
   executeReadOnlyQuery,
+  getDbQueryConcurrencyCap,
   warnDbQuerySpawnUnavailableOnce,
 } from "./db-query-shared";
 
@@ -159,24 +160,23 @@ const { Database } = require("bun:sqlite");
  * raw stdout buffer, and the parent's parsed JS object all live at once per
  * in-flight query).
  *
- * Sized against the largest payload measured against this code path — a 68MB
- * result set, ~15ms to `JSON.parse` on the parent side (see the PR
- * discussion) — and the API pod's 10Gi memory limit. Treating 3x that
- * payload as one query's worst-case footprint (~200MB), a cap of 8 bounds
- * worst-case fan-out to ~1.6GB: comfortable headroom inside 10Gi, leaving the
- * rest for the pod's steady-state work. Rejects immediately when full rather
- * than queueing — an unbounded queue would just move the memory growth from
- * "many children" to "many pending callers," and a caller that's told to
- * retry can back off, whereas a caller stuck in an in-process queue can't.
+ * The default is `DB_QUERY_CONCURRENCY_CAP_DEFAULT` (see db-query-shared.ts
+ * for the sizing math against the API pod's real 1 GiB memory limit);
+ * overridable per deployment via `DB_QUERY_CONCURRENCY_CAP`, read dynamically
+ * on every call (never captured in a module-level const) so a `swarm_config`
+ * edit takes effect on the next request with no restart — mirrors
+ * `isDbQueryBoundedEnabled`. Rejects immediately when full rather than
+ * queueing — an unbounded queue would just move the memory growth from "many
+ * children" to "many pending callers," and a caller that's told to retry can
+ * back off, whereas a caller stuck in an in-process queue can't.
  */
-export const DB_QUERY_CONCURRENCY_CAP = 8;
-
 let activeBoundedQueryCount = 0;
 
 function acquireBoundedQuerySlot(): void {
-  if (activeBoundedQueryCount >= DB_QUERY_CONCURRENCY_CAP) {
+  const cap = getDbQueryConcurrencyCap();
+  if (activeBoundedQueryCount >= cap) {
     throw new DbQueryConcurrencyCapError(
-      `Too many concurrent db-query executions in flight (cap ${DB_QUERY_CONCURRENCY_CAP}). Retry shortly.`,
+      `Too many concurrent db-query executions in flight (cap ${cap}). Retry shortly.`,
     );
   }
   activeBoundedQueryCount++;

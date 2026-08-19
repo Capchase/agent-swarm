@@ -363,6 +363,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         defaultValue: "5000",
         placeholder: "5000",
       },
+      {
+        key: "DB_QUERY_CONCURRENCY_CAP",
+        label: "Concurrent query cap",
+        description:
+          "Maximum bounded db-query executions in flight at once, across HTTP and MCP callers. Each in-flight query can peak around 200MB; the default of 3 is sized against a 1 GiB API pod memory limit. Raise it only if the API pod has more memory headroom.",
+        kind: "number",
+        defaultValue: "3",
+        placeholder: "3",
+      },
     ],
   },
   {

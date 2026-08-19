@@ -104,6 +104,23 @@ export const DB_QUERY_HTTP_MAX_ROWS_DEFAULT = 1000;
 export const DB_QUERY_MCP_BUDGET_MS_DEFAULT = 5_000;
 
 /**
+ * Default concurrency cap for in-flight bounded child-process queries (see
+ * `acquireBoundedQuerySlot` in db-query-bounded.ts).
+ *
+ * Codex review, PR #1192 thread 3816146995: the deployment guide's real API
+ * memory limit is 1 GiB (`docs-site/.../guides/performance-resource-sizing.mdx`
+ * — the `10Gi` size in `charts/agent-swarm/values.yaml` is PVC storage, not a
+ * memory limit). Sized against the largest payload measured against this code
+ * path — a 68MB result set — and a ~3x-per-query worst-case footprint (the
+ * child's own rows array, the parent's raw stdout buffer, and the parent's
+ * parsed JS object all live at once per in-flight query, ~200MB): a cap of 3
+ * bounds worst-case fan-out to ~600MB, leaving headroom in the 1 GiB limit for
+ * the API process's own baseline footprint. Configurable via
+ * `DB_QUERY_CONCURRENCY_CAP` for operators running a larger API pod.
+ */
+export const DB_QUERY_CONCURRENCY_CAP_DEFAULT = 3;
+
+/**
  * Master kill switch for the bounded child-process execution path (Fix 1).
  * Enabled by default — the fix ships active; an operator sets this to
  * `false` to restore the pre-fix synchronous, unbounded path. Read
@@ -169,6 +186,11 @@ export function getDbQueryMcpBudgetMs(env: NodeJS.ProcessEnv = process.env): num
     env,
     MAX_TIMER_DELAY_MS,
   );
+}
+
+/** Concurrency cap for in-flight bounded child-process queries. Overridable via `DB_QUERY_CONCURRENCY_CAP`. */
+export function getDbQueryConcurrencyCap(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntEnv("DB_QUERY_CONCURRENCY_CAP", DB_QUERY_CONCURRENCY_CAP_DEFAULT, env);
 }
 
 let hasWarnedBoundedDisabled = false;
