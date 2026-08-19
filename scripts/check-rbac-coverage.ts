@@ -49,6 +49,16 @@ const GATE_HELPER_SPECIFIERS = [
 ];
 
 /**
+ * Gate helpers that live in a module also exporting non-auth symbols (so an
+ * import-path match on GATE_HELPER_SPECIFIERS would false-positive on other
+ * importers — e.g. create-metric.ts imports assertSelectOnlyQuery from the
+ * same src/http/db-query.ts module). Matched by call expression instead.
+ */
+const GATE_HELPER_CALL_PATTERNS: RegExp[] = [
+  /\bcheckDbQueryAccess\(/, // src/http/db-query.ts → can("db-query.execute") on behalf of callers
+];
+
+/**
  * Tool-registration files with NO principal gate, pinned at the slice-1
  * inventory (plan Appendix A: every HARD authorization site at HEAD got a
  * verb; everything else was ungated by design — read-only, own-scoped, or
@@ -160,7 +170,10 @@ function checkTools(): string[] {
     const src = readFileSync(file, "utf8");
     // Helper detection matches the import specifier's basename, so both
     // same-dir (./kv-write-auth) and aliased (@/tools/task-tool-ctx) imports count.
-    const gated = /\bcan\(/.test(src) || GATE_HELPER_SPECIFIERS.some((h) => src.includes(`${h}"`));
+    const gated =
+      /\bcan\(/.test(src) ||
+      GATE_HELPER_SPECIFIERS.some((h) => src.includes(`${h}"`)) ||
+      GATE_HELPER_CALL_PATTERNS.some((p) => p.test(src));
     const allowlisted = rel in UNGATED_TOOL_FILES;
 
     if (gated && allowlisted) {
@@ -254,7 +267,6 @@ const ROUTE_RBAC_BACKLOG: Record<string, string> = {
   "POST /api/approval-requests/{id}/respond": BACKLOG_REASON,
   "POST /api/channel-activity/commit-cursors": BACKLOG_REASON,
   "POST /api/config/reload": BACKLOG_REASON,
-  "POST /api/db-query": BACKLOG_REASON,
   "POST /api/events": BACKLOG_REASON,
   "POST /api/events/batch": BACKLOG_REASON,
   "POST /api/fs/agent-credentials": BACKLOG_REASON,

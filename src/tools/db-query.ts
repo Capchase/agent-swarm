@@ -1,28 +1,15 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
-import { getAgentById, getSwarmConfigs } from "@/be/db";
-import { DbQueryInputShape, executeReadOnlyQuery, resolveDbQuerySql } from "@/http/db-query";
-import { can } from "@/rbac";
+import { getAgentById } from "@/be/db";
+import {
+  checkDbQueryAccess,
+  DbQueryInputShape,
+  executeReadOnlyQuery,
+  resolveDbQuerySql,
+} from "@/http/db-query";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 
 const MCP_MAX_ROWS = 100;
-
-/** Agent-scoped swarm_config key that grants a non-lead agent db-query access. */
-const DB_QUERY_ALLOWED_KEY = "DB_QUERY_ALLOWED";
-
-/**
- * Lead is always allowed. A non-lead agent is allowed only if the lead has
- * explicitly granted it via `set-config` (scope: "agent", key:
- * "DB_QUERY_ALLOWED", value: "true") — that write path is itself lead-gated
- * (src/tools/swarm-config/set-config.ts), so this is a real security
- * boundary, unlike the self-editable `agent.capabilities` field.
- */
-function isDbQueryGranted(agentId: string): boolean {
-  return (
-    getSwarmConfigs({ scope: "agent", scopeId: agentId, key: DB_QUERY_ALLOWED_KEY })[0]?.value ===
-    "true"
-  );
-}
 
 const DbQueryToolInputSchema = z
   .object({
@@ -54,17 +41,14 @@ export const registerDbQueryTool = (server: McpServer) => {
     },
     async (input, requestInfo, _meta) => {
       const callerAgent = requestInfo.agentId ? getAgentById(requestInfo.agentId) : null;
-      const granted = requestInfo.agentId ? isDbQueryGranted(requestInfo.agentId) : false;
-      const decision = can({
-        principal: {
+      const decision = checkDbQueryAccess(
+        {
           kind: "agent",
           agentId: requestInfo.agentId ?? "",
           isLead: callerAgent?.isLead ?? false,
         },
-        verb: "db-query.execute",
-        resource: { kind: "capability-grant", granted },
-        source: "mcp",
-      });
+        "mcp",
+      );
       if (!decision.allow || !callerAgent) {
         return toolErr(
           "Only the lead agent, or an agent explicitly granted db-query access, can run this query.",

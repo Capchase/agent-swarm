@@ -21,6 +21,7 @@ import { SwarmConfigSchema } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
 import { registerVolatileSecret } from "../utils/secret-scrubber";
 import { reloadGlobalConfigsAndIntegrations, scheduleIntegrationsReload } from "./core";
+import { DB_QUERY_ALLOWED_KEY } from "./db-query";
 import { route } from "./route-def";
 import { jsonError } from "./utils";
 
@@ -104,6 +105,29 @@ function ensureConfigAdmin(
     return false;
   }
   return true;
+}
+
+/**
+ * Extra, narrowly-scoped gate on top of `ensureConfigAdmin` for one specific
+ * key: `DB_QUERY_ALLOWED` (src/http/db-query.ts). `ensureConfigAdmin` treats
+ * the shared swarm bearer as an always-allowed operator context by design
+ * (dashboard, codex-oauth refresh, etc. all operate as operator) — but every
+ * agent process authenticates with that SAME shared bearer (see CLAUDE.md's
+ * architecture invariants), so a non-lead agent PUTting its own X-Agent-ID
+ * would otherwise mint itself the one grant db-query.execute withholds.
+ *
+ * Scoped narrowly on purpose: only this key, only when an X-Agent-ID is
+ * present. Requests with no X-Agent-ID (dashboard/operator provisioning,
+ * e.g. Oscar granting an agent access) are unaffected. A broader redesign of
+ * config-write authorization is out of scope here.
+ */
+function ensureDbQueryGrantAdmin(req: IncomingMessage, res: ServerResponse): boolean {
+  const agentId = singleHeader(req, "x-agent-id");
+  if (!agentId) return true;
+  const agent = getAgentById(agentId);
+  if (agent?.isLead) return true;
+  jsonError(res, `Writing ${DB_QUERY_ALLOWED_KEY} requires the lead agent`, 403);
+  return false;
 }
 
 // ─── Route Definitions ───────────────────────────────────────────────────────
@@ -370,6 +394,10 @@ export async function handleConfig(
     if (!parsed) return true;
     if (!ensureConfigAdmin(req, res, "config.write.any")) return true;
     const { scope, scopeId, key, value, isSecret, envPath, description } = parsed.body;
+
+    if (scope === "agent" && key.toUpperCase() === DB_QUERY_ALLOWED_KEY) {
+      if (!ensureDbQueryGrantAdmin(req, res)) return true;
+    }
 
     if (scope === "global" && scopeId) {
       jsonError(res, "Global scope must not have scopeId", 400);
