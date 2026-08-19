@@ -125,6 +125,7 @@ import {
   ReasoningEffortSchema,
   RoutingAffinitySchema,
   SessionCostModelBreakdownSchema,
+  TaskDescriptionSchema,
 } from "../types";
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import { isEnvFlagEnabled } from "../utils/env-flag";
@@ -136,6 +137,7 @@ import {
 } from "../utils/identity-field-budget";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { formatZodIssues, summarizeIssues, ValidationError } from "../utils/validation-error";
 import { auditAssetKeys, enforceAssetKeyStartupAudit } from "./asset-key-audit";
 import { migrateLegacyCredentialBindingBlob } from "./connection-bindings-blob-migration";
 import { decryptSecret, encryptSecret, getEncryptionKey, resolveEncryptionKey } from "./crypto";
@@ -4720,14 +4722,27 @@ export function findRecentSimilarTasks(opts: {
 }
 
 export function createTaskExtended(task: string, options?: CreateTaskOptions): AgentTask {
-  if (typeof task !== "string" || task.trim().length === 0) {
-    throw new Error("createTaskExtended: 'task' must be a non-empty string");
-  }
   // Single runtime enforcement point for every task write (REST, MCP,
   // scripts bridge, webhooks, scheduler, internal callers). Reject, never
   // coerce: a bad shape throws before anything reaches the INSERT; absent
   // fields keep the `??` defaults at the bind site below.
-  options = CreateTaskOptionsSchema.parse(options ?? {});
+  //
+  // Both halves are checked before throwing so a caller learns about EVERY
+  // offending field in one round trip instead of one per retry, and the
+  // positional `task` argument is reported under the field name the caller
+  // actually sent. The thrown `ValidationError` is what lets the REST catch,
+  // the MCP bridge, and the MCP tool registrar answer 400 with the field
+  // detail instead of an anonymous 500.
+  const taskResult = TaskDescriptionSchema.safeParse(task);
+  const optionsResult = CreateTaskOptionsSchema.safeParse(options ?? {});
+  if (!taskResult.success || !optionsResult.success) {
+    const issues = [
+      ...(taskResult.success ? [] : formatZodIssues(taskResult.error, "task")),
+      ...(optionsResult.success ? [] : formatZodIssues(optionsResult.error)),
+    ];
+    throw new ValidationError(summarizeIssues(issues), issues, "createTaskExtended");
+  }
+  options = optionsResult.data;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const status: AgentTaskStatus = options?.offeredTo
