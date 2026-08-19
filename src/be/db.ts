@@ -192,16 +192,32 @@ export function isSqliteVecAvailable(): boolean {
  * the path instead of loading it: the bounded db-query child process (see
  * src/http/db-query-bounded.ts) opens its own read-only connection and must
  * load the extension itself, so the parent resolves the path once and passes
- * it along.
+ * it along. The result is memoized — `undefined` is a valid resolved answer
+ * (extension genuinely unavailable) and is cached too, so a failing
+ * `require` doesn't retry on every query.
  */
+let cachedSqliteVecExtensionPath: string | undefined | null = null;
+
 export function resolveSqliteVecExtensionPath(): string | undefined {
+  if (cachedSqliteVecExtensionPath !== null) return cachedSqliteVecExtensionPath;
   const extensionPath = process.env.SQLITE_VEC_EXTENSION_PATH;
-  if (extensionPath) return extensionPath;
-  try {
-    return (require("sqlite-vec") as { getLoadablePath(): string }).getLoadablePath();
-  } catch {
-    return undefined;
+  if (extensionPath) {
+    cachedSqliteVecExtensionPath = extensionPath;
+    return cachedSqliteVecExtensionPath;
   }
+  try {
+    cachedSqliteVecExtensionPath = (
+      require("sqlite-vec") as { getLoadablePath(): string }
+    ).getLoadablePath();
+  } catch {
+    cachedSqliteVecExtensionPath = undefined;
+  }
+  return cachedSqliteVecExtensionPath;
+}
+
+/** Test-only: clear the memoized sqlite-vec extension path cache. */
+export function __resetSqliteVecExtensionPathCacheForTests(): void {
+  cachedSqliteVecExtensionPath = null;
 }
 
 function loadSqliteVec(database: Database): void {

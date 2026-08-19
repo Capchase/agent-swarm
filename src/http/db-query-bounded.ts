@@ -85,6 +85,43 @@ const { Database } = require("bun:sqlite");
 `;
 
 /**
+ * Concurrency cap for in-flight bounded child-process queries.
+ *
+ * Before this cap, N concurrent callers spawned N children in parallel, each
+ * materializing its own full result set — peak memory went from roughly 1x
+ * (the old synchronous path serialized callers on one thread) to roughly
+ * 3x-per-query and unbounded in N (the child's own rows array, the parent's
+ * raw stdout buffer, and the parent's parsed JS object all live at once per
+ * in-flight query).
+ *
+ * Sized against the largest payload measured against this code path — a 68MB
+ * result set, ~15ms to `JSON.parse` on the parent side (see the PR
+ * discussion) — and the API pod's 10Gi memory limit. Treating 3x that
+ * payload as one query's worst-case footprint (~200MB), a cap of 8 bounds
+ * worst-case fan-out to ~1.6GB: comfortable headroom inside 10Gi, leaving the
+ * rest for the pod's steady-state work. Rejects immediately when full rather
+ * than queueing — an unbounded queue would just move the memory growth from
+ * "many children" to "many pending callers," and a caller that's told to
+ * retry can back off, whereas a caller stuck in an in-process queue can't.
+ */
+const DB_QUERY_CONCURRENCY_CAP = 8;
+
+let activeBoundedQueryCount = 0;
+
+function acquireBoundedQuerySlot(): void {
+  if (activeBoundedQueryCount >= DB_QUERY_CONCURRENCY_CAP) {
+    throw new Error(
+      `Too many concurrent db-query executions in flight (cap ${DB_QUERY_CONCURRENCY_CAP}). Retry shortly.`,
+    );
+  }
+  activeBoundedQueryCount++;
+}
+
+function releaseBoundedQuerySlot(): void {
+  activeBoundedQueryCount--;
+}
+
+/**
  * Run one read-only query in a bounded `bun -e` child process, SIGKILLing it
  * if it runs past `budgetMs`. Semantics match executeReadOnlyQuery exactly:
  * the full result set is materialized before `maxRows` caps it, so `total`
@@ -99,7 +136,21 @@ export async function executeReadOnlyQueryBounded(
   maxRows?: number,
 ): Promise<DbQueryResult> {
   assertSingleStatement(sql);
+  acquireBoundedQuerySlot();
 
+  try {
+    return await runBoundedQueryChild(sql, params, budgetMs, maxRows);
+  } finally {
+    releaseBoundedQuerySlot();
+  }
+}
+
+async function runBoundedQueryChild(
+  sql: string,
+  params: unknown[],
+  budgetMs: number,
+  maxRows?: number,
+): Promise<DbQueryResult> {
   const payload: ChildPayload = {
     file: getDb().filename,
     sql,
@@ -135,9 +186,13 @@ export async function executeReadOnlyQueryBounded(
     clearTimeout(timer);
   }
 
-  if (timedOut) {
+  // A complete, correct result can land in the same tick the budget timer
+  // fires. Prefer it over reporting a timeout — only the kill genuinely
+  // preventing an answer (no successful, non-empty stdout) counts as a
+  // timeout to the caller.
+  if (timedOut && !(exitCode === 0 && stdout.length > 0)) {
     throw new Error(
-      `Query exceeded the ${budgetMs}ms budget and was terminated. Filter on an indexed column and add LIMIT 1000 or less.`,
+      `Query exceeded the ${budgetMs}ms budget and was terminated. Filter on an indexed column and add a LIMIT. Aggregates such as COUNT(*), SUM(...) or typeof() over session_logs, agent_log, events or task_context_snapshots read every row in range and cannot be made cheap by chunking on rowid.`,
     );
   }
 
