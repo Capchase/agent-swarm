@@ -34,6 +34,7 @@ let sdk: NodeSDK | undefined;
 let costCounter: Counter | undefined;
 let tokenCounter: Counter | undefined;
 let costDriftCounter: Counter | undefined;
+let responseSchemaViolationCounter: Counter | undefined;
 
 function decodeResourceAttributeValue(value: string): string {
   try {
@@ -276,6 +277,33 @@ function ensureInstruments(): void {
   costDriftCounter = meter.createCounter("agentswarm.cost.drift.usd", {
     description: "Absolute USD drift between stored and harness-reported session costs",
     unit: "{usd}",
+  });
+  responseSchemaViolationCounter = meter.createCounter(
+    "agentswarm.http.response_schema_violations",
+    {
+      description:
+        "Responses whose payload failed its declared schema. respond() fails open outside tests, so this is the only signal that an endpoint's declared contract is being violated.",
+      unit: "{violation}",
+    },
+  );
+}
+
+/**
+ * Count one `respond()` response-schema violation. Labels are the route
+ * TEMPLATE, method, and status — bounded to one series per declared route
+ * response. The scrubbed field-level detail stays in the stderr log; it is far
+ * too high-cardinality for a metric attribute.
+ */
+export function recordResponseSchemaViolation(m: {
+  method: string;
+  route: string;
+  status: number;
+}): void {
+  ensureInstruments();
+  responseSchemaViolationCounter?.add(1, {
+    "http.request.method": scrubSecrets(m.method),
+    "http.route": scrubSecrets(m.route),
+    "http.response.status_code": m.status,
   });
 }
 

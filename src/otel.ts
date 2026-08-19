@@ -61,6 +61,9 @@ let realInjectTraceContext:
   | undefined;
 let realShutdown: (() => Promise<void>) | undefined;
 let realRecordSessionCost: ((m: SessionCostMetric) => void) | undefined;
+let realRecordResponseSchemaViolation:
+  | ((m: { method: string; route: string; status: number }) => void)
+  | undefined;
 
 export function isOtelEnabled(): boolean {
   return otelConfigured();
@@ -85,6 +88,7 @@ export async function initOtel(serviceRole = process.env.AGENT_ROLE || "api"): P
     realInjectTraceContext = impl.injectTraceContext;
     realShutdown = impl.shutdown;
     realRecordSessionCost = impl.recordSessionCost;
+    realRecordResponseSchemaViolation = impl.recordResponseSchemaViolation;
     console.log(`[OTel] enabled for ${impl.resolveServiceName(serviceRole)} (${serviceRole})`);
   } catch (error) {
     console.warn(`[OTel] disabled after initialization failure: ${error}`);
@@ -143,6 +147,21 @@ export function recordSessionCost(m: SessionCostMetric): void {
   realRecordSessionCost(m);
 }
 
+/**
+ * Count one `respond()` response-schema violation (route template, method,
+ * status). See `src/http/response-schema-violations.ts` for why this exists:
+ * `respond()` fails open outside tests, and a failed-open violation is
+ * otherwise indistinguishable from a healthy 200.
+ */
+export function recordResponseSchemaViolation(m: {
+  method: string;
+  route: string;
+  status: number;
+}): void {
+  if (!otelConfigured() || !realRecordResponseSchemaViolation) return;
+  realRecordResponseSchemaViolation(m);
+}
+
 export function _resetOtelForTests() {
   initialized = false;
   realWithSpan = undefined;
@@ -152,4 +171,5 @@ export function _resetOtelForTests() {
   realInjectTraceContext = undefined;
   realShutdown = undefined;
   realRecordSessionCost = undefined;
+  realRecordResponseSchemaViolation = undefined;
 }

@@ -1,8 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { z } from "zod";
+import type { z } from "zod";
 import type { PermissionVerb } from "../rbac";
 import { scrubSecrets } from "../utils/secret-scrubber";
-import { jsonError, matchRoute, parseBody } from "./utils";
+import { toValidationError, validationErrorBody } from "../utils/validation-error";
+import { countResponseSchemaViolation } from "./response-schema-violations";
+import { matchRoute, parseBody } from "./utils";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -226,6 +228,17 @@ export function route<
               result.error.issues
                 .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
                 .join("; ");
+            // Count BEFORE the test-mode throw: failing open makes the
+            // violation invisible to telemetry (the HTTP span records an error
+            // only for status >= 500, and the OTel setup exports no logs), so
+            // the counter is the only thing that makes recurring contract
+            // corruption alertable. Counting first also gives tests a
+            // deterministic seam on the throwing path.
+            countResponseSchemaViolation({
+              method: def.method.toUpperCase(),
+              route: def.path,
+              status: code,
+            });
             if (process.env.NODE_ENV === "test") {
               throw new Error(detail);
             }
@@ -271,12 +284,13 @@ export function route<
           z.infer<TBody>
         >;
       } catch (err) {
-        if (err instanceof z.ZodError) {
-          jsonError(
-            res,
-            `Validation error: ${err.issues.map((e) => `${e.path.join(".")}: ${e.message}`).join(", ")}`,
-            400,
-          );
+        // Same wire shape as every other entrypoint (see
+        // src/utils/validation-error.ts): a caller must not have to tell an
+        // ingress-schema rejection apart from a choke-point rejection.
+        const validation = toValidationError(err);
+        if (validation) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(validationErrorBody(validation)));
           return null;
         }
         throw err;
