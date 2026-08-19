@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { closeDb, initDb } from "../be/db";
+import { closeDb, createAgent, initDb } from "../be/db";
 import {
   deleteOAuthTokens,
   getOAuthTokens,
@@ -20,6 +20,9 @@ import {
 
 const TEST_DB_PATH = "./test-oauth-access-token-tool.sqlite";
 const originalFetch = globalThis.fetch;
+const LEAD_ID = "aaaa5000-0000-4000-8000-000000000001";
+/** get-oauth-access-token is lead-gated (oauth-token.read) — simulate a lead caller. */
+const LEAD_EXTRA = { requestInfo: { headers: { "x-agent-id": LEAD_ID } } };
 
 const testApp = {
   clientId: "client-id",
@@ -32,6 +35,7 @@ const testApp = {
 
 beforeAll(() => {
   initDb(TEST_DB_PATH);
+  createAgent({ id: LEAD_ID, name: "OAuth Tool Test Lead", isLead: true, status: "idle" });
   upsertOAuthApp("linear", testApp);
   upsertOAuthApp("jira", {
     ...testApp,
@@ -87,7 +91,7 @@ describe("resolveOAuthAccessToken", () => {
 
     const result = (await tool.handler(
       { provider: "custom-provider", minValiditySeconds: 300 },
-      {},
+      LEAD_EXTRA,
     )) as {
       content: Array<{ type: string; text: string }>;
       structuredContent: {
@@ -151,7 +155,7 @@ describe("resolveOAuthAccessToken", () => {
     )._registeredTools["get-oauth-access-token"];
     if (!tool) throw new Error("get-oauth-access-token tool was not registered");
 
-    const result = (await tool.handler({ provider: "custom-provider" }, {})) as {
+    const result = (await tool.handler({ provider: "custom-provider" }, LEAD_EXTRA)) as {
       content: Array<{ type: string; text: string }>;
       structuredContent: { success: boolean; message: string };
       isError?: boolean;
