@@ -186,6 +186,24 @@ export function isSqliteVecAvailable(): boolean {
   return sqliteVecAvailable;
 }
 
+/**
+ * Resolve the sqlite-vec loadable extension path without opening a Database.
+ * Mirrors loadSqliteVec's env-var-first, npm-fallback resolution, but returns
+ * the path instead of loading it: the bounded db-query child process (see
+ * src/http/db-query-bounded.ts) opens its own read-only connection and must
+ * load the extension itself, so the parent resolves the path once and passes
+ * it along.
+ */
+export function resolveSqliteVecExtensionPath(): string | undefined {
+  const extensionPath = process.env.SQLITE_VEC_EXTENSION_PATH;
+  if (extensionPath) return extensionPath;
+  try {
+    return (require("sqlite-vec") as { getLoadablePath(): string }).getLoadablePath();
+  } catch {
+    return undefined;
+  }
+}
+
 function loadSqliteVec(database: Database): void {
   sqliteVecAvailable = false;
   try {

@@ -1,15 +1,22 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { getDb } from "../be/db";
+import { executeReadOnlyQueryBounded } from "./db-query-bounded";
+import {
+  assertSingleStatement,
+  type DbQueryResult,
+  stripTrailingSemicolon,
+} from "./db-query-shared";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
-export interface DbQueryResult {
-  columns: string[];
-  rows: unknown[][];
-  elapsed: number;
-  total: number;
-}
+export type { DbQueryResult } from "./db-query-shared";
+export { assertSingleStatement } from "./db-query-shared";
+
+/** Wall-clock budget for the /api/db-query HTTP route — bounded execution runs the query in a child process and SIGKILLs it past this budget (see db-query-bounded.ts). */
+const HTTP_BUDGET_MS = 10_000;
+/** Default row cap for the HTTP route, which previously had none. Matches the LIMIT the §9.2 guidance recommends. */
+const HTTP_DEFAULT_MAX_ROWS = 1000;
 
 export const DbQueryInputShape = {
   sql: z.string().min(1).max(10_000).optional(),
@@ -27,17 +34,6 @@ export type DbQueryInput = z.infer<typeof DbQueryInputSchema>;
 
 export function resolveDbQuerySql(input: Pick<DbQueryInput, "sql" | "query">): string {
   return input.sql ?? input.query ?? "";
-}
-
-function stripTrailingSemicolon(sql: string): string {
-  return sql.trim().replace(/;\s*$/, "").trim();
-}
-
-function assertSingleStatement(sql: string): void {
-  const stripped = stripTrailingSemicolon(sql);
-  if (stripped.includes(";")) {
-    throw new Error("Only one SQL statement is allowed");
-  }
 }
 
 export function assertSelectOnlyQuery(sql: string): void {
@@ -115,7 +111,12 @@ export async function handleDbQuery(
   if (!parsed) return true;
 
   try {
-    const result = executeReadOnlyQuery(resolveDbQuerySql(parsed.body), parsed.body.params);
+    const result = await executeReadOnlyQueryBounded(
+      resolveDbQuerySql(parsed.body),
+      parsed.body.params,
+      HTTP_BUDGET_MS,
+      HTTP_DEFAULT_MAX_ROWS,
+    );
     json(res, result);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
