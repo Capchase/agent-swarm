@@ -789,6 +789,19 @@ export function updateAgentCredentialState(
   return row ? rowToAgent(row) : null;
 }
 
+/**
+ * Record which env vars a worker is missing without touching status — the
+ * logical status is derived from runtime readiness in multi-runtime mode.
+ */
+export function updateAgentCredentialMissing(agentId: string, missing: string[] | null): void {
+  const json = missing && missing.length > 0 ? JSON.stringify(missing) : null;
+  getDb()
+    .prepare(
+      "UPDATE agents SET credentialMissing = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .run(json, agentId);
+}
+
 export function createAgent(
   agent: Omit<Agent, "id" | "createdAt" | "lastUpdatedAt"> & { id?: string },
 ): Agent {
@@ -1028,12 +1041,22 @@ export function deleteAgent(id: string): boolean {
  * Get the count of active (in_progress) tasks for an agent.
  * Used to determine current capacity usage.
  */
+/**
+ * Tasks occupying one of the agent's concurrency slots.
+ *
+ * A claimed offer counts too — omitting it let a second concurrent poll take
+ * another task past the limit. It is counted only through `offeredTo`, the
+ * agent actually reviewing it: `agentId` on an offer may still be the lead
+ * that created it, which would otherwise consume the lead's own capacity.
+ */
 export function getActiveTaskCount(agentId: string): number {
   const result = getDb()
-    .prepare<{ count: number }, [string]>(
-      "SELECT COUNT(*) as count FROM agent_tasks WHERE agentId = ? AND status = 'in_progress'",
+    .prepare<{ count: number }, [string, string]>(
+      `SELECT COUNT(*) as count FROM agent_tasks
+       WHERE (agentId = ? AND status = 'in_progress')
+          OR (offeredTo = ? AND status = 'reviewing')`,
     )
-    .get(agentId);
+    .get(agentId, agentId);
   return result?.count ?? 0;
 }
 
@@ -8552,6 +8575,7 @@ export function insertActiveSession(session: {
   inboxMessageId?: string;
   taskDescription?: string;
   runnerSessionId?: string;
+  runtimeInstanceId?: string;
 }): ActiveSession {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -8567,12 +8591,13 @@ export function insertActiveSession(session: {
         string | null,
         string | null,
         string | null,
+        string | null,
         string,
         string,
       ]
     >(
-      `INSERT INTO active_sessions (id, agentId, taskId, triggerType, inboxMessageId, taskDescription, runnerSessionId, startedAt, lastHeartbeatAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO active_sessions (id, agentId, taskId, triggerType, inboxMessageId, taskDescription, runnerSessionId, runtimeInstanceId, startedAt, lastHeartbeatAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        RETURNING *`,
     )
     .get(
@@ -8583,6 +8608,7 @@ export function insertActiveSession(session: {
       session.inboxMessageId ?? null,
       session.taskDescription ?? null,
       session.runnerSessionId ?? null,
+      session.runtimeInstanceId ?? null,
       now,
       now,
     );
