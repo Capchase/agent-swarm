@@ -1,15 +1,27 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import { getDb } from "../be/db";
+import { executeReadOnlyQueryBounded } from "./db-query-bounded";
+import {
+  assertSingleStatement,
+  type DbQueryResult,
+  getDbQueryHttpBudgetMs,
+  getDbQueryHttpMaxRows,
+  isDbQueryBoundedEnabled,
+  stripTrailingSemicolon,
+  warnDbQueryBoundedDisabledOnce,
+} from "./db-query-shared";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
-export interface DbQueryResult {
-  columns: string[];
-  rows: unknown[][];
-  elapsed: number;
-  total: number;
-}
+export type { DbQueryResult } from "./db-query-shared";
+export {
+  assertSingleStatement,
+  getDbQueryHttpBudgetMs,
+  getDbQueryHttpMaxRows,
+  getDbQueryMcpBudgetMs,
+  isDbQueryBoundedEnabled,
+} from "./db-query-shared";
 
 export const DbQueryInputShape = {
   sql: z.string().min(1).max(10_000).optional(),
@@ -27,17 +39,6 @@ export type DbQueryInput = z.infer<typeof DbQueryInputSchema>;
 
 export function resolveDbQuerySql(input: Pick<DbQueryInput, "sql" | "query">): string {
   return input.sql ?? input.query ?? "";
-}
-
-function stripTrailingSemicolon(sql: string): string {
-  return sql.trim().replace(/;\s*$/, "").trim();
-}
-
-function assertSingleStatement(sql: string): void {
-  const stripped = stripTrailingSemicolon(sql);
-  if (stripped.includes(";")) {
-    throw new Error("Only one SQL statement is allowed");
-  }
 }
 
 export function assertSelectOnlyQuery(sql: string): void {
@@ -79,6 +80,26 @@ export function executeReadOnlyQuery(
   return { columns, rows: rowArrays, elapsed, total: rows.length };
 }
 
+/**
+ * Gate in front of the bounded executor (Fix 1). `DB_QUERY_BOUNDED_ENABLED`
+ * (default on) picks the path: enabled runs the bounded child-process
+ * executor unchanged; disabled restores the pre-fix synchronous path with no
+ * wall-clock budget and logs a one-time warning, so turning off the
+ * protection can't happen silently.
+ */
+export async function executeReadOnlyQueryGated(
+  sql: string,
+  params: unknown[] = [],
+  budgetMs: number,
+  maxRows?: number,
+): Promise<DbQueryResult> {
+  if (isDbQueryBoundedEnabled()) {
+    return executeReadOnlyQueryBounded(sql, params, budgetMs, maxRows);
+  }
+  warnDbQueryBoundedDisabledOnce();
+  return executeReadOnlyQuery(sql, params, maxRows);
+}
+
 const dbQueryRoute = route({
   method: "post",
   path: "/api/db-query",
@@ -115,7 +136,12 @@ export async function handleDbQuery(
   if (!parsed) return true;
 
   try {
-    const result = executeReadOnlyQuery(resolveDbQuerySql(parsed.body), parsed.body.params);
+    const result = await executeReadOnlyQueryGated(
+      resolveDbQuerySql(parsed.body),
+      parsed.body.params,
+      getDbQueryHttpBudgetMs(),
+      getDbQueryHttpMaxRows(),
+    );
     json(res, result);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
