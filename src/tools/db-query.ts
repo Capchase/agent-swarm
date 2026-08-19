@@ -1,12 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
-import { DbQueryInputShape, resolveDbQuerySql } from "@/http/db-query";
-import { executeReadOnlyQueryBounded } from "@/http/db-query-bounded";
+import { DbQueryInputShape, executeReadOnlyQueryGated, resolveDbQuerySql } from "@/http/db-query";
+import { getDbQueryMcpBudgetMs } from "@/http/db-query-shared";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 
 const MCP_MAX_ROWS = 100;
-/** Wall-clock budget for the MCP db-query tool — see db-query-bounded.ts. */
-const MCP_BUDGET_MS = 5_000;
 
 const DbQueryToolInputSchema = z
   .object({
@@ -40,7 +38,12 @@ export const registerDbQueryTool = (server: McpServer) => {
       try {
         const sql = resolveDbQuerySql(input);
         const params = input.params ?? [];
-        const result = await executeReadOnlyQueryBounded(sql, params, MCP_BUDGET_MS, MCP_MAX_ROWS);
+        const result = await executeReadOnlyQueryGated(
+          sql,
+          params,
+          getDbQueryMcpBudgetMs(),
+          MCP_MAX_ROWS,
+        );
         const truncated = result.total > MCP_MAX_ROWS;
 
         // Build a simple text table for Claude

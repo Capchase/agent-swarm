@@ -5,18 +5,23 @@ import { executeReadOnlyQueryBounded } from "./db-query-bounded";
 import {
   assertSingleStatement,
   type DbQueryResult,
+  getDbQueryHttpBudgetMs,
+  getDbQueryHttpMaxRows,
+  isDbQueryBoundedEnabled,
   stripTrailingSemicolon,
+  warnDbQueryBoundedDisabledOnce,
 } from "./db-query-shared";
 import { route } from "./route-def";
 import { json, jsonError } from "./utils";
 
 export type { DbQueryResult } from "./db-query-shared";
-export { assertSingleStatement } from "./db-query-shared";
-
-/** Wall-clock budget for the /api/db-query HTTP route — bounded execution runs the query in a child process and SIGKILLs it past this budget (see db-query-bounded.ts). */
-const HTTP_BUDGET_MS = 10_000;
-/** Default row cap for the HTTP route, which previously had none. Matches the LIMIT the §9.2 guidance recommends. */
-const HTTP_DEFAULT_MAX_ROWS = 1000;
+export {
+  assertSingleStatement,
+  getDbQueryHttpBudgetMs,
+  getDbQueryHttpMaxRows,
+  getDbQueryMcpBudgetMs,
+  isDbQueryBoundedEnabled,
+} from "./db-query-shared";
 
 export const DbQueryInputShape = {
   sql: z.string().min(1).max(10_000).optional(),
@@ -75,6 +80,26 @@ export function executeReadOnlyQuery(
   return { columns, rows: rowArrays, elapsed, total: rows.length };
 }
 
+/**
+ * Gate in front of the bounded executor (Fix 1). `DB_QUERY_BOUNDED_ENABLED`
+ * (default on) picks the path: enabled runs the bounded child-process
+ * executor unchanged; disabled restores the pre-fix synchronous path with no
+ * wall-clock budget and logs a one-time warning, so turning off the
+ * protection can't happen silently.
+ */
+export async function executeReadOnlyQueryGated(
+  sql: string,
+  params: unknown[] = [],
+  budgetMs: number,
+  maxRows?: number,
+): Promise<DbQueryResult> {
+  if (isDbQueryBoundedEnabled()) {
+    return executeReadOnlyQueryBounded(sql, params, budgetMs, maxRows);
+  }
+  warnDbQueryBoundedDisabledOnce();
+  return executeReadOnlyQuery(sql, params, maxRows);
+}
+
 const dbQueryRoute = route({
   method: "post",
   path: "/api/db-query",
@@ -111,11 +136,11 @@ export async function handleDbQuery(
   if (!parsed) return true;
 
   try {
-    const result = await executeReadOnlyQueryBounded(
+    const result = await executeReadOnlyQueryGated(
       resolveDbQuerySql(parsed.body),
       parsed.body.params,
-      HTTP_BUDGET_MS,
-      HTTP_DEFAULT_MAX_ROWS,
+      getDbQueryHttpBudgetMs(),
+      getDbQueryHttpMaxRows(),
     );
     json(res, result);
   } catch (err: unknown) {
