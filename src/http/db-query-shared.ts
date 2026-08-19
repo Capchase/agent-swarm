@@ -19,6 +19,31 @@ export interface DbQueryResult {
   total: number;
 }
 
+/**
+ * Thrown when a bounded query is killed after exceeding its wall-clock
+ * budget. A distinct class (not a plain `Error`) so `handleDbQuery` can
+ * return a documented, machine-readable status instead of a generic 400.
+ */
+export class DbQueryTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DbQueryTimeoutError";
+  }
+}
+
+/**
+ * Thrown when `DB_QUERY_CONCURRENCY_CAP` in-flight bounded queries are
+ * already running. A distinct class so `handleDbQuery` can return 429 with
+ * retry guidance instead of a generic 400 — the caller isn't wrong, the
+ * server is just saturated right now.
+ */
+export class DbQueryConcurrencyCapError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DbQueryConcurrencyCapError";
+  }
+}
+
 export function stripTrailingSemicolon(sql: string): string {
   return sql.trim().replace(/;\s*$/, "").trim();
 }
@@ -55,16 +80,22 @@ export function executeReadOnlyQuery(
 
   const columns = stmt.columnNames as string[];
   const start = performance.now();
-  const rows = (params.length > 0 ? stmt.all(...(params as [string])) : stmt.all()) as Record<
-    string,
-    unknown
-  >[];
+  // Iterate rather than `stmt.all()` + slice: a query against a huge table
+  // with a small maxRows would otherwise hold every matched row's object in
+  // memory at once just to throw most of them away. Iterating still visits
+  // every row (so `total` keeps meaning "rows SQLite matched"), but only the
+  // first `maxRows` are converted and retained.
+  const rowArrays: unknown[][] = [];
+  let total = 0;
+  for (const row of stmt.iterate(...(params as [string]))) {
+    total++;
+    if (maxRows === undefined || rowArrays.length < maxRows) {
+      rowArrays.push(columns.map((col) => (row as Record<string, unknown>)[col]));
+    }
+  }
   const elapsed = Math.round(performance.now() - start);
 
-  const capped = maxRows ? rows.slice(0, maxRows) : rows;
-  const rowArrays = capped.map((row) => columns.map((col) => row[col]));
-
-  return { columns, rows: rowArrays, elapsed, total: rows.length };
+  return { columns, rows: rowArrays, elapsed, total };
 }
 
 /** Hardcoded pre-flag defaults — kept equal to the values PR #87 shipped with, so adding the flag changes no behaviour out of the box. */
@@ -84,19 +115,45 @@ export function isDbQueryBoundedEnabled(env: NodeJS.ProcessEnv = process.env): b
   return isEnvFlagEnabled("DB_QUERY_BOUNDED_ENABLED", true, env);
 }
 
-/** Read a positive-integer override, falling back to `defaultValue` for anything absent, non-numeric, or <= 0. */
+/**
+ * Node/Bun's `setTimeout` takes a 32-bit signed delay internally; a value
+ * above this silently wraps instead of waiting that long (observed as the
+ * timer firing almost immediately). A budget read from an env var must never
+ * cross it. See https://nodejs.org/api/timers.html#settimeoutcallback-delay-args.
+ */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Read a positive-integer override, falling back to `defaultValue` for
+ * anything absent, non-integer (including fractions — `"500.5"` is rejected,
+ * not truncated to 500), <= 0, or above `maxValue`. Mirrors the `^\d+$`
+ * integer check `integerValidators` in swarm-config-guard.ts applies to the
+ * same keys when set via `swarm_config` — this function is the path that
+ * check does NOT cover, since these getters read `process.env` directly.
+ */
 function readPositiveIntEnv(
   key: string,
   defaultValue: number,
   env: NodeJS.ProcessEnv = process.env,
+  maxValue: number = Number.MAX_SAFE_INTEGER,
 ): number {
-  const raw = Number(env[key]);
-  return Number.isFinite(raw) && raw > 0 ? raw : defaultValue;
+  const raw = env[key];
+  if (raw === undefined) return defaultValue;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return defaultValue;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maxValue) return defaultValue;
+  return parsed;
 }
 
 /** Wall-clock budget for `/api/db-query`. Overridable via `DB_QUERY_HTTP_BUDGET_MS`. */
 export function getDbQueryHttpBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readPositiveIntEnv("DB_QUERY_HTTP_BUDGET_MS", DB_QUERY_HTTP_BUDGET_MS_DEFAULT, env);
+  return readPositiveIntEnv(
+    "DB_QUERY_HTTP_BUDGET_MS",
+    DB_QUERY_HTTP_BUDGET_MS_DEFAULT,
+    env,
+    MAX_TIMER_DELAY_MS,
+  );
 }
 
 /** Row cap for `/api/db-query`. Overridable via `DB_QUERY_HTTP_MAX_ROWS`. */
@@ -106,7 +163,12 @@ export function getDbQueryHttpMaxRows(env: NodeJS.ProcessEnv = process.env): num
 
 /** Wall-clock budget for the MCP `db-query` tool. Overridable via `DB_QUERY_MCP_BUDGET_MS`. */
 export function getDbQueryMcpBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readPositiveIntEnv("DB_QUERY_MCP_BUDGET_MS", DB_QUERY_MCP_BUDGET_MS_DEFAULT, env);
+  return readPositiveIntEnv(
+    "DB_QUERY_MCP_BUDGET_MS",
+    DB_QUERY_MCP_BUDGET_MS_DEFAULT,
+    env,
+    MAX_TIMER_DELAY_MS,
+  );
 }
 
 let hasWarnedBoundedDisabled = false;

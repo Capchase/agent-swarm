@@ -202,7 +202,7 @@ registerTemplate({
   defaultBody: `
 ### Database queries (\`db-query\`)
 
-The swarm database is SQLite inside the API process. A query runs synchronously. While it runs, the API answers nothing else. A query that reads millions of rows can stop the API long enough for Kubernetes to restart it. A restart fails every task that is in flight.
+The swarm database is SQLite. By default a query runs in a short-lived child process with a wall-clock budget (around 10s over HTTP, 5s over MCP); the API itself keeps answering other requests while it runs, and a query that runs past its budget is killed. That budget protection can be off — an operator can disable it, or a host with no separate \`bun\` executable falls back to running the query in-process — so a query that reads millions of rows still wastes a full child process (or, on the fallback path, can stop the API long enough for Kubernetes to restart it, failing every task in flight) even when it does not crash anything.
 
 Four tables are too large to read whole: \`session_logs\`, \`agent_log\`, \`events\`, \`task_context_snapshots\`.
 

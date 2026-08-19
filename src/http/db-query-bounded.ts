@@ -26,12 +26,20 @@
  * If no `bun` executable can be spawned at all (no separate Bun CLI on
  * $PATH), the query falls back to the synchronous in-process path instead
  * of failing outright — see runBoundedQueryChild's catch around Bun.spawn.
+ *
+ * The child's own connection sets `PRAGMA busy_timeout` to the same
+ * `budgetMs` the parent uses for its SIGKILL timer, not a fixed value — a
+ * lock wait that would out-wait the overall budget anyway should surface as
+ * SQLite's own busy error (or the parent's timeout) rather than waiting
+ * longer than the query could ever be allowed to run.
  */
 
 import { getDb, resolveSqliteVecExtensionPath } from "../be/db";
 import type { DbQueryResult } from "./db-query-shared";
 import {
   assertSingleStatement,
+  DbQueryConcurrencyCapError,
+  DbQueryTimeoutError,
   executeReadOnlyQuery,
   warnDbQuerySpawnUnavailableOnce,
 } from "./db-query-shared";
@@ -42,6 +50,7 @@ interface ChildPayload {
   params: unknown[];
   vecExtensionPath?: string;
   maxRows?: number;
+  busyTimeoutMs: number;
 }
 
 interface ChildSuccess {
@@ -56,15 +65,19 @@ const WRITE_REJECTED_EXIT_CODE = 2;
 
 // Plain JS (no TypeScript syntax) — this string is executed directly by
 // `bun -e`, not compiled first. Mirrors executeReadOnlyQuery's read-only
-// guard and materialize-then-cap shape exactly, so `total` keeps meaning
-// "rows SQLite actually returned" regardless of which path ran the query.
+// guard exactly, so `total` keeps meaning "rows SQLite actually returned"
+// regardless of which path ran the query.
 //
-// `maxRows` is applied here, before `rowArrays` is built and serialized —
-// not after, in the parent. `stmt.all()` still visits every matching row
-// (that's how `total` stays the true match count), but only the first
-// `maxRows` of them are converted to arrays and written to stdout. A query
-// against a huge table with a small `maxRows` therefore transfers and
-// parses a payload bounded by `maxRows`, not by how many rows matched.
+// Iterates the statement rather than calling `stmt.all()` — Codex review,
+// PR #1192 thread 3815922598: `stmt.all()` still materializes every matching
+// row as a JS object before anything gets to look at `maxRows`, even though
+// the earlier fix already bounded what crosses the child/parent boundary.
+// Iterating keeps that same boundary bound, but only ever holds one row
+// object at a time plus the (at most `maxRows`) retained arrays — a query
+// against a huge table with a small `maxRows` no longer allocates one JS
+// object per matched row just to discard almost all of them. `total` is
+// still incremented for every row visited, so truncation stays detectable
+// by comparing it against `rows.length`.
 const CHILD_SCRIPT = `
 const { Database } = require("bun:sqlite");
 
@@ -74,10 +87,16 @@ const { Database } = require("bun:sqlite");
     payload += Buffer.from(chunk).toString("utf8");
   }
 
-  const { file, sql, params, vecExtensionPath, maxRows } = JSON.parse(payload);
+  const { file, sql, params, vecExtensionPath, maxRows, busyTimeoutMs } = JSON.parse(payload);
 
   try {
     const db = new Database(file, { readonly: true });
+    // Bound by the same wall-clock budget the parent uses for its SIGKILL
+    // timer, not a fixed value — a lock wait that would out-wait the overall
+    // budget anyway should surface as SQLite's own busy error (or the
+    // parent's timeout) rather than waiting longer than the query could ever
+    // be allowed to run.
+    db.exec("PRAGMA busy_timeout = " + Math.trunc(busyTimeoutMs) + ";");
     if (vecExtensionPath) {
       try {
         db.loadExtension(vecExtensionPath);
@@ -94,11 +113,15 @@ const { Database } = require("bun:sqlite");
 
     const columns = stmt.columnNames;
     const start = performance.now();
-    const rows = params && params.length > 0 ? stmt.all(...params) : stmt.all();
+    const rowArrays = [];
+    let total = 0;
+    for (const row of stmt.iterate(...(params || []))) {
+      total++;
+      if (!maxRows || rowArrays.length < maxRows) {
+        rowArrays.push(columns.map((col) => row[col]));
+      }
+    }
     const elapsed = Math.round(performance.now() - start);
-    const total = rows.length;
-    const capped = maxRows ? rows.slice(0, maxRows) : rows;
-    const rowArrays = capped.map((row) => columns.map((col) => row[col]));
 
     process.stdout.write(JSON.stringify({ columns, rows: rowArrays, elapsed, total }));
   } catch (err) {
@@ -134,7 +157,7 @@ let activeBoundedQueryCount = 0;
 
 function acquireBoundedQuerySlot(): void {
   if (activeBoundedQueryCount >= DB_QUERY_CONCURRENCY_CAP) {
-    throw new Error(
+    throw new DbQueryConcurrencyCapError(
       `Too many concurrent db-query executions in flight (cap ${DB_QUERY_CONCURRENCY_CAP}). Retry shortly.`,
     );
   }
@@ -148,11 +171,12 @@ function releaseBoundedQuerySlot(): void {
 /**
  * Run one read-only query in a bounded `bun -e` child process, SIGKILLing it
  * if it runs past `budgetMs`. `total` semantics match executeReadOnlyQuery
- * exactly: SQLite materializes every matching row before `maxRows` caps how
- * many get converted and serialized (in the child, see CHILD_SCRIPT), so
- * `total` still means "rows SQLite returned," not "rows delivered" (callers
- * such as src/tools/db-query.ts:41 and src/http/metrics.ts:168 compare the
- * two to decide whether a result was truncated).
+ * exactly: the child visits every matching row to count `total`, but only
+ * converts and serializes the first `maxRows` of them (in the child, see
+ * CHILD_SCRIPT), so `total` still means "rows SQLite returned," not "rows
+ * delivered" (callers such as src/tools/db-query.ts:41 and
+ * src/http/metrics.ts:168 compare the two to decide whether a result was
+ * truncated).
  */
 export async function executeReadOnlyQueryBounded(
   sql: string,
@@ -196,6 +220,7 @@ async function runBoundedQueryChild(
     params,
     vecExtensionPath: resolveSqliteVecExtensionPath(),
     maxRows,
+    busyTimeoutMs: budgetMs,
   };
 
   let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
@@ -244,7 +269,7 @@ async function runBoundedQueryChild(
   }
 
   if (isReportableTimeout(timedOut, exitCode, stdout)) {
-    throw new Error(
+    throw new DbQueryTimeoutError(
       `Query exceeded the ${budgetMs}ms budget and was terminated. Filter on an indexed column and add a LIMIT. Aggregates such as COUNT(*), SUM(...) or typeof() over session_logs, agent_log, events or task_context_snapshots read every row in range and cannot be made cheap by chunking on rowid.`,
     );
   }

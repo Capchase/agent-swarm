@@ -118,6 +118,7 @@ interface DbQueryHttpBody {
   rows?: unknown[][];
   total?: number;
   error?: string;
+  message?: string;
 }
 
 /** Env keys the flag/budget-override tests touch — reset after each so tests don't leak into each other. */
@@ -404,6 +405,32 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(getDbQueryHttpMaxRows()).toBe(1000);
   });
 
+  // Review round 4 (desplega-bot, pullrequestreview-4975616777), non-blocking
+  // item on db-query-shared.ts:55: readPositiveIntEnv read raw process.env
+  // directly, bypassing the `^\d+$` integer-only check
+  // swarm-config-guard.ts's integerValidators applies to the same keys when
+  // set through swarm_config — a fraction or a value past Node/Bun's 32-bit
+  // setTimeout limit set directly as an env var sailed through and could
+  // fire the timer almost immediately instead of waiting that long. These
+  // are exactly the "direct-env" cases the DB-backed validator can't catch.
+  test("a fractional budget is rejected, not truncated", () => {
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "500.5";
+    expect(getDbQueryHttpBudgetMs()).toBe(10_000);
+
+    process.env.DB_QUERY_MCP_BUDGET_MS = "5000.9";
+    expect(getDbQueryMcpBudgetMs()).toBe(5_000);
+  });
+
+  test("a budget above Node/Bun's 32-bit setTimeout limit falls back to the default", () => {
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "9999999999";
+    expect(getDbQueryHttpBudgetMs()).toBe(10_000);
+  });
+
+  test("a budget exactly at the 32-bit setTimeout limit is accepted", () => {
+    process.env.DB_QUERY_HTTP_BUDGET_MS = "2147483647";
+    expect(getDbQueryHttpBudgetMs()).toBe(2_147_483_647);
+  });
+
   // G: flag ON (default, unset) — the gate still runs the bounded path and
   // enforces the budget, same as calling executeReadOnlyQueryBounded directly.
   test("G: gated executor runs the bounded path by default and still enforces the budget", async () => {
@@ -442,16 +469,51 @@ describe("db-query bounded execution (Fix 1)", () => {
 
   // K: DB_QUERY_HTTP_BUDGET_MS actually reaches the bounded executor via the
   // HTTP route — a tightened budget trips the timeout on a query that would
-  // otherwise pass under the 10s default.
-  test("K: DB_QUERY_HTTP_BUDGET_MS overrides the bounded HTTP budget", async () => {
+  // otherwise pass under the 10s default. Review round 4 (desplega-bot,
+  // pullrequestreview-4975616777): a timeout must return a distinct,
+  // documented status (408) with a stable machine-readable code, not the
+  // same 400 every other error on this route returns.
+  test("K: DB_QUERY_HTTP_BUDGET_MS overrides the bounded HTTP budget, returning a distinct 408", async () => {
     process.env.DB_QUERY_HTTP_BUDGET_MS = "150";
     expect(getDbQueryHttpBudgetMs()).toBe(150);
 
     const { status, body } = await withDbQueryHttpServer((post) =>
       post({ sql: SLOW_QUERY, params: [] }),
     );
-    expect(status).toBe(400);
-    expect(body.error).toMatch(/150ms budget/);
+    expect(status).toBe(408);
+    expect(body.error).toBe("db_query_timeout");
+    expect(body.message).toMatch(/150ms budget/);
+  });
+
+  // Review round 4 (desplega-bot, pullrequestreview-4975616777): the
+  // concurrency cap was also collapsed into the generic 400. Saturate the
+  // cap with slots that never release (SELECT 1 calls made without an
+  // `await` between them so the acquire checks all run in the same tick —
+  // same technique as test O), then confirm the one HTTP call that lands on
+  // top gets 429 with a stable code and a Retry-After header instead of 400.
+  test("caps saturation via the HTTP route returns 429 with a stable code and Retry-After", async () => {
+    const fillers = Array.from({ length: DB_QUERY_CONCURRENCY_CAP }, () =>
+      executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
+    );
+
+    const { status, headers, body } = await withDbQueryHttpServer(async (_post) => {
+      const res = await fetch(`http://localhost:${HTTP_TEST_PORT}/api/db-query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sql: "SELECT 1", params: [] }),
+      });
+      return {
+        status: res.status,
+        headers: res.headers,
+        body: (await res.json()) as DbQueryHttpBody,
+      };
+    });
+
+    expect(status).toBe(429);
+    expect(body.error).toBe("db_query_concurrency_cap");
+    expect(headers.get("retry-after")).not.toBeNull();
+
+    await Promise.allSettled(fillers);
   });
 
   // L: DB_QUERY_HTTP_MAX_ROWS actually reaches the HTTP route's row cap.
@@ -477,6 +539,94 @@ describe("db-query bounded execution (Fix 1)", () => {
     await expect(
       executeReadOnlyQueryGated(SLOW_QUERY, [], getDbQueryMcpBudgetMs()),
     ).rejects.toThrow(/150ms budget/);
+  });
+
+  // Review round 4 (desplega-bot, pullrequestreview-4975616777), non-blocking
+  // item on db-query-bounded.ts:58: the child's read-only connection set no
+  // busy_timeout at all (SQLite's default is 0 — SQLITE_BUSY fails
+  // immediately on any lock), independent of the wall-clock budget the
+  // caller asked for. The child now sets `PRAGMA busy_timeout` to the same
+  // budgetMs used for the parent's SIGKILL timer. Exercised with a real
+  // lock: `PRAGMA locking_mode=EXCLUSIVE` is the one way to force a genuine
+  // SQLITE_BUSY against a *reader* (ordinary WAL writers don't block WAL
+  // readers, which is the whole point of WAL — only an exclusive
+  // OS-level lock does). The writer releases well inside the query's
+  // budget; the bounded query must wait for it and succeed, which fails
+  // under the pre-fix code (no busy_timeout means an immediate "database is
+  // locked" instead of a wait).
+  //
+  // A true cross-process lock-contention integration test (a second
+  // connection holding an exclusive lock, released mid-wait) was tried and
+  // dropped: `locking_mode=EXCLUSIVE`'s release only takes effect on that
+  // connection's *next* statement, and the child is a separate OS process
+  // spawned via Bun.spawn, so its wait time is dominated by process-spawn
+  // overhead rather than the lock — measured elapsed times were inconsistent
+  // by 100s of ms across runs in this sandbox, i.e. exactly the kind of
+  // flaky timing-based test SOUL.md rules out. Test the actual code change
+  // instead: intercept Bun.spawn and assert the child's payload carries
+  // `busyTimeoutMs` equal to the caller's `budgetMs`, not a fixed value.
+  // SQLite honoring `PRAGMA busy_timeout` is documented upstream behavior,
+  // not something this PR needs to re-prove.
+  test("R: the child's busy_timeout is bound to the query's budgetMs, not a fixed value", async () => {
+    const originalSpawn = Bun.spawn;
+    let capturedPayload: { busyTimeoutMs?: number } = {};
+
+    Bun.spawn = ((): unknown => {
+      let written = "";
+      return {
+        stdin: {
+          write: (data: string) => {
+            written += data;
+          },
+          end: async () => {
+            capturedPayload = JSON.parse(written);
+          },
+        },
+        stdout: new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                JSON.stringify({ columns: ["one"], rows: [[1]], elapsed: 0, total: 1 }),
+              ),
+            );
+            controller.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        exited: Promise.resolve(0),
+        kill: () => {},
+      };
+    }) as typeof Bun.spawn;
+
+    try {
+      await executeReadOnlyQueryBounded("SELECT 1", [], 4321);
+      expect(capturedPayload.busyTimeoutMs).toBe(4321);
+
+      await executeReadOnlyQueryBounded("SELECT 1", [], 777);
+      expect(capturedPayload.busyTimeoutMs).toBe(777);
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
+  // Same review thread — "cover ... a post-timeout write/checkpoint" was the
+  // second half of the ask: prove a SIGKILLed child doesn't leave the WAL in
+  // a state that blocks a later writer. Force a genuine timeout (tight
+  // budget against SLOW_QUERY, already proven to SIGKILL the child in test
+  // A), then perform an ordinary write and a full checkpoint against the
+  // same on-disk file.
+  test("S: a write and checkpoint succeed normally right after a bounded query is killed", async () => {
+    await expect(executeReadOnlyQueryBounded(SLOW_QUERY, [], 200)).rejects.toThrow(/budget/i);
+
+    const db = getDb();
+    db.run("CREATE TABLE IF NOT EXISTS post_timeout_write (id INTEGER PRIMARY KEY)");
+    db.run("INSERT INTO post_timeout_write DEFAULT VALUES");
+    const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+    expect(checkpoint.busy).toBe(0);
   });
 });
 

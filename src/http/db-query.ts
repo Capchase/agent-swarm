@@ -3,7 +3,9 @@ import { z } from "zod";
 import { executeReadOnlyQueryBounded } from "./db-query-bounded";
 import {
   assertSingleStatement,
+  DbQueryConcurrencyCapError,
   type DbQueryResult,
+  DbQueryTimeoutError,
   executeReadOnlyQuery,
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
@@ -88,6 +90,8 @@ const dbQueryRoute = route({
       }),
     },
     400: { description: "Invalid or disallowed SQL" },
+    408: { description: "Query exceeded its wall-clock budget and was terminated" },
+    429: { description: "Too many concurrent bounded db-query executions; retry shortly" },
   },
   auth: { apiKey: true },
 });
@@ -114,6 +118,18 @@ export async function handleDbQuery(
     );
     json(res, result);
   } catch (err: unknown) {
+    if (err instanceof DbQueryConcurrencyCapError) {
+      // Machine-readable code + Retry-After so a caller can back off instead
+      // of treating this like a malformed request (the pre-existing generic
+      // 400 every other error path here returns).
+      res.setHeader("Retry-After", "1");
+      json(res, { error: "db_query_concurrency_cap", message: err.message }, 429);
+      return true;
+    }
+    if (err instanceof DbQueryTimeoutError) {
+      json(res, { error: "db_query_timeout", message: err.message }, 408);
+      return true;
+    }
     const message = err instanceof Error ? err.message : String(err);
     jsonError(res, message);
   }
