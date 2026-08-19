@@ -70,6 +70,8 @@ function resourceIdOf(resource: RbacCheck["resource"]): string | null {
       return resource.appId;
     case "owned":
       return resource.ownerAgentId ?? null;
+    case "capability-grant":
+      return null;
     case "none":
       return null;
   }

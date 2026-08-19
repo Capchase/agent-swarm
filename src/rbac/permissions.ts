@@ -241,6 +241,15 @@ export const PERMISSIONS = {
     description: "Delete an external script API endpoint.",
     namespace: "script",
   },
+  "db-query.execute": {
+    description:
+      "Run a read-only SQL query against the swarm database (lead, or an explicit grant).",
+    namespace: "db-query",
+  },
+  "oauth-token.read": {
+    description: "Resolve a live, decrypted OAuth access token for an integrated provider.",
+    namespace: "oauth-token",
+  },
 } as const satisfies Record<string, { description: string; namespace: string }>;
 
 export type PermissionVerb = keyof typeof PERMISSIONS;

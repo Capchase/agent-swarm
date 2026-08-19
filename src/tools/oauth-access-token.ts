@@ -1,7 +1,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
+import { getAgentById } from "@/be/db";
 import { getAuthorizationById, getOAuthAppById, getOAuthTokens } from "@/be/db-queries/oauth";
 import { ensureAuthorizationTokenOrThrow, ensureTokenOrThrow } from "@/oauth/ensure-token";
+import { can } from "@/rbac";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import { registerVolatileSecret } from "@/utils/secret-scrubber";
 
@@ -92,7 +94,7 @@ export const registerGetOauthAccessTokenTool = (server: McpServer) => {
     {
       title: "Get OAuth access token",
       description:
-        "Return a valid plaintext OAuth access token for an integrated tracker. The token is refreshed first when it is near expiry. Returns access_token only; never returns refresh_token.",
+        "Return a valid plaintext OAuth access token for an integrated tracker. The token is refreshed first when it is near expiry. Returns access_token only; never returns refresh_token. Lead-only: this hands over a live credential to whatever third-party system the token authorizes.",
       annotations: { destructiveHint: false, openWorldHint: true },
       inputSchema: z.object({
         provider: z
@@ -128,7 +130,22 @@ export const registerGetOauthAccessTokenTool = (server: McpServer) => {
         tokenType: z.literal("Bearer").optional(),
       }),
     },
-    async ({ provider, authorizationId, minValiditySeconds }, _requestInfo, _meta) => {
+    async ({ provider, authorizationId, minValiditySeconds }, requestInfo, _meta) => {
+      const callerAgent = requestInfo.agentId ? getAgentById(requestInfo.agentId) : null;
+      const decision = can({
+        principal: {
+          kind: "agent",
+          agentId: requestInfo.agentId ?? "",
+          isLead: callerAgent?.isLead ?? false,
+        },
+        verb: "oauth-token.read",
+        resource: { kind: "none" },
+        source: "mcp",
+      });
+      if (!decision.allow || !callerAgent) {
+        return toolErr("Only the lead agent can read OAuth access tokens.");
+      }
+
       try {
         if (!provider && !authorizationId) {
           throw new Error("Provide either provider or authorizationId.");

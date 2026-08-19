@@ -130,6 +130,23 @@ const taskFsMutate: LegacyRule = {
   },
 };
 
+/**
+ * db-query.execute — lead OR an explicit per-agent grant (src/tools/db-query.ts).
+ * ~194 non-lead-owned scripts call `db_query` through the script SDK bridge
+ * under their own agent identity (src/scripts-runtime/sdk-allowlist.ts:58), so
+ * a plain lead-only gate would break them. The tool handler pre-fetches the
+ * grant (an agent-scoped swarm_config row) and passes it as `granted`.
+ */
+const leadOrCapabilityGrant: LegacyRule = {
+  name: "lead-or-capability-grant",
+  denyReason: "requires lead agent, or an agent explicitly granted this capability",
+  evaluate: (principal, resource) => {
+    if (principal.kind !== "agent") return false;
+    if (principal.isLead) return true;
+    return resource?.kind === "capability-grant" && resource.granted === true;
+  },
+};
+
 /** All named (non-composite) rule kinds, keyed by identifier. */
 export const LEGACY_RULES = {
   "lead-only": leadOnly,
@@ -199,4 +216,6 @@ export const LEGACY_POLICY = {
   "script.api.update": leadOnly,
   "script.api.rotate": leadOnly,
   "script.api.delete": leadOnly,
+  "db-query.execute": leadOrCapabilityGrant,
+  "oauth-token.read": leadOnly,
 } as const satisfies Record<PermissionVerb, LegacyRule>;

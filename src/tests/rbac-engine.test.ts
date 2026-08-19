@@ -76,6 +76,7 @@ const LEAD_ONLY_VERBS: PermissionVerb[] = [
   "script.api.update",
   "script.api.rotate",
   "script.api.delete",
+  "oauth-token.read",
 ];
 
 const LEAD_OR_RESOURCE_OWNER_VERBS: PermissionVerb[] = [
@@ -107,7 +108,11 @@ const REQUESTER_OWNS_TASK_VERBS: PermissionVerb[] = [
   "task.action.own",
 ];
 
-const COMPOSITE_VERBS: PermissionVerb[] = ["memory.delete.any", "task.fs.mutate"];
+const COMPOSITE_VERBS: PermissionVerb[] = [
+  "memory.delete.any",
+  "task.fs.mutate",
+  "db-query.execute",
+];
 
 // ── Resource fixtures ────────────────────────────────────────────────────────
 
@@ -137,6 +142,9 @@ const OWN_NAMESPACE_RESOURCE: RbacResource = {
   kind: "kv-namespace",
   namespace: `task:agent:${OWNER_WORKER_ID}`,
 };
+
+const CAPABILITY_GRANTED_RESOURCE: RbacResource = { kind: "capability-grant", granted: true };
+const CAPABILITY_NOT_GRANTED_RESOURCE: RbacResource = { kind: "capability-grant", granted: false };
 
 // ── Shared assertion helper ──────────────────────────────────────────────────
 
@@ -396,6 +404,32 @@ describe("task.fs.mutate composite (operator OR user OR lead OR assignee OR crea
       userRequester: true,
       foreignUser: true, // any authenticated user passes (fs.ts canMutateTask)
       operator: true,
+    });
+  });
+});
+
+describe("db-query.execute composite (lead OR an explicit capability grant)", () => {
+  test("granted resource: lead and every granted agent allowed", () => {
+    expectDecisions("db-query.execute", CAPABILITY_GRANTED_RESOURCE, {
+      lead: true,
+      worker: true,
+      ownerWorker: true,
+      creatorWorker: true,
+      userRequester: false,
+      foreignUser: false,
+      operator: false,
+    });
+  });
+
+  test("ungranted resource: only lead allowed (deny edge — this is the point of the gate)", () => {
+    expectDecisions("db-query.execute", CAPABILITY_NOT_GRANTED_RESOURCE, {
+      lead: true,
+      worker: false,
+      ownerWorker: false,
+      creatorWorker: false,
+      userRequester: false,
+      foreignUser: false,
+      operator: false,
     });
   });
 });

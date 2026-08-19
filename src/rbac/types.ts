@@ -32,6 +32,12 @@ export type RbacResource =
   | { kind: "app"; appId: string }
   /** Skills, mcp-servers, memory entries, scripts. */
   | { kind: "owned"; ownerAgentId?: string | null; scope?: string }
+  /**
+   * An explicit, caller-pre-fetched per-agent grant beyond isLead (e.g. an
+   * agent-scoped swarm_config allowlist row). The tool handler resolves
+   * `granted`; `can()` only reads the boolean.
+   */
+  | { kind: "capability-grant"; granted: boolean }
   | { kind: "none" };
 
 export type RbacDecision =
