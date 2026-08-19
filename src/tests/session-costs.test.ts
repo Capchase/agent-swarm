@@ -3,17 +3,25 @@ import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import {
   closeDb,
+  completeTask,
   createAgent,
+  createScheduledTask,
   createSessionCost,
   createTaskExtended,
   createUser,
+  createWorkflow,
+  createWorkflowRun,
+  deleteScheduledTask,
   getAllSessionCosts,
+  getAttributionByPerson,
   getDashboardCostSummary,
+  getDb,
   getSessionCostSummary,
   getSessionCostsByAgentId,
   getSessionCostsByTaskId,
   getSessionCostsFiltered,
   initDb,
+  insertTaskAttachment,
   UNATTRIBUTED_USER_ID,
 } from "../be/db";
 import type { SessionCost } from "../types";
@@ -965,6 +973,245 @@ describe("Session Costs API", () => {
       expect(none.byUser.length).toBe(1);
       expect(none.byUser[0]?.userId).toBe(null);
     });
+
+    test("attributableCostUsd excludes structurally-human-free cost from the coverage denominator", () => {
+      const agent = createAgent({ name: "Denominator Agent", isLead: false, status: "idle" });
+      const user = createUser({ name: "Denominator Requester" });
+      const workflowUser = createUser({ name: "Workflow Schedule Requester" });
+      const humanWork = createTaskExtended("Human-requested work", { requestedByUserId: user.id });
+      // Structurally human-free: no human requester belongs on a heartbeat-checklist
+      // task by construction, even though this row carries one (a stale/inherited
+      // id) — it must be excluded from BOTH sides of the coverage ratio.
+      const heartbeat = createTaskExtended("Heartbeat checklist", {
+        taskType: "heartbeat-checklist",
+        requestedByUserId: user.id,
+      });
+      const legacyHeartbeat = createTaskExtended("Legacy heartbeat", {
+        taskType: "heartbeat",
+        requestedByUserId: user.id,
+      });
+      const tagOnlyHeartbeat = createTaskExtended("Tag-only heartbeat", {
+        tags: ["heartbeat"],
+        requestedByUserId: user.id,
+      });
+      const scheduled = createTaskExtended("Scheduled run", { source: "schedule" });
+      const scheduledChild = createTaskExtended("Autonomous schedule child", {
+        parentTaskId: scheduled.id,
+      });
+      const scheduledGrandchild = createTaskExtended("Autonomous schedule grandchild", {
+        parentTaskId: scheduledChild.id,
+      });
+      const scheduledHumanHandoff = createTaskExtended("Schedule handed to a human", {
+        parentTaskId: scheduled.id,
+        requestedByUserId: user.id,
+      });
+      const humanScheduled = createTaskExtended("Human-created scheduled run", {
+        source: "schedule",
+        requestedByUserId: user.id,
+      });
+      const workflow = createWorkflow({
+        name: `denominator-workflow-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const autonomousWorkflowSchedule = createScheduledTask({
+        name: `denominator-autonomous-workflow-schedule-${crypto.randomUUID()}`,
+        intervalMs: 60_000,
+        targetType: "workflow",
+        workflowId: workflow.id,
+      });
+      const autonomousWorkflowRun = createWorkflowRun({
+        id: crypto.randomUUID(),
+        workflowId: workflow.id,
+        triggerType: "schedule",
+        triggerData: { scheduleId: autonomousWorkflowSchedule.id },
+      });
+      const autonomousWorkflowRoot = createTaskExtended("Autonomous scheduled workflow root", {
+        source: "workflow",
+        workflowRunId: autonomousWorkflowRun.id,
+      });
+      const humanWorkflowSchedule = createScheduledTask({
+        name: `denominator-human-workflow-schedule-${crypto.randomUUID()}`,
+        intervalMs: 60_000,
+        targetType: "workflow",
+        workflowId: workflow.id,
+        createdBy: workflowUser.id,
+      });
+      const humanWorkflowRun = createWorkflowRun({
+        id: crypto.randomUUID(),
+        workflowId: workflow.id,
+        triggerType: "schedule",
+        triggerData: { scheduleId: humanWorkflowSchedule.id },
+        createdBy: workflowUser.id,
+      });
+      const humanWorkflowRoot = createTaskExtended("Human-created scheduled workflow root", {
+        source: "workflow",
+        workflowRunId: humanWorkflowRun.id,
+        requestedByUserId: workflowUser.id,
+      });
+      const manualWorkflowRun = createWorkflowRun({
+        id: crypto.randomUUID(),
+        workflowId: workflow.id,
+        // Caller-controlled trigger data can mimic the scheduled payload; the
+        // server-owned workflow_runs.triggerType must remain authoritative.
+        triggerData: {
+          triggerType: "schedule",
+          scheduleId: autonomousWorkflowSchedule.id,
+          scheduleName: autonomousWorkflowSchedule.name,
+          scheduleCreatedBy: null,
+          firedAt: new Date().toISOString(),
+        },
+      });
+      const manualWorkflowRoot = createTaskExtended("Requester-less manual workflow root", {
+        source: "workflow",
+        workflowRunId: manualWorkflowRun.id,
+      });
+      // Historical classification must not depend on the live schedule row.
+      expect(deleteScheduledTask(autonomousWorkflowSchedule.id)).toBe(true);
+
+      createSessionCost({
+        sessionId: "denom-human",
+        taskId: humanWork.id,
+        agentId: agent.id,
+        totalCostUsd: 1.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-heartbeat",
+        taskId: heartbeat.id,
+        agentId: agent.id,
+        totalCostUsd: 2.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-legacy-heartbeat",
+        taskId: legacyHeartbeat.id,
+        agentId: agent.id,
+        totalCostUsd: 4.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-scheduled",
+        taskId: scheduled.id,
+        agentId: agent.id,
+        totalCostUsd: 3.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-tag-only-heartbeat",
+        taskId: tagOnlyHeartbeat.id,
+        agentId: agent.id,
+        totalCostUsd: 5.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-human-scheduled",
+        taskId: humanScheduled.id,
+        agentId: agent.id,
+        totalCostUsd: 6.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-scheduled-grandchild",
+        taskId: scheduledGrandchild.id,
+        agentId: agent.id,
+        totalCostUsd: 8.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-scheduled-human-handoff",
+        taskId: scheduledHumanHandoff.id,
+        agentId: agent.id,
+        totalCostUsd: 9.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-autonomous-workflow-root",
+        taskId: autonomousWorkflowRoot.id,
+        agentId: agent.id,
+        totalCostUsd: 10.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-human-workflow-root",
+        taskId: humanWorkflowRoot.id,
+        agentId: agent.id,
+        totalCostUsd: 11.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+      createSessionCost({
+        sessionId: "denom-manual-workflow-root",
+        taskId: manualWorkflowRoot.id,
+        agentId: agent.id,
+        totalCostUsd: 12.0,
+        durationMs: 1000,
+        numTurns: 1,
+        model: "opus",
+      });
+
+      const summary = getSessionCostSummary({ agentId: agent.id, groupBy: "both" });
+
+      expect(summary.totals.totalCostUsd).toBeCloseTo(71.0, 5);
+      // Direct human work, a human-created schedule, and an explicitly
+      // attributed handoff stay attributed, including a workflow root launched
+      // by a human-created schedule. Stale heartbeat requesters, autonomous
+      // schedule descendants, and creatorless scheduled workflow roots do not.
+      expect(summary.totals.attributedCostUsd).toBeCloseTo(27.0, 5);
+      // Denominator drops both heartbeat task types, the tag-only legacy
+      // representation, autonomous scheduled cost and its grandchild, and the
+      // creatorless scheduled workflow root (2.0 + 4.0 + 5.0 + 3.0 + 8.0 +
+      // 10.0), leaving the human work plus the requester-less manual workflow
+      // run in the population that could carry a human requester.
+      expect(summary.totals.attributableCostUsd).toBeCloseTo(39.0, 5);
+      expect(summary.totals.excludedCostUsd).toBeCloseTo(32.0, 5);
+      expect(summary.totals.excludedTaskCount).toBe(6);
+
+      expect(summary.byUser.find((row) => row.userId === user.id)?.costUsd).toBeCloseTo(16.0, 5);
+      expect(summary.byUser.find((row) => row.userId === workflowUser.id)?.costUsd).toBeCloseTo(
+        11.0,
+        5,
+      );
+      expect(summary.byUser.find((row) => row.userId === null)?.costUsd).toBeCloseTo(44.0, 5);
+
+      const mine = getSessionCostSummary({ agentId: agent.id, userId: user.id, groupBy: "user" });
+      expect(mine.totals.totalCostUsd).toBeCloseTo(16.0, 5);
+      expect(mine.byUser).toHaveLength(1);
+      expect(mine.byUser[0]?.userId).toBe(user.id);
+
+      const autonomous = getSessionCostSummary({
+        agentId: agent.id,
+        userId: UNATTRIBUTED_USER_ID,
+        groupBy: "user",
+      });
+      expect(autonomous.totals.totalCostUsd).toBeCloseTo(44.0, 5);
+      expect(autonomous.byUser).toHaveLength(1);
+      expect(autonomous.byUser[0]?.userId).toBe(null);
+
+      const attribution = getAttributionByPerson({});
+      const workflowPerson = attribution.find((row) => row.userId === workflowUser.id);
+      // Of the two workflow roots above, only the one launched by the
+      // human-created schedule belongs in the per-person report.
+      expect(workflowPerson?.problemsInitiated).toBe(1);
+    });
   });
 
   describe("Database: getDashboardCostSummary", () => {
@@ -1069,6 +1316,136 @@ describe("Session Costs API", () => {
       expect(typeof data.costToday).toBe("number");
       expect(typeof data.costMtd).toBe("number");
       expect(data.costMtd).toBeGreaterThanOrEqual(data.costToday);
+    });
+  });
+
+  describe("Database: getAttributionByPerson", () => {
+    test("counts root tasks only, and reach across the full task tree", () => {
+      const agentA = createAgent({ name: "Attribution Agent A", isLead: false, status: "idle" });
+      const agentB = createAgent({ name: "Attribution Agent B", isLead: false, status: "idle" });
+      const user = createUser({ name: "Attribution Requester" });
+
+      const root = createTaskExtended("Root problem", {
+        requestedByUserId: user.id,
+        vcsRepo: "desplega-ai/agent-swarm",
+        agentId: agentA.id,
+      });
+      // Fan-out child of the same root — must NOT inflate problemsInitiated,
+      // but DOES count toward reach (a second agent engaged).
+      createTaskExtended("Fan-out child", {
+        requestedByUserId: user.id,
+        parentTaskId: root.id,
+        agentId: agentB.id,
+        vcsRepo: "desplega-ai/agent-swarm",
+      });
+      // Structurally human-free despite a (stale) requester — excluded from
+      // both problemsInitiated and reach.
+      createTaskExtended("Heartbeat noise", {
+        requestedByUserId: user.id,
+        taskType: "heartbeat-checklist",
+      });
+      createTaskExtended("Legacy heartbeat noise", {
+        requestedByUserId: user.id,
+        taskType: "heartbeat",
+      });
+      createTaskExtended("Tag-only heartbeat noise", {
+        requestedByUserId: user.id,
+        tags: ["heartbeat"],
+      });
+      createTaskExtended("Human-created schedule", {
+        requestedByUserId: user.id,
+        source: "schedule",
+        agentId: agentA.id,
+        vcsRepo: "desplega-ai/agent-swarm",
+      });
+
+      const rows = getAttributionByPerson({});
+      const mine = rows.find((r) => r.userId === user.id);
+      expect(mine).toBeDefined();
+      expect(mine?.problemsInitiated).toBe(2);
+      expect(mine?.agentsReached).toBe(2);
+      expect(mine?.reposReached).toBe(1);
+      expect(mine?.firstPassYield).toBe(null);
+    });
+
+    test("counts GitHub PR and GitLab MR evidence as shipped", () => {
+      const agent = createAgent({ name: "Shipped Agent", isLead: false, status: "idle" });
+      const user = createUser({ name: "Shipped Requester" });
+
+      const shippedViaAttachment = createTaskExtended("Shipped via attachment", {
+        requestedByUserId: user.id,
+      });
+      const attachmentChild = createTaskExtended("Child with shipping evidence", {
+        parentTaskId: shippedViaAttachment.id,
+        requestedByUserId: user.id,
+      });
+      insertTaskAttachment({
+        taskId: attachmentChild.id,
+        agentId: agent.id,
+        name: "PR",
+        kind: "url",
+        url: "https://github.com/desplega-ai/agent-swarm/pull/1234",
+      });
+      completeTask(shippedViaAttachment.id);
+
+      const shippedViaOutput = createTaskExtended("Shipped via output fallback", {
+        requestedByUserId: user.id,
+      });
+      completeTask(
+        shippedViaOutput.id,
+        "Opened https://github.com/desplega-ai/agent-swarm/pull/5678",
+      );
+
+      const shippedViaGitLabAttachment = createTaskExtended("Shipped via GitLab attachment", {
+        requestedByUserId: user.id,
+        vcsProvider: "gitlab",
+      });
+      const gitLabAttachmentChild = createTaskExtended("Child with GitLab shipping evidence", {
+        parentTaskId: shippedViaGitLabAttachment.id,
+        requestedByUserId: user.id,
+      });
+      insertTaskAttachment({
+        taskId: gitLabAttachmentChild.id,
+        agentId: agent.id,
+        name: "MR",
+        kind: "url",
+        url: "https://gitlab.example.com/group/project/-/merge_requests/1234",
+      });
+      completeTask(shippedViaGitLabAttachment.id);
+
+      const shippedViaGitLabOutput = createTaskExtended("Shipped via GitLab output", {
+        requestedByUserId: user.id,
+        vcsProvider: "gitlab",
+      });
+      completeTask(
+        shippedViaGitLabOutput.id,
+        "Opened https://gitlab.internal/group/project/-/merge_requests/5678",
+      );
+
+      const notShipped = createTaskExtended("Not shipped", { requestedByUserId: user.id });
+      completeTask(notShipped.id, "Just some notes, no PR");
+
+      const rows = getAttributionByPerson({});
+      const mine = rows.find((r) => r.userId === user.id);
+      expect(mine?.problemsInitiated).toBe(5);
+      expect(mine?.problemsShipped).toBe(4);
+    });
+
+    test("respects the date range filter", () => {
+      const user = createUser({ name: "Date Range Requester" });
+      const inRange = createTaskExtended("In range", { requestedByUserId: user.id });
+      getDb()
+        .prepare("UPDATE agent_tasks SET createdAt = ? WHERE id = ?")
+        .run("2026-08-19T23:59:59.000Z", inRange.id);
+
+      const past = getAttributionByPerson({ endDate: "2026-08-18" });
+      expect(past.find((r) => r.userId === user.id)).toBeUndefined();
+
+      const present = getAttributionByPerson({
+        startDate: "2026-08-19",
+        endDate: "2026-08-19",
+      });
+      expect(present.find((r) => r.userId === user.id)?.problemsInitiated).toBe(1);
     });
   });
 });
