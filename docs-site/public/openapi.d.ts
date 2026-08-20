@@ -10228,6 +10228,13 @@ export interface paths {
                                 type: "task_offered";
                                 taskId: string;
                                 task: components["schemas"]["AgentTask"];
+                                requestedBy?: {
+                                    name: string;
+                                    email?: string;
+                                    role?: string;
+                                    notes?: string;
+                                    comms?: components["schemas"]["UserCommsPrefs"];
+                                };
                             } | {
                                 /** @enum {string} */
                                 type: "task_assigned";
@@ -10246,6 +10253,7 @@ export interface paths {
                                     email?: string;
                                     role?: string;
                                     notes?: string;
+                                    comms?: components["schemas"]["UserCommsPrefs"];
                                 };
                             } | components["schemas"]["BudgetRefusedTrigger"] | {
                                 /** @enum {string} */
@@ -17436,6 +17444,12 @@ export interface paths {
                         metadata?: {
                             [key: string]: unknown;
                         } | null;
+                        /** @description Merges into metadata.comms without touching sibling metadata keys; null removes only the comms key. When metadata is also provided, it is applied first and replaces the whole blob. */
+                        comms?: {
+                            tone?: string;
+                            language?: string;
+                            verbosity?: string;
+                        } | null;
                         dailyBudgetUsd?: number | null;
                         /** @enum {string} */
                         status?: "invited" | "active" | "suspended";
@@ -20074,6 +20088,11 @@ export interface components {
             changedBy: string | null;
             changedAt: string;
             changeReason: string | null;
+        };
+        UserCommsPrefs: {
+            tone?: string;
+            language?: string;
+            verbosity?: string;
         };
         BudgetRefusedTrigger: {
             /** @enum {string} */
