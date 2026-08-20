@@ -186,6 +186,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "DB_QUERY_HTTP_BUDGET_MS",
       "DB_QUERY_HTTP_MAX_ROWS",
       "DB_QUERY_MCP_BUDGET_MS",
+      "DB_QUERY_MCP_MAX_ROWS",
     ],
     1,
   ),

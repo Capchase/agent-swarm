@@ -19,6 +19,7 @@ import {
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
   getDbQueryMcpBudgetMs,
+  getDbQueryMcpMaxRows,
   resetDbQueryBoundedWarningForTests,
   resetDbQuerySpawnUnavailableWarningForTests,
 } from "../http/db-query-shared";
@@ -124,6 +125,7 @@ const DB_QUERY_OVERRIDE_ENV_KEYS = [
   "DB_QUERY_HTTP_BUDGET_MS",
   "DB_QUERY_HTTP_MAX_ROWS",
   "DB_QUERY_MCP_BUDGET_MS",
+  "DB_QUERY_MCP_MAX_ROWS",
   "DB_QUERY_CONCURRENCY_CAP",
 ] as const;
 
@@ -421,12 +423,16 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(getDbQueryHttpBudgetMs()).toBe(10_000);
     expect(getDbQueryHttpMaxRows()).toBe(1000);
     expect(getDbQueryMcpBudgetMs()).toBe(5_000);
+    expect(getDbQueryMcpMaxRows()).toBe(100);
 
     process.env.DB_QUERY_HTTP_BUDGET_MS = "-5";
     expect(getDbQueryHttpBudgetMs()).toBe(10_000);
 
     process.env.DB_QUERY_HTTP_MAX_ROWS = "not-a-number";
     expect(getDbQueryHttpMaxRows()).toBe(1000);
+
+    process.env.DB_QUERY_MCP_MAX_ROWS = "not-a-number";
+    expect(getDbQueryMcpMaxRows()).toBe(100);
   });
 
   // Review round 4 (desplega-bot, pullrequestreview-4975616777), non-blocking
@@ -579,6 +585,25 @@ describe("db-query bounded execution (Fix 1)", () => {
     const settled = await Promise.allSettled(calls);
     const rejected = settled.filter((outcome) => outcome.status === "rejected");
     expect(rejected.length).toBe(1);
+  });
+
+  // V: review round 3 (tarasyarema, threads 3819136863/3819139208) — the MCP
+  // tool's row cap was a hardcoded 100 with no operator override, unlike every
+  // other budget/cap this PR made tunable. DB_QUERY_MCP_MAX_ROWS must actually
+  // reach the gated executor the MCP tool calls, the same way L proves
+  // DB_QUERY_HTTP_MAX_ROWS reaches the HTTP route's row cap.
+  test("V: DB_QUERY_MCP_MAX_ROWS overrides the MCP row cap", async () => {
+    process.env.DB_QUERY_MCP_MAX_ROWS = "5";
+    expect(getDbQueryMcpMaxRows()).toBe(5);
+
+    const result = await executeReadOnlyQueryGated(
+      "SELECT id FROM http_cap_test",
+      [],
+      getDbQueryMcpBudgetMs(),
+      getDbQueryMcpMaxRows(),
+    );
+    expect(result.rows.length).toBe(5);
+    expect(result.total).toBeGreaterThan(5);
   });
 
   // Review round 4 (desplega-bot, pullrequestreview-4975616777), non-blocking

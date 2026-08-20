@@ -102,6 +102,7 @@ export function executeReadOnlyQuery(
 export const DB_QUERY_HTTP_BUDGET_MS_DEFAULT = 10_000;
 export const DB_QUERY_HTTP_MAX_ROWS_DEFAULT = 1000;
 export const DB_QUERY_MCP_BUDGET_MS_DEFAULT = 5_000;
+export const DB_QUERY_MCP_MAX_ROWS_DEFAULT = 100;
 
 /**
  * Default concurrency cap for in-flight bounded child-process queries (see
@@ -191,6 +192,11 @@ export function getDbQueryMcpBudgetMs(env: NodeJS.ProcessEnv = process.env): num
 /** Concurrency cap for in-flight bounded child-process queries. Overridable via `DB_QUERY_CONCURRENCY_CAP`. */
 export function getDbQueryConcurrencyCap(env: NodeJS.ProcessEnv = process.env): number {
   return readPositiveIntEnv("DB_QUERY_CONCURRENCY_CAP", DB_QUERY_CONCURRENCY_CAP_DEFAULT, env);
+}
+
+/** Row cap for the MCP `db-query` tool. Overridable via `DB_QUERY_MCP_MAX_ROWS`. */
+export function getDbQueryMcpMaxRows(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntEnv("DB_QUERY_MCP_MAX_ROWS", DB_QUERY_MCP_MAX_ROWS_DEFAULT, env);
 }
 
 let hasWarnedBoundedDisabled = false;

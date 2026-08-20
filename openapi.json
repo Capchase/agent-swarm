@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.132.0",
+    "version": "1.133.0",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -2336,6 +2336,20 @@
           "changedAt",
           "changeReason"
         ]
+      },
+      "UserCommsPrefs": {
+        "type": "object",
+        "properties": {
+          "tone": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "verbosity": {
+            "type": "string"
+          }
+        }
       },
       "BudgetRefusedTrigger": {
         "type": "object",
@@ -9212,6 +9226,116 @@
                   "required": [
                     "setupScript",
                     "globalSetupScript"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Agent not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/runtime-instances": {
+      "get": {
+        "summary": "List runtime instances serving an agent",
+        "description": "Read-only view of the worker processes currently registered for a logical agent. Rows exist only for multi-runtime registrations (MULTI_RUNTIME_ENABLED), so the list is empty in the default configuration. `isLive` combines `status` with `lastSeenAt` freshness against the server's staleness cutoff (`staleThresholdMinutes`); `reportedSlots` is each process's self-reported capacity, distinct from the agent's logical `maxTasks` policy.",
+        "tags": [
+          "Agents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Runtime instances for the agent (empty when none are registered)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runtimeInstances": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "agentId": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "active",
+                              "offline"
+                            ]
+                          },
+                          "reportedSlots": {
+                            "type": "integer"
+                          },
+                          "credentialReady": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
+                          "lastSeenAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "createdAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "updatedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "isLive": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "agentId",
+                          "status",
+                          "reportedSlots",
+                          "lastSeenAt",
+                          "createdAt",
+                          "updatedAt",
+                          "isLive"
+                        ]
+                      }
+                    },
+                    "staleThresholdMinutes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "runtimeInstances",
+                    "staleThresholdMinutes"
                   ]
                 }
               }
@@ -22595,6 +22719,30 @@
                             },
                             "task": {
                               "$ref": "#/components/schemas/AgentTask"
+                            },
+                            "requestedBy": {
+                              "type": "object",
+                              "properties": {
+                                "name": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "email": {
+                                  "type": "string"
+                                },
+                                "role": {
+                                  "type": "string"
+                                },
+                                "notes": {
+                                  "type": "string"
+                                },
+                                "comms": {
+                                  "$ref": "#/components/schemas/UserCommsPrefs"
+                                }
+                              },
+                              "required": [
+                                "name"
+                              ]
                             }
                           },
                           "required": [
@@ -22671,6 +22819,9 @@
                                 },
                                 "notes": {
                                   "type": "string"
+                                },
+                                "comms": {
+                                  "$ref": "#/components/schemas/UserCommsPrefs"
                                 }
                               },
                               "required": [
@@ -41600,6 +41751,24 @@
                       "null"
                     ],
                     "additionalProperties": {}
+                  },
+                  "comms": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "tone": {
+                        "type": "string"
+                      },
+                      "language": {
+                        "type": "string"
+                      },
+                      "verbosity": {
+                        "type": "string"
+                      }
+                    },
+                    "description": "Merges into metadata.comms without touching sibling metadata keys; null removes only the comms key. When metadata is also provided, it is applied first and replaces the whole blob."
                   },
                   "dailyBudgetUsd": {
                     "type": [

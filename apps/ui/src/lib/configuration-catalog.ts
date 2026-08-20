@@ -364,6 +364,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         placeholder: "5000",
       },
       {
+        key: "DB_QUERY_MCP_MAX_ROWS",
+        label: "MCP row cap",
+        description:
+          "Maximum rows returned by the MCP db-query tool, regardless of how many the query matched.",
+        kind: "number",
+        defaultValue: "100",
+        placeholder: "100",
+      },
+      {
         key: "DB_QUERY_CONCURRENCY_CAP",
         label: "Concurrent query cap",
         description:

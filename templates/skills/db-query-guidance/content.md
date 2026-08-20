@@ -50,6 +50,7 @@ effect on the next request, no restart) and surfaced on the dashboard's
 | `DB_QUERY_HTTP_BUDGET_MS` | `10000` | Wall-clock budget for `/api/db-query` before its child process is killed. |
 | `DB_QUERY_HTTP_MAX_ROWS` | `1000` | Row cap for `/api/db-query`, regardless of how many rows the query matched. |
 | `DB_QUERY_MCP_BUDGET_MS` | `5000` | Wall-clock budget for the MCP `db-query` tool. |
+| `DB_QUERY_MCP_MAX_ROWS` | `100` | Row cap for the MCP `db-query` tool, regardless of how many rows the query matched. |
 | `DB_QUERY_CONCURRENCY_CAP` | `3` | Max bounded queries in flight at once, across HTTP and MCP callers. Each in-flight query can peak around 200MB; the default is sized against a 1 GiB API pod memory limit — raise it only if the pod has more headroom. |
 
 `total` in a result always reports every row SQLite matched, even when the
