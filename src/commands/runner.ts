@@ -4581,7 +4581,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   let agentProfileName: string | undefined;
   let agentDescription: string | undefined;
   let agentSkillsSummary: { name: string; description: string }[] | undefined;
-  let agentMcpServersSummary: string | undefined;
+  let agentMcpServers: string[] | undefined;
 
   // Per-task repo context — set when processing a task with githubRepo
   let currentRepoContext: BasePromptArgs["repoContext"] | undefined;
@@ -4596,7 +4596,6 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     return getBasePrompt({
       role,
       agentId,
-      swarmUrl,
       capabilities,
       serverCapabilities,
       traits,
@@ -4604,17 +4603,17 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
       scriptsOnly: resolvedScriptsOnly,
       name: agentProfileName,
       description: agentDescription,
-      ...(traits.hasLocalEnvironment && {
-        soulMd: agentSoulMd,
-        identityMd: agentIdentityMd,
-        toolsMd: agentToolsMd,
-        claudeMd: agentClaudeMd,
-      }),
+      // SOUL.md is the persona and travels to every provider. base-prompt
+      // gates IDENTITY.md (inject when edited) and CLAUDE.md (local
+      // non-claude providers, inject when edited) itself.
+      soulMd: agentSoulMd,
+      identityMd: agentIdentityMd,
+      claudeMd: agentClaudeMd,
       repoContext: currentRepoContext,
       slackContext: currentTaskSlackContext,
       ...(traits.hasMcp && {
         skillsSummary: agentSkillsSummary,
-        mcpServersSummary: agentMcpServersSummary,
+        mcpServers: agentMcpServers,
       }),
     });
   };
@@ -5208,9 +5207,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           };
           const activeMcpServers = mcpServersData.servers.filter((s) => s.isActive && s.isEnabled);
           if (activeMcpServers.length > 0) {
-            agentMcpServersSummary = activeMcpServers
-              .map((s) => `- **${s.name}** (${s.transport}): ${s.description || "No description"}`)
-              .join("\n");
+            agentMcpServers = activeMcpServers.map((s) => s.name);
             console.log(
               `[${role}] Loaded ${activeMcpServers.length} MCP servers for system prompt`,
             );
