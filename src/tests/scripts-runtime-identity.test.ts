@@ -13,7 +13,7 @@ import {
   createAgent,
   createTaskExtended,
   getActiveTaskCount,
-  getDb,
+  getDbClient,
   getTaskById,
   initDb,
 } from "../be/db";
@@ -58,23 +58,31 @@ function createTestServer(): Server {
   });
 }
 
-function makeAgent(maxTasks = 1): string {
+async function makeAgent(maxTasks = 1): Promise<string> {
   const id = crypto.randomUUID();
-  createAgent({ id, name: "sri-agent", isLead: false, status: "idle", capabilities: [], maxTasks });
+  await createAgent({
+    id,
+    name: "sri-agent",
+    isLead: false,
+    status: "idle",
+    capabilities: [],
+    maxTasks,
+  });
   return id;
 }
 
-function registerRuntime(agentId: string): string {
+async function registerRuntime(agentId: string): Promise<string> {
   const rt = crypto.randomUUID();
-  upsertRuntimeInstance({ id: rt, agentId, reportedSlots: 1 });
+  await upsertRuntimeInstance({ id: rt, agentId, reportedSlots: 1 });
   return rt;
 }
 
-function makeRuntimeStale(runtimeInstanceId: string, minutesAgo = 30): void {
+async function makeRuntimeStale(runtimeInstanceId: string, minutesAgo = 30): Promise<void> {
   const when = new Date(Date.now() - minutesAgo * 60 * 1000).toISOString();
-  getDb()
-    .prepare("UPDATE runtime_instances SET last_seen_at = ? WHERE id = ?")
-    .run(when, runtimeInstanceId);
+  await getDbClient().run("UPDATE runtime_instances SET last_seen_at = ? WHERE id = ?", [
+    when,
+    runtimeInstanceId,
+  ]);
 }
 
 function sdkFor(agentId: string, runtimeInstanceId?: string) {
@@ -309,66 +317,66 @@ describe("script subprocess carries the invoking worker's identity", () => {
 describe("script SDK dispatch hits the real runtime gates", () => {
   test("a live runtime acquires pending work through task_poll; a stale one does not", async () => {
     process.env.MULTI_RUNTIME_ENABLED = "true";
-    const agentId = makeAgent(1);
-    const live = registerRuntime(agentId);
-    const stale = registerRuntime(agentId);
-    makeRuntimeStale(stale);
-    const task = createTaskExtended("script-poll-work", { agentId });
+    const agentId = await makeAgent(1);
+    const live = await registerRuntime(agentId);
+    const stale = await registerRuntime(agentId);
+    await makeRuntimeStale(stale);
+    const task = await createTaskExtended("script-poll-work", { agentId });
 
     const staleResult = (await sdkFor(agentId, stale).task_poll()) as {
       data: { trigger: { type?: string } | null };
     };
     expect(staleResult.data.trigger).toBeNull();
-    expect(getTaskById(task.id)?.status).toBe("pending");
+    expect((await getTaskById(task.id))?.status).toBe("pending");
 
     const liveResult = (await sdkFor(agentId, live).task_poll()) as {
       data: { trigger: { type?: string } | null };
     };
     expect(liveResult.data.trigger?.type).toBe("task_assigned");
-    expect(getTaskById(task.id)?.status).toBe("in_progress");
-    expect(getActiveTaskCount(agentId)).toBe(1);
+    expect((await getTaskById(task.id))?.status).toBe("in_progress");
+    expect(await getActiveTaskCount(agentId)).toBe(1);
   });
 
   test("task_action claim through the bridge respects the live-runtime gate", async () => {
     process.env.MULTI_RUNTIME_ENABLED = "true";
-    const agentId = makeAgent(1);
-    const live = registerRuntime(agentId);
-    const stale = registerRuntime(agentId);
-    makeRuntimeStale(stale);
-    const task = createTaskExtended("script-claim-work");
+    const agentId = await makeAgent(1);
+    const live = await registerRuntime(agentId);
+    const stale = await registerRuntime(agentId);
+    await makeRuntimeStale(stale);
+    const task = await createTaskExtended("script-claim-work");
 
     await sdkFor(agentId, stale).task_action({ action: "claim", taskId: task.id });
-    expect(getTaskById(task.id)?.agentId ?? null).toBeNull();
+    expect((await getTaskById(task.id))?.agentId ?? null).toBeNull();
     await sdkFor(agentId).task_action({ action: "claim", taskId: task.id });
-    expect(getTaskById(task.id)?.agentId ?? null).toBeNull();
+    expect((await getTaskById(task.id))?.agentId ?? null).toBeNull();
 
     await sdkFor(agentId, live).task_action({ action: "claim", taskId: task.id });
-    expect(getTaskById(task.id)?.agentId).toBe(agentId);
-    expect(getTaskById(task.id)?.status).toBe("in_progress");
+    expect((await getTaskById(task.id))?.agentId).toBe(agentId);
+    expect((await getTaskById(task.id))?.status).toBe("in_progress");
   });
 
   test("task_action accept through the bridge respects the live-runtime gate", async () => {
     process.env.MULTI_RUNTIME_ENABLED = "true";
-    const agentId = makeAgent(1);
-    const live = registerRuntime(agentId);
-    const stale = registerRuntime(agentId);
-    makeRuntimeStale(stale);
-    const task = createTaskExtended("script-accept-work", { offeredTo: agentId });
+    const agentId = await makeAgent(1);
+    const live = await registerRuntime(agentId);
+    const stale = await registerRuntime(agentId);
+    await makeRuntimeStale(stale);
+    const task = await createTaskExtended("script-accept-work", { offeredTo: agentId });
 
     await sdkFor(agentId, stale).task_action({ action: "accept", taskId: task.id });
-    expect(getTaskById(task.id)?.status).toBe("offered");
+    expect((await getTaskById(task.id))?.status).toBe("offered");
 
     await sdkFor(agentId, live).task_action({ action: "accept", taskId: task.id });
-    expect(getTaskById(task.id)?.status).toBe("pending");
-    expect(getTaskById(task.id)?.agentId).toBe(agentId);
+    expect((await getTaskById(task.id))?.status).toBe("pending");
+    expect((await getTaskById(task.id))?.agentId).toBe(agentId);
   });
 
   test("with the flag off, the SDK dispatches without runtime identity as before", async () => {
     delete process.env.MULTI_RUNTIME_ENABLED;
-    const agentId = makeAgent(1);
-    const task = createTaskExtended("legacy-claim-work");
+    const agentId = await makeAgent(1);
+    const task = await createTaskExtended("legacy-claim-work");
 
     await sdkFor(agentId).task_action({ action: "claim", taskId: task.id });
-    expect(getTaskById(task.id)?.agentId).toBe(agentId);
+    expect((await getTaskById(task.id))?.agentId).toBe(agentId);
   });
 });
