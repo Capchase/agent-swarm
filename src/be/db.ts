@@ -7259,37 +7259,45 @@ export async function getAttributionByPerson(opts: {
         SELECT tree.rootId, child.id, child.output
         FROM agent_tasks child
         JOIN task_tree tree ON child.parentTaskId = tree.taskId
+      ),
+      -- Every root with shippable evidence anywhere in its tree, computed ONCE for
+      -- the whole window. The old form asked the same question with 3 CORRELATED
+      -- EXISTS subqueries, which SQLite re-entered once per root: 2 of them scanned
+      -- task_attachments whole and the third scanned the whole tree with two
+      -- leading-wildcard LIKEs. That is the O(R x T) shape that took 60 s.
+      --
+      -- Two rules keep this fast and correct, and both are load-bearing:
+      --   1. UNION, never UNION ALL. It makes rootId unique, so the LEFT JOIN below
+      --      cannot duplicate a root and COUNT(*) stays exact.
+      --   2. LEFT JOIN, never a correlated EXISTS against this CTE. The EXISTS form
+      --      returns the same answer but SQLite re-enters the CTE per root:
+      --      measured 4,189 ms for a 2-day window against 460 ms for 30 days.
+      shipped_roots(rootId) AS (
+        SELECT tree.rootId
+        FROM task_tree tree
+        JOIN task_attachments ta ON ta.task_id = tree.taskId
+        WHERE ta.kind = 'page'
+           OR (
+             ta.kind = 'url'
+             AND (
+               ta.url LIKE '%github.com/%/pull/%'
+               OR ta.url LIKE '%/-/merge_requests/%'
+             )
+           )
+
+        UNION
+
+        SELECT tree.rootId
+        FROM task_tree tree
+        WHERE tree.output LIKE '%github.com/%/pull/%'
+           OR tree.output LIKE '%/-/merge_requests/%'
       )
       SELECT
         t.requestedByUserId as userId,
         COUNT(*) as initiated,
-        SUM(CASE WHEN t.status = 'completed' AND (
-          EXISTS (
-            SELECT 1
-            FROM task_tree tree
-            JOIN task_attachments ta ON ta.task_id = tree.taskId
-            WHERE tree.rootId = t.id
-              AND ta.kind = 'url'
-              AND (
-                ta.url LIKE '%github.com/%/pull/%'
-                OR ta.url LIKE '%/-/merge_requests/%'
-              )
-          )
-          OR EXISTS (
-            SELECT 1 FROM task_attachments ta
-            JOIN task_tree tree ON tree.taskId = ta.task_id
-            WHERE tree.rootId = t.id AND ta.kind = 'page'
-          )
-          OR EXISTS (
-            SELECT 1 FROM task_tree tree
-            WHERE tree.rootId = t.id
-              AND (
-                tree.output LIKE '%github.com/%/pull/%'
-                OR tree.output LIKE '%/-/merge_requests/%'
-              )
-          )
-        ) THEN 1 ELSE 0 END) as shipped
+        SUM(CASE WHEN t.status = 'completed' AND s.rootId IS NOT NULL THEN 1 ELSE 0 END) as shipped
       FROM selected_roots t
+      LEFT JOIN shipped_roots s ON s.rootId = t.id
       GROUP BY t.requestedByUserId`,
     params,
   );
