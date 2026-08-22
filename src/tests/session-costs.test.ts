@@ -1988,5 +1988,40 @@ describe("Session Costs API", () => {
       expect(newRow?.problemsShipped).toBe(1);
       expect(newRow?.problemsInitiated).toBe(oldRow?.initiated);
     });
+
+    test("shape guard: shipped_roots stays a non-correlated LEFT JOIN deduped with UNION", async () => {
+      const querySpy = spyOn(getDbClient(), "query");
+      try {
+        await getAttributionByPerson({});
+        const call = querySpy.mock.calls.find(([sql]) =>
+          String(sql).includes("task_tree(rootId, taskId, output)"),
+        );
+        const sql = String(call?.[0] ?? "");
+
+        // Rule 2: LEFT JOIN, never a correlated EXISTS against shipped_roots.
+        // Measured regression if this reverts: 4,189 ms for a 2-day window.
+        expect(sql).toContain("LEFT JOIN shipped_roots s ON s.rootId = t.id");
+        expect(sql).not.toMatch(/EXISTS\s*\(\s*SELECT[^)]*FROM\s+shipped_roots/);
+
+        // Rule 1: UNION, never UNION ALL, inside shipped_roots — the only
+        // UNION ALL in this statement belongs to the task_tree recursion.
+        // Strip `--` comments first: the explanatory comment above
+        // shipped_roots mentions "UNION ALL" in prose.
+        const sqlWithoutComments = sql.replace(/--[^\n]*/g, "");
+        expect((sqlWithoutComments.match(/UNION ALL/g) ?? []).length).toBe(1);
+        const shippedRootsIdx = sqlWithoutComments.indexOf("shipped_roots(rootId) AS (");
+        expect(shippedRootsIdx).toBeGreaterThan(-1);
+        const afterShippedRoots = sqlWithoutComments.slice(shippedRootsIdx);
+        const finalSelectIdx = afterShippedRoots.indexOf(
+          "SELECT\n        t.requestedByUserId as userId,",
+        );
+        expect(finalSelectIdx).toBeGreaterThan(-1);
+        const shippedRootsBody = afterShippedRoots.slice(0, finalSelectIdx);
+        expect(shippedRootsBody).toMatch(/\bUNION\b(?!\s*ALL)/);
+        expect(shippedRootsBody).not.toContain("UNION ALL");
+      } finally {
+        querySpy.mockRestore();
+      }
+    });
   });
 });
