@@ -139,6 +139,10 @@ docker run --rm -v swarm_api:/app -v $(pwd):/backup alpine \
   sh -c 'cp /app/agent-swarm-db.sqlite /backup/agent-swarm-db-backup.sqlite && if [ -f /app/.page-session-secret ]; then cp /app/.page-session-secret /backup/page-session-secret.backup; fi'
 ```
 
+### Database retention
+
+`SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, and `EVENTS_RETENTION_DAYS` are disabled until you set them. Each value permanently deletes rows older than its window. Start with `DB_RETENTION_DRY_RUN=true`, confirm the `[db-retention]` log output and `GET /api/metrics`, then enable one table at a time. See [runbooks/db-retention.md](./runbooks/db-retention.md) before activation.
+
 ### Adding More Workers
 
 To add a worker, copy an existing worker block in `docker-compose.yml`:
