@@ -9,6 +9,7 @@ import {
   startDbRetention,
   stopDbRetention,
 } from "../be/db-retention";
+import { validateConfigValue } from "../be/swarm-config-guard";
 
 const TEST_DB_PATH = "./test-db-retention.sqlite";
 const NOW = new Date("2026-08-23T12:00:00.000Z");
@@ -79,6 +80,15 @@ describe("DB retention", () => {
       "agent_log",
       "events",
     ]);
+  });
+
+  test("validates each retention setting as an integer of at least one day", () => {
+    for (const key of RETENTION_KEYS) {
+      expect(validateConfigValue(key, "30")).toBeNull();
+      expect(validateConfigValue(key, "0")).toContain(">= 1");
+      expect(validateConfigValue(key, "-1")).toContain("integer");
+      expect(validateConfigValue(key, "abc")).toContain("integer");
+    }
   });
 
   test("is opt-in and rejects invalid retention windows", async () => {

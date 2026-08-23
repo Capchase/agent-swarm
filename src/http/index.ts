@@ -9,6 +9,7 @@ import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/se
 import { getEnabledCapabilities, hasCapability } from "@/server";
 import { initAgentMail } from "../agentmail";
 import { closeDb, getSwarmConfigs, upsertSwarmConfig } from "../be/db";
+import { startDbRetention, stopDbRetention } from "../be/db-retention";
 import {
   enqueueAuditRow,
   flushAuditBuffer,
@@ -449,6 +450,9 @@ async function shutdown() {
   // Stop memory expired-row garbage collector
   stopMemoryGc();
 
+  // Stop opt-in session, agent-log, and event retention before closing SQLite.
+  stopDbRetention();
+
   // Stop scratch-script retention garbage collector
   stopScratchScriptGc();
 
@@ -692,6 +696,10 @@ httpServer
 
     // Start expired-memory garbage collector (1-hour tick, immediate first run)
     await startMemoryGc();
+
+    // Start the opt-in DB retention sweep after config hydration. Every key is
+    // read on each tick, so config reloads take effect without a restart.
+    await startDbRetention();
 
     // (RBAC audit sink is wired pre-listen — see above httpServer.listen.)
 
