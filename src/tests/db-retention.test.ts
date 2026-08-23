@@ -231,6 +231,27 @@ describe("DB retention", () => {
     expect(await countRows("session_logs")).toBe(250_001);
   });
 
+  test("dry run scans sparse tables in bounded keyset pages when no rows are eligible", async () => {
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    process.env.DB_RETENTION_DRY_RUN = "true";
+    await getDbClient().run(
+      `WITH RECURSIVE recent(value) AS (
+         SELECT 1
+         UNION ALL
+         SELECT value + 1 FROM recent WHERE value < 10000
+       )
+       INSERT INTO session_logs (id, sessionId, iteration, cli, content, lineNumber, createdAt)
+       SELECT 'recent-' || printf('%05d', value), 'recent-session', 0, 'bun', 'log', value,
+              '2026-08-23T11:59:59.999Z'
+       FROM recent`,
+    );
+
+    await runDbRetentionTick({ now: NOW, batchSize: 100, wallClockCapMs: 1 });
+
+    expect(getDbRetentionStats().sessionLogs).toBeUndefined();
+    expect(await countRows("session_logs")).toBe(10_000);
+  });
+
   test("stops a dry-run count when its wall-clock budget expires", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = "1";
     process.env.DB_RETENTION_DRY_RUN = "true";

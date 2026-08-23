@@ -99,42 +99,64 @@ async function sweepTable(
   signal: AbortSignal,
 ): Promise<{ rowsDeleted: number; batches: number; complete: boolean }> {
   const client = getDbClient();
-  if (dryRun) {
-    let rowsDeleted = 0;
-    let batches = 0;
-    let lastId: string | null = null;
-    while (!signal.aborted && Date.now() < deadline) {
-      const rows: { id: string }[] = await client.query<{ id: string }>(
-        `SELECT id FROM ${table.table}
-         WHERE ${table.timeColumn} < ? AND (? IS NULL OR id > ?)
-         ORDER BY id LIMIT ?`,
-        [cutoff, lastId, lastId, batchSize],
-      );
-      rowsDeleted += rows.length;
-      batches += 1;
-      if (rows.length < batchSize) return { rowsDeleted, batches, complete: true };
-      lastId = rows.at(-1)?.id ?? null;
-      await yieldTick();
-    }
-    return { rowsDeleted, batches, complete: false };
-  }
-
   let rowsDeleted = 0;
   let batches = 0;
-  while (!signal.aborted && batches < perTableBatchCap && Date.now() < deadline) {
-    // The identifiers come only from DB_RETENTION_TABLES. This stays one
-    // top-level statement so DbClient's cross-process SQLITE_BUSY retry applies.
-    const result = await client.run(
-      `DELETE FROM ${table.table}
-       WHERE id IN (SELECT id FROM ${table.table} WHERE ${table.timeColumn} < ? LIMIT ?)`,
-      [cutoff, batchSize],
+  let cursor: string | null = null;
+  let complete = true;
+  let exhausted = false;
+  const batchLimit = dryRun ? Number.POSITIVE_INFINITY : perTableBatchCap;
+  while (!signal.aborted && batches < batchLimit && Date.now() < deadline) {
+    // Page by the primary key, not by the retention predicate. A query that
+    // filters on createdAt while ordering by id can scan the whole PK index
+    // before finding LIMIT matches when eligible rows are sparse. This query
+    // visits at most batchSize rows per statement; cutoff filtering happens in
+    // memory and deletes are restricted to the IDs in that bounded page.
+    const page = await client.query<{ id: string; createdAt: string }>(
+      `SELECT id, ${table.timeColumn} AS createdAt
+       FROM ${table.table}
+       ${cursor === null ? "" : "WHERE id > ?"}
+       ORDER BY id
+       LIMIT ?`,
+      cursor === null ? [batchSize] : [cursor, batchSize],
     );
-    rowsDeleted += result.changes;
-    batches += 1;
-    if (result.changes < batchSize) break;
+    if (Date.now() >= deadline || signal.aborted) {
+      complete = false;
+      break;
+    }
+    if (page.length === 0) {
+      exhausted = true;
+      break;
+    }
+
+    cursor = page[page.length - 1]?.id ?? null;
+    const expiredIds = page
+      .filter((row) => row.createdAt < cutoff)
+      .map((row) => row.id);
+    if (expiredIds.length > 0) {
+      if (dryRun) {
+        rowsDeleted += expiredIds.length;
+      } else {
+        // IDs came directly from the bounded page and are placeholders, so
+        // this statement is bounded by the page size and remains retryable.
+        const placeholders = expiredIds.map(() => "?").join(", ");
+        const result = await client.run(
+          `DELETE FROM ${table.table} WHERE id IN (${placeholders})`,
+          expiredIds,
+        );
+        rowsDeleted += result.changes;
+      }
+      batches += 1;
+    }
+    if (page.length < batchSize) {
+      exhausted = true;
+      break;
+    }
     await yieldTick();
   }
-  return { rowsDeleted, batches, complete: true };
+  // A dry-run count is only useful if the full table was scanned. Never
+  // publish a partial count when the wall-clock budget or shutdown interrupted
+  // the keyset scan.
+  return { rowsDeleted, batches, complete: !dryRun || (complete && exhausted) };
 }
 
 /** Run one bounded sweep over every enabled table. Failures are isolated per table. */
