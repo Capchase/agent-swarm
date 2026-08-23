@@ -179,7 +179,7 @@ export function getDbRetentionStats(): DbRetentionStats {
   return { ...retentionStats };
 }
 
-/** Start the hourly sweep. The first tick runs before the API begins serving traffic. */
+/** Start the hourly sweep. The first tick runs immediately. */
 export async function startDbRetention(intervalMs = RETENTION_INTERVAL_MS): Promise<void> {
   if (retentionTimer) return;
   const configured = DB_RETENTION_TABLES.map(
