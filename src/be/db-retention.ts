@@ -97,14 +97,26 @@ async function sweepTable(
   batchSize: number,
   perTableBatchCap: number,
   signal: AbortSignal,
-): Promise<{ rowsDeleted: number; batches: number }> {
+): Promise<{ rowsDeleted: number; batches: number; complete: boolean }> {
   const client = getDbClient();
   if (dryRun) {
-    const row = await client.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM ${table.table} WHERE ${table.timeColumn} < ?`,
-      [cutoff],
-    );
-    return { rowsDeleted: row?.count ?? 0, batches: 0 };
+    let rowsDeleted = 0;
+    let batches = 0;
+    let lastId: string | null = null;
+    while (!signal.aborted && Date.now() < deadline) {
+      const rows = await client.query<{ id: string }>(
+        `SELECT id FROM ${table.table}
+         WHERE ${table.timeColumn} < ? AND (? IS NULL OR id > ?)
+         ORDER BY id LIMIT ?`,
+        [cutoff, lastId, lastId, batchSize],
+      );
+      rowsDeleted += rows.length;
+      batches += 1;
+      if (rows.length < batchSize) return { rowsDeleted, batches, complete: true };
+      lastId = rows.at(-1)?.id ?? null;
+      await yieldTick();
+    }
+    return { rowsDeleted, batches, complete: false };
   }
 
   let rowsDeleted = 0;
@@ -122,7 +134,7 @@ async function sweepTable(
     if (result.changes < batchSize) break;
     await yieldTick();
   }
-  return { rowsDeleted, batches };
+  return { rowsDeleted, batches, complete: true };
 }
 
 /** Run one bounded sweep over every enabled table. Failures are isolated per table. */
@@ -158,6 +170,9 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             perTableBatchCap,
             abortController.signal,
           );
+          if (dryRun && !result.complete) {
+            throw new Error("dry-run count stopped before completion");
+          }
           deletedAny ||= !dryRun && result.rowsDeleted > 0;
           const cumulative =
             (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);

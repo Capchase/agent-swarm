@@ -231,6 +231,28 @@ describe("DB retention", () => {
     expect(await countRows("session_logs")).toBe(250_001);
   });
 
+  test("stops a dry-run count when its wall-clock budget expires", async () => {
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    process.env.DB_RETENTION_DRY_RUN = "true";
+    await getDbClient().run(
+      `WITH RECURSIVE candidates(value) AS (
+         SELECT 1
+         UNION ALL
+         SELECT value + 1 FROM candidates WHERE value < 1000
+       )
+       INSERT INTO session_logs (id, sessionId, iteration, cli, content, lineNumber, createdAt)
+       SELECT 'deadline-' || value, 'deadline-session', 0, 'bun', 'log', value, '2026-08-01T00:00:00.000Z'
+       FROM candidates`,
+    );
+
+    const startedAt = Date.now();
+    await runDbRetentionTick({ now: NOW, batchSize: 1, wallClockCapMs: 10 });
+
+    expect(Date.now() - startedAt).toBeLessThan(150);
+    expect(await countRows("session_logs")).toBe(1000);
+    expect(getDbRetentionStats().sessionLogs).toBeUndefined();
+  });
+
   test("rejects an excessive window without aborting later table sweeps", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = String(MAX_DB_RETENTION_DAYS + 1);
     process.env.AGENT_LOG_RETENTION_DAYS = "1";
