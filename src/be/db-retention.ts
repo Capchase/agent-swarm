@@ -111,7 +111,10 @@ async function sweepTable(
     // before finding LIMIT matches when eligible rows are sparse. This query
     // visits at most batchSize rows per statement; cutoff filtering happens in
     // memory and deletes are restricted to the IDs in that bounded page.
-    const page = await client.query<{ id: string; createdAt: string }>(
+    const page: Array<{ id: string; createdAt: string }> = await client.query<{
+      id: string;
+      createdAt: string;
+    }>(
       `SELECT id, ${table.timeColumn} AS createdAt
        FROM ${table.table}
        ${cursor === null ? "" : "WHERE id > ?"}
