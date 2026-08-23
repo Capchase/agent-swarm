@@ -200,6 +200,17 @@ describe("DB retention", () => {
     });
   });
 
+  test("uses dry run when the deployed dry-run value is invalid", async () => {
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    process.env.DB_RETENTION_DRY_RUN = "treu";
+    await insertRow("session_logs", "invalid-dry-run-old", "2026-08-01T00:00:00.000Z");
+
+    await runDbRetentionTick({ now: NOW });
+
+    expect(await countRows("session_logs")).toBe(1);
+    expect(getDbRetentionStats().sessionLogs).toMatchObject({ rowsDeleted: 1, dryRun: true });
+  });
+
   test("dry run reports an exact count above the former safety cap", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = "1";
     process.env.DB_RETENTION_DRY_RUN = "true";

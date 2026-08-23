@@ -83,6 +83,12 @@ function retentionDays(table: RetentionTable): number | null {
   return readPositiveIntEnv(table.envKey);
 }
 
+function dryRunEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.DB_RETENTION_DRY_RUN;
+  if (raw === undefined || raw.trim() === "") return false;
+  return isEnvFlagEnabled("DB_RETENTION_DRY_RUN", true, env);
+}
+
 async function sweepTable(
   table: RetentionTable,
   cutoff: string,
@@ -129,7 +135,7 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
     try {
       const tickStartedAt = Date.now();
       const cutoffBase = options.now ?? new Date(tickStartedAt);
-      const dryRun = isEnvFlagEnabled("DB_RETENTION_DRY_RUN", false);
+      const dryRun = dryRunEnabled();
       const batchSize = options.batchSize ?? BATCH_SIZE;
       const perTableBatchCap = options.perTableBatchCap ?? PER_TABLE_BATCH_CAP;
       const deadline = tickStartedAt + (options.wallClockCapMs ?? WALL_CLOCK_CAP_MS);
@@ -201,9 +207,7 @@ export async function startDbRetention(intervalMs = RETENTION_INTERVAL_MS): Prom
   const configured = DB_RETENTION_TABLES.map(
     (table) => `${table.table}=${retentionDays(table) ?? "disabled"}`,
   ).join(", ");
-  console.log(
-    `[db-retention] starting (${configured}, dryRun=${isEnvFlagEnabled("DB_RETENTION_DRY_RUN", false)})`,
-  );
+  console.log(`[db-retention] starting (${configured}, dryRun=${dryRunEnabled()})`);
   retentionTimer = scheduleContextFree(() =>
     setInterval(() => void runDbRetentionTick(), intervalMs),
   );
