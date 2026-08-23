@@ -101,11 +101,15 @@ async function sweepTable(
   const client = getDbClient();
   let rowsDeleted = 0;
   let batches = 0;
+  let pagesFetched = 0;
   let cursor: string | null = null;
   let complete = true;
   let exhausted = false;
-  const batchLimit = dryRun ? Number.POSITIVE_INFINITY : perTableBatchCap;
-  while (!signal.aborted && batches < batchLimit && Date.now() < deadline) {
+  // Bounded on pages fetched, not on delete batches: a sparse or no-match
+  // table would otherwise walk every primary-key page until the wall-clock
+  // deadline, since batches only increments when a page has expired rows.
+  const pageLimit = dryRun ? Number.POSITIVE_INFINITY : perTableBatchCap;
+  while (!signal.aborted && pagesFetched < pageLimit && Date.now() < deadline) {
     // Page by the primary key, not by the retention predicate. A query that
     // filters on createdAt while ordering by id can scan the whole PK index
     // before finding LIMIT matches when eligible rows are sparse. This query
@@ -122,6 +126,7 @@ async function sweepTable(
        LIMIT ?`,
       cursor === null ? [batchSize] : [cursor, batchSize],
     );
+    pagesFetched += 1;
     if (Date.now() >= deadline || signal.aborted) {
       complete = false;
       break;
@@ -132,9 +137,7 @@ async function sweepTable(
     }
 
     cursor = page[page.length - 1]?.id ?? null;
-    const expiredIds = page
-      .filter((row) => row.createdAt < cutoff)
-      .map((row) => row.id);
+    const expiredIds = page.filter((row) => row.createdAt < cutoff).map((row) => row.id);
     if (expiredIds.length > 0) {
       if (dryRun) {
         rowsDeleted += expiredIds.length;

@@ -252,6 +252,32 @@ describe("DB retention", () => {
     expect(await countRows("session_logs")).toBe(10_000);
   });
 
+  test("bounds pages fetched on a non-dry sweep of a sparse table with no eligible rows", async () => {
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    await getDbClient().run(
+      `WITH RECURSIVE recent(value) AS (
+         SELECT 1
+         UNION ALL
+         SELECT value + 1 FROM recent WHERE value < 10000
+       )
+       INSERT INTO session_logs (id, sessionId, iteration, cli, content, lineNumber, createdAt)
+       SELECT 'recent-' || printf('%05d', value), 'recent-session', 0, 'bun', 'log', value,
+              '2026-08-23T11:59:59.999Z'
+       FROM recent`,
+    );
+
+    const startedAt = Date.now();
+    await runDbRetentionTick({ now: NOW, batchSize: 1, perTableBatchCap: 1 });
+
+    // A page counter must cap the loop even when zero rows are eligible for
+    // deletion, since batches only increments on a page with a match. Without
+    // that cap this sweep walks all 10,000 pages (with a 5ms yield between
+    // each) instead of stopping after the one page the cap allows.
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(getDbRetentionStats().sessionLogs).toMatchObject({ rowsDeleted: 0, batches: 0 });
+    expect(await countRows("session_logs")).toBe(10_000);
+  });
+
   test("stops a dry-run count when its wall-clock budget expires", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = "1";
     process.env.DB_RETENTION_DRY_RUN = "true";
