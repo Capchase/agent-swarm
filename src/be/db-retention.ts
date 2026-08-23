@@ -104,7 +104,7 @@ async function sweepTable(
     let batches = 0;
     let lastId: string | null = null;
     while (!signal.aborted && Date.now() < deadline) {
-      const rows = await client.query<{ id: string }>(
+      const rows: { id: string }[] = await client.query<{ id: string }>(
         `SELECT id FROM ${table.table}
          WHERE ${table.timeColumn} < ? AND (? IS NULL OR id > ?)
          ORDER BY id LIMIT ?`,
