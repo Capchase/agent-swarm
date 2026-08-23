@@ -451,7 +451,7 @@ async function shutdown() {
   stopMemoryGc();
 
   // Stop opt-in session, agent-log, and event retention before closing SQLite.
-  stopDbRetention();
+  await stopDbRetention();
 
   // Stop scratch-script retention garbage collector
   stopScratchScriptGc();

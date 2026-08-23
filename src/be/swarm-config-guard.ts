@@ -39,6 +39,9 @@ type ConfigValidator = (value: unknown) => string | null;
 
 const BOOLEAN_LITERALS = ["true", "false", "1", "0"];
 
+/** A conservative window that remains representable by JavaScript Date arithmetic. */
+export const MAX_DB_RETENTION_DAYS = 1_000_000;
+
 /** Build `{ KEY: validator }` entries accepting only boolean literals. */
 function booleanValidators(keys: string[]): Record<string, ConfigValidator> {
   const message = (key: string) =>
@@ -74,6 +77,27 @@ function integerValidators(keys: string[], min: number): Record<string, ConfigVa
         const str = String(value).trim();
         if (!/^\d+$/.test(str) || Number(str) < min) {
           return `Invalid ${key} (must be an integer >= ${min})`;
+        }
+        return null;
+      },
+    ]),
+  );
+}
+
+/** Build `{ KEY: validator }` entries accepting integers inside a closed range. */
+function boundedIntegerValidators(
+  keys: string[],
+  min: number,
+  max: number,
+): Record<string, ConfigValidator> {
+  return Object.fromEntries(
+    keys.map((key) => [
+      key,
+      (value: unknown) => {
+        const str = String(value).trim();
+        const parsed = Number(str);
+        if (!/^\d+$/.test(str) || !Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+          return `Invalid ${key} (must be an integer between ${min} and ${max})`;
         }
         return null;
       },
@@ -163,6 +187,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "ANONYMIZED_TELEMETRY",
     "SWARM_HIDE_CLOUD_PROMO",
     "DB_QUERY_BOUNDED_ENABLED",
+    "DB_RETENTION_DRY_RUN",
   ]),
   ...enumValidator("SLACK_THREAD_STEERING", ["lead", "all"]),
   ...enumValidator("SLACK_THREAD_STEERING_MODE", ["steer", "queue"]),
@@ -177,9 +202,6 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "HEARTBEAT_MAX_RESUME_GENERATIONS",
       "MEMORY_RECENCY_HALF_LIFE_DAYS",
       "RBAC_AUDIT_RETENTION_DAYS",
-      "SESSION_LOG_RETENTION_DAYS",
-      "AGENT_LOG_RETENTION_DAYS",
-      "EVENTS_RETENTION_DAYS",
       "WORKFLOW_MAX_ITERATIONS",
       "WORKFLOW_MAX_STEPS_PER_RUN",
       "SCHEDULER_INTERVAL_MS",
@@ -193,6 +215,11 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
       "AGENT_FS_REQUEST_TIMEOUT_MS",
     ],
     1,
+  ),
+  ...boundedIntegerValidators(
+    ["SESSION_LOG_RETENTION_DAYS", "AGENT_LOG_RETENTION_DAYS", "EVENTS_RETENTION_DAYS"],
+    1,
+    MAX_DB_RETENTION_DAYS,
   ),
   // 0 is meaningful here: "auto-assign nothing this sweep".
   ...integerValidators(["HEARTBEAT_MAX_AUTO_ASSIGN"], 0),

@@ -1,13 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { getDbClient } from "./db";
+import { MAX_DB_RETENTION_DAYS } from "./swarm-config-guard";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETENTION_INTERVAL_MS = 60 * 60 * 1000;
 const BATCH_SIZE = 5_000;
 const PER_TABLE_BATCH_CAP = 40;
 const WALL_CLOCK_CAP_MS = 60_000;
-const DRY_RUN_COUNT_LIMIT = 250_000;
 const YIELD_MS = 5;
 
 /**
@@ -60,7 +60,8 @@ export type DbRetentionTickOptions = {
 };
 
 let retentionTimer: ReturnType<typeof setInterval> | null = null;
-let tickInFlight = false;
+let retentionTickPromise: Promise<void> | null = null;
+let retentionAbortController: AbortController | null = null;
 let retentionStats: DbRetentionStats = {};
 let cumulativeRowsDeleted: Partial<Record<RetentionMetricsKey, number>> = {};
 
@@ -71,7 +72,7 @@ function readPositiveIntEnv(key: string, env: NodeJS.ProcessEnv = process.env): 
   const raw = env[key]?.trim();
   if (!raw || !/^\d+$/.test(raw)) return null;
   const value = Number(raw);
-  return Number.isSafeInteger(value) && value >= 1 ? value : null;
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_DB_RETENTION_DAYS ? value : null;
 }
 
 function yieldTick(): Promise<void> {
@@ -89,19 +90,20 @@ async function sweepTable(
   deadline: number,
   batchSize: number,
   perTableBatchCap: number,
+  signal: AbortSignal,
 ): Promise<{ rowsDeleted: number; batches: number }> {
   const client = getDbClient();
   if (dryRun) {
     const row = await client.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM (SELECT id FROM ${table.table} WHERE ${table.timeColumn} < ? LIMIT ?)`,
-      [cutoff, DRY_RUN_COUNT_LIMIT],
+      `SELECT COUNT(*) AS count FROM ${table.table} WHERE ${table.timeColumn} < ?`,
+      [cutoff],
     );
     return { rowsDeleted: row?.count ?? 0, batches: 0 };
   }
 
   let rowsDeleted = 0;
   let batches = 0;
-  while (batches < perTableBatchCap && Date.now() < deadline) {
+  while (!signal.aborted && batches < perTableBatchCap && Date.now() < deadline) {
     // The identifiers come only from DB_RETENTION_TABLES. This stays one
     // top-level statement so DbClient's cross-process SQLITE_BUSY retry applies.
     const result = await client.run(
@@ -118,61 +120,75 @@ async function sweepTable(
 }
 
 /** Run one bounded sweep over every enabled table. Failures are isolated per table. */
-export async function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promise<void> {
-  if (tickInFlight) return;
-  tickInFlight = true;
-  const tickStartedAt = Date.now();
-  const cutoffBase = options.now ?? new Date(tickStartedAt);
-  const dryRun = isEnvFlagEnabled("DB_RETENTION_DRY_RUN", false);
-  const batchSize = options.batchSize ?? BATCH_SIZE;
-  const perTableBatchCap = options.perTableBatchCap ?? PER_TABLE_BATCH_CAP;
-  const deadline = tickStartedAt + (options.wallClockCapMs ?? WALL_CLOCK_CAP_MS);
+export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promise<void> {
+  if (retentionTickPromise) return retentionTickPromise;
 
-  try {
-    for (const table of DB_RETENTION_TABLES) {
-      if (Date.now() >= deadline) break;
-      const days = retentionDays(table);
-      if (days === null) continue;
-
-      const startedAt = Date.now();
-      const cutoff = new Date(cutoffBase.getTime() - days * DAY_MS).toISOString();
-      try {
-        const result = await sweepTable(
-          table,
-          cutoff,
-          dryRun,
-          deadline,
-          batchSize,
-          perTableBatchCap,
-        );
-        const cumulative =
-          (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);
-        cumulativeRowsDeleted[table.metricsKey] = cumulative;
-        retentionStats[table.metricsKey] = {
-          at: new Date().toISOString(),
-          rowsDeleted: result.rowsDeleted,
-          batches: result.batches,
-          durationMs: Date.now() - startedAt,
-          dryRun,
-          cumulativeRowsDeleted: cumulative,
-        };
-        console.log(
-          `[db-retention] ${table.table}: ${dryRun ? "would delete" : "deleted"} ${result.rowsDeleted} row(s) in ${result.batches} batch(es)`,
-        );
-      } catch (err) {
-        console.error(`[db-retention] ${table.table} sweep failed:`, (err as Error).message);
-      }
-    }
-
+  const abortController = new AbortController();
+  retentionAbortController = abortController;
+  const promise = Promise.resolve().then(async () => {
     try {
-      // Harmless when auto_vacuum is not INCREMENTAL; never run a blocking VACUUM here.
-      await getDbClient().run("PRAGMA incremental_vacuum(2000)");
-    } catch (err) {
-      console.error("[db-retention] incremental vacuum failed:", (err as Error).message);
+      const tickStartedAt = Date.now();
+      const cutoffBase = options.now ?? new Date(tickStartedAt);
+      const dryRun = isEnvFlagEnabled("DB_RETENTION_DRY_RUN", false);
+      const batchSize = options.batchSize ?? BATCH_SIZE;
+      const perTableBatchCap = options.perTableBatchCap ?? PER_TABLE_BATCH_CAP;
+      const deadline = tickStartedAt + (options.wallClockCapMs ?? WALL_CLOCK_CAP_MS);
+      let deletedAny = false;
+
+      for (const table of DB_RETENTION_TABLES) {
+        if (abortController.signal.aborted || Date.now() >= deadline) break;
+        const days = retentionDays(table);
+        if (days === null) continue;
+
+        const startedAt = Date.now();
+        try {
+          const cutoff = new Date(cutoffBase.getTime() - days * DAY_MS).toISOString();
+          const result = await sweepTable(
+            table,
+            cutoff,
+            dryRun,
+            deadline,
+            batchSize,
+            perTableBatchCap,
+            abortController.signal,
+          );
+          deletedAny ||= !dryRun && result.rowsDeleted > 0;
+          const cumulative =
+            (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);
+          cumulativeRowsDeleted[table.metricsKey] = cumulative;
+          retentionStats[table.metricsKey] = {
+            at: new Date().toISOString(),
+            rowsDeleted: result.rowsDeleted,
+            batches: result.batches,
+            durationMs: Date.now() - startedAt,
+            dryRun,
+            cumulativeRowsDeleted: cumulative,
+          };
+          if (result.rowsDeleted > 0) {
+            console.log(
+              `[db-retention] ${table.table}: ${dryRun ? "would delete" : "deleted"} ${result.rowsDeleted} row(s) in ${result.batches} batch(es) after ${Date.now() - startedAt}ms`,
+            );
+          }
+        } catch (err) {
+          console.error(`[db-retention] ${table.table} sweep failed:`, (err as Error).message);
+        }
+      }
+
+      if (deletedAny && !abortController.signal.aborted) {
+        try {
+          // Harmless when auto_vacuum is not INCREMENTAL; never run a blocking VACUUM here.
+          await getDbClient().run("PRAGMA incremental_vacuum(2000)");
+        } catch (err) {
+          console.error("[db-retention] incremental vacuum failed:", (err as Error).message);
+        }
+      }
+    } finally {
+      if (retentionAbortController === abortController) retentionAbortController = null;
+      retentionTickPromise = null;
     }
-  } finally {
-    tickInFlight = false;
-  }
+  });
+  retentionTickPromise = promise;
+  return promise;
 }
 
 export function getDbRetentionStats(): DbRetentionStats {
@@ -188,23 +204,25 @@ export async function startDbRetention(intervalMs = RETENTION_INTERVAL_MS): Prom
   console.log(
     `[db-retention] starting (${configured}, dryRun=${isEnvFlagEnabled("DB_RETENTION_DRY_RUN", false)})`,
   );
-  await runDbRetentionTick();
   retentionTimer = scheduleContextFree(() =>
     setInterval(() => void runDbRetentionTick(), intervalMs),
   );
   if (typeof retentionTimer.unref === "function") retentionTimer.unref();
+  await runDbRetentionTick();
 }
 
-export function stopDbRetention(): void {
-  if (!retentionTimer) return;
-  clearInterval(retentionTimer);
-  retentionTimer = null;
+export async function stopDbRetention(): Promise<void> {
+  if (retentionTimer) {
+    clearInterval(retentionTimer);
+    retentionTimer = null;
+  }
+  retentionAbortController?.abort();
+  await retentionTickPromise;
 }
 
 /** Test hook to prevent module state leaking between Bun test files. */
-export function resetDbRetentionForTests(): void {
-  stopDbRetention();
-  tickInFlight = false;
+export async function resetDbRetentionForTests(): Promise<void> {
+  await stopDbRetention();
   retentionStats = {};
   cumulativeRowsDeleted = {};
 }
