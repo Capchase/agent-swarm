@@ -195,9 +195,9 @@ docker run --rm -v swarm_api:/app -v $(pwd):/backup alpine \
 docker compose up -d
 ```
 
-### Database retention
+<h3 id="database-retention">Database retention</h3>
 
-`SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, and `EVENTS_RETENTION_DAYS` are disabled until you set them. Each value permanently deletes rows older than its window. Start with `DB_RETENTION_DRY_RUN=true`, confirm the `[db-retention]` log output and `GET /api/metrics`, then enable one table at a time. See the [database-retention runbook](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/db-retention.md) before activation.
+`SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, and `EVENTS_RETENTION_DAYS` are disabled until you set them. Each value permanently deletes rows older than its window. Start with `DB_RETENTION_DRY_RUN=true`, confirm the exact `[db-retention]` would-delete count and `GET /api/metrics`, then enable one table at a time. See the [database-retention runbook](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/db-retention.md) before activation.
 
 <Callout type="warn">
 A database backup is useless without the matching [encryption key](#encryption-key). Back up both together.
