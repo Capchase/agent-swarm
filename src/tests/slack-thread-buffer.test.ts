@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
   closeDb,
@@ -23,10 +23,12 @@ process.env.SLACK_RENDER_V2 = "false";
 const SYSTEM_ACTOR: IdentityActor = { kind: "system", id: "test" };
 
 const TEST_DB_PATH = "./test-slack-thread-buffer.sqlite";
-const originalAdditiveSlack = process.env.ADDITIVE_SLACK;
-const originalSteeringEnabled = process.env.STEERING_ENABLED;
 
-const reactionsAdd = async () => ({ ok: true });
+let reactionCalls: Array<{ channel: string; name: string; timestamp: string }> = [];
+const reactionsAdd = async (args: { channel: string; name: string; timestamp: string }) => {
+  reactionCalls.push(args);
+  return { ok: true };
+};
 const handlerClient = {
   auth: {
     test: async () => ({ user_id: "U_THREAD_BUFFER_BOT", bot_id: "B_THREAD_BUFFER_BOT" }),
@@ -60,10 +62,6 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  if (originalAdditiveSlack === undefined) delete process.env.ADDITIVE_SLACK;
-  else process.env.ADDITIVE_SLACK = originalAdditiveSlack;
-  if (originalSteeringEnabled === undefined) delete process.env.STEERING_ENABLED;
-  else process.env.STEERING_ENABLED = originalSteeringEnabled;
   closeDb();
   try {
     unlinkSync(TEST_DB_PATH);
@@ -76,12 +74,32 @@ afterAll(() => {
 
 describe("Slack thread buffer", () => {
   describe("ADDITIVE_SLACK thread ingress", () => {
+    const originalAdditiveSlack = process.env.ADDITIVE_SLACK;
+    const originalSteeringEnabled = process.env.STEERING_ENABLED;
+    const originalRequireMention = process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION;
+
     beforeAll(() => {
       process.env.ADDITIVE_SLACK = "true";
       process.env.STEERING_ENABLED = "false";
+      // Pin explicitly rather than relying on it being unset — some environments
+      // export this at the OS level, which would silently disable the whole gate.
+      process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION = "false";
     });
 
-    test("does not create a task for a human reply in a thread with no swarm activity", async () => {
+    afterAll(() => {
+      if (originalAdditiveSlack === undefined) delete process.env.ADDITIVE_SLACK;
+      else process.env.ADDITIVE_SLACK = originalAdditiveSlack;
+      if (originalSteeringEnabled === undefined) delete process.env.STEERING_ENABLED;
+      else process.env.STEERING_ENABLED = originalSteeringEnabled;
+      if (originalRequireMention === undefined) delete process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION;
+      else process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION = originalRequireMention;
+    });
+
+    beforeEach(() => {
+      reactionCalls = [];
+    });
+
+    test("does not create a task, buffer, or react for a human reply in a thread with no swarm activity", async () => {
       expect(messageHandler).toBeDefined();
       const channelId = "C_NO_SWARM_ACTIVITY";
       const threadTs = "14000.0001";
@@ -99,9 +117,90 @@ describe("Slack thread buffer", () => {
         say: async () => {},
       });
 
+      // Assert the gate immediately: no buffer entry, no :eyes: reaction —
+      // this is the user-visible symptom the fix targets.
+      expect(getBufferMessageCount(`${channelId}:${threadTs}`)).toBe(0);
+      expect(reactionCalls).toHaveLength(0);
+
       await instantFlush(`${channelId}:${threadTs}`);
 
       expect(await getMostRecentTaskInThread(channelId, threadTs)).toBeNull();
+    });
+
+    test("buffers and reacts to a human reply when the thread root was posted by the swarm bot (no task row yet)", async () => {
+      expect(messageHandler).toBeDefined();
+      const channelId = "C_SWARM_ROOT_NO_TASK";
+      const threadTs = "14003.0001";
+
+      const swarmRootClient = {
+        ...handlerClient,
+        conversations: {
+          replies: async () => ({
+            ok: true,
+            messages: [
+              { user: "U_THREAD_BUFFER_BOT", ts: threadTs, text: "proactive swarm message" },
+            ],
+          }),
+        },
+      };
+
+      await messageHandler!({
+        event: {
+          channel: channelId,
+          thread_ts: threadTs,
+          ts: "14003.0002",
+          text: "thanks, following up",
+          user: "U_HUMAN_SWARM_ROOT",
+        },
+        body: { event_id: "evt_swarm_root_no_task" },
+        client: swarmRootClient,
+        say: async () => {},
+      });
+
+      expect(getBufferMessageCount(`${channelId}:${threadTs}`)).toBe(1);
+      expect(reactionCalls).toHaveLength(1);
+      expect(reactionCalls[0]?.name).toBe("eyes");
+
+      await instantFlush(`${channelId}:${threadTs}`);
+
+      const followUp = await getMostRecentTaskInThread(channelId, threadTs);
+      expect(followUp).not.toBeNull();
+      expect(followUp!.task).toContain("thanks, following up");
+    });
+
+    test("does not buffer, react, or create a task for a threaded reply that mentions another user", async () => {
+      expect(messageHandler).toBeDefined();
+      const channelId = "C_OTHER_USER_MENTION";
+      const threadTs = "14004.0001";
+      const existingTask = await createTaskExtended("original swarm task", {
+        agentId: leadAgent.id,
+        source: "slack",
+        slackChannelId: channelId,
+        slackThreadTs: threadTs,
+      });
+
+      await messageHandler!({
+        event: {
+          channel: channelId,
+          thread_ts: threadTs,
+          ts: "14004.0002",
+          text: "<@UOTHERBOT> what do you think?",
+          user: "U_HUMAN_OTHER_MENTION",
+        },
+        body: { event_id: "evt_other_user_mention" },
+        client: handlerClient,
+        say: async () => {},
+      });
+
+      expect(getBufferMessageCount(`${channelId}:${threadTs}`)).toBe(0);
+      expect(reactionCalls).toHaveLength(0);
+
+      await instantFlush(`${channelId}:${threadTs}`);
+
+      // Still just the pre-existing task — the other-user mention must not
+      // create a new follow-up task.
+      const latest = await getMostRecentTaskInThread(channelId, threadTs);
+      expect(latest?.id).toBe(existingTask.id);
     });
 
     test("creates a follow-up task for a human reply in a thread with swarm activity", async () => {
