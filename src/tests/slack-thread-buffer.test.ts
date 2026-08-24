@@ -128,6 +128,34 @@ describe("Slack thread buffer", () => {
       expect(await getMostRecentTaskInThread(channelId, threadTs)).toBeNull();
     });
 
+    test("does not create a task, buffer, or react to a !now reply in a thread with no swarm activity", async () => {
+      expect(messageHandler).toBeDefined();
+      const channelId = "C_NOW_NO_SWARM_ACTIVITY";
+      const threadTs = "14005.0001";
+
+      await messageHandler!({
+        event: {
+          channel: channelId,
+          thread_ts: threadTs,
+          ts: "14005.0002",
+          text: "!now unsolicited work",
+          user: "U_HUMAN_NOW_NO_SWARM_ACTIVITY",
+        },
+        body: { event_id: "evt_now_no_swarm_activity" },
+        client: handlerClient,
+        say: async () => {},
+      });
+
+      // HEURISTICS.md: "!now" works only in a thread with swarm activity —
+      // an unrelated human reply must not buffer, react, or create a task.
+      expect(getBufferMessageCount(`${channelId}:${threadTs}`)).toBe(0);
+      expect(reactionCalls).toHaveLength(0);
+
+      await instantFlush(`${channelId}:${threadTs}`);
+
+      expect(await getMostRecentTaskInThread(channelId, threadTs)).toBeNull();
+    });
+
     test("buffers and reacts to a human reply when the thread root was posted by the swarm bot (no task row yet)", async () => {
       expect(messageHandler).toBeDefined();
       const channelId = "C_SWARM_ROOT_NO_TASK";

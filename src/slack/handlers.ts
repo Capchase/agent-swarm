@@ -255,6 +255,23 @@ async function wasThreadStartedBySwarm(
 }
 
 /**
+ * True when a thread has swarm activity: either an agent is actively working
+ * the thread, or the swarm itself posted the thread's root message. This is
+ * the single gate for every ADDITIVE_SLACK ingress path — the normal buffer
+ * and the `!now` override must share it so they cannot drift out of sync.
+ */
+async function hasSwarmThreadActivity(
+  client: WebClient,
+  channelId: string,
+  threadTs: string,
+): Promise<boolean> {
+  return (
+    (await getAgentWorkingOnThread(channelId, threadTs)) !== null ||
+    (await wasThreadStartedBySwarm(client, channelId, threadTs))
+  );
+}
+
+/**
  * Fetch thread history and format as context for the task.
  * Returns empty string if not in a thread or no previous messages.
  */
@@ -494,7 +511,10 @@ export function registerMessageHandler(app: App): void {
     );
     if (additiveSlack && msg.thread_ts) {
       const stripped = effectiveText.replace(/<@[A-Z0-9]+>/g, "").trim();
-      if (stripped.startsWith("!now")) {
+      if (
+        stripped.startsWith("!now") &&
+        (await hasSwarmThreadActivity(client, msg.channel, msg.thread_ts))
+      ) {
         const nowMessage = stripped.replace(/^!now\s*/, "").trim();
         const threadKey = `${msg.channel}:${msg.thread_ts}`;
 
@@ -536,9 +556,7 @@ export function registerMessageHandler(app: App): void {
       //    message the swarm started). In the latter case there is no task row yet,
       //    so the human's reply would otherwise require an @mention. The Slack lookup
       //    is skipped when a task already matches.
-      const hasSwarmActivity =
-        (await getAgentWorkingOnThread(msg.channel, msg.thread_ts)) !== null ||
-        (await wasThreadStartedBySwarm(client, msg.channel, msg.thread_ts));
+      const hasSwarmActivity = await hasSwarmThreadActivity(client, msg.channel, msg.thread_ts);
 
       if (hasSwarmActivity) {
         const threadKey = `${msg.channel}:${msg.thread_ts}`;
