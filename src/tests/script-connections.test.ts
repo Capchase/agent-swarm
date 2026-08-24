@@ -657,9 +657,12 @@ describe("script connections", () => {
   });
 
   test("migration 117 keeps a user-attached shared binding standalone (adopts only derived-key bindings)", () => {
-    const dbPath = "./test-script-connections-migration-117-adoption.sqlite";
-    removeDbFiles(dbPath);
-    const database = new Database(dbPath, { create: true });
+    // In-memory scratch DB on purpose: this fixture replays the whole migration
+    // chain, and the runner commits each migration in its own transaction. On a
+    // file-backed DB that is one fsync per migration (~1.9s locally, >13s on a
+    // contended CI runner — it blew the 10s default timeout); in memory the same
+    // chain is ~0.3s. Nothing asserted here needs on-disk durability.
+    const database = new Database(":memory:");
     try {
       // Materialize the pre-redesign schema through 116 by temporarily marking
       // the consolidated migration as applied.
@@ -681,7 +684,7 @@ describe("script connections", () => {
           new Date().toISOString(),
           createHash("sha256").update(sql117).digest("hex"),
         );
-      runMigrations(database); // applies 001..116
+      runMigrations(database); // applies every migration except 117
 
       const now = new Date().toISOString();
       // A user-created STANDALONE binding: source='user', arbitrary config_key
@@ -750,7 +753,6 @@ describe("script connections", () => {
       expect(conn?.auth_type).toBe("none");
     } finally {
       database.close();
-      removeDbFiles(dbPath);
     }
   });
 
