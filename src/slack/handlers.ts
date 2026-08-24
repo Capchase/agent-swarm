@@ -537,7 +537,7 @@ export function registerMessageHandler(app: App): void {
       //    so the human's reply would otherwise require an @mention. The Slack lookup
       //    is skipped when a task already matches.
       const hasSwarmActivity =
-        getAgentWorkingOnThread(msg.channel, msg.thread_ts) !== null ||
+        (await getAgentWorkingOnThread(msg.channel, msg.thread_ts)) !== null ||
         (await wasThreadStartedBySwarm(client, msg.channel, msg.thread_ts));
 
       if (hasSwarmActivity) {

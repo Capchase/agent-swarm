@@ -6,9 +6,11 @@ import {
   createTaskExtended,
   createUser,
   getLatestActiveTaskInThread,
+  getMostRecentTaskInThread,
   initDb,
 } from "../be/db";
 import { type IdentityActor, linkIdentity } from "../be/users";
+import { registerMessageHandler } from "../slack/handlers";
 import {
   bufferThreadMessage,
   getBufferMessageCount,
@@ -21,14 +23,47 @@ process.env.SLACK_RENDER_V2 = "false";
 const SYSTEM_ACTOR: IdentityActor = { kind: "system", id: "test" };
 
 const TEST_DB_PATH = "./test-slack-thread-buffer.sqlite";
+const originalAdditiveSlack = process.env.ADDITIVE_SLACK;
+const originalSteeringEnabled = process.env.STEERING_ENABLED;
+
+const reactionsAdd = async () => ({ ok: true });
+const handlerClient = {
+  auth: {
+    test: async () => ({ user_id: "U_THREAD_BUFFER_BOT", bot_id: "B_THREAD_BUFFER_BOT" }),
+  },
+  conversations: {
+    replies: async () => ({ messages: [], ok: true }),
+  },
+  reactions: { add: reactionsAdd },
+  users: {
+    info: async () => ({ ok: true, user: { profile: {} } }),
+  },
+};
+
+let messageHandler: ((args: Record<string, unknown>) => Promise<void>) | undefined;
+let leadAgent: Awaited<ReturnType<typeof createAgent>>;
 
 beforeAll(async () => {
   initDb(TEST_DB_PATH);
   // Create a lead agent for flush to assign tasks to
-  await createAgent({ name: "lead-agent", isLead: true, status: "idle", capabilities: [] });
+  leadAgent = await createAgent({
+    name: "lead-agent",
+    isLead: true,
+    status: "idle",
+    capabilities: [],
+  });
+  registerMessageHandler({
+    event: (eventType: string, handler: (args: Record<string, unknown>) => Promise<void>) => {
+      if (eventType === "message") messageHandler = handler;
+    },
+  } as never);
 });
 
 afterAll(() => {
+  if (originalAdditiveSlack === undefined) delete process.env.ADDITIVE_SLACK;
+  else process.env.ADDITIVE_SLACK = originalAdditiveSlack;
+  if (originalSteeringEnabled === undefined) delete process.env.STEERING_ENABLED;
+  else process.env.STEERING_ENABLED = originalSteeringEnabled;
   closeDb();
   try {
     unlinkSync(TEST_DB_PATH);
@@ -40,6 +75,89 @@ afterAll(() => {
 });
 
 describe("Slack thread buffer", () => {
+  describe("ADDITIVE_SLACK thread ingress", () => {
+    beforeAll(() => {
+      process.env.ADDITIVE_SLACK = "true";
+      process.env.STEERING_ENABLED = "false";
+    });
+
+    test("does not create a task for a human reply in a thread with no swarm activity", async () => {
+      expect(messageHandler).toBeDefined();
+      const channelId = "C_NO_SWARM_ACTIVITY";
+      const threadTs = "14000.0001";
+
+      await messageHandler!({
+        event: {
+          channel: channelId,
+          thread_ts: threadTs,
+          ts: "14000.0002",
+          text: "regular human reply",
+          user: "U_HUMAN_NO_SWARM_ACTIVITY",
+        },
+        body: { event_id: "evt_no_swarm_activity" },
+        client: handlerClient,
+        say: async () => {},
+      });
+
+      await instantFlush(`${channelId}:${threadTs}`);
+
+      expect(await getMostRecentTaskInThread(channelId, threadTs)).toBeNull();
+    });
+
+    test("creates a follow-up task for a human reply in a thread with swarm activity", async () => {
+      expect(messageHandler).toBeDefined();
+      const channelId = "C_SWARM_ACTIVITY";
+      const threadTs = "14001.0001";
+      const existingTask = await createTaskExtended("original swarm task", {
+        agentId: leadAgent.id,
+        source: "slack",
+        slackChannelId: channelId,
+        slackThreadTs: threadTs,
+      });
+
+      await messageHandler!({
+        event: {
+          channel: channelId,
+          thread_ts: threadTs,
+          ts: "14001.0002",
+          text: "regular human follow-up",
+          user: "U_HUMAN_SWARM_ACTIVITY",
+        },
+        body: { event_id: "evt_swarm_activity" },
+        client: handlerClient,
+        say: async () => {},
+      });
+
+      await instantFlush(`${channelId}:${threadTs}`);
+
+      const followUp = await getMostRecentTaskInThread(channelId, threadTs);
+      expect(followUp).not.toBeNull();
+      expect(followUp!.id).not.toBe(existingTask.id);
+      expect(followUp!.task).toContain("[Thread follow-up — 1 message(s) buffered]");
+      expect(followUp!.task).toContain("regular human follow-up");
+    });
+
+    test("does not create a task for a top-level channel message without a mention", async () => {
+      expect(messageHandler).toBeDefined();
+      const channelId = "C_TOP_LEVEL_NO_MENTION";
+      const ts = "14002.0001";
+
+      await messageHandler!({
+        event: {
+          channel: channelId,
+          ts,
+          text: "regular top-level human message",
+          user: "U_HUMAN_TOP_LEVEL_NO_MENTION",
+        },
+        body: { event_id: "evt_top_level_no_mention" },
+        client: handlerClient,
+        say: async () => {},
+      });
+
+      expect(await getMostRecentTaskInThread(channelId, ts)).toBeNull();
+    });
+  });
+
   describe("buffer creation and message appending", () => {
     test("bufferThreadMessage creates a buffer entry", () => {
       bufferThreadMessage("C100", "1000.0001", "first message", "U1", "1000.0010");
