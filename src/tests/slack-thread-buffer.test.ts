@@ -91,7 +91,8 @@ describe("Slack thread buffer", () => {
       else process.env.ADDITIVE_SLACK = originalAdditiveSlack;
       if (originalSteeringEnabled === undefined) delete process.env.STEERING_ENABLED;
       else process.env.STEERING_ENABLED = originalSteeringEnabled;
-      if (originalRequireMention === undefined) delete process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION;
+      if (originalRequireMention === undefined)
+        delete process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION;
       else process.env.SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION = originalRequireMention;
     });
 
