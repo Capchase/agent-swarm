@@ -33,6 +33,7 @@ import {
   readFile,
   rm,
   stat,
+  unlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -41,13 +42,14 @@ import { join } from "node:path";
 import {
   backupMalformedClaudeJson,
   ClaudeAdapter,
+  observeLockOwner,
   parseClaudeBinary,
   parseClaudeBridgeEnabled,
   preseedClaudeTrustDialog,
-  reclaimStaleLock,
   resolveClaudeBinary,
   resolveClaudeBinaryArgv,
   resolveClaudeBridgeEnabled,
+  withClaudeJsonLock,
 } from "../providers/claude-adapter";
 import type { ProviderSessionConfig } from "../providers/types";
 
@@ -510,112 +512,86 @@ describe("preseedClaudeTrustDialog", () => {
     expect(entries).not.toContain(".claude.json.lock");
   }, 10_000);
 
-  test("stale-lock recovery never steals a fresh lock recreated at the same path (three-actor race)", async () => {
+  test("observeLockOwner reads token and age from one coherent generation, immune to a same-path swap mid-read", async () => {
     const claudeJsonPath = join(homeDir, ".claude.json");
     const lockPath = `${claudeJsonPath}.lock`;
-
-    // Actor 0 (crashed holder): `mkdir`s the lock, then crashes before ever
-    // reaching its own release — never writes an owner token either.
     await mkdir(lockPath);
+    const staleToken = crypto.randomUUID();
+    await writeFile(join(lockPath, "owner"), staleToken);
     const past = new Date(Date.now() - 60_000);
-    await utimes(lockPath, past, past);
+    await utimes(join(lockPath, "owner"), past, past);
 
-    // Waiter A and waiter B both observe this SAME stale generation before
-    // either acts on it — the exact interleaving the review flagged: two
-    // waiters decide staleness off one shared observation, then act on it
-    // independently and later.
-    const observedByA = await readFile(join(lockPath, "owner"), "utf-8").catch(() => null);
-    const observedByB = observedByA; // identical observation, same generation
-
-    // A reclaims first: renames the stale lock away and, since no owner
-    // token was ever written, the "moved token" (also null) matches what A
-    // observed — a genuine steal. It's removed for good.
-    await reclaimStaleLock(lockPath, observedByA);
-    expect(await readdir(homeDir)).not.toContain(".claude.json.lock");
-
-    // A third session now legitimately `mkdir`s a FRESH lock at the same
-    // path and writes its own owner token — standing in for
-    // `withClaudeJsonLock` having entered `fn()`.
-    await mkdir(lockPath);
-    const freshToken = crypto.randomUUID();
-    await writeFile(join(lockPath, "owner"), freshToken);
-
-    // B now acts on its stale decision from BEFORE A's reclaim, carrying no
-    // ownership check beyond the (null) token it captured back then.
-    await reclaimStaleLock(lockPath, observedByB);
-
-    // The fresh holder's lock must still be standing, with its own token
-    // intact: B's mismatched reclaim must have put it back rather than
-    // deleting (or silently replacing) it.
-    const entries = await readdir(homeDir);
-    expect(entries.filter((e) => e === ".claude.json.lock")).toHaveLength(1);
-    const survivingToken = await readFile(join(lockPath, "owner"), "utf-8");
-    expect(survivingToken).toBe(freshToken);
-
-    // No orphaned ".dead-" directories should remain — B's reclaim resolved
-    // one way or the other, not left half-done.
-    expect(entries.filter((e) => e.includes(".dead-"))).toEqual([]);
-
-    // A fourth writer attempting to acquire the lock right now must be
-    // rejected — a successful `mkdir` here would mean two writers holding
-    // the lock at once, the exact double-critical-section bug under test.
-    await expect(mkdir(lockPath)).rejects.toThrow();
-  });
-
-  test("stale-lock recovery discards (never deletes or replaces) a still-newer holder that wins the restore race", async () => {
-    const claudeJsonPath = join(homeDir, ".claude.json");
-    const lockPath = `${claudeJsonPath}.lock`;
-
-    // Same setup as the three-actor test: a crashed holder (never wrote an
-    // owner token), observed by both A and B, reclaimed for real by A, then
-    // a fresh third-session lock started at the same path.
-    await mkdir(lockPath);
-    await utimes(lockPath, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
-    const staleObservedToken = await readFile(join(lockPath, "owner"), "utf-8").catch(() => null);
-    await reclaimStaleLock(lockPath, staleObservedToken);
-    await mkdir(lockPath);
-    const thirdSessionToken = crypto.randomUUID();
-    await writeFile(join(lockPath, "owner"), thirdSessionToken);
-
-    // Drive the fourth actor into the exact window `reclaimStaleLock` can't
-    // observe from the outside: between B's steal (rename lockPath away)
-    // and B's restore attempt (`mkdir` back). Intercept the restore's
-    // `mkdir` call and have a fourth writer grab `lockPath` first, using
-    // the real `mkdir`, before letting B's own restore `mkdir` run (and
-    // fail) for real.
+    // Drive the exact interleaving the round-4 review flagged: a fresh
+    // holder replaces the owner file at the same path in the gap between
+    // `open` and the subsequent reads off the returned handle. The old
+    // implementation's separate `stat(lockPath)` + `readFile(lockPath)`
+    // calls would tear across this swap and pair a stale age with a fresh
+    // token; `observeLockOwner` must not.
     const fsp = await import("node:fs/promises");
-    const realMkdir = fsp.mkdir;
-    let fourthWriterToken: string | null = null;
-    let injected = false;
-    const mkdirSpy = spyOn(fsp, "mkdir").mockImplementation((async (
-      path: Parameters<typeof realMkdir>[0],
-      opts?: Parameters<typeof realMkdir>[1],
+    const realOpen = fsp.open;
+    let swapped = false;
+    const openSpy = spyOn(fsp, "open").mockImplementation((async (
+      ...args: Parameters<typeof realOpen>
     ) => {
-      if (path === lockPath && !injected) {
-        injected = true;
-        await realMkdir(lockPath);
-        fourthWriterToken = crypto.randomUUID();
-        await writeFile(join(lockPath, "owner"), fourthWriterToken);
+      const handle = await realOpen(...args);
+      if (!swapped) {
+        swapped = true;
+        await unlink(join(lockPath, "owner")).catch(() => {});
+        await writeFile(join(lockPath, "owner"), crypto.randomUUID());
       }
-      return realMkdir(path, opts);
-    }) as typeof mkdir);
+      return handle;
+    }) as typeof realOpen);
 
+    let observed: Awaited<ReturnType<typeof observeLockOwner>>;
     try {
-      // B, racing on its earlier (now-stale) observation, tries to reclaim.
-      await reclaimStaleLock(lockPath, staleObservedToken);
+      observed = await observeLockOwner(lockPath);
     } finally {
-      mkdirSpy.mockRestore();
+      openSpy.mockRestore();
     }
 
-    // The fourth writer's lock must be the one standing, with its own
-    // token intact — never silently replaced by B's restore, and never
-    // deleted outright.
-    const entries = await readdir(homeDir);
-    expect(entries.filter((e) => e === ".claude.json.lock")).toHaveLength(1);
-    expect(entries.filter((e) => e.includes(".dead-"))).toEqual([]);
-    const survivingToken = await readFile(join(lockPath, "owner"), "utf-8");
-    expect(survivingToken).toBe(fourthWriterToken);
+    // The read must reflect the ORIGINAL (stale) generation in full —
+    // never the fresh token paired with the stale age, or vice versa.
+    expect(observed?.token).toBe(staleToken);
+    expect(observed?.ageMs).toBeGreaterThanOrEqual(59_000);
   });
+
+  test("a live holder inside fn blocks a concurrent acquirer until it releases (no concurrent critical sections)", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    let cEntered = false;
+    let dEntered = false;
+    let releaseC: () => void = () => {};
+    const cHeld = new Promise<void>((resolve) => {
+      releaseC = resolve;
+    });
+
+    const cPromise = withClaudeJsonLock(claudeJsonPath, async () => {
+      cEntered = true;
+      await cHeld;
+      return "c-done";
+    });
+
+    // Give C a chance to actually acquire the lock before D starts trying.
+    while (!cEntered) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const dPromise = withClaudeJsonLock(claudeJsonPath, async () => {
+      dEntered = true;
+      return "d-done";
+    });
+
+    // While C is still holding the lock (its gate hasn't been released), D
+    // must never have entered `fn` — a successful concurrent entry here is
+    // exactly the double-critical-section bug the round-4 review flagged.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(dEntered).toBe(false);
+
+    releaseC();
+    const [cResult, dResult] = await Promise.all([cPromise, dPromise]);
+    expect(cResult).toBe("c-done");
+    expect(dResult).toBe("d-done");
+    expect(dEntered).toBe(true);
+  }, 10_000);
 });
 
 describe("backupMalformedClaudeJson", () => {

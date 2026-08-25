@@ -1,4 +1,14 @@
-import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type Span, trace } from "@opentelemetry/api";
@@ -271,8 +281,17 @@ function withClaudeBridgeAuthArgs(
 const STALE_LOCK_MS = 30_000;
 
 /**
+ * A lock *arbiter* (see `withArbiter`) older than this is assumed abandoned.
+ * The arbiter only ever guards a handful of synchronous fs calls — no
+ * caller-supplied `fn` ever runs while it's held — so legitimate hold time
+ * is low single-digit milliseconds. This threshold only needs to be well
+ * above that, not anywhere near `STALE_LOCK_MS`.
+ */
+const ARBITER_STALE_MS = 5_000;
+
+/**
  * Name of the small file written inside a held lock directory, containing a
- * random token unique to that specific acquisition. See `reclaimStaleLock`
+ * random token unique to that specific acquisition. See `withClaudeJsonLock`
  * for why this exists instead of relying on the lock directory's identity
  * (inode) or its path alone.
  */
@@ -288,71 +307,106 @@ async function readLockOwnerToken(lockPath: string): Promise<string | null> {
 }
 
 /**
- * Hand a stale lock directory off for removal, but only the EXACT generation
- * that was measured as stale — never whatever happens to be sitting at
- * `lockPath` by the time this runs.
+ * Read a held lock's owner token and age as one coherent observation of a
+ * single generation, never a mix of two.
  *
- * `rename` alone is not enough: it operates on a path, not on the directory
- * identity behind it. If the measured-stale directory has already been
- * renamed away and a brand-new holder has `mkdir`'d a fresh lock at the same
- * path in between, a second waiter's `rename(lockPath, deadPath)` still
- * "succeeds" — it just steals the fresh holder's live lock instead of the
- * dead one. Two waiters can then both `mkdir` and enter the critical section
- * concurrently, which is exactly the lost-update bug this lock exists to
- * prevent.
+ * The earlier implementation `stat`'d the lock directory for age and then
+ * separately `readFile`'d the owner token — two independent reads of
+ * `lockPath` with a gap in between. If the lock was reclaimed and replaced
+ * by a fresh holder in that gap, a caller could pair a stale age (from the
+ * generation `stat` saw) with a fresh token (from the generation `readFile`
+ * saw afterwards) — an ABA read that doesn't correspond to any single real
+ * generation, and can talk a reclaimer into stealing a live lock.
  *
- * The per-acquisition owner token (see `LOCK_OWNER_FILE`) closes that
- * window: it identifies a specific holder independent of the directory's
- * path or inode, so after the rename, comparing the moved directory's token
- * against `observedToken` (captured by the caller from the very
- * read+`stat` that decided the lock was stale) tells us, with certainty
- * rather than a narrowed probability, whether we moved the generation we
- * measured:
+ * Opening the owner file once and reading its content *and* its own mtime
+ * off that same `FileHandle` closes the gap: both values come from the
+ * exact inode the `open` resolved to, unaffected by anything that happens
+ * to the `lockPath` directory entry afterwards (a POSIX fd/handle is bound
+ * to the underlying file, not the path that found it).
  *
- * - Match → this is genuinely the crashed holder's lock. Remove it.
- * - Mismatch → we accidentally renamed away a directory that didn't exist
- *   (or was a different generation) when we took our staleness reading —
- *   i.e. a fresh holder's live lock. Put it back immediately, using
- *   `mkdir` (not a bare `rename` onto `lockPath`) to test vacancy: a
- *   `rename` onto an existing *empty* directory silently replaces it
- *   instead of failing, which would reopen this exact hole one level down.
- *   `mkdir` fails on any occupant, empty or not. If the original path has
- *   since been reclaimed by yet another holder (so the restore's `mkdir`
- *   fails), the moved directory is orphaned: no process can still be
- *   waiting on it at `lockPath`, and the rightful owner's own release path
- *   re-checks its token before removing (see `withClaudeJsonLock`), so it
- *   will not blindly delete whatever is at `lockPath` when it finishes — it
- *   is safe to discard here.
+ * Falls back to `stat`-ing the lock directory itself, with a `null` token,
+ * when the owner file doesn't exist yet — the narrow window between a
+ * holder's `mkdir` and its `writeLockOwnerToken`, or a holder that crashed
+ * before ever reaching the latter. That fallback carries no ABA risk of its
+ * own: with no owner file to race on, there is nothing to tear a read of.
+ *
+ * Exported for unit testing.
  */
-export async function reclaimStaleLock(
+export async function observeLockOwner(
   lockPath: string,
-  observedToken: string | null,
-): Promise<void> {
-  const deadPath = `${lockPath}.dead-${process.pid}-${Date.now()}`;
+): Promise<{ ageMs: number; token: string | null } | null> {
+  let handle: Awaited<ReturnType<typeof open>>;
   try {
-    await rename(lockPath, deadPath);
+    handle = await open(join(lockPath, LOCK_OWNER_FILE), "r");
   } catch {
-    // Another waiter already reclaimed (or the real holder already released) it.
-    return;
+    return await stat(lockPath)
+      .then((s) => ({ ageMs: Date.now() - s.mtimeMs, token: null }))
+      .catch(() => null);
   }
-  const movedToken = await readLockOwnerToken(deadPath);
-  if (movedToken === observedToken) {
-    await rm(deadPath, { recursive: true, force: true }).catch(() => {});
-    return;
-  }
-  // Wrong generation — try to undo the theft before anyone notices.
   try {
-    await mkdir(lockPath);
+    const [token, st] = await Promise.all([handle.readFile("utf-8"), handle.stat()]);
+    return { ageMs: Date.now() - st.mtimeMs, token };
   } catch {
-    // `lockPath` was already reclaimed by a still-newer holder; nothing
-    // waits on `deadPath` anymore, so it's safe to discard.
-    await rm(deadPath, { recursive: true, force: true }).catch(() => {});
-    return;
+    return null;
+  } finally {
+    await handle.close().catch(() => {});
   }
-  if (movedToken !== null) {
-    await writeLockOwnerToken(lockPath, movedToken).catch(() => {});
+}
+
+/**
+ * Serialize every mutation of `lockPath`'s existence — first-time creation,
+ * stale-holder reclamation, and release — behind one short-lived mutex, so
+ * two callers can never interleave an observe-then-act sequence on it.
+ *
+ * This is what actually closes the round-4 review's second finding: even
+ * with a coherent `observeLockOwner` read, a caller that acts on that
+ * observation *after* the read (rename it away, decide, maybe put it back)
+ * still leaves a window between "observed" and "acted" for someone else to
+ * mutate `lockPath` in between — which is exactly how a third `mkdir` could
+ * win a lock a reclaimer only meant to borrow, forcing the reclaimer to
+ * either overwrite a live holder's fresh lock or discard the moved-aside
+ * directory while its original holder is still inside `fn`. Once every
+ * creation, reclaim, and release of `lockPath` runs while holding this
+ * arbiter, there is no gap left for a second mutation to land in — the
+ * entire observe-and-act sequence for a given generation happens under one
+ * exclusive hold, so no other caller can be attempting a conflicting
+ * mutation at the same time. `fn` itself never runs while the arbiter is
+ * held; only the bookkeeping around `lockPath` does, so contention here
+ * stays brief regardless of how long `fn` runs under the (separately held)
+ * main lock.
+ */
+async function withArbiter<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+  const arbiterPath = `${lockPath}.arbiter`;
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    try {
+      await mkdir(arbiterPath);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      const ageMs = await stat(arbiterPath)
+        .then((s) => Date.now() - s.mtimeMs)
+        .catch(() => null);
+      // No caller code ever runs while the arbiter is held (see above), so
+      // an ABA-style identity check isn't needed to recover it safely the
+      // way the main lock's reclaim does: anything past this threshold can
+      // only mean its holder crashed mid-bookkeeping, not a legitimately
+      // long-running critical section.
+      if (ageMs !== null && ageMs >= ARBITER_STALE_MS) {
+        await rm(arbiterPath, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for ${arbiterPath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   }
-  await rm(deadPath, { recursive: true, force: true }).catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    await rm(arbiterPath, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -364,67 +418,68 @@ export async function reclaimStaleLock(
  * without `recursive` is atomic on POSIX filesystems and fails with `EEXIST`
  * when the directory already exists, which makes it a usable exclusive-lock
  * primitive without extra dependencies.
+ *
+ * Exported for unit testing.
  */
-async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T>): Promise<T> {
+export async function withClaudeJsonLock<T>(
+  claudeJsonPath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
   const lockPath = `${claudeJsonPath}.lock`;
   const deadline = Date.now() + 5_000;
-  // Only the loop that broke out via a successful `mkdir` may reach `fn` and
-  // its `finally` — a timed-out waiter never owns the lock, so it must never
-  // remove it out from under whoever does (that recreates the lost-update
-  // race this lock exists to prevent). Abort instead: callers already treat
-  // pre-seed failures as best-effort and log a warning. The one exception is
-  // a STALE lock (see `STALE_LOCK_MS`): that can only mean its creator
-  // crashed without releasing it, so every future waiter would otherwise
-  // wait out the deadline and skip pre-seeding forever — `reclaimStaleLock`
-  // recovers it via a token-verified rename rather than an unconditional
-  // remove.
   while (true) {
-    try {
-      await mkdir(lockPath);
-      break;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      const observed = await stat(lockPath)
-        .then(async (s) => ({
-          ageMs: Date.now() - s.mtimeMs,
-          token: await readLockOwnerToken(lockPath),
-        }))
-        .catch(() => null);
-      if (observed !== null && observed.ageMs >= STALE_LOCK_MS) {
+    // Every attempt to create or reclaim `lockPath` — observe, then act on
+    // that observation — happens inside one `withArbiter` hold, so nothing
+    // else can mutate `lockPath` between the observation and the action.
+    const ownToken = await withArbiter(lockPath, async (): Promise<string | false> => {
+      try {
+        await mkdir(lockPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        const observed = await observeLockOwner(lockPath);
+        if (observed === null || observed.ageMs < STALE_LOCK_MS) {
+          return false; // Live holder — not our turn.
+        }
         console.warn(
           `\x1b[33m[claude]\x1b[0m ${lockPath} is stale (${Math.round(observed.ageMs / 1000)}s old); recovering from a crashed holder`,
         );
-        await reclaimStaleLock(lockPath, observed.token);
-        continue;
+        // Safe to replace outright, not just rename-and-verify: nothing
+        // else can be creating, reclaiming, or releasing `lockPath` while
+        // we hold the arbiter, so whatever's there is exactly the
+        // generation we just measured as stale.
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        await mkdir(lockPath);
       }
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `Timed out waiting for ${lockPath}; refusing to proceed without exclusive ownership`,
-        );
+      const token = crypto.randomUUID();
+      try {
+        await writeLockOwnerToken(lockPath, token);
+      } catch (err) {
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        throw err;
       }
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      return token;
+    });
+    if (ownToken !== false) {
+      try {
+        return await fn();
+      } finally {
+        // Release also runs under the arbiter: it must never race a
+        // concurrent reclaim attempt's own observe-then-replace sequence on
+        // the same `lockPath`.
+        await withArbiter(lockPath, async () => {
+          const currentToken = await readLockOwnerToken(lockPath);
+          if (currentToken === ownToken) {
+            await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+          }
+        });
+      }
     }
-  }
-  // Bind this call's release to the exact generation it created, so if a
-  // waiter elsewhere ever mis-steals this lock and can't undo it (see
-  // `reclaimStaleLock`), this call's own `finally` won't blindly `rm`
-  // whatever a newer holder has since `mkdir`'d at the same path. A failure
-  // to even write the token means we can't establish that guarantee — drop
-  // the lock we just took and fail rather than hold it ungraded.
-  const ownToken = crypto.randomUUID();
-  try {
-    await writeLockOwnerToken(lockPath, ownToken);
-  } catch (err) {
-    await rm(lockPath, { recursive: true, force: true }).catch(() => {});
-    throw err;
-  }
-  try {
-    return await fn();
-  } finally {
-    const currentToken = await readLockOwnerToken(lockPath);
-    if (currentToken === ownToken) {
-      await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out waiting for ${lockPath}; refusing to proceed without exclusive ownership`,
+      );
     }
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
 
