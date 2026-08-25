@@ -271,20 +271,86 @@ function withClaudeBridgeAuthArgs(
 const STALE_LOCK_MS = 30_000;
 
 /**
- * Atomically hand a stale lock directory off for removal. `rename` is a
- * single filesystem op, so if two waiters both decide the same lock is stale
- * and race to steal it, exactly one `rename` succeeds (the other fails with
- * ENOENT because the source is already gone) — only the winner removes it.
- * A legitimate, still-active holder is never affected: it never renames or
- * removes its own lock mid-flight, so this can't collide with real work.
+ * Name of the small file written inside a held lock directory, containing a
+ * random token unique to that specific acquisition. See `reclaimStaleLock`
+ * for why this exists instead of relying on the lock directory's identity
+ * (inode) or its path alone.
  */
-async function stealStaleLock(lockPath: string): Promise<void> {
+const LOCK_OWNER_FILE = "owner";
+
+async function writeLockOwnerToken(lockPath: string, token: string): Promise<void> {
+  await writeFile(join(lockPath, LOCK_OWNER_FILE), token);
+}
+
+/** `null` covers both "no such lock" and "lock exists but hasn't written its token yet". */
+async function readLockOwnerToken(lockPath: string): Promise<string | null> {
+  return await readFile(join(lockPath, LOCK_OWNER_FILE), "utf-8").catch(() => null);
+}
+
+/**
+ * Hand a stale lock directory off for removal, but only the EXACT generation
+ * that was measured as stale — never whatever happens to be sitting at
+ * `lockPath` by the time this runs.
+ *
+ * `rename` alone is not enough: it operates on a path, not on the directory
+ * identity behind it. If the measured-stale directory has already been
+ * renamed away and a brand-new holder has `mkdir`'d a fresh lock at the same
+ * path in between, a second waiter's `rename(lockPath, deadPath)` still
+ * "succeeds" — it just steals the fresh holder's live lock instead of the
+ * dead one. Two waiters can then both `mkdir` and enter the critical section
+ * concurrently, which is exactly the lost-update bug this lock exists to
+ * prevent.
+ *
+ * The per-acquisition owner token (see `LOCK_OWNER_FILE`) closes that
+ * window: it identifies a specific holder independent of the directory's
+ * path or inode, so after the rename, comparing the moved directory's token
+ * against `observedToken` (captured by the caller from the very
+ * read+`stat` that decided the lock was stale) tells us, with certainty
+ * rather than a narrowed probability, whether we moved the generation we
+ * measured:
+ *
+ * - Match → this is genuinely the crashed holder's lock. Remove it.
+ * - Mismatch → we accidentally renamed away a directory that didn't exist
+ *   (or was a different generation) when we took our staleness reading —
+ *   i.e. a fresh holder's live lock. Put it back immediately, using
+ *   `mkdir` (not a bare `rename` onto `lockPath`) to test vacancy: a
+ *   `rename` onto an existing *empty* directory silently replaces it
+ *   instead of failing, which would reopen this exact hole one level down.
+ *   `mkdir` fails on any occupant, empty or not. If the original path has
+ *   since been reclaimed by yet another holder (so the restore's `mkdir`
+ *   fails), the moved directory is orphaned: no process can still be
+ *   waiting on it at `lockPath`, and the rightful owner's own release path
+ *   re-checks its token before removing (see `withClaudeJsonLock`), so it
+ *   will not blindly delete whatever is at `lockPath` when it finishes — it
+ *   is safe to discard here.
+ */
+export async function reclaimStaleLock(
+  lockPath: string,
+  observedToken: string | null,
+): Promise<void> {
   const deadPath = `${lockPath}.dead-${process.pid}-${Date.now()}`;
   try {
     await rename(lockPath, deadPath);
   } catch {
-    // Another waiter already stole (or the real holder already released) it.
+    // Another waiter already reclaimed (or the real holder already released) it.
     return;
+  }
+  const movedToken = await readLockOwnerToken(deadPath);
+  if (movedToken === observedToken) {
+    await rm(deadPath, { recursive: true, force: true }).catch(() => {});
+    return;
+  }
+  // Wrong generation — try to undo the theft before anyone notices.
+  try {
+    await mkdir(lockPath);
+  } catch {
+    // `lockPath` was already reclaimed by a still-newer holder; nothing
+    // waits on `deadPath` anymore, so it's safe to discard.
+    await rm(deadPath, { recursive: true, force: true }).catch(() => {});
+    return;
+  }
+  if (movedToken !== null) {
+    await writeLockOwnerToken(lockPath, movedToken).catch(() => {});
   }
   await rm(deadPath, { recursive: true, force: true }).catch(() => {});
 }
@@ -309,22 +375,26 @@ async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T
   // pre-seed failures as best-effort and log a warning. The one exception is
   // a STALE lock (see `STALE_LOCK_MS`): that can only mean its creator
   // crashed without releasing it, so every future waiter would otherwise
-  // wait out the deadline and skip pre-seeding forever — `stealStaleLock`
-  // recovers it via an atomic rename rather than an unconditional remove.
+  // wait out the deadline and skip pre-seeding forever — `reclaimStaleLock`
+  // recovers it via a token-verified rename rather than an unconditional
+  // remove.
   while (true) {
     try {
       await mkdir(lockPath);
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      const ageMs = await stat(lockPath)
-        .then((s) => Date.now() - s.mtimeMs)
+      const observed = await stat(lockPath)
+        .then(async (s) => ({
+          ageMs: Date.now() - s.mtimeMs,
+          token: await readLockOwnerToken(lockPath),
+        }))
         .catch(() => null);
-      if (ageMs !== null && ageMs >= STALE_LOCK_MS) {
+      if (observed !== null && observed.ageMs >= STALE_LOCK_MS) {
         console.warn(
-          `\x1b[33m[claude]\x1b[0m ${lockPath} is stale (${Math.round(ageMs / 1000)}s old); recovering from a crashed holder`,
+          `\x1b[33m[claude]\x1b[0m ${lockPath} is stale (${Math.round(observed.ageMs / 1000)}s old); recovering from a crashed holder`,
         );
-        await stealStaleLock(lockPath);
+        await reclaimStaleLock(lockPath, observed.token);
         continue;
       }
       if (Date.now() >= deadline) {
@@ -335,10 +405,26 @@ async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
+  // Bind this call's release to the exact generation it created, so if a
+  // waiter elsewhere ever mis-steals this lock and can't undo it (see
+  // `reclaimStaleLock`), this call's own `finally` won't blindly `rm`
+  // whatever a newer holder has since `mkdir`'d at the same path. A failure
+  // to even write the token means we can't establish that guarantee — drop
+  // the lock we just took and fail rather than hold it ungraded.
+  const ownToken = crypto.randomUUID();
+  try {
+    await writeLockOwnerToken(lockPath, ownToken);
+  } catch (err) {
+    await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
   try {
     return await fn();
   } finally {
-    await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    const currentToken = await readLockOwnerToken(lockPath);
+    if (currentToken === ownToken) {
+      await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
