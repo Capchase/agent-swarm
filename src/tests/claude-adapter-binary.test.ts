@@ -927,6 +927,38 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
   });
 
+  test("default CLAUDE_BINARY=claude merges into a populated ~/.claude.json without clobbering it", async () => {
+    delete process.env.CLAUDE_BINARY;
+    const cwd = "/some/abs/cwd";
+    await writeFile(
+      join(homeDir, ".claude.json"),
+      JSON.stringify({
+        userID: "existing-user-id",
+        oauthAccount: { accountUuid: "existing-account" },
+        hasCompletedOnboarding: true,
+        history: ["prior command"],
+        projects: {
+          "/other/cwd": { hasTrustDialogAccepted: true, customKey: "preserved" },
+        },
+      }),
+    );
+    const adapter = new ClaudeAdapter();
+    await createCompletedSession(adapter, makeConfig({ cwd }));
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    // Pre-existing OAuth/history/other-project state must survive the write.
+    expect(data.userID).toBe("existing-user-id");
+    expect(data.oauthAccount).toEqual({ accountUuid: "existing-account" });
+    expect(data.hasCompletedOnboarding).toBe(true);
+    expect(data.history).toEqual(["prior command"]);
+    expect(data.projects["/other/cwd"]).toEqual({
+      hasTrustDialogAccepted: true,
+      customKey: "preserved",
+    });
+    // The new cwd is now trusted too.
+    expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
+  });
+
   test("SWARM_USE_CLAUDE_BRIDGE=true writes hasTrustDialogAccepted for config.cwd", async () => {
     process.env.SWARM_USE_CLAUDE_BRIDGE = "true";
     const cwd = "/some/bridge/cwd";
