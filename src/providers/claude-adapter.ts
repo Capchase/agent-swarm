@@ -281,15 +281,6 @@ function withClaudeBridgeAuthArgs(
 const STALE_LOCK_MS = 30_000;
 
 /**
- * A lock *arbiter* (see `withArbiter`) older than this is assumed abandoned.
- * The arbiter only ever guards a handful of synchronous fs calls — no
- * caller-supplied `fn` ever runs while it's held — so legitimate hold time
- * is low single-digit milliseconds. This threshold only needs to be well
- * above that, not anywhere near `STALE_LOCK_MS`.
- */
-const ARBITER_STALE_MS = 5_000;
-
-/**
  * Name of the small file written inside a held lock directory, containing a
  * random token unique to that specific acquisition. See `withClaudeJsonLock`
  * for why this exists instead of relying on the lock directory's identity
@@ -374,6 +365,20 @@ export async function observeLockOwner(
  * held; only the bookkeeping around `lockPath` does, so contention here
  * stays brief regardless of how long `fn` runs under the (separately held)
  * main lock.
+ *
+ * Deliberately does not steal a stale-looking `arbiterPath`: unlike
+ * `lockPath`, there is no outer mutex left to serialize a reclaim of the
+ * arbiter itself against a concurrent reclaim attempt, so any steal here
+ * would reintroduce the exact ABA class this function exists to close — a
+ * delayed waiter deleting an arbiter a different process created after the
+ * waiter's own staleness observation. Instead, a waiter only ever retries
+ * until `deadline` and then aborts. This keeps `arbiterPath`'s entire
+ * lifecycle — create via `mkdir`, delete via the `finally` below — exclusive
+ * to its rightful holder, so the delete never needs an identity check: no
+ * other caller can be creating or deleting that path while we hold it. The
+ * cost is that a holder crashing inside the tiny bookkeeping window (never
+ * `fn`) leaves a stuck arbiter requiring manual cleanup, which is an
+ * acceptable trade given how narrow and rare that window is.
  */
 async function withArbiter<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
   const arbiterPath = `${lockPath}.arbiter`;
@@ -384,18 +389,6 @@ async function withArbiter<T>(lockPath: string, fn: () => Promise<T>): Promise<T
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      const ageMs = await stat(arbiterPath)
-        .then((s) => Date.now() - s.mtimeMs)
-        .catch(() => null);
-      // No caller code ever runs while the arbiter is held (see above), so
-      // an ABA-style identity check isn't needed to recover it safely the
-      // way the main lock's reclaim does: anything past this threshold can
-      // only mean its holder crashed mid-bookkeeping, not a legitimately
-      // long-running critical section.
-      if (ageMs !== null && ageMs >= ARBITER_STALE_MS) {
-        await rm(arbiterPath, { recursive: true, force: true }).catch(() => {});
-        continue;
-      }
       if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for ${arbiterPath}`);
       }

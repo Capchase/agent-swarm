@@ -512,6 +512,32 @@ describe("preseedClaudeTrustDialog", () => {
     expect(entries).not.toContain(".claude.json.lock");
   }, 10_000);
 
+  test("arbiter never steals a stale-looking directory: a delayed waiter times out instead of deleting an arbiter it doesn't own", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const arbiterPath = `${claudeJsonPath}.lock.arbiter`;
+    // Simulate another process's arbiter hold that looks abandoned by the
+    // old age threshold (previously 5s) — back-dated well past it so this
+    // test doesn't need to sleep. On the pre-fix code, a waiter here would
+    // `stat` this path, see it as stale, and unlink it by pathname alone —
+    // exactly the ABA-unsafe steal the round-6 review flagged: nothing ties
+    // that unlink to the specific generation the waiter observed, so it can
+    // just as easily delete an arbiter a *different* process created after
+    // the observation. The fix removes stealing entirely: a waiter must
+    // never delete an arbiter path it didn't create itself.
+    await mkdir(arbiterPath);
+    const past = new Date(Date.now() - 60_000);
+    await utimes(arbiterPath, past, past);
+
+    await expect(preseedClaudeTrustDialog("/abs/cwd/x", homeDir)).rejects.toThrow(
+      /Timed out waiting for/,
+    );
+
+    // The arbiter directory must still be exactly the one we created —
+    // never deleted (stolen) and never replaced by the timed-out waiter.
+    const entries = await readdir(homeDir);
+    expect(entries).toContain(".claude.json.lock.arbiter");
+  }, 10_000);
+
   test("observeLockOwner reads token and age from one coherent generation, immune to a same-path swap mid-read", async () => {
     const claudeJsonPath = join(homeDir, ".claude.json");
     const lockPath = `${claudeJsonPath}.lock`;
