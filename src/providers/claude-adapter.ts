@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type Span, trace } from "@opentelemetry/api";
@@ -272,6 +272,11 @@ function withClaudeBridgeAuthArgs(
 async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = `${claudeJsonPath}.lock`;
   const deadline = Date.now() + 5_000;
+  // Only the loop that broke out via a successful `mkdir` may reach `fn` and
+  // its `finally` — a timed-out waiter never owns the lock, so it must never
+  // remove it out from under whoever does (that recreates the lost-update
+  // race this lock exists to prevent). Abort instead: callers already treat
+  // pre-seed failures as best-effort and log a warning.
   while (true) {
     try {
       await mkdir(lockPath);
@@ -279,13 +284,9 @@ async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       if (Date.now() >= deadline) {
-        // Stale lock from a killed process — proceed without it rather than
-        // hang the session forever. Worst case is the lost-update race this
-        // lock exists to prevent, on a single stuck run.
-        console.warn(
-          `\x1b[33m[claude]\x1b[0m Timed out waiting for ${lockPath}; proceeding without the lock`,
+        throw new Error(
+          `Timed out waiting for ${lockPath}; refusing to proceed without exclusive ownership`,
         );
-        break;
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
@@ -295,6 +296,35 @@ async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T
   } finally {
     await rm(lockPath, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/**
+ * Rename the existing `.claude.json` aside before discarding an invalid
+ * in-memory representation of it (unparseable JSON, or a parseable document
+ * whose `projects` field isn't an object). Returns `false` (and leaves the
+ * original file untouched) when the rename itself fails, so a backup failure
+ * never lets the caller continue toward replacing the only copy of
+ * `userID`/`oauthAccount`/`history`/`projects`.
+ *
+ * Exported for unit testing.
+ */
+export async function backupMalformedClaudeJson(
+  claudeJsonPath: string,
+  reason: string,
+): Promise<boolean> {
+  const backupPath = `${claudeJsonPath}.bak-${Date.now()}`;
+  try {
+    await rename(claudeJsonPath, backupPath);
+  } catch (err) {
+    console.warn(
+      `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} ${reason} and could not be backed up (${scrubSecrets(String(err))}); leaving it untouched for trust pre-seed`,
+    );
+    return false;
+  }
+  console.warn(
+    `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} ${reason}; backed up to ${backupPath} and starting fresh for trust pre-seed`,
+  );
+  return true;
 }
 
 /**
@@ -314,11 +344,13 @@ async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T
  * read-merge-write across all directories in one lock + one write (never
  * clobbers other keys or other directories' entries). Serialized across
  * concurrent callers via `withClaudeJsonLock`, and the write itself is atomic
- * (temp file + same-directory rename). A read failure other than "file
- * missing" leaves the file untouched — we can't safely merge into something
- * we couldn't read. A malformed (unparseable) file is backed up (renamed,
- * not deleted) before starting fresh, so a corrupt file never silently loses
- * `userID`/`oauthAccount`/`history`/`projects`.
+ * (temp file + same-directory rename, preserving the existing file's mode).
+ * A read failure other than "file missing" leaves the file untouched — we
+ * can't safely merge into something we couldn't read. A malformed
+ * (unparseable) file, or one with an invalid `projects` shape, is backed up
+ * (renamed, not deleted) before starting fresh, so a corrupt file never
+ * silently loses `userID`/`oauthAccount`/`history`/`projects` — and a backup
+ * failure aborts rather than proceeding to overwrite the only copy.
  *
  * Exported for unit testing.
  */
@@ -345,24 +377,40 @@ export async function preseedClaudeTrustDialog(
           data = parsed as Record<string, unknown>;
         }
       } catch {
-        const backupPath = `${claudeJsonPath}.bak-${Date.now()}`;
-        await rename(claudeJsonPath, backupPath).catch(() => {});
-        console.warn(
-          `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} was malformed JSON; backed up to ${backupPath} and starting fresh for trust pre-seed`,
-        );
+        if (!(await backupMalformedClaudeJson(claudeJsonPath, "was malformed JSON"))) return;
         data = {};
       }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
         console.warn(
-          `\x1b[33m[claude]\x1b[0m Failed to read ${claudeJsonPath} (${err}); leaving it untouched for trust pre-seed`,
+          `\x1b[33m[claude]\x1b[0m Failed to read ${claudeJsonPath} (${scrubSecrets(String(err))}); leaving it untouched for trust pre-seed`,
         );
         return;
       }
       // ENOENT — missing file, start from {} (data already {}).
     }
 
-    const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
+    const rawProjects = data.projects;
+    let projects: Record<string, Record<string, unknown>>;
+    if (rawProjects === undefined) {
+      projects = {};
+    } else if (rawProjects && typeof rawProjects === "object" && !Array.isArray(rawProjects)) {
+      projects = rawProjects as Record<string, Record<string, unknown>>;
+    } else {
+      // A parseable document with an invalid `projects` shape (e.g. `[]`) is
+      // just as unsafe to merge into as unparseable JSON — go through the
+      // same backup-or-abort path rather than silently discarding it.
+      if (
+        !(await backupMalformedClaudeJson(
+          claudeJsonPath,
+          'had an invalid "projects" field (expected an object)',
+        ))
+      ) {
+        return;
+      }
+      data = {};
+      projects = {};
+    }
     let changed = false;
     for (const directory of uniqueDirectories) {
       const existing = projects[directory] ?? {};
@@ -377,9 +425,26 @@ export async function preseedClaudeTrustDialog(
     if (!changed) return;
     data.projects = projects;
 
+    // Preserve the existing file's permission bits (0600 commonly, since
+    // `.claude.json` holds OAuth/account data) rather than letting the
+    // replacement land at the platform default mode. A brand-new file
+    // defaults to 0600.
+    let existingMode: number | undefined;
+    try {
+      existingMode = (await stat(claudeJsonPath)).mode & 0o777;
+    } catch {
+      // File doesn't exist yet — new file defaults to 0600 below.
+    }
+
     const tmpPath = `${claudeJsonPath}.tmp-${process.pid}-${Date.now()}`;
-    await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
-    await rename(tmpPath, claudeJsonPath);
+    try {
+      await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
+      await chmod(tmpPath, existingMode ?? 0o600);
+      await rename(tmpPath, claudeJsonPath);
+    } catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
     console.log(
       `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${uniqueDirectories.join(", ")} in ${claudeJsonPath}`,
     );
@@ -1365,7 +1430,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         await preseedClaudeTrustDialog([config.cwd, ...(config.trustDirectories ?? [])]);
       } catch (err) {
         console.warn(
-          `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${err}`,
+          `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${scrubSecrets(String(err))}`,
         );
       }
     }

@@ -25,10 +25,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  backupMalformedClaudeJson,
   ClaudeAdapter,
   parseClaudeBinary,
   parseClaudeBridgeEnabled,
@@ -392,6 +393,88 @@ describe("preseedClaudeTrustDialog", () => {
     for (const cwd of cwds) {
       expect(data.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
     }
+  });
+
+  test("invalid `projects` shape (e.g. an array): backs up the original and starts fresh", async () => {
+    const original = JSON.stringify({ userID: "keep-me", projects: [] });
+    await writeFile(join(homeDir, ".claude.json"), original);
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+    // The invalid `projects: []` is discarded (not merged into), but the
+    // original bytes survive as a backup rather than being silently dropped.
+    expect(Array.isArray(data.projects)).toBe(false);
+
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(original);
+  });
+
+  test("preserves the existing file's permission bits (e.g. 0644) across a rewrite", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    await writeFile(claudeJsonPath, JSON.stringify({ projects: {} }));
+    await chmod(claudeJsonPath, 0o644);
+
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const mode = (await stat(claudeJsonPath)).mode & 0o777;
+    expect(mode).toBe(0o644);
+  });
+
+  test("a brand-new ~/.claude.json defaults to 0600", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const mode = (await stat(claudeJsonPath)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  test("lock timeout: a stuck lock is aborted, never stolen or removed by the timed-out waiter", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const lockPath = `${claudeJsonPath}.lock`;
+    // Simulate another process holding the lock indefinitely.
+    await mkdir(lockPath);
+
+    await expect(preseedClaudeTrustDialog("/abs/cwd/x", homeDir)).rejects.toThrow(
+      /Timed out waiting for/,
+    );
+
+    // The timed-out waiter must never have removed a lock it doesn't own —
+    // otherwise a third writer could interleave with whoever really holds it.
+    const entries = await readdir(homeDir);
+    expect(entries).toContain(".claude.json.lock");
+  }, 10_000);
+});
+
+describe("backupMalformedClaudeJson", () => {
+  let homeDir: string;
+
+  beforeEach(async () => {
+    homeDir = await mkdtemp(join(tmpdir(), "claude-backup-test-"));
+  });
+
+  afterEach(async () => {
+    await chmod(homeDir, 0o700).catch(() => {});
+    await rm(homeDir, { recursive: true, force: true });
+  });
+
+  test("returns false and leaves the original untouched when the rename fails", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const original = "{ not valid json";
+    await writeFile(claudeJsonPath, original);
+    // Deny write on the parent directory so `rename()` (which needs to
+    // remove/add a directory entry) fails with EACCES/EPERM.
+    await chmod(homeDir, 0o500);
+
+    const ok = await backupMalformedClaudeJson(claudeJsonPath, "was malformed JSON");
+
+    await chmod(homeDir, 0o700);
+    expect(ok).toBe(false);
+    expect(await readFile(claudeJsonPath, "utf-8")).toBe(original);
+    const entries = await readdir(homeDir);
+    expect(entries.some((name) => name.startsWith(".claude.json.bak-"))).toBe(false);
   });
 });
 
