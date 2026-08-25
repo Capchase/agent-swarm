@@ -283,6 +283,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
     icon: Cpu,
     entries: [
       {
+        key: "CLAUDE_TRUST_PRESEED",
+        label: "Claude project trust pre-seed",
+        description:
+          "Pre-approve Claude Code workspace trust for the worker workspace, registered repositories, and task directories.",
+        kind: "boolean",
+        defaultValue: "true",
+        restartRequired: false,
+        docsUrl: `${DOCS}guides/harness-providers`,
+      },
+      {
         key: "SCRIPTS_ONLY_MCP",
         label: "Scripts-only MCP",
         description:

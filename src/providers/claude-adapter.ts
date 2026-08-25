@@ -13,6 +13,7 @@ import {
   getContextWindowSize,
 } from "../utils/context-window";
 import { validateClaudeCredentials } from "../utils/credentials";
+import { isEnvFlagEnabled } from "../utils/env-flag";
 import {
   parseStderrForErrors,
   SessionErrorTracker,
@@ -275,7 +276,7 @@ function withClaudeBridgeAuthArgs(
  * Exported for unit testing.
  */
 export async function preseedClaudeTrustDialog(
-  cwd: string,
+  directories: string | readonly string[],
   // Prefer `$HOME` over `homedir()` so callers in tests / sandboxed envs that
   // override HOME get the override. Bun's `os.homedir()` caches the real
   // passwd entry at process boot and ignores HOME mutations.
@@ -297,22 +298,26 @@ export async function preseedClaudeTrustDialog(
   }
 
   const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
-  const existing = projects[cwd] ?? {};
-  if (existing.hasTrustDialogAccepted === true) {
-    // Already trusted — no-op, no write.
-    return;
+  const uniqueDirectories = [
+    ...new Set((typeof directories === "string" ? [directories] : directories).filter(Boolean)),
+  ];
+  let changed = false;
+  for (const directory of uniqueDirectories) {
+    const existing = projects[directory] ?? {};
+    if (existing.hasTrustDialogAccepted === true) continue;
+    projects[directory] = {
+      ...existing,
+      hasTrustDialogAccepted: true,
+      hasCompletedProjectOnboarding: true,
+    };
+    changed = true;
   }
-
-  projects[cwd] = {
-    ...existing,
-    hasTrustDialogAccepted: true,
-    hasCompletedProjectOnboarding: true,
-  };
+  if (!changed) return;
   data.projects = projects;
 
   await writeFile(claudeJsonPath, `${JSON.stringify(data, null, 2)}\n`);
   console.log(
-    `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${cwd} in ${claudeJsonPath}`,
+    `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${uniqueDirectories.join(", ")} in ${claudeJsonPath}`,
   );
 }
 
@@ -1287,11 +1292,12 @@ export class ClaudeAdapter implements ProviderAdapter {
       );
     }
 
-    // Claude Bridge and its legacy compatibility path drive interactive
-    // `claude` in tmux, where the first-run trust dialog can block startup.
-    if (isInteractiveTmuxClaude) {
+    // Claude stores project trust by exact cwd. Seed every directory this
+    // worker can start from, including headless sessions that bypass the
+    // interactive tmux path.
+    if (isEnvFlagEnabled("CLAUDE_TRUST_PRESEED", true, sourceEnv)) {
       try {
-        await preseedClaudeTrustDialog(config.cwd);
+        await preseedClaudeTrustDialog([config.cwd, ...(config.trustDirectories ?? [])]);
       } catch (err) {
         console.warn(
           `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${err}`,

@@ -12,10 +12,10 @@
  *   3. Tmux fail-fast — when the resolved binary string uses the legacy
  *      bridge compatibility path or claude-bridge is enabled, createSession
  *      throws if `tmux` is not on PATH.
- *   4. Trust pre-seed — when the resolved path drives interactive claude in
- *      tmux, the adapter writes
- *      `projects[cwd].hasTrustDialogAccepted: true` to `$HOME/.claude.json`
- *      before spawning. Idempotent. No-op for "claude".
+ *   4. Trust pre-seed — enabled by default for headless and tmux sessions,
+ *      the adapter writes `projects[cwd].hasTrustDialogAccepted: true` to
+ *      `$HOME/.claude.json` before spawning. It can cover all worker project
+ *      directories and can be disabled with CLAUDE_TRUST_PRESEED=false.
  *
  * `Bun.spawn` and the synchronous binary-version probe are stubbed so the
  * tests don't actually exec anything; we read the argv off the call args.
@@ -382,6 +382,7 @@ describe("CLAUDE_BINARY env override", () => {
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
+  let originalTrustPreseed: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
   let spawnSyncSpy: ReturnType<typeof spyOn>;
@@ -394,10 +395,12 @@ describe("CLAUDE_BINARY env override", () => {
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     originalHome = process.env.HOME;
+    originalTrustPreseed = process.env.CLAUDE_TRUST_PRESEED;
     homeDir = await mkdtemp(join(tmpdir(), "claude-adapter-test-home-"));
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
+    delete process.env.CLAUDE_TRUST_PRESEED;
     delete process.env.CLAUDE_QUEUE_STEERING;
     // Credential check runs before binary resolution; satisfy it.
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
@@ -442,6 +445,11 @@ describe("CLAUDE_BINARY env override", () => {
       delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     } else {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = originalOauthToken;
+    }
+    if (originalTrustPreseed === undefined) {
+      delete process.env.CLAUDE_TRUST_PRESEED;
+    } else {
+      process.env.CLAUDE_TRUST_PRESEED = originalTrustPreseed;
     }
   });
 
@@ -813,6 +821,7 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
+  let originalTrustPreseed: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
   let spawnSyncSpy: ReturnType<typeof spyOn>;
@@ -823,10 +832,12 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     originalHome = process.env.HOME;
+    originalTrustPreseed = process.env.CLAUDE_TRUST_PRESEED;
     homeDir = await mkdtemp(join(tmpdir(), "claude-adapter-trust-test-"));
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
+    delete process.env.CLAUDE_TRUST_PRESEED;
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
     spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => makeFakeProc()) as typeof Bun.spawn);
     spawnSyncSpy = mockClaudeVersionProbe();
@@ -860,6 +871,11 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
       delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     } else {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = originalOauthToken;
+    }
+    if (originalTrustPreseed === undefined) {
+      delete process.env.CLAUDE_TRUST_PRESEED;
+    } else {
+      process.env.CLAUDE_TRUST_PRESEED = originalTrustPreseed;
     }
   });
 
@@ -913,14 +929,29 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     expect(data.projects["/new/cwd"].hasTrustDialogAccepted).toBe(true);
   });
 
-  test("default CLAUDE_BINARY=claude does NOT touch ~/.claude.json", async () => {
+  test("default headless CLAUDE_BINARY=claude pre-seeds every supplied project directory", async () => {
     delete process.env.CLAUDE_BINARY;
+    const adapter = new ClaudeAdapter();
+    await createCompletedSession(
+      adapter,
+      makeConfig({
+        cwd: "/some/abs/cwd",
+        trustDirectories: ["/workspace/personal", "/repo/one", "/repo/two", "/some/abs/cwd"],
+      }),
+    );
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    for (const directory of ["/workspace/personal", "/repo/one", "/repo/two", "/some/abs/cwd"]) {
+      expect(data.projects[directory].hasTrustDialogAccepted).toBe(true);
+    }
+  });
+
+  test("CLAUDE_TRUST_PRESEED=false skips the pre-seed", async () => {
+    process.env.CLAUDE_TRUST_PRESEED = "false";
     const adapter = new ClaudeAdapter();
     await createCompletedSession(adapter, makeConfig({ cwd: "/some/abs/cwd" }));
 
-    // No .claude.json should have been written.
-    const exists = await Bun.file(join(homeDir, ".claude.json")).exists();
-    expect(exists).toBe(false);
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true writes hasTrustDialogAccepted for config.cwd", async () => {

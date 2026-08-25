@@ -180,6 +180,20 @@ async function fetchRepoConfig(
   }
 }
 
+/** Return every registered clone path so Claude trust can be pre-seeded per exact cwd. */
+async function fetchRegisteredRepoClonePaths(apiUrl: string, apiKey: string): Promise<string[]> {
+  try {
+    const resp = await fetch(`${apiUrl}/api/repos`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!resp.ok) return [];
+    const data = (await resp.json()) as { repos?: Array<{ clonePath?: string }> };
+    return (data.repos ?? []).flatMap((repo) => (repo.clonePath ? [repo.clonePath] : []));
+  } catch {
+    return [];
+  }
+}
+
 /** Read CLAUDE.md from a repo directory, returning null if not found */
 async function readClaudeMd(clonePath: string, role: string): Promise<string | null> {
   const claudeMdFile = Bun.file(`${clonePath}/CLAUDE.md`);
@@ -849,6 +863,7 @@ export const RELOADABLE_ENV_KEYS: ReadonlySet<string> = new Set([
   "TEMPLATE_REGISTRY_URL",
   "SLACK_DISABLE",
   "SWARM_ORG_NAME",
+  "CLAUDE_TRUST_PRESEED",
 ]);
 
 /**
@@ -3249,6 +3264,7 @@ async function spawnProviderProcess(
     resumeSessionId?: string;
     harnessProvider: ProviderName;
     cwd?: string;
+    trustDirectories?: string[];
     vcsRepo?: string;
     contextKey?: string;
   },
@@ -3342,6 +3358,11 @@ async function spawnProviderProcess(
     apiUrl: opts.apiUrl,
     apiKey: opts.apiKey,
     cwd: opts.cwd || process.cwd(),
+    trustDirectories: [
+      process.cwd(),
+      opts.cwd || process.cwd(),
+      ...(opts.trustDirectories ?? (await fetchRegisteredRepoClonePaths(opts.apiUrl, opts.apiKey))),
+    ],
     vcsRepo: opts.vcsRepo,
     logFile: opts.logFile,
     additionalArgs: opts.additionalArgs,

@@ -108,6 +108,12 @@ export interface ProviderSessionConfig {
   apiUrl: string;
   apiKey: string;
   cwd: string;
+  /**
+   * Directories that Claude Code can later use as a project cwd on this worker.
+   * The runner includes the workspace root, registered repository clone paths,
+   * and the task directory so Claude's exact-path trust state is pre-seeded.
+   */
+  trustDirectories?: string[];
   vcsRepo?: string;
   contextKey?: string;
   /**

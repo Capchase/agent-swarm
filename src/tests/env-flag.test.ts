@@ -43,7 +43,12 @@ describe("isEnvFlagEnabled", () => {
 
 describe("swarm-config-guard: Configuration-page value validation", () => {
   test("boolean keys accept true/false/1/0 and reject anything else", () => {
-    for (const key of ["STEERING_ENABLED", "RBAC_ENABLED", "POOL_AFFINITY_ENFORCEMENT"]) {
+    for (const key of [
+      "STEERING_ENABLED",
+      "RBAC_ENABLED",
+      "POOL_AFFINITY_ENFORCEMENT",
+      "CLAUDE_TRUST_PRESEED",
+    ]) {
       for (const ok of ["true", "false", "1", "0", " TRUE "]) {
         expect(validateConfigValue(key, ok)).toBeNull();
       }
