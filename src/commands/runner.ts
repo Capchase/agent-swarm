@@ -47,6 +47,7 @@ import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
 import { type CredentialSelection, resolveCredentialPools } from "../utils/credentials.ts";
+import { isEnvFlagEnabled } from "../utils/env-flag.ts";
 import {
   isCodexCreditsExhaustedMessage,
   isRateLimitMessage,
@@ -3358,11 +3359,21 @@ async function spawnProviderProcess(
     apiUrl: opts.apiUrl,
     apiKey: opts.apiKey,
     cwd: opts.cwd || process.cwd(),
-    trustDirectories: [
-      process.cwd(),
-      opts.cwd || process.cwd(),
-      ...(opts.trustDirectories ?? (await fetchRegisteredRepoClonePaths(opts.apiUrl, opts.apiKey))),
-    ],
+    // Repo-clone-path enumeration is Claude-specific (only ClaudeAdapter reads
+    // `trustDirectories`) and only useful when the pre-seed is on — gate both
+    // so codex/opencode/pi sessions, and Claude sessions with
+    // CLAUDE_TRUST_PRESEED=false, never pay for the extra `/api/repos` fetch.
+    trustDirectories:
+      opts.harnessProvider === "claude" && isEnvFlagEnabled("CLAUDE_TRUST_PRESEED", true, freshEnv)
+        ? [
+            process.cwd(),
+            opts.cwd || process.cwd(),
+            "/workspace",
+            "/workspace/personal",
+            ...(opts.trustDirectories ??
+              (await fetchRegisteredRepoClonePaths(opts.apiUrl, opts.apiKey))),
+          ]
+        : undefined,
     vcsRepo: opts.vcsRepo,
     logFile: opts.logFile,
     additionalArgs: opts.additionalArgs,

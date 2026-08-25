@@ -25,7 +25,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -365,12 +365,33 @@ describe("preseedClaudeTrustDialog", () => {
     expect(afterStat).toBe(beforeStat);
   });
 
-  test("malformed file: starts from {} and writes the entry", async () => {
-    await writeFile(join(homeDir, ".claude.json"), "{ this is not valid json");
+  test("malformed file: backs up the original bytes (renamed, not deleted) and writes the entry fresh", async () => {
+    const malformed = "{ this is not valid json";
+    await writeFile(join(homeDir, ".claude.json"), malformed);
     await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(malformed);
+  });
+
+  test("concurrent preseedClaudeTrustDialog calls for distinct cwds don't lose an update (lost-update regression)", async () => {
+    const cwds = Array.from({ length: 12 }, (_, i) => `/abs/concurrent/cwd-${i}`);
+    // Fire all calls concurrently, each seeding a single distinct cwd — this
+    // is the exact race the mkdir-based lock + atomic write exist to close:
+    // without serialization, two overlapping read-merge-write cycles can
+    // each read the same stale document and the later write drops the
+    // earlier caller's entry.
+    await Promise.all(cwds.map((cwd) => preseedClaudeTrustDialog(cwd, homeDir)));
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    for (const cwd of cwds) {
+      expect(data.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    }
   });
 });
 

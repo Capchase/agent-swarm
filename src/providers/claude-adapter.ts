@@ -1,4 +1,4 @@
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type Span, trace } from "@opentelemetry/api";
@@ -260,18 +260,65 @@ function withClaudeBridgeAuthArgs(
 }
 
 /**
+ * Hold an exclusive cross-process lock on `<path>.lock` for the duration of
+ * `fn`, so concurrent Claude sessions never interleave a read-merge-write of
+ * `~/.claude.json` (which would lose one session's project entry to a lost
+ * update — every task's Claude session calls the pre-seed, so this race is
+ * live in normal swarm operation, not just a theoretical concern). `mkdir`
+ * without `recursive` is atomic on POSIX filesystems and fails with `EEXIST`
+ * when the directory already exists, which makes it a usable exclusive-lock
+ * primitive without extra dependencies.
+ */
+async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T>): Promise<T> {
+  const lockPath = `${claudeJsonPath}.lock`;
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    try {
+      await mkdir(lockPath);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (Date.now() >= deadline) {
+        // Stale lock from a killed process — proceed without it rather than
+        // hang the session forever. Worst case is the lost-update race this
+        // lock exists to prevent, on a single stuck run.
+        console.warn(
+          `\x1b[33m[claude]\x1b[0m Timed out waiting for ${lockPath}; proceeding without the lock`,
+        );
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * Pre-seed `~/.claude.json` so the per-project trust-dialog ("Quick safety
- * check: Is this a project you trust?") doesn't block on first run.
+ * check: Is this a project you trust?") doesn't block on first run, for every
+ * directory in `directories`.
  *
  * Mirrors the onboarding-skip hack in `Dockerfile.worker` (which writes
- * `hasCompletedOnboarding` and `bypassPermissionsModeAccepted`). When the
- * resolved binary runs interactive claude inside tmux, claude does NOT
- * reliably auto-accept the dialog, so the pane can hang forever. Writing
+ * `hasCompletedOnboarding` and `bypassPermissionsModeAccepted`). Claude Code
+ * matches trust on the exact cwd string (`projects["<cwd>"]`), so a parent
+ * directory does not cover a subdirectory — every directory a worker session
+ * can start in needs its own entry. Writing
  * `projects[cwd].hasTrustDialogAccepted = true` (and `hasCompletedProjectOnboarding`)
  * tells claude-code the cwd is pre-trusted.
  *
- * Idempotent (no-op when already true), read-merge-write (never clobbers
- * other keys), graceful on missing / malformed file.
+ * Idempotent (no-op, no write, when every directory is already trusted),
+ * read-merge-write across all directories in one lock + one write (never
+ * clobbers other keys or other directories' entries). Serialized across
+ * concurrent callers via `withClaudeJsonLock`, and the write itself is atomic
+ * (temp file + same-directory rename). A read failure other than "file
+ * missing" leaves the file untouched — we can't safely merge into something
+ * we couldn't read. A malformed (unparseable) file is backed up (renamed,
+ * not deleted) before starting fresh, so a corrupt file never silently loses
+ * `userID`/`oauthAccount`/`history`/`projects`.
  *
  * Exported for unit testing.
  */
@@ -282,43 +329,61 @@ export async function preseedClaudeTrustDialog(
   // passwd entry at process boot and ignores HOME mutations.
   homeDir: string = process.env.HOME ?? homedir(),
 ): Promise<void> {
-  const claudeJsonPath = join(homeDir, ".claude.json");
-  let data: Record<string, unknown> = {};
-  try {
-    const raw = await readFile(claudeJsonPath, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      data = parsed as Record<string, unknown>;
-    }
-  } catch {
-    // missing or malformed — start from {}
-    console.warn(
-      `\x1b[33m[claude]\x1b[0m Starting with empty .claude.json for trust pre-seed at ${claudeJsonPath}`,
-    );
-  }
-
-  const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
   const uniqueDirectories = [
     ...new Set((typeof directories === "string" ? [directories] : directories).filter(Boolean)),
   ];
-  let changed = false;
-  for (const directory of uniqueDirectories) {
-    const existing = projects[directory] ?? {};
-    if (existing.hasTrustDialogAccepted === true) continue;
-    projects[directory] = {
-      ...existing,
-      hasTrustDialogAccepted: true,
-      hasCompletedProjectOnboarding: true,
-    };
-    changed = true;
-  }
-  if (!changed) return;
-  data.projects = projects;
+  if (uniqueDirectories.length === 0) return;
 
-  await writeFile(claudeJsonPath, `${JSON.stringify(data, null, 2)}\n`);
-  console.log(
-    `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${uniqueDirectories.join(", ")} in ${claudeJsonPath}`,
-  );
+  const claudeJsonPath = join(homeDir, ".claude.json");
+  await withClaudeJsonLock(claudeJsonPath, async () => {
+    let data: Record<string, unknown> = {};
+    try {
+      const raw = await readFile(claudeJsonPath, "utf-8");
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          data = parsed as Record<string, unknown>;
+        }
+      } catch {
+        const backupPath = `${claudeJsonPath}.bak-${Date.now()}`;
+        await rename(claudeJsonPath, backupPath).catch(() => {});
+        console.warn(
+          `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} was malformed JSON; backed up to ${backupPath} and starting fresh for trust pre-seed`,
+        );
+        data = {};
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn(
+          `\x1b[33m[claude]\x1b[0m Failed to read ${claudeJsonPath} (${err}); leaving it untouched for trust pre-seed`,
+        );
+        return;
+      }
+      // ENOENT — missing file, start from {} (data already {}).
+    }
+
+    const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
+    let changed = false;
+    for (const directory of uniqueDirectories) {
+      const existing = projects[directory] ?? {};
+      if (existing.hasTrustDialogAccepted === true) continue;
+      projects[directory] = {
+        ...existing,
+        hasTrustDialogAccepted: true,
+        hasCompletedProjectOnboarding: true,
+      };
+      changed = true;
+    }
+    if (!changed) return;
+    data.projects = projects;
+
+    const tmpPath = `${claudeJsonPath}.tmp-${process.pid}-${Date.now()}`;
+    await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
+    await rename(tmpPath, claudeJsonPath);
+    console.log(
+      `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${uniqueDirectories.join(", ")} in ${claudeJsonPath}`,
+    );
+  });
 }
 
 /**
