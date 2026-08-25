@@ -91,30 +91,34 @@ describe("canonicalizeTrustDirectory", () => {
   });
 
   describe("symlink escape", () => {
-    let fixtureDir: string;
+    // Uses an injected tmpdir-based root rather than the real /workspace:
+    // CI runners (e.g. GitHub Actions' /home/runner/work/...) don't have a
+    // real /workspace on disk to create fixtures under, and realpath()
+    // resolution requires the symlink to actually exist.
+    let root: string;
 
     afterEach(async () => {
-      if (fixtureDir) await rm(fixtureDir, { recursive: true, force: true });
+      if (root) await rm(root, { recursive: true, force: true });
     });
 
-    test("rejects a /workspace symlink that resolves outside the root", async () => {
-      fixtureDir = await mkdtemp(join("/workspace", ".trust-canonicalize-test-"));
+    test("rejects a symlink under the root that resolves outside it", async () => {
+      root = await mkdtemp(join(tmpdir(), "trust-root-"));
       const outsideTarget = await mkdtemp(join(tmpdir(), "trust-escape-target-"));
-      const linkPath = join(fixtureDir, "escape");
+      const linkPath = join(root, "escape");
       await symlink(outsideTarget, linkPath);
 
-      expect(await canonicalizeTrustDirectory(linkPath)).toBeNull();
+      expect(await canonicalizeTrustDirectory(linkPath, root)).toBeNull();
       await rm(outsideTarget, { recursive: true, force: true });
     });
 
-    test("keeps a /workspace symlink that resolves back inside the root", async () => {
-      fixtureDir = await mkdtemp(join("/workspace", ".trust-canonicalize-test-"));
-      const realTarget = join(fixtureDir, "real");
+    test("keeps a symlink under the root that resolves back inside it", async () => {
+      root = await mkdtemp(join(tmpdir(), "trust-root-"));
+      const realTarget = join(root, "real");
       await mkdir(realTarget);
-      const linkPath = join(fixtureDir, "alias");
+      const linkPath = join(root, "alias");
       await symlink(realTarget, linkPath);
 
-      expect(await canonicalizeTrustDirectory(linkPath)).toBe(realTarget);
+      expect(await canonicalizeTrustDirectory(linkPath, root)).toBe(realTarget);
     });
   });
 });

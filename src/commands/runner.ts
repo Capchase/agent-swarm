@@ -204,16 +204,23 @@ const CLAUDE_TRUST_PRESEED_ROOT = "/workspace";
 
 /**
  * Resolve `candidate` to a canonical path and require it to live under
- * `CLAUDE_TRUST_PRESEED_ROOT`. `clonePath` (from `/api/repos`, operator-set)
- * and a task's `dir` field are externally-configurable strings — trusting
- * either verbatim would let a value like `/etc`, or a symlink that escapes
- * the workspace, suppress Claude's safety prompt for a directory the worker
- * doesn't own. A path that doesn't exist yet (a repo not yet cloned) is
- * normalized instead of `realpath`-resolved: a nonexistent path cannot be a
- * symlink escape, so normalization alone is enough to reject an out-of-root
- * value.
+ * `root` (defaults to `CLAUDE_TRUST_PRESEED_ROOT`). `clonePath` (from
+ * `/api/repos`, operator-set) and a task's `dir` field are
+ * externally-configurable strings — trusting either verbatim would let a
+ * value like `/etc`, or a symlink that escapes the workspace, suppress
+ * Claude's safety prompt for a directory the worker doesn't own. A path that
+ * doesn't exist yet (a repo not yet cloned) is normalized instead of
+ * `realpath`-resolved: a nonexistent path cannot be a symlink escape, so
+ * normalization alone is enough to reject an out-of-root value.
+ *
+ * `root` is a parameter (not just the module constant) so tests can exercise
+ * real symlink-escape resolution against a tmpdir-based root — CI runners
+ * don't have a real `/workspace` on disk.
  */
-export async function canonicalizeTrustDirectory(candidate: string): Promise<string | null> {
+export async function canonicalizeTrustDirectory(
+  candidate: string,
+  root: string = CLAUDE_TRUST_PRESEED_ROOT,
+): Promise<string | null> {
   const normalized = resolvePath(candidate);
   let resolved: string;
   try {
@@ -221,12 +228,9 @@ export async function canonicalizeTrustDirectory(candidate: string): Promise<str
   } catch {
     resolved = normalized;
   }
-  if (
-    resolved !== CLAUDE_TRUST_PRESEED_ROOT &&
-    !resolved.startsWith(`${CLAUDE_TRUST_PRESEED_ROOT}/`)
-  ) {
+  if (resolved !== root && !resolved.startsWith(`${root}/`)) {
     console.warn(
-      `[claude-trust] Refusing to pre-seed trust for "${candidate}" (resolves to "${resolved}", outside ${CLAUDE_TRUST_PRESEED_ROOT})`,
+      `[claude-trust] Refusing to pre-seed trust for "${candidate}" (resolves to "${resolved}", outside ${root})`,
     );
     return null;
   }
@@ -250,7 +254,9 @@ export async function resolveTrustDirectories(
     "/workspace/personal",
     ...(await fetchRegisteredRepoClonePaths(apiUrl, apiKey)),
   ];
-  const resolved = await Promise.all(candidates.map(canonicalizeTrustDirectory));
+  const resolved = await Promise.all(
+    candidates.map((candidate) => canonicalizeTrustDirectory(candidate)),
+  );
   return [...new Set(resolved.filter((dir): dir is string => dir !== null))];
 }
 
