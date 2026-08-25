@@ -12,10 +12,11 @@
  *   3. Tmux fail-fast — when the resolved binary string uses the legacy
  *      bridge compatibility path or claude-bridge is enabled, createSession
  *      throws if `tmux` is not on PATH.
- *   4. Trust pre-seed — when the resolved path drives interactive claude in
- *      tmux, the adapter writes
- *      `projects[cwd].hasTrustDialogAccepted: true` to `$HOME/.claude.json`
- *      before spawning. Idempotent. No-op for "claude".
+ *   4. Trust pre-seed — for every resolved binary, including the default
+ *      headless "claude" (`.claude/settings.json` permissions are dropped
+ *      for an untrusted cwd whether or not the run is interactive), the
+ *      adapter writes `projects[cwd].hasTrustDialogAccepted: true` to
+ *      `$HOME/.claude.json` before spawning. Idempotent.
  *
  * `Bun.spawn` and the synchronous binary-version probe are stubbed so the
  * tests don't actually exec anything; we read the argv off the call args.
@@ -913,14 +914,17 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     expect(data.projects["/new/cwd"].hasTrustDialogAccepted).toBe(true);
   });
 
-  test("default CLAUDE_BINARY=claude does NOT touch ~/.claude.json", async () => {
+  test("default CLAUDE_BINARY=claude also pre-seeds the trust dialog", async () => {
     delete process.env.CLAUDE_BINARY;
+    const cwd = "/some/abs/cwd";
     const adapter = new ClaudeAdapter();
-    await createCompletedSession(adapter, makeConfig({ cwd: "/some/abs/cwd" }));
+    await createCompletedSession(adapter, makeConfig({ cwd }));
 
-    // No .claude.json should have been written.
-    const exists = await Bun.file(join(homeDir, ".claude.json")).exists();
-    expect(exists).toBe(false);
+    // The stock headless `claude -p` path reads `.claude/settings.json`
+    // permissions the same as the tmux/bridge path, so it needs the
+    // pre-seed too — not just the interactive-tmux binaries.
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true writes hasTrustDialogAccepted for config.cwd", async () => {

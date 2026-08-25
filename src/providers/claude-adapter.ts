@@ -1287,16 +1287,17 @@ export class ClaudeAdapter implements ProviderAdapter {
       );
     }
 
-    // Claude Bridge and its legacy compatibility path drive interactive
-    // `claude` in tmux, where the first-run trust dialog can block startup.
-    if (isInteractiveTmuxClaude) {
-      try {
-        await preseedClaudeTrustDialog(config.cwd);
-      } catch (err) {
-        console.warn(
-          `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${err}`,
-        );
-      }
+    // Every claude invocation — headless `-p` included — reads
+    // `.claude/settings.json` `permissions.allow` and silently drops it
+    // when the cwd isn't marked trusted in `~/.claude.json`. Claude Bridge's
+    // tmux path additionally hangs on the interactive dialog. Pre-seed
+    // unconditionally so both cases are covered, not just the tmux one.
+    try {
+      await preseedClaudeTrustDialog(config.cwd);
+    } catch (err) {
+      console.warn(
+        `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${err}`,
+      );
     }
 
     const taskFilePid = process.pid;
