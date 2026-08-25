@@ -266,12 +266,24 @@ The published npm package is `@desplega.ai/claude-bridge`; version `0.1.13` is p
 
 ### Prompt pre-clear
 
-The adapter runs the same `$HOME/.claude.json` project trust pre-seed for
-bridge mode that it uses for the legacy bridge compatibility path before
-spawning the binary. This is required because bridge mode launches interactive
-Claude Code inside `tmux`; if Claude hits the first-run "is this a project you
-trust?" prompt before the bridge is ready, the pane can exit or hang with no
-useful stderr.
+`createSession` runs the `$HOME/.claude.json` project trust pre-seed
+(`preseedClaudeTrustDialog`) unconditionally, for every resolved binary —
+stock `claude`, the legacy bridge compatibility path, and bridge mode alike —
+not only for bridge/legacy paths. Headless `claude -p` reads
+`.claude/settings.json`-derived trust the same way an interactive run does, so
+it needs the pre-seed too; skipping it for the default binary left every
+non-bridge session dropping straight into the first-run "is this a project
+you trust?" prompt. Bridge mode additionally needs it because it launches
+interactive Claude Code inside `tmux`; if Claude hits that prompt before the
+bridge is ready, the pane can exit or hang with no useful stderr.
+
+The pre-seed's read-merge-write is serialized across concurrent callers
+(same process or not) via an mkdir-based lock on `$HOME/.claude.json.lock`,
+and the write itself is a temp-file-plus-rename so no process ever observes a
+partial file. A read error other than "file does not exist" leaves the file
+untouched instead of writing over something it couldn't see; a JSON parse
+failure backs up the malformed file (rename, not delete) before starting
+from an empty config.
 
 claude-bridge also handles first-run blocking prompts itself after startup:
 
@@ -294,13 +306,13 @@ The resolved raw string is parsed by `parseClaudeBinary`: trim + whitespace-spli
 
 | `CLAUDE_BINARY` | Resulting argv prefix |
 |---|---|
-| (unset) or empty | `["claude"]` — default, no behavior change |
+| (unset) or empty | `["claude"]` — default; still gets the unconditional trust pre-seed (see Prompt pre-clear) |
 | legacy bridge binary | deprecated global install |
 | legacy bridge absolute path | deprecated absolute path |
 | legacy bridge package command | deprecated no-install form |
 | legacy bridge npm command | deprecated npm form |
 
-The legacy compatibility gates remain unchanged: tmux fail-fast plus the shared `preseedClaudeTrustDialog(cwd, homeDir?)` helper, which writes `$HOME/.claude.json` to set `projects[cwd].hasTrustDialogAccepted = true` and `hasCompletedProjectOnboarding = true`. The helper is idempotent and read-merge-write. Bun's `os.homedir()` caches the real passwd entry and ignores `process.env.HOME` mutations, so the helper defaults to `process.env.HOME ?? homedir()` for testability.
+The legacy compatibility gates remain unchanged: tmux fail-fast plus the same unconditional `preseedClaudeTrustDialog(cwd, homeDir?)` helper described above, which writes `$HOME/.claude.json` to set `projects[cwd].hasTrustDialogAccepted = true` and `hasCompletedProjectOnboarding = true`. The helper is idempotent and read-merge-write. Bun's `os.homedir()` caches the real passwd entry and ignores `process.env.HOME` mutations, so the helper defaults to `process.env.HOME ?? homedir()` for testability.
 
 ### Auth
 

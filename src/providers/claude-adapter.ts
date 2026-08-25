@@ -1,4 +1,4 @@
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type Span, trace } from "@opentelemetry/api";
@@ -270,7 +270,14 @@ function withClaudeBridgeAuthArgs(
  * tells claude-code the cwd is pre-trusted.
  *
  * Idempotent (no-op when already true), read-merge-write (never clobbers
- * other keys), graceful on missing / malformed file.
+ * other keys). The read-merge-write is serialized across concurrent callers
+ * (same process or not) via an mkdir-based lock, and the write itself is a
+ * temp-file-plus-rename so a reader never observes a partial file. A read
+ * error other than "file does not exist" leaves the file untouched instead
+ * of risking an overwrite of something we couldn't actually see; a parse
+ * failure backs up the malformed file (rename, not delete) before starting
+ * fresh, so a corrupt file blocks nothing but nothing is silently discarded
+ * either.
  *
  * Exported for unit testing.
  */
@@ -282,38 +289,105 @@ export async function preseedClaudeTrustDialog(
   homeDir: string = process.env.HOME ?? homedir(),
 ): Promise<void> {
   const claudeJsonPath = join(homeDir, ".claude.json");
-  let data: Record<string, unknown> = {};
+  const releaseLock = await acquireFileLock(claudeJsonPath);
   try {
-    const raw = await readFile(claudeJsonPath, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      data = parsed as Record<string, unknown>;
+    let data: Record<string, unknown> = {};
+    let raw: string | undefined;
+    try {
+      raw = await readFile(claudeJsonPath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn(
+          `\x1b[33m[claude]\x1b[0m Could not read ${claudeJsonPath}, leaving it untouched: ${err}`,
+        );
+        return;
+      }
+      // Missing file — proceed with an empty config below.
     }
-  } catch {
-    // missing or malformed — start from {}
-    console.warn(
-      `\x1b[33m[claude]\x1b[0m Starting with empty .claude.json for trust pre-seed at ${claudeJsonPath}`,
+
+    if (raw !== undefined) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          data = parsed as Record<string, unknown>;
+        }
+      } catch {
+        const backupPath = `${claudeJsonPath}.corrupt-${Date.now()}`;
+        await rename(claudeJsonPath, backupPath);
+        console.warn(
+          `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} was malformed JSON; backed up to ${backupPath} and starting from an empty config`,
+        );
+      }
+    }
+
+    const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
+    const existing = projects[cwd] ?? {};
+    if (existing.hasTrustDialogAccepted === true) {
+      // Already trusted — no-op, no write.
+      return;
+    }
+
+    projects[cwd] = {
+      ...existing,
+      hasTrustDialogAccepted: true,
+      hasCompletedProjectOnboarding: true,
+    };
+    data.projects = projects;
+
+    await atomicWriteFile(claudeJsonPath, `${JSON.stringify(data, null, 2)}\n`);
+    console.log(
+      `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${cwd} in ${claudeJsonPath}`,
     );
+  } finally {
+    await releaseLock();
   }
+}
 
-  const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
-  const existing = projects[cwd] ?? {};
-  if (existing.hasTrustDialogAccepted === true) {
-    // Already trusted — no-op, no write.
-    return;
+/**
+ * Cross-process advisory lock via an mkdir-based lockfile — `mkdir` is atomic
+ * even across processes sharing a filesystem, unlike an in-memory mutex which
+ * only serializes callers inside this process. Reclaims a lock left behind by
+ * a crashed holder after `LOCK_STALE_MS`, and gives up after `LOCK_WAIT_MS` of
+ * a live holder (caller's try/catch at the call site logs and continues).
+ *
+ * Exported for unit testing.
+ */
+export async function acquireFileLock(targetPath: string): Promise<() => Promise<void>> {
+  const lockPath = `${targetPath}.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      return () => rm(lockPath, { recursive: true, force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw err;
+      }
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
+          await rm(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // Lock vanished between our failed mkdir and this stat — loop and retry mkdir.
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for lock on ${targetPath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_INTERVAL_MS));
+    }
   }
+}
 
-  projects[cwd] = {
-    ...existing,
-    hasTrustDialogAccepted: true,
-    hasCompletedProjectOnboarding: true,
-  };
-  data.projects = projects;
+const LOCK_WAIT_MS = 5_000;
+const LOCK_STALE_MS = 10_000;
+const LOCK_POLL_INTERVAL_MS = 25;
 
-  await writeFile(claudeJsonPath, `${JSON.stringify(data, null, 2)}\n`);
-  console.log(
-    `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${cwd} in ${claudeJsonPath}`,
-  );
+async function atomicWriteFile(filePath: string, content: string): Promise<void> {
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await writeFile(tmpPath, content);
+  await rename(tmpPath, filePath);
 }
 
 /**

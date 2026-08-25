@@ -26,10 +26,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  acquireFileLock,
   ClaudeAdapter,
   parseClaudeBinary,
   parseClaudeBridgeEnabled,
@@ -366,12 +367,67 @@ describe("preseedClaudeTrustDialog", () => {
     expect(afterStat).toBe(beforeStat);
   });
 
-  test("malformed file: starts from {} and writes the entry", async () => {
-    await writeFile(join(homeDir, ".claude.json"), "{ this is not valid json");
+  test("malformed file: backs up the original bytes (rename, not delete) then starts from {}", async () => {
+    const original = "{ this is not valid json";
+    await writeFile(join(homeDir, ".claude.json"), original);
     await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.corrupt-"));
+    expect(backupName).toBeDefined();
+    const backedUp = await readFile(join(homeDir, backupName as string), "utf-8");
+    expect(backedUp).toBe(original);
+  });
+
+  test("unreadable file (read error other than ENOENT): leaves it untouched, does not write", async () => {
+    // A directory in place of the file reliably triggers a read error
+    // (EISDIR) regardless of the user the test runs as — chmod-based
+    // permission tests are unreliable when running as root.
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    await mkdir(claudeJsonPath);
+
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    // Still a directory — preseed must not have attempted any write over it.
+    const entries = await readdir(homeDir);
+    expect(entries).toEqual([".claude.json"]);
+    const stillADir = await readdir(claudeJsonPath);
+    expect(stillADir).toEqual([]);
+  });
+
+  test("concurrent writers for different cwds all survive (no lost update)", async () => {
+    const cwds = Array.from({ length: 10 }, (_, i) => `/abs/cwd/${i}`);
+    await Promise.all(cwds.map((cwd) => preseedClaudeTrustDialog(cwd, homeDir)));
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    for (const cwd of cwds) {
+      expect(data.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    }
+  });
+
+  test("acquireFileLock serializes a second acquirer until the first releases", async () => {
+    const lockTarget = join(homeDir, ".claude.json");
+    const order: string[] = [];
+
+    const release1 = await acquireFileLock(lockTarget);
+    const secondAcquire = acquireFileLock(lockTarget).then((release2) => {
+      order.push("second-acquired");
+      return release2;
+    });
+
+    // Give the second acquirer a chance to run — it must still be waiting.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual([]);
+
+    order.push("first-released");
+    await release1();
+
+    const release2 = await secondAcquire;
+    expect(order).toEqual(["first-released", "second-acquired"]);
+    await release2();
   });
 });
 
