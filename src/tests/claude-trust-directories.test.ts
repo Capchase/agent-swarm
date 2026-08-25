@@ -120,6 +120,37 @@ describe("canonicalizeTrustDirectory", () => {
 
       expect(await canonicalizeTrustDirectory(linkPath, root)).toBe(realTarget);
     });
+
+    test("rejects a missing leaf whose EXISTING parent is a symlink escaping the root", async () => {
+      // The specific bypass this closes: `root/link` is a symlink pointing
+      // outside `root`, and `root/link/new` itself has never been created.
+      // `realpath(root/link/new)` fails (ENOENT on the whole path) — naively
+      // falling back to the lexical, un-resolved path would read as "under
+      // root" even though the real location, through the symlinked parent,
+      // is not. The fix walks up to the nearest EXISTING ancestor (`root/link`)
+      // and realpath's THAT before re-appending the nonexistent leaf.
+      root = await mkdtemp(join(tmpdir(), "trust-root-"));
+      const outsideTarget = await mkdtemp(join(tmpdir(), "trust-escape-target-"));
+      const linkPath = join(root, "link");
+      await symlink(outsideTarget, linkPath);
+      const missingLeaf = join(linkPath, "new");
+
+      expect(await canonicalizeTrustDirectory(missingLeaf, root)).toBeNull();
+      await rm(outsideTarget, { recursive: true, force: true });
+    });
+
+    test("keeps a missing leaf whose existing parent is a symlink resolving back inside the root", async () => {
+      root = await mkdtemp(join(tmpdir(), "trust-root-"));
+      const realTarget = join(root, "real");
+      await mkdir(realTarget);
+      const linkPath = join(root, "alias");
+      await symlink(realTarget, linkPath);
+      const missingLeaf = join(linkPath, "not-cloned-yet");
+
+      expect(await canonicalizeTrustDirectory(missingLeaf, root)).toBe(
+        join(realTarget, "not-cloned-yet"),
+      );
+    });
   });
 });
 

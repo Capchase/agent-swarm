@@ -17,7 +17,8 @@ import {
 let server: ReturnType<typeof Bun.serve>;
 let testUrl: string;
 
-type MockResponse = { status: number; body: unknown };
+/** `rawBody`, when set, is sent verbatim (bypassing JSON.stringify) so a test can simulate a truly malformed response body. */
+type MockResponse = { status: number; body: unknown; rawBody?: string };
 
 const defaultMockResponse: MockResponse = {
   status: 200,
@@ -34,7 +35,7 @@ beforeAll(() => {
       if (url.pathname === "/api/config/resolved") {
         const agentId = url.searchParams.get("agentId") ?? "";
         const mockResponse = mockResponsesByAgentId.get(agentId) ?? defaultMockResponse;
-        return new Response(JSON.stringify(mockResponse.body), {
+        return new Response(mockResponse.rawBody ?? JSON.stringify(mockResponse.body), {
           status: mockResponse.status,
           headers: { "Content-Type": "application/json" },
         });
@@ -105,6 +106,49 @@ describe("fetchResolvedEnv", () => {
     const baseEnv = { EXISTING: "value" };
     const result = await fetchResolvedEnv("http://localhost:19999", "key", "agent-1", baseEnv);
     expect(result.env).toEqual({ EXISTING: "value" });
+  });
+
+  // ─── Non-authoritative config-fetch regression ──────────────────────────
+  //
+  // `configuredReloadableKeys` must be `undefined` — not an empty Set — on
+  // every failure path, so `applyResolvedEnvToProcessEnv` treats "the fetch
+  // failed" the same as "don't touch anything" rather than "every
+  // reloadable key's row was deleted". An empty Set here previously read as
+  // the latter and reset every live operator setting (e.g.
+  // CLAUDE_TRUST_PRESEED) back to the boot baseline on a transient outage.
+
+  test("configuredReloadableKeys is undefined (non-authoritative) on a non-200 response", async () => {
+    const agentId = "agent-500-reloadable";
+    mockResponsesByAgentId.set(agentId, { status: 500, body: { error: "server error" } });
+
+    const result = await fetchResolvedEnv(testUrl, "key", agentId, {});
+    expect(result.configuredReloadableKeys).toBeUndefined();
+  });
+
+  test("configuredReloadableKeys is undefined (non-authoritative) when the API is unreachable", async () => {
+    const result = await fetchResolvedEnv("http://localhost:19999", "key", "agent-1", {});
+    expect(result.configuredReloadableKeys).toBeUndefined();
+  });
+
+  test("configuredReloadableKeys is undefined (non-authoritative) when the response body isn't valid JSON", async () => {
+    const agentId = "agent-bad-json";
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: undefined,
+      rawBody: "{ this is not valid json",
+    });
+
+    const result = await fetchResolvedEnv(testUrl, "key", agentId, {});
+    expect(result.configuredReloadableKeys).toBeUndefined();
+  });
+
+  test("configuredReloadableKeys is a (possibly empty) Set on an authoritative 200 with no configs", async () => {
+    const agentId = "agent-authoritative-empty";
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+
+    const result = await fetchResolvedEnv(testUrl, "key", agentId, {});
+    expect(result.configuredReloadableKeys).toBeDefined();
+    expect(result.configuredReloadableKeys?.size).toBe(0);
   });
 
   test("does not mutate the baseEnv object", async () => {
@@ -366,5 +410,33 @@ describe("fetchResolvedEnv + applyResolvedEnvToProcessEnv — CLAUDE_TRUST_PRESE
     // Restored to the boot baseline (unset here — worker falls back to the
     // documented default, true), not stuck at the deleted row's last value.
     expect(process.env.CLAUDE_TRUST_PRESEED).toBeUndefined();
+  });
+
+  test("a transient config-fetch failure does NOT reset a previously-configured value", async () => {
+    delete process.env.CLAUDE_TRUST_PRESEED; // boot baseline: unset (documented default: true)
+
+    const agentId = "agent-trust-preseed-transient-failure";
+
+    // Step 1: an operator sets CLAUDE_TRUST_PRESEED=false via swarm_config,
+    // and the runner applies it live — same as the happy-path test above.
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: { configs: [{ key: "CLAUDE_TRUST_PRESEED", value: "false" }] },
+    });
+    const first = await fetchResolvedEnv(testUrl, "key", agentId);
+    applyResolvedEnvToProcessEnv(first.env, first.configuredReloadableKeys);
+    expect(process.env.CLAUDE_TRUST_PRESEED).toBe("false");
+
+    // Step 2: the config API has a transient outage on the next reload — the
+    // row was never deleted, the fetch just failed this round.
+    mockResponsesByAgentId.set(agentId, { status: 503, body: { error: "unavailable" } });
+    const second = await fetchResolvedEnv(testUrl, "key", agentId, process.env);
+    expect(second.configuredReloadableKeys).toBeUndefined();
+    applyResolvedEnvToProcessEnv(second.env, second.configuredReloadableKeys);
+
+    // The live value must survive the outage — a reset here would silently
+    // re-enable the trust dialog (CLAUDE_TRUST_PRESEED back to the true
+    // default) until the next successful reload.
+    expect(process.env.CLAUDE_TRUST_PRESEED).toBe("false");
   });
 });
