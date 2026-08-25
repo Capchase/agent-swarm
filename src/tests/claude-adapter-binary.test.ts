@@ -432,21 +432,23 @@ describe("preseedClaudeTrustDialog", () => {
     expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(original);
   });
 
-  test.each(["[]", "null", "42", '"just a string"'])(
-    "non-object JSON root (%s): backs up the original and starts fresh instead of silently discarding it",
-    async (rawRoot) => {
-      await writeFile(join(homeDir, ".claude.json"), rawRoot);
-      await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+  test.each([
+    "[]",
+    "null",
+    "42",
+    '"just a string"',
+  ])("non-object JSON root (%s): backs up the original and starts fresh instead of silently discarding it", async (rawRoot) => {
+    await writeFile(join(homeDir, ".claude.json"), rawRoot);
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
 
-      const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
-      expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
 
-      const entries = await readdir(homeDir);
-      const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
-      expect(backupName).toBeDefined();
-      expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(rawRoot);
-    },
-  );
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(rawRoot);
+  });
 
   test("preserves the existing file's permission bits (e.g. 0644) across a rewrite", async () => {
     const claudeJsonPath = join(homeDir, ".claude.json");
