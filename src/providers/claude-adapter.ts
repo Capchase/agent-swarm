@@ -22,6 +22,7 @@ import {
 import { fetchInstalledMcpServers } from "../utils/mcp-server-fetcher";
 import { swarmRuntimeInstanceId } from "../utils/multi-runtime";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { canonicalizeTrustDirectories } from "../utils/trust-directory";
 import { CTX_MODE_NUDGE_EVERY } from "./ctx-mode-env";
 import { buildOtelTraceparentEnv, isHarnessOtelEnabled } from "./otel-env";
 import { applyReasoningEffort, type ReasoningEffort } from "./reasoning-effort";
@@ -260,6 +261,35 @@ function withClaudeBridgeAuthArgs(
 }
 
 /**
+ * A lock directory older than this is assumed to belong to a holder that
+ * crashed mid-critical-section rather than one that is merely slow — the
+ * critical section here is a single read-merge-write of a small JSON file,
+ * which never legitimately takes anywhere close to this long. Comfortably
+ * above the 5s waiter deadline so a lock that's merely being waited-on by
+ * many callers is never mistaken for stale.
+ */
+const STALE_LOCK_MS = 30_000;
+
+/**
+ * Atomically hand a stale lock directory off for removal. `rename` is a
+ * single filesystem op, so if two waiters both decide the same lock is stale
+ * and race to steal it, exactly one `rename` succeeds (the other fails with
+ * ENOENT because the source is already gone) — only the winner removes it.
+ * A legitimate, still-active holder is never affected: it never renames or
+ * removes its own lock mid-flight, so this can't collide with real work.
+ */
+async function stealStaleLock(lockPath: string): Promise<void> {
+  const deadPath = `${lockPath}.dead-${process.pid}-${Date.now()}`;
+  try {
+    await rename(lockPath, deadPath);
+  } catch {
+    // Another waiter already stole (or the real holder already released) it.
+    return;
+  }
+  await rm(deadPath, { recursive: true, force: true }).catch(() => {});
+}
+
+/**
  * Hold an exclusive cross-process lock on `<path>.lock` for the duration of
  * `fn`, so concurrent Claude sessions never interleave a read-merge-write of
  * `~/.claude.json` (which would lose one session's project entry to a lost
@@ -276,13 +306,27 @@ async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T
   // its `finally` — a timed-out waiter never owns the lock, so it must never
   // remove it out from under whoever does (that recreates the lost-update
   // race this lock exists to prevent). Abort instead: callers already treat
-  // pre-seed failures as best-effort and log a warning.
+  // pre-seed failures as best-effort and log a warning. The one exception is
+  // a STALE lock (see `STALE_LOCK_MS`): that can only mean its creator
+  // crashed without releasing it, so every future waiter would otherwise
+  // wait out the deadline and skip pre-seeding forever — `stealStaleLock`
+  // recovers it via an atomic rename rather than an unconditional remove.
   while (true) {
     try {
       await mkdir(lockPath);
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      const ageMs = await stat(lockPath)
+        .then((s) => Date.now() - s.mtimeMs)
+        .catch(() => null);
+      if (ageMs !== null && ageMs >= STALE_LOCK_MS) {
+        console.warn(
+          `\x1b[33m[claude]\x1b[0m ${lockPath} is stale (${Math.round(ageMs / 1000)}s old); recovering from a crashed holder`,
+        );
+        await stealStaleLock(lockPath);
+        continue;
+      }
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out waiting for ${lockPath}; refusing to proceed without exclusive ownership`,
@@ -375,6 +419,21 @@ export async function preseedClaudeTrustDialog(
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           data = parsed as Record<string, unknown>;
+        } else {
+          // Parseable JSON (`[]`, `null`, a number, a string, ...) whose root
+          // isn't a plain object is just as unsafe to merge into as
+          // unparseable JSON — go through the same backup-or-abort path
+          // rather than silently discarding it by falling through to the
+          // `data = {}` default above.
+          if (
+            !(await backupMalformedClaudeJson(
+              claudeJsonPath,
+              "had a non-object JSON root (expected an object)",
+            ))
+          ) {
+            return;
+          }
+          data = {};
         }
       } catch {
         if (!(await backupMalformedClaudeJson(claudeJsonPath, "was malformed JSON"))) return;
@@ -438,7 +497,14 @@ export async function preseedClaudeTrustDialog(
 
     const tmpPath = `${claudeJsonPath}.tmp-${process.pid}-${Date.now()}`;
     try {
-      await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
+      // Create at 0600 up front — `writeFile`'s default mode is masked by
+      // umask but not narrowed by it, so under a permissive umask (e.g. 022)
+      // the temp file would otherwise sit world-readable, holding OAuth
+      // account data, for the entire write duration before the chmod below
+      // ever ran. Explicit `mode: 0o600` closes that window; the chmod call
+      // still runs afterward to widen to the ORIGINAL file's mode when that
+      // was less restrictive.
+      await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
       await chmod(tmpPath, existingMode ?? 0o600);
       await rename(tmpPath, claudeJsonPath);
     } catch (err) {
@@ -1425,12 +1491,27 @@ export class ClaudeAdapter implements ProviderAdapter {
     // Claude stores project trust by exact cwd. Seed every directory this
     // worker can start from, including headless sessions that bypass the
     // interactive tmux path.
+    //
+    // `config.cwd` is a raw, task-controlled string that has NEVER passed
+    // through the worker-root gate (unlike `config.trustDirectories`, which
+    // the runner already canonicalizes in `resolveTrustDirectories`) — an
+    // out-of-root value here would otherwise get pre-trusted verbatim. Both
+    // lists are re-canonicalized HERE, immediately before the write, rather
+    // than trusting whatever the runner resolved earlier: a symlink can be
+    // swapped in between that earlier resolution and this actual use
+    // (TOCTOU), so this is the point that must hold the guarantee.
     if (isEnvFlagEnabled("CLAUDE_TRUST_PRESEED", true, sourceEnv)) {
       try {
-        await preseedClaudeTrustDialog([config.cwd, ...(config.trustDirectories ?? [])]);
+        const trustedDirectories = await canonicalizeTrustDirectories([
+          config.cwd,
+          ...(config.trustDirectories ?? []),
+        ]);
+        await preseedClaudeTrustDialog(trustedDirectories);
       } catch (err) {
         console.warn(
-          `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${scrubSecrets(String(err))}`,
+          scrubSecrets(
+            `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${String(err)}`,
+          ),
         );
       }
     }

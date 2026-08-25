@@ -1,6 +1,5 @@
 import { existsSync, statSync } from "node:fs";
-import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { resolve as resolvePath } from "node:path";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { ensure, initialize } from "@desplega.ai/business-use";
 import type { TemplateResponse } from "../../templates/schema.ts";
 import {
@@ -64,6 +63,7 @@ import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
 import { isSteeringEnabled } from "../utils/steering-enabled.ts";
 import { interpolate } from "../utils/template.ts";
+import { CLAUDE_TRUST_PRESEED_ROOT, canonicalizeTrustDirectory } from "../utils/trust-directory.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { validateJsonSchema } from "../workflows/json-schema-validator.ts";
 import { buildContextPreamble, buildResumeContextPreamble } from "./context-preamble.ts";
@@ -199,43 +199,12 @@ export async function fetchRegisteredRepoClonePaths(
   }
 }
 
-/** Every directory Claude trust pre-seeding is allowed to mark trusted. */
-const CLAUDE_TRUST_PRESEED_ROOT = "/workspace";
-
-/**
- * Resolve `candidate` to a canonical path and require it to live under
- * `root` (defaults to `CLAUDE_TRUST_PRESEED_ROOT`). `clonePath` (from
- * `/api/repos`, operator-set) and a task's `dir` field are
- * externally-configurable strings — trusting either verbatim would let a
- * value like `/etc`, or a symlink that escapes the workspace, suppress
- * Claude's safety prompt for a directory the worker doesn't own. A path that
- * doesn't exist yet (a repo not yet cloned) is normalized instead of
- * `realpath`-resolved: a nonexistent path cannot be a symlink escape, so
- * normalization alone is enough to reject an out-of-root value.
- *
- * `root` is a parameter (not just the module constant) so tests can exercise
- * real symlink-escape resolution against a tmpdir-based root — CI runners
- * don't have a real `/workspace` on disk.
- */
-export async function canonicalizeTrustDirectory(
-  candidate: string,
-  root: string = CLAUDE_TRUST_PRESEED_ROOT,
-): Promise<string | null> {
-  const normalized = resolvePath(candidate);
-  let resolved: string;
-  try {
-    resolved = await realpath(normalized);
-  } catch {
-    resolved = normalized;
-  }
-  if (resolved !== root && !resolved.startsWith(`${root}/`)) {
-    console.warn(
-      `[claude-trust] Refusing to pre-seed trust for "${candidate}" (resolves to "${resolved}", outside ${root})`,
-    );
-    return null;
-  }
-  return resolved;
-}
+// Re-exported for existing callers/tests that import the trust-directory
+// gate from the runner; the implementation lives in a dependency-free shared
+// util (`src/utils/trust-directory.ts`) so `claude-adapter.ts` can also
+// re-validate at the point of use without risking a circular import back
+// through `provider-credentials.ts` → `claude-adapter.ts` → `runner.ts`.
+export { canonicalizeTrustDirectory, CLAUDE_TRUST_PRESEED_ROOT };
 
 /**
  * Build the canonicalized, worker-root-restricted list of directories Claude
@@ -745,8 +714,14 @@ export interface ResolvedEnvResult {
    * `applyResolvedEnvToProcessEnv` tell "no row exists" apart from "we didn't
    * ask" so a deleted row can restore the boot baseline instead of staying
    * pinned to whatever a prior reload wrote.
+   *
+   * `undefined` means this round's config fetch was NOT authoritative (HTTP
+   * failure, network/parse error) — as opposed to an authoritative fetch
+   * that legitimately found zero reloadable rows. `applyResolvedEnvToProcessEnv`
+   * treats `undefined` the same as "don't reset anything", so a transient
+   * outage can never masquerade as every operator setting being deleted.
    */
-  configuredReloadableKeys: ReadonlySet<string>;
+  configuredReloadableKeys: ReadonlySet<string> | undefined;
 }
 
 /**
@@ -772,7 +747,11 @@ export async function fetchResolvedEnv(
 ): Promise<ResolvedEnvResult> {
   const env: Record<string, string | undefined> = { ...baseEnv };
   let scriptsOnlyConfigValue: string | undefined;
-  const configuredReloadableKeys = new Set<string>();
+  // Stays `undefined` (non-authoritative) unless the fetch actually
+  // completes with an HTTP-ok response — see the field doc on
+  // `ResolvedEnvResult.configuredReloadableKeys` for why that distinction
+  // matters to `applyResolvedEnvToProcessEnv`.
+  let configuredReloadableKeys: Set<string> | undefined;
 
   if (apiUrl && agentId) {
     try {
@@ -785,6 +764,7 @@ export async function fetchResolvedEnv(
       if (!response.ok) {
         console.warn(`[env-reload] Failed to fetch config: ${response.status}`);
       } else {
+        configuredReloadableKeys = new Set<string>();
         const data = (await response.json()) as {
           configs: Array<{ key: string; value: string }>;
         };
@@ -830,6 +810,11 @@ export async function fetchResolvedEnv(
       }
     } catch (error) {
       console.warn(`[env-reload] Could not fetch config, using current env: ${error}`);
+      // Reset even though the `response.ok` branch above may have already
+      // allocated the Set: a `response.json()` parse failure throws AFTER
+      // that point, and a partially-built (or empty) Set here would read as
+      // an authoritative "nothing configured" to `applyResolvedEnvToProcessEnv`.
+      configuredReloadableKeys = undefined;
     }
   }
 
