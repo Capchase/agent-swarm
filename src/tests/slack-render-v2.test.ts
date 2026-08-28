@@ -2356,4 +2356,50 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     expect(finalRows).toHaveLength(1);
     expect(finalRows[0]?.conclusion_kind).toBe("complete");
   });
+
+  test("ask and child both terminal before the first tick: conclusion still links the child's permalink, not a digest", async () => {
+    const lead = await createAgent({ name: "First Tick Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "First Tick Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_FIRST_TICK");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("first tick ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("first tick child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    // Both members reach a terminal state before processSlackRenderV2 ever
+    // runs for this thread — there is no earlier tick in which the child
+    // could have picked up its own card first.
+    await completeTask(child.id, "Child result body.");
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const childCard = await getSlackOutcomeMessage(child.id);
+    expect(childCard?.finalizedAt).toBeDefined();
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(askCard?.conclusionKind).toBe("complete");
+    const conclusionStream = calls.find(
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(conclusionStream).toBeDefined();
+    expect(String(conclusionStream?.payload.markdown_text)).toContain(childCard!.permalink);
+    expect(String(conclusionStream?.payload.markdown_text)).not.toContain(getTaskLink(child.id));
+  });
 });

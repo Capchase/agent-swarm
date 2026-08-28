@@ -1137,61 +1137,18 @@ export async function processSlackRenderV2(): Promise<void> {
     }
 
     let outcomeCreated = false;
+    // Child cards post before ask conclusions, in two passes over the same
+    // tick. Tasks are walked in creation order, so an ask is otherwise
+    // visited before the delegated children it owns; if their conclusion
+    // ran first, a closure that goes fully terminal within one tick would
+    // compute conclusionResultsLines() against children that have no card
+    // yet, permanently fall back to digest text, and never self-correct —
+    // the conclusion card is immutable once finalized.
     let childCardsThisTick = 0;
     for (const task of tasks) {
       if (!isSlackRenderV2Enabled()) return;
+      if (task.source === "slack") continue;
       if ((await getSlackOutcomeMessage(task.id))?.finalizedAt) continue;
-
-      if (task.source === "slack") {
-        if (!isOutcomeStatus(task.status) || task.createdAt < activatedAt) continue;
-        const deferByClosure =
-          delegationEnabled &&
-          delegationActivatedAt !== null &&
-          task.createdAt >= delegationActivatedAt;
-
-        if (!deferByClosure) {
-          try {
-            const outcome = await streamOutcomeCard(task, tree);
-            if (outcome) await finalizeTerminalSlackReactions([task]);
-            outcomeCreated ||= !!outcome;
-          } catch (error) {
-            console.error(`[Slack] Failed to stream outcome for task ${task.id}:`, error);
-          }
-          continue;
-        }
-
-        const closure = closuresByAskId.get(task.id) ?? buildAskClosure(task, tasks);
-        const state = closureState(task, closure, new Date(), settleSec, timeoutMin);
-        if (state === "open") continue;
-        try {
-          const outcome = await streamOutcomeCard(task, tree, {
-            buildContent: (_t, slackReplySent) =>
-              askConclusionContent(task, closure, state, slackReplySent),
-            conclusionKind: state === "timedOut" ? "timeout" : "complete",
-          });
-          if (outcome) {
-            const app = getSlackApp();
-            if (app && task.slackChannelId && task.slackTriggerMessageTs) {
-              await finalizeSlackMessageReaction(
-                app.client,
-                task.slackChannelId,
-                task.slackTriggerMessageTs,
-                conclusionReactionOutcome(state, task, closure),
-              );
-            }
-            await recordSlackDelivery(
-              task,
-              outcome,
-              state === "timedOut" ? "conclusion_timeout" : "conclusion",
-            );
-          }
-          outcomeCreated ||= !!outcome;
-        } catch (error) {
-          console.error(`[Slack] Failed to stream ask conclusion for task ${task.id}:`, error);
-        }
-        continue;
-      }
-
       if (!delegationEnabled || delegationActivatedAt === null) continue;
       if (!isChildCardCandidate(task, delegationActivatedAt) || task.slackReplySent) continue;
       if (childCardsThisTick >= CHILD_CARDS_PER_TICK) continue;
@@ -1207,6 +1164,58 @@ export async function processSlackRenderV2(): Promise<void> {
         outcomeCreated ||= !!outcome;
       } catch (error) {
         console.error(`[Slack] Failed to stream child outcome for task ${task.id}:`, error);
+      }
+    }
+
+    for (const task of tasks) {
+      if (!isSlackRenderV2Enabled()) return;
+      if (task.source !== "slack") continue;
+      if ((await getSlackOutcomeMessage(task.id))?.finalizedAt) continue;
+      if (!isOutcomeStatus(task.status) || task.createdAt < activatedAt) continue;
+      const deferByClosure =
+        delegationEnabled &&
+        delegationActivatedAt !== null &&
+        task.createdAt >= delegationActivatedAt;
+
+      if (!deferByClosure) {
+        try {
+          const outcome = await streamOutcomeCard(task, tree);
+          if (outcome) await finalizeTerminalSlackReactions([task]);
+          outcomeCreated ||= !!outcome;
+        } catch (error) {
+          console.error(`[Slack] Failed to stream outcome for task ${task.id}:`, error);
+        }
+        continue;
+      }
+
+      const closure = closuresByAskId.get(task.id) ?? buildAskClosure(task, tasks);
+      const state = closureState(task, closure, new Date(), settleSec, timeoutMin);
+      if (state === "open") continue;
+      try {
+        const outcome = await streamOutcomeCard(task, tree, {
+          buildContent: (_t, slackReplySent) =>
+            askConclusionContent(task, closure, state, slackReplySent),
+          conclusionKind: state === "timedOut" ? "timeout" : "complete",
+        });
+        if (outcome) {
+          const app = getSlackApp();
+          if (app && task.slackChannelId && task.slackTriggerMessageTs) {
+            await finalizeSlackMessageReaction(
+              app.client,
+              task.slackChannelId,
+              task.slackTriggerMessageTs,
+              conclusionReactionOutcome(state, task, closure),
+            );
+          }
+          await recordSlackDelivery(
+            task,
+            outcome,
+            state === "timedOut" ? "conclusion_timeout" : "conclusion",
+          );
+        }
+        outcomeCreated ||= !!outcome;
+      } catch (error) {
+        console.error(`[Slack] Failed to stream ask conclusion for task ${task.id}:`, error);
       }
     }
     try {
