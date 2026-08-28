@@ -31,6 +31,7 @@ import {
   markdownToSlack,
   splitSlackSectionText,
 } from "./blocks";
+import { buildAskClosure } from "./closure";
 import { getAgentDisplayName, getAgentEmoji } from "./responses";
 
 const TREE_UPDATE_DEBOUNCE_MS = 500;
@@ -686,23 +687,7 @@ async function outcomeFooter(
   tasks: AgentTask[],
   duration: string,
 ): Promise<unknown[]> {
-  const childrenByParent = new Map<string, AgentTask[]>();
-  for (const candidate of tasks) {
-    if (!candidate.parentTaskId) continue;
-    const children = childrenByParent.get(candidate.parentTaskId) ?? [];
-    children.push(candidate);
-    childrenByParent.set(candidate.parentTaskId, children);
-  }
-  const descendants: AgentTask[] = [];
-  const queue = [...(childrenByParent.get(task.id) ?? [])];
-  while (queue.length > 0) {
-    const candidate = queue.shift()!;
-    // A later human ask may be parented to the previous ask for context
-    // continuity, but it is a sibling in the Slack tree and owns its own card.
-    if (candidate.source === "slack") continue;
-    descendants.push(candidate);
-    queue.push(...(childrenByParent.get(candidate.id) ?? []));
-  }
+  const descendants = buildAskClosure(task, tasks);
   const candidateAgentIds = [
     ...new Set(
       descendants.map((candidate) => candidate.agentId).filter((id): id is string => !!id),
