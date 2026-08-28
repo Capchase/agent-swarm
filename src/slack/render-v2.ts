@@ -1,6 +1,7 @@
 import type { WebClient } from "@slack/web-api";
 import {
   bindSlackMessageTimestamp,
+  checkDependencies,
   deleteSlackMessageRecord,
   ensureSlackRenderV2Activation,
   getAgentById,
@@ -31,7 +32,7 @@ import {
   markdownToSlack,
   splitSlackSectionText,
 } from "./blocks";
-import { buildAskClosure } from "./closure";
+import { buildAskClosure, closureState } from "./closure";
 import { getAgentDisplayName, getAgentEmoji } from "./responses";
 
 const TREE_UPDATE_DEBOUNCE_MS = 500;
@@ -103,8 +104,37 @@ export async function callSlackWithRetry(
   }
 }
 
-function statusIcon(status: AgentTask["status"]): string {
-  switch (status) {
+function slackTreeStallMinutes(): number {
+  return Number(process.env.SLACK_TREE_STALL_MIN) || 15;
+}
+
+function isStalledMember(task: AgentTask, now: Date): boolean {
+  if (task.status !== "in_progress") return false;
+  const idleMin = (now.getTime() - new Date(task.lastUpdatedAt).getTime()) / 60_000;
+  return idleMin >= slackTreeStallMinutes();
+}
+
+/**
+ * One glyph per task line in the tree, replacing the old `statusIcon`.
+ * Blocked detection reuses `checkDependencies` — the same source `get-tasks`
+ * `readyOnly` uses — rather than re-deriving it from the tree's own task list,
+ * since a dependency can point outside the current Slack thread.
+ */
+async function taskStateGlyph(task: AgentTask, now: Date): Promise<string> {
+  switch (task.status) {
+    case "backlog":
+    case "unassigned":
+    case "offered":
+    case "reviewing":
+      return "🕒";
+    case "pending": {
+      const { ready } = await checkDependencies(task.id);
+      return ready ? "▶️" : "⛔";
+    }
+    case "in_progress":
+      return isStalledMember(task, now) ? "⚠️" : "🔄";
+    case "paused":
+      return "⏸️";
     case "completed":
       return "✅";
     case "failed":
@@ -114,7 +144,7 @@ function statusIcon(status: AgentTask["status"]): string {
     case "superseded":
       return "↪️";
     default:
-      return "⏳";
+      return "🕒";
   }
 }
 
@@ -214,7 +244,7 @@ async function renderNodeLines(
     indent.length > MAX_TREE_PREFIX_LENGTH
       ? `${indent.slice(0, MAX_TREE_PREFIX_LENGTH - 1)}…`
       : indent;
-  let line = `${boundedPrefix}↳ ${statusIcon(node.task.status)} ${await renderNodeLabel(node, isAsk)} · ${duration} · ${getTaskLink(node.task.id)}`;
+  let line = `${boundedPrefix}↳ ${await taskStateGlyph(node.task, now)} ${await renderNodeLabel(node, isAsk)} · ${duration} · ${getTaskLink(node.task.id)}`;
   const progress = renderProgress(node.task.progress);
   const suffix = isTerminalTreeStatus(node.task.status) ? "" : progress ? ` · ${progress}` : "";
   if (suffix && line.length + suffix.length <= MAX_TREE_NODE_LINE_LENGTH) {
@@ -234,13 +264,35 @@ function normalizeV2Text(value: string): string {
   return value.trim().replace(/\n{3,}/g, "\n\n");
 }
 
+/**
+ * The tree's first line, replacing the old constant "🧵 worked for <duration>".
+ * A timed-out ask closure outranks a stalled member outranks plain activity —
+ * each of those states implies a non-terminal member is still sitting there,
+ * so "concluded" here means "the engine gave up waiting", not "nothing left".
+ */
+function threadHeaderText(tasks: AgentTask[], now: Date, duration: string): string {
+  const settleSec = Number(process.env.SLACK_CONCLUSION_SETTLE_SEC) || 10;
+  const timeoutMin = Number(process.env.SLACK_CONCLUSION_TIMEOUT_MIN) || 240;
+  const asks = tasks.filter((task) => task.source === "slack");
+  const timedOut = asks.some(
+    (ask) =>
+      closureState(ask, buildAskClosure(ask, tasks), now, settleSec, timeoutMin) === "timedOut",
+  );
+  if (timedOut) return `🧵 ⚠️ concluded with unfinished work — ${duration}`;
+  if (tasks.some((task) => isStalledMember(task, now))) return `🧵 ⚠️ stalled — ${duration}`;
+  if (tasks.some((task) => !isTerminalTreeStatus(task.status)))
+    return `🧵 🔄 working — ${duration}`;
+  const hasFailure = tasks.some((task) => task.status === "failed");
+  return hasFailure ? `🧵 ❌ done with failures — ${duration}` : `🧵 ✅ done — ${duration}`;
+}
+
 export async function renderThreadTree(
   tasks: AgentTask[],
   _outcomeLinks: ReadonlyMap<string, string> = new Map(),
   now = new Date(),
   _triggerLinks: ReadonlyMap<string, string> = new Map(),
 ): Promise<string> {
-  if (tasks.length === 0) return "🧵 worked for 0s";
+  if (tasks.length === 0) return `🧵 🔄 working — 0s`;
   const asks = tasks.filter((task) => task.source === "slack");
   const first = asks[0] ?? tasks[0]!;
   const hasActiveTask = tasks.some((task) => !isTerminalTreeStatus(task.status));
@@ -251,7 +303,7 @@ export async function renderThreadTree(
         return end > latest ? end : latest;
       }, new Date(first.createdAt));
   const threadDuration = formatV2Duration(new Date(first.createdAt), threadEnd);
-  const lines = [`🧵 worked for ${threadDuration}`];
+  const lines = [threadHeaderText(tasks, now, threadDuration)];
   const roots = buildRenderForest(tasks);
   for (const root of roots) {
     lines.push(...(await renderNodeLines(root, 1, now, root.task.source === "slack")));

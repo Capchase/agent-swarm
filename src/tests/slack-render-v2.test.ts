@@ -669,11 +669,11 @@ describe("Slack renderer v2", () => {
 
     expect(text).toBe(
       [
-        "🧵 worked for 8m05s",
-        ` ↳ ⏳ format tests · 8m05s · <https://app.agent-swarm.dev/tasks/${ask.id}|\`${ask.id.slice(0, 8)}\`>`,
-        `    ↳ ⏳ Researcher · 8m05s · <https://app.agent-swarm.dev/tasks/${child.id}|\`${child.id.slice(0, 8)}\`> · Reading *Slack docs* carefully…`,
+        "🧵 🔄 working — 8m05s",
+        ` ↳ ▶️ format tests · 8m05s · <https://app.agent-swarm.dev/tasks/${ask.id}|\`${ask.id.slice(0, 8)}\`>`,
+        `    ↳ ▶️ Researcher · 8m05s · <https://app.agent-swarm.dev/tasks/${child.id}|\`${child.id.slice(0, 8)}\`> · Reading *Slack docs* carefully…`,
         `       ↳ ✅ Researcher · 4m · <https://app.agent-swarm.dev/tasks/${grandchild.id}|\`${grandchild.id.slice(0, 8)}\`>`,
-        ` ↳ ⏳ ship this PR · 8m05s · <https://app.agent-swarm.dev/tasks/${secondAsk.id}|\`${secondAsk.id.slice(0, 8)}\`>`,
+        ` ↳ ▶️ ship this PR · 8m05s · <https://app.agent-swarm.dev/tasks/${secondAsk.id}|\`${secondAsk.id.slice(0, 8)}\`>`,
       ].join("\n"),
     );
     expect(text).not.toContain("workspace.slack.com");
@@ -686,6 +686,108 @@ describe("Slack renderer v2", () => {
     expect(text).not.toContain(":leftwards_arrow_with_hook:");
     const rows = text.split("\n").slice(1);
     expect(rows.slice(0, 3).map((row) => row.match(/^ +/u)?.[0].length)).toEqual([1, 4, 7]);
+  });
+
+  test("glyphs: running vs stalled in_progress, and a pending task blocked on a dependency", async () => {
+    const lead = await createAgent({ name: "Glyph Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Glyph Worker", isLead: false, status: "idle" });
+    const ask = await createTaskExtended("glyph ask", { agentId: lead.id, source: "slack" });
+    const freshRunning = await createTaskExtended("fresh running child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const stalledRunning = await createTaskExtended("stalled running child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const blocker = await createTaskExtended("blocker", { agentId: worker.id, source: "mcp" });
+    const blockedChild = await createTaskExtended("blocked child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      dependsOn: [blocker.id],
+      followUpConfig: { disabled: true },
+    });
+
+    const now = new Date();
+    const sixteenMinAgo = new Date(now.getTime() - 16 * 60_000).toISOString();
+
+    const text = await renderThreadTree(
+      [
+        { ...ask, status: "pending" as const },
+        { ...freshRunning, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+        { ...stalledRunning, status: "in_progress" as const, lastUpdatedAt: sixteenMinAgo },
+        { ...blockedChild, status: "pending" as const },
+      ],
+      new Map(),
+      now,
+    );
+
+    const lines = text.split("\n");
+    const freshLine = lines.find((line) => line.includes(getTaskLink(freshRunning.id)));
+    const stalledLine = lines.find((line) => line.includes(getTaskLink(stalledRunning.id)));
+    const blockedLine = lines.find((line) => line.includes(getTaskLink(blockedChild.id)));
+    expect(freshLine).toContain("🔄");
+    expect(stalledLine).toContain("⚠️");
+    expect(blockedLine).toContain("⛔");
+  });
+
+  test("header transitions from active to stalled to done", async () => {
+    const lead = await createAgent({ name: "Header Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Header Worker", isLead: false, status: "idle" });
+    const ask = await createTaskExtended("header ask", { agentId: lead.id, source: "slack" });
+    const child = await createTaskExtended("header child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const now = new Date();
+
+    const activeText = await renderThreadTree(
+      [
+        { ...ask, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+        { ...child, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+      ],
+      new Map(),
+      now,
+    );
+    expect(activeText.startsWith("🧵 🔄 working")).toBe(true);
+
+    const sixteenMinAgo = new Date(now.getTime() - 16 * 60_000).toISOString();
+    const stalledText = await renderThreadTree(
+      [
+        { ...ask, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+        { ...child, status: "in_progress" as const, lastUpdatedAt: sixteenMinAgo },
+      ],
+      new Map(),
+      now,
+    );
+    expect(stalledText.startsWith("🧵 ⚠️ stalled")).toBe(true);
+
+    const doneText = await renderThreadTree(
+      [
+        {
+          ...ask,
+          status: "completed" as const,
+          lastUpdatedAt: now.toISOString(),
+          finishedAt: now.toISOString(),
+        },
+        {
+          ...child,
+          status: "completed" as const,
+          lastUpdatedAt: now.toISOString(),
+          finishedAt: now.toISOString(),
+        },
+      ],
+      new Map(),
+      now,
+    );
+    expect(doneText.startsWith("🧵 ✅ done")).toBe(true);
   });
 
   test("does not resolve or render direct-trigger permalink backlinks", async () => {
