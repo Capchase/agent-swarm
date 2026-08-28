@@ -163,6 +163,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
     "ANONYMIZED_TELEMETRY",
     "SWARM_HIDE_CLOUD_PROMO",
     "DB_QUERY_BOUNDED_ENABLED",
+    "CLAUDE_TRUST_PRESEED",
   ]),
   ...enumValidator("SLACK_THREAD_STEERING", ["lead", "all"]),
   ...enumValidator("SLACK_THREAD_STEERING_MODE", ["steer", "queue"]),

@@ -12,10 +12,10 @@
  *   3. Tmux fail-fast — when the resolved binary string uses the legacy
  *      bridge compatibility path or claude-bridge is enabled, createSession
  *      throws if `tmux` is not on PATH.
- *   4. Trust pre-seed — when the resolved path drives interactive claude in
- *      tmux, the adapter writes
- *      `projects[cwd].hasTrustDialogAccepted: true` to `$HOME/.claude.json`
- *      before spawning. Idempotent. No-op for "claude".
+ *   4. Trust pre-seed — enabled by default for headless and tmux sessions,
+ *      the adapter writes `projects[cwd].hasTrustDialogAccepted: true` to
+ *      `$HOME/.claude.json` before spawning. It can cover all worker project
+ *      directories and can be disabled with CLAUDE_TRUST_PRESEED=false.
  *
  * `Bun.spawn` and the synchronous binary-version probe are stubbed so the
  * tests don't actually exec anything; we read the argv off the call args.
@@ -25,17 +25,31 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  unlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  backupMalformedClaudeJson,
   ClaudeAdapter,
+  observeLockOwner,
   parseClaudeBinary,
   parseClaudeBridgeEnabled,
   preseedClaudeTrustDialog,
   resolveClaudeBinary,
   resolveClaudeBinaryArgv,
   resolveClaudeBridgeEnabled,
+  withClaudeJsonLock,
 } from "../providers/claude-adapter";
 import type { ProviderSessionConfig } from "../providers/types";
 
@@ -365,12 +379,274 @@ describe("preseedClaudeTrustDialog", () => {
     expect(afterStat).toBe(beforeStat);
   });
 
-  test("malformed file: starts from {} and writes the entry", async () => {
-    await writeFile(join(homeDir, ".claude.json"), "{ this is not valid json");
+  test("malformed file: backs up the original bytes (renamed, not deleted) and writes the entry fresh", async () => {
+    const malformed = "{ this is not valid json";
+    await writeFile(join(homeDir, ".claude.json"), malformed);
     await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(malformed);
+  });
+
+  test("concurrent preseedClaudeTrustDialog calls for distinct cwds don't lose an update (lost-update regression)", async () => {
+    // Seed pre-existing top-level, non-`projects` fields (mirrors the real
+    // `userID`/`oauthAccount`/`history`-style keys `.claude.json` carries)
+    // before the race — a lost-update bug in the read-merge-write path could
+    // just as easily drop these as it could drop a sibling `projects` entry,
+    // and the review flagged that this test asserted neither.
+    const preExisting = { userID: "keep-me", oauthAccount: { email: "worker@example.com" } };
+    await writeFile(join(homeDir, ".claude.json"), JSON.stringify(preExisting));
+
+    const cwds = Array.from({ length: 12 }, (_, i) => `/abs/concurrent/cwd-${i}`);
+    // Fire all calls concurrently, each seeding a single distinct cwd — this
+    // is the exact race the mkdir-based lock + atomic write exist to close:
+    // without serialization, two overlapping read-merge-write cycles can
+    // each read the same stale document and the later write drops the
+    // earlier caller's entry.
+    await Promise.all(cwds.map((cwd) => preseedClaudeTrustDialog(cwd, homeDir)));
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.userID).toBe(preExisting.userID);
+    expect(data.oauthAccount).toEqual(preExisting.oauthAccount);
+    for (const cwd of cwds) {
+      expect(data.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    }
+  });
+
+  test("invalid `projects` shape (e.g. an array): backs up the original and starts fresh", async () => {
+    const original = JSON.stringify({ userID: "keep-me", projects: [] });
+    await writeFile(join(homeDir, ".claude.json"), original);
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+    // The invalid `projects: []` is discarded (not merged into), but the
+    // original bytes survive as a backup rather than being silently dropped.
+    expect(Array.isArray(data.projects)).toBe(false);
+
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(original);
+  });
+
+  test.each([
+    "[]",
+    "null",
+    "42",
+    '"just a string"',
+  ])("non-object JSON root (%s): backs up the original and starts fresh instead of silently discarding it", async (rawRoot) => {
+    await writeFile(join(homeDir, ".claude.json"), rawRoot);
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+
+    const entries = await readdir(homeDir);
+    const backupName = entries.find((name) => name.startsWith(".claude.json.bak-"));
+    expect(backupName).toBeDefined();
+    expect(await readFile(join(homeDir, backupName as string), "utf-8")).toBe(rawRoot);
+  });
+
+  test("preserves the existing file's permission bits (e.g. 0644) across a rewrite", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    await writeFile(claudeJsonPath, JSON.stringify({ projects: {} }));
+    await chmod(claudeJsonPath, 0o644);
+
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const mode = (await stat(claudeJsonPath)).mode & 0o777;
+    expect(mode).toBe(0o644);
+  });
+
+  test("a brand-new ~/.claude.json defaults to 0600", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const mode = (await stat(claudeJsonPath)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  test("lock timeout: a stuck lock is aborted, never stolen or removed by the timed-out waiter", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const lockPath = `${claudeJsonPath}.lock`;
+    // Simulate another process holding the lock indefinitely.
+    await mkdir(lockPath);
+
+    await expect(preseedClaudeTrustDialog("/abs/cwd/x", homeDir)).rejects.toThrow(
+      /Timed out waiting for/,
+    );
+
+    // The timed-out waiter must never have removed a lock it doesn't own —
+    // otherwise a third writer could interleave with whoever really holds it.
+    const entries = await readdir(homeDir);
+    expect(entries).toContain(".claude.json.lock");
+  }, 10_000);
+
+  test("stale lock recovery: a lock left behind by a crashed holder is stolen, not waited out forever", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const lockPath = `${claudeJsonPath}.lock`;
+    // Simulate a holder that `mkdir`'d the lock and then crashed before ever
+    // reaching the `finally` that removes it. Back-date the lock dir's mtime
+    // well past the staleness threshold so this test doesn't need to sleep
+    // 30s to prove the recovery path.
+    await mkdir(lockPath);
+    const past = new Date(Date.now() - 60_000);
+    await utimes(lockPath, past, past);
+
+    // Resolves promptly (well under the 5s waiter deadline) because the
+    // stale lock gets stolen on the very first EEXIST, not waited out.
+    await preseedClaudeTrustDialog("/abs/cwd/x", homeDir);
+
+    const data = JSON.parse(await readFile(claudeJsonPath, "utf-8"));
+    expect(data.projects["/abs/cwd/x"].hasTrustDialogAccepted).toBe(true);
+    // The stolen lock (renamed aside, then removed) must not still be sitting
+    // at the canonical lock path — a real second holder needs to be able to
+    // acquire it going forward.
+    const entries = await readdir(homeDir);
+    expect(entries).not.toContain(".claude.json.lock");
+  }, 10_000);
+
+  test("arbiter never steals a stale-looking directory: a delayed waiter times out instead of deleting an arbiter it doesn't own", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const arbiterPath = `${claudeJsonPath}.lock.arbiter`;
+    // Simulate another process's arbiter hold that looks abandoned by the
+    // old age threshold (previously 5s) — back-dated well past it so this
+    // test doesn't need to sleep. On the pre-fix code, a waiter here would
+    // `stat` this path, see it as stale, and unlink it by pathname alone —
+    // exactly the ABA-unsafe steal the round-6 review flagged: nothing ties
+    // that unlink to the specific generation the waiter observed, so it can
+    // just as easily delete an arbiter a *different* process created after
+    // the observation. The fix removes stealing entirely: a waiter must
+    // never delete an arbiter path it didn't create itself.
+    await mkdir(arbiterPath);
+    const past = new Date(Date.now() - 60_000);
+    await utimes(arbiterPath, past, past);
+
+    await expect(preseedClaudeTrustDialog("/abs/cwd/x", homeDir)).rejects.toThrow(
+      /Timed out waiting for/,
+    );
+
+    // The arbiter directory must still be exactly the one we created —
+    // never deleted (stolen) and never replaced by the timed-out waiter.
+    const entries = await readdir(homeDir);
+    expect(entries).toContain(".claude.json.lock.arbiter");
+  }, 10_000);
+
+  test("observeLockOwner reads token and age from one coherent generation, immune to a same-path swap mid-read", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const lockPath = `${claudeJsonPath}.lock`;
+    await mkdir(lockPath);
+    const staleToken = crypto.randomUUID();
+    await writeFile(join(lockPath, "owner"), staleToken);
+    const past = new Date(Date.now() - 60_000);
+    await utimes(join(lockPath, "owner"), past, past);
+
+    // Drive the exact interleaving the round-4 review flagged: a fresh
+    // holder replaces the owner file at the same path in the gap between
+    // `open` and the subsequent reads off the returned handle. The old
+    // implementation's separate `stat(lockPath)` + `readFile(lockPath)`
+    // calls would tear across this swap and pair a stale age with a fresh
+    // token; `observeLockOwner` must not.
+    const fsp = await import("node:fs/promises");
+    const realOpen = fsp.open;
+    let swapped = false;
+    const openSpy = spyOn(fsp, "open").mockImplementation((async (
+      ...args: Parameters<typeof realOpen>
+    ) => {
+      const handle = await realOpen(...args);
+      if (!swapped) {
+        swapped = true;
+        await unlink(join(lockPath, "owner")).catch(() => {});
+        await writeFile(join(lockPath, "owner"), crypto.randomUUID());
+      }
+      return handle;
+    }) as typeof realOpen);
+
+    let observed: Awaited<ReturnType<typeof observeLockOwner>>;
+    try {
+      observed = await observeLockOwner(lockPath);
+    } finally {
+      openSpy.mockRestore();
+    }
+
+    // The read must reflect the ORIGINAL (stale) generation in full —
+    // never the fresh token paired with the stale age, or vice versa.
+    expect(observed?.token).toBe(staleToken);
+    expect(observed?.ageMs).toBeGreaterThanOrEqual(59_000);
+  });
+
+  test("a live holder inside fn blocks a concurrent acquirer until it releases (no concurrent critical sections)", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    let cEntered = false;
+    let dEntered = false;
+    let releaseC: () => void = () => {};
+    const cHeld = new Promise<void>((resolve) => {
+      releaseC = resolve;
+    });
+
+    const cPromise = withClaudeJsonLock(claudeJsonPath, async () => {
+      cEntered = true;
+      await cHeld;
+      return "c-done";
+    });
+
+    // Give C a chance to actually acquire the lock before D starts trying.
+    while (!cEntered) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const dPromise = withClaudeJsonLock(claudeJsonPath, async () => {
+      dEntered = true;
+      return "d-done";
+    });
+
+    // While C is still holding the lock (its gate hasn't been released), D
+    // must never have entered `fn` — a successful concurrent entry here is
+    // exactly the double-critical-section bug the round-4 review flagged.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(dEntered).toBe(false);
+
+    releaseC();
+    const [cResult, dResult] = await Promise.all([cPromise, dPromise]);
+    expect(cResult).toBe("c-done");
+    expect(dResult).toBe("d-done");
+    expect(dEntered).toBe(true);
+  }, 10_000);
+});
+
+describe("backupMalformedClaudeJson", () => {
+  let homeDir: string;
+
+  beforeEach(async () => {
+    homeDir = await mkdtemp(join(tmpdir(), "claude-backup-test-"));
+  });
+
+  afterEach(async () => {
+    await chmod(homeDir, 0o700).catch(() => {});
+    await rm(homeDir, { recursive: true, force: true });
+  });
+
+  test("returns false and leaves the original untouched when the rename fails", async () => {
+    const claudeJsonPath = join(homeDir, ".claude.json");
+    const original = "{ not valid json";
+    await writeFile(claudeJsonPath, original);
+    // Deny write on the parent directory so `rename()` (which needs to
+    // remove/add a directory entry) fails with EACCES/EPERM.
+    await chmod(homeDir, 0o500);
+
+    const ok = await backupMalformedClaudeJson(claudeJsonPath, "was malformed JSON");
+
+    await chmod(homeDir, 0o700);
+    expect(ok).toBe(false);
+    expect(await readFile(claudeJsonPath, "utf-8")).toBe(original);
+    const entries = await readdir(homeDir);
+    expect(entries.some((name) => name.startsWith(".claude.json.bak-"))).toBe(false);
   });
 });
 
@@ -382,6 +658,7 @@ describe("CLAUDE_BINARY env override", () => {
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
+  let originalTrustPreseed: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
   let spawnSyncSpy: ReturnType<typeof spyOn>;
@@ -394,10 +671,12 @@ describe("CLAUDE_BINARY env override", () => {
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     originalHome = process.env.HOME;
+    originalTrustPreseed = process.env.CLAUDE_TRUST_PRESEED;
     homeDir = await mkdtemp(join(tmpdir(), "claude-adapter-test-home-"));
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
+    delete process.env.CLAUDE_TRUST_PRESEED;
     delete process.env.CLAUDE_QUEUE_STEERING;
     // Credential check runs before binary resolution; satisfy it.
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
@@ -442,6 +721,11 @@ describe("CLAUDE_BINARY env override", () => {
       delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     } else {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = originalOauthToken;
+    }
+    if (originalTrustPreseed === undefined) {
+      delete process.env.CLAUDE_TRUST_PRESEED;
+    } else {
+      process.env.CLAUDE_TRUST_PRESEED = originalTrustPreseed;
     }
   });
 
@@ -813,6 +1097,7 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
+  let originalTrustPreseed: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
   let spawnSyncSpy: ReturnType<typeof spyOn>;
@@ -823,10 +1108,12 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     originalHome = process.env.HOME;
+    originalTrustPreseed = process.env.CLAUDE_TRUST_PRESEED;
     homeDir = await mkdtemp(join(tmpdir(), "claude-adapter-trust-test-"));
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
+    delete process.env.CLAUDE_TRUST_PRESEED;
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
     spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => makeFakeProc()) as typeof Bun.spawn);
     spawnSyncSpy = mockClaudeVersionProbe();
@@ -861,11 +1148,24 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     } else {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = originalOauthToken;
     }
+    if (originalTrustPreseed === undefined) {
+      delete process.env.CLAUDE_TRUST_PRESEED;
+    } else {
+      process.env.CLAUDE_TRUST_PRESEED = originalTrustPreseed;
+    }
   });
+
+  // Every cwd/trustDirectory below is deliberately placed under /workspace:
+  // `ClaudeAdapter.createSession` now re-canonicalizes `config.cwd` and
+  // `config.trustDirectories` against the CLAUDE_TRUST_PRESEED_ROOT gate
+  // immediately before the write (see the out-of-root regression tests
+  // below for the rejection path), so an out-of-root fixture path here would
+  // silently vanish from `.claude.json` instead of exercising what these
+  // tests are actually about (preseed writing/idempotency/merge behavior).
 
   test("legacy CLAUDE_BINARY writes hasTrustDialogAccepted for config.cwd", async () => {
     process.env.CLAUDE_BINARY = LEGACY_BRIDGE_COMPAT_BINARY;
-    const cwd = "/some/abs/cwd";
+    const cwd = "/workspace/some/abs/cwd";
     const adapter = new ClaudeAdapter();
     await createCompletedSession(adapter, makeConfig({ cwd }));
 
@@ -876,7 +1176,7 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
 
   test("legacy CLAUDE_BINARY command string also triggers the pre-seed", async () => {
     process.env.CLAUDE_BINARY = LEGACY_BRIDGE_COMPAT_COMMAND;
-    const cwd = "/some/other/cwd";
+    const cwd = "/workspace/some/other/cwd";
     const adapter = new ClaudeAdapter();
     await createCompletedSession(adapter, makeConfig({ cwd }));
 
@@ -886,7 +1186,7 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
 
   test("idempotent: re-creating legacy bridge session does not rewrite the file", async () => {
     process.env.CLAUDE_BINARY = LEGACY_BRIDGE_COMPAT_BINARY;
-    const cwd = "/some/abs/cwd";
+    const cwd = "/workspace/some/abs/cwd";
     const adapter = new ClaudeAdapter();
     await createCompletedSession(adapter, makeConfig({ cwd }));
     const first = await readFile(join(homeDir, ".claude.json"), "utf-8");
@@ -900,37 +1200,97 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
       join(homeDir, ".claude.json"),
       JSON.stringify({
         projects: {
-          "/other/cwd": { hasTrustDialogAccepted: true, custom: 1 },
+          "/workspace/other/cwd": { hasTrustDialogAccepted: true, custom: 1 },
         },
       }),
     );
     process.env.CLAUDE_BINARY = LEGACY_BRIDGE_COMPAT_BINARY;
     const adapter = new ClaudeAdapter();
-    await createCompletedSession(adapter, makeConfig({ cwd: "/new/cwd" }));
+    await createCompletedSession(adapter, makeConfig({ cwd: "/workspace/new/cwd" }));
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
-    expect(data.projects["/other/cwd"]).toEqual({ hasTrustDialogAccepted: true, custom: 1 });
-    expect(data.projects["/new/cwd"].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects["/workspace/other/cwd"]).toEqual({
+      hasTrustDialogAccepted: true,
+      custom: 1,
+    });
+    expect(data.projects["/workspace/new/cwd"].hasTrustDialogAccepted).toBe(true);
   });
 
-  test("default CLAUDE_BINARY=claude does NOT touch ~/.claude.json", async () => {
+  test("default headless CLAUDE_BINARY=claude pre-seeds every supplied project directory", async () => {
     delete process.env.CLAUDE_BINARY;
     const adapter = new ClaudeAdapter();
-    await createCompletedSession(adapter, makeConfig({ cwd: "/some/abs/cwd" }));
+    await createCompletedSession(
+      adapter,
+      makeConfig({
+        cwd: "/workspace/some/abs/cwd",
+        trustDirectories: [
+          "/workspace/personal",
+          "/workspace/repo/one",
+          "/workspace/repo/two",
+          "/workspace/some/abs/cwd",
+        ],
+      }),
+    );
 
-    // No .claude.json should have been written.
-    const exists = await Bun.file(join(homeDir, ".claude.json")).exists();
-    expect(exists).toBe(false);
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    for (const directory of [
+      "/workspace/personal",
+      "/workspace/repo/one",
+      "/workspace/repo/two",
+      "/workspace/some/abs/cwd",
+    ]) {
+      expect(data.projects[directory].hasTrustDialogAccepted).toBe(true);
+    }
+  });
+
+  test("CLAUDE_TRUST_PRESEED=false skips the pre-seed", async () => {
+    process.env.CLAUDE_TRUST_PRESEED = "false";
+    const adapter = new ClaudeAdapter();
+    await createCompletedSession(adapter, makeConfig({ cwd: "/workspace/some/abs/cwd" }));
+
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true writes hasTrustDialogAccepted for config.cwd", async () => {
     process.env.SWARM_USE_CLAUDE_BRIDGE = "true";
-    const cwd = "/some/bridge/cwd";
+    const cwd = "/workspace/some/bridge/cwd";
     const adapter = new ClaudeAdapter();
     await createCompletedSession(adapter, makeConfig({ cwd }));
 
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects[cwd].hasTrustDialogAccepted).toBe(true);
     expect(data.projects[cwd].hasCompletedProjectOnboarding).toBe(true);
+  });
+
+  // ─── Out-of-root cwd regression (review finding: raw task cwd bypassed ──
+  // the worker-root gate) ───────────────────────────────────────────────
+
+  test("an out-of-root cwd is never written to .claude.json", async () => {
+    delete process.env.CLAUDE_BINARY;
+    const adapter = new ClaudeAdapter();
+    await createCompletedSession(adapter, makeConfig({ cwd: "/etc" }));
+
+    // No in-root directory was supplied either, so nothing should have been
+    // written at all — not even an empty projects object from a rejected-cwd
+    // no-op call.
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
+  });
+
+  test("an out-of-root cwd is dropped while other in-root trustDirectories still get pre-seeded", async () => {
+    delete process.env.CLAUDE_BINARY;
+    const adapter = new ClaudeAdapter();
+    await createCompletedSession(
+      adapter,
+      makeConfig({
+        cwd: "/etc",
+        trustDirectories: ["/workspace/personal/repos/agent-swarm"],
+      }),
+    );
+
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/etc"]).toBeUndefined();
+    expect(data.projects["/workspace/personal/repos/agent-swarm"].hasTrustDialogAccepted).toBe(
+      true,
+    );
   });
 });

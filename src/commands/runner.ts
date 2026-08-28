@@ -47,6 +47,7 @@ import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
 import { type CredentialSelection, resolveCredentialPools } from "../utils/credentials.ts";
+import { isEnvFlagEnabled } from "../utils/env-flag.ts";
 import {
   isCodexCreditsExhaustedMessage,
   isRateLimitMessage,
@@ -62,6 +63,7 @@ import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
 import { isSteeringEnabled } from "../utils/steering-enabled.ts";
 import { interpolate } from "../utils/template.ts";
+import { CLAUDE_TRUST_PRESEED_ROOT, canonicalizeTrustDirectory } from "../utils/trust-directory.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
 import { validateJsonSchema } from "../workflows/json-schema-validator.ts";
 import { buildContextPreamble, buildResumeContextPreamble } from "./context-preamble.ts";
@@ -178,6 +180,53 @@ async function fetchRepoConfig(
   } catch {
     return null;
   }
+}
+
+/** Return every registered clone path so Claude trust can be pre-seeded per exact cwd. */
+export async function fetchRegisteredRepoClonePaths(
+  apiUrl: string,
+  apiKey: string,
+): Promise<string[]> {
+  try {
+    const resp = await fetch(`${apiUrl}/api/repos`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!resp.ok) return [];
+    const data = (await resp.json()) as { repos?: Array<{ clonePath?: string }> };
+    return (data.repos ?? []).flatMap((repo) => (repo.clonePath ? [repo.clonePath] : []));
+  } catch {
+    return [];
+  }
+}
+
+// Re-exported for existing callers/tests that import the trust-directory
+// gate from the runner; the implementation lives in a dependency-free shared
+// util (`src/utils/trust-directory.ts`) so `claude-adapter.ts` can also
+// re-validate at the point of use without risking a circular import back
+// through `provider-credentials.ts` → `claude-adapter.ts` → `runner.ts`.
+export { canonicalizeTrustDirectory, CLAUDE_TRUST_PRESEED_ROOT };
+
+/**
+ * Build the canonicalized, worker-root-restricted list of directories Claude
+ * should treat as pre-trusted for this session (see
+ * `canonicalizeTrustDirectory`).
+ */
+export async function resolveTrustDirectories(
+  apiUrl: string,
+  apiKey: string,
+  cwd: string,
+): Promise<string[]> {
+  const candidates = [
+    process.cwd(),
+    cwd,
+    "/workspace",
+    "/workspace/personal",
+    ...(await fetchRegisteredRepoClonePaths(apiUrl, apiKey)),
+  ];
+  const resolved = await Promise.all(
+    candidates.map((candidate) => canonicalizeTrustDirectory(candidate)),
+  );
+  return [...new Set(resolved.filter((dir): dir is string => dir !== null))];
 }
 
 /** Read CLAUDE.md from a repo directory, returning null if not found */
@@ -659,7 +708,35 @@ export interface ResolvedEnvResult {
    * takes effect on the worker.
    */
   resolvedProvider: ProviderName;
+  /**
+   * RELOADABLE_ENV_KEYS entries that had a live swarm_config row this round
+   * (after BLANK_ROW_IS_STRAY_KEYS filtering). Lets
+   * `applyResolvedEnvToProcessEnv` tell "no row exists" apart from "we didn't
+   * ask" so a deleted row can restore the boot baseline instead of staying
+   * pinned to whatever a prior reload wrote.
+   *
+   * `undefined` means this round's config fetch was NOT authoritative (HTTP
+   * failure, network/parse error) — as opposed to an authoritative fetch
+   * that legitimately found zero reloadable rows. `applyResolvedEnvToProcessEnv`
+   * treats `undefined` the same as "don't reset anything", so a transient
+   * outage can never masquerade as every operator setting being deleted.
+   */
+  configuredReloadableKeys: ReadonlySet<string> | undefined;
 }
+
+/**
+ * `process.env` as the container/CLI (and any `.env` file Bun auto-loads)
+ * provided it, captured at module load — before the runner ever mutates it
+ * via `applyResolvedEnvToProcessEnv`. Used as the restore target when a
+ * RELOADABLE_ENV_KEYS swarm_config row is deleted: without this, the next
+ * `fetchResolvedEnv(..., process.env, ...)` call would copy the *live*
+ * (already-mutated) `process.env` as its base, and a stored `false` for e.g.
+ * `CLAUDE_TRUST_PRESEED` would survive its own reset instead of falling back
+ * to the boot env / documented default.
+ */
+export const BOOT_ENV_SNAPSHOT: Readonly<Record<string, string | undefined>> = Object.freeze({
+  ...process.env,
+});
 
 export async function fetchResolvedEnv(
   apiUrl: string,
@@ -670,6 +747,11 @@ export async function fetchResolvedEnv(
 ): Promise<ResolvedEnvResult> {
   const env: Record<string, string | undefined> = { ...baseEnv };
   let scriptsOnlyConfigValue: string | undefined;
+  // Stays `undefined` (non-authoritative) unless the fetch actually
+  // completes with an HTTP-ok response — see the field doc on
+  // `ResolvedEnvResult.configuredReloadableKeys` for why that distinction
+  // matters to `applyResolvedEnvToProcessEnv`.
+  let configuredReloadableKeys: Set<string> | undefined;
 
   if (apiUrl && agentId) {
     try {
@@ -682,6 +764,7 @@ export async function fetchResolvedEnv(
       if (!response.ok) {
         console.warn(`[env-reload] Failed to fetch config: ${response.status}`);
       } else {
+        configuredReloadableKeys = new Set<string>();
         const data = (await response.json()) as {
           configs: Array<{ key: string; value: string }>;
         };
@@ -718,12 +801,20 @@ export async function fetchResolvedEnv(
               continue;
             }
             env[config.key] = config.value;
+            if (RELOADABLE_ENV_KEYS.has(config.key)) {
+              configuredReloadableKeys.add(config.key);
+            }
           }
           console.log(`[env-reload] Loaded ${data.configs.length} config entries from API`);
         }
       }
     } catch (error) {
       console.warn(`[env-reload] Could not fetch config, using current env: ${error}`);
+      // Reset even though the `response.ok` branch above may have already
+      // allocated the Set: a `response.json()` parse failure throws AFTER
+      // that point, and a partially-built (or empty) Set here would read as
+      // an authoritative "nothing configured" to `applyResolvedEnvToProcessEnv`.
+      configuredReloadableKeys = undefined;
     }
   }
 
@@ -749,7 +840,13 @@ export async function fetchResolvedEnv(
     model: effectiveModel,
   });
 
-  return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
+  return {
+    env,
+    credentialSelections,
+    resolvedProvider,
+    scriptsOnlyConfigValue,
+    configuredReloadableKeys,
+  };
 }
 
 async function ensureAgentFsCredentials(
@@ -849,6 +946,7 @@ export const RELOADABLE_ENV_KEYS: ReadonlySet<string> = new Set([
   "TEMPLATE_REGISTRY_URL",
   "SLACK_DISABLE",
   "SWARM_ORG_NAME",
+  "CLAUDE_TRUST_PRESEED",
 ]);
 
 /**
@@ -878,9 +976,20 @@ const BLANK_ROW_IS_STRAY_KEYS: ReadonlySet<string> = new Set([
 /**
  * Apply a fresh resolved env to `process.env` for keys safe to mutate live.
  * Returns the list of keys that actually changed (useful for logging).
+ *
+ * `configuredReloadableKeys`, when passed (real runtime callers — see
+ * `fetchResolvedEnv`), is the set of RELOADABLE_ENV_KEYS with a live
+ * swarm_config row THIS round. A key that drops out of that set (its row was
+ * deleted — a UI "Reset") is restored to the `BOOT_ENV_SNAPSHOT` baseline
+ * here, rather than left at whatever a PRIOR reload wrote into
+ * `process.env`; without this, e.g. `CLAUDE_TRUST_PRESEED=false` would stay
+ * stuck after being reset. Omitting the argument (the original two unit
+ * tests below) preserves the old "never touch a key freshEnv doesn't
+ * mention" behavior.
  */
 export function applyResolvedEnvToProcessEnv(
   freshEnv: Record<string, string | undefined>,
+  configuredReloadableKeys?: ReadonlySet<string>,
 ): string[] {
   const changed: string[] = [];
   for (const key of RELOADABLE_ENV_KEYS) {
@@ -896,6 +1005,19 @@ export function applyResolvedEnvToProcessEnv(
       // trace in the logs).
       if (previous && !next) {
         console.warn(`[env-reload] ${key} cleared: was set, swarm_config reload blanked it`);
+      }
+      continue;
+    }
+    if (configuredReloadableKeys && !configuredReloadableKeys.has(key)) {
+      const bootValue = BOOT_ENV_SNAPSHOT[key];
+      if (process.env[key] !== bootValue) {
+        if (bootValue === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = bootValue;
+        }
+        changed.push(key);
+        console.log(`[env-reload] ${key} reset: swarm_config row removed, restored boot baseline`);
       }
     }
   }
@@ -3342,6 +3464,14 @@ async function spawnProviderProcess(
     apiUrl: opts.apiUrl,
     apiKey: opts.apiKey,
     cwd: opts.cwd || process.cwd(),
+    // Repo-clone-path enumeration is Claude-specific (only ClaudeAdapter reads
+    // `trustDirectories`) and only useful when the pre-seed is on — gate both
+    // so codex/opencode/pi sessions, and Claude sessions with
+    // CLAUDE_TRUST_PRESEED=false, never pay for the extra `/api/repos` fetch.
+    trustDirectories:
+      opts.harnessProvider === "claude" && isEnvFlagEnabled("CLAUDE_TRUST_PRESEED", true, freshEnv)
+        ? await resolveTrustDirectories(opts.apiUrl, opts.apiKey, opts.cwd || process.cwd())
+        : undefined,
     vcsRepo: opts.vcsRepo,
     logFile: opts.logFile,
     additionalArgs: opts.additionalArgs,
@@ -4490,7 +4620,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     // below. Otherwise a dashboard-saved value only lands at the first
     // poll-loop reconciliation — after the startup telemetry event and the
     // one-time template fetch have already read the deployment env.
-    const bootApplied = applyResolvedEnvToProcessEnv(bootEnv.env);
+    const bootApplied = applyResolvedEnvToProcessEnv(bootEnv.env, bootEnv.configuredReloadableKeys);
     if (bootApplied.length > 0) {
       console.log(`[runner] Applied resolved swarm config at boot: ${bootApplied.join(", ")}`);
     }
@@ -4788,6 +4918,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     freshEnv: Record<string, string | undefined>,
     resolvedProvider: ProviderName,
     nextScriptsOnly: boolean,
+    configuredReloadableKeys?: ReadonlySet<string>,
   ): Promise<{ agentVisibleChanged: boolean }> => {
     let agentVisibleChanged = false;
     let promptRebuiltForProvider = false;
@@ -4854,7 +4985,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     }
 
     // (3) Apply the small allowlist of safe-to-mutate env keys to process.env.
-    const changedKeys = applyResolvedEnvToProcessEnv(freshEnv);
+    const changedKeys = applyResolvedEnvToProcessEnv(freshEnv, configuredReloadableKeys);
     if (changedKeys.length > 0) {
       console.log(`[${role}] [env-reload] Updated process.env: ${changedKeys.join(", ")}`);
     }
@@ -4958,11 +5089,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
         // the wait pivots the credential predicate (and onwards).
         getProvider: () => state.harnessProvider,
         refreshEnv: async () => {
-          const { env, resolvedProvider, scriptsOnlyConfigValue } = await fetchResolvedEnv(
-            apiUrl,
-            apiKey,
-            agentId,
-          );
+          const { env, resolvedProvider, scriptsOnlyConfigValue, configuredReloadableKeys } =
+            await fetchResolvedEnv(apiUrl, apiKey, agentId);
           const nextScriptsOnly = resolveScriptsOnlyMode({
             env: process.env.SCRIPTS_ONLY_MCP,
             configValue: scriptsOnlyConfigValue,
@@ -4974,6 +5102,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
             env,
             resolvedProvider,
             nextScriptsOnly,
+            configuredReloadableKeys,
           );
           if (agentVisibleChanged) {
             // Fire-and-forget — dashboard reflects the live values, the
@@ -5631,6 +5760,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           env: freshEnv,
           resolvedProvider,
           scriptsOnlyConfigValue,
+          configuredReloadableKeys,
         } = await fetchResolvedEnv(apiUrl, apiKey, agentId);
         const nextScriptsOnly = resolveScriptsOnlyMode({
           env: process.env.SCRIPTS_ONLY_MCP,
@@ -5640,6 +5770,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           freshEnv,
           resolvedProvider,
           nextScriptsOnly,
+          configuredReloadableKeys,
         );
         if (
           agentVisibleChanged ||

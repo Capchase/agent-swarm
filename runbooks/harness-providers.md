@@ -232,6 +232,17 @@ Internal refactors that don't change observable behavior don't need a doc update
 7. Add adapter tests for advertised steering modes and SDK rejection.
 8. Verify the docs build per [docs-site/CLAUDE.md](../docs-site/CLAUDE.md).
 
+## Claude trust pre-seed (`CLAUDE_TRUST_PRESEED`)
+
+Every `HARNESS_PROVIDER=claude` session (headless, legacy tmux-bridge, and `claude-bridge` alike — not just the tmux-based paths) pre-seeds Claude Code's per-project trust dialog ("Quick safety check: Is this a project you trust?") before spawning the binary, so a first-run prompt never blocks a headless/tmux session with no way to answer it.
+
+- **Default on.** Disable per session with `CLAUDE_TRUST_PRESEED=false` (env, or the usual swarm_config overlay precedence via `isEnvFlagEnabled`). When disabled, `createSession` skips both the directory-resolution fetch and the pre-seed write entirely — no `/api/repos` call is made.
+- **Multi-directory, not single-`cwd`.** `resolveTrustDirectories` (`src/commands/runner.ts`) builds the candidate list: `process.cwd()`, the task's `cwd`, the fixed worker roots `/workspace` and `/workspace/personal`, and every registered repo's clone path fetched from `/api/repos`. That list flows into `ProviderSessionConfig.trustDirectories`, and `ClaudeAdapter.createSession` re-adds `config.cwd` and re-resolves the whole set immediately before writing — a symlink can be swapped between the runner's earlier resolution and this actual use (TOCTOU), so re-validating at the point of use is required, not just convenient. Claude Code matches trust on the exact cwd string (`projects["<cwd>"]`), so every directory a worker session can start in needs its own entry; a parent directory does not cover a subdirectory.
+- **Workspace-root restriction + canonicalization.** `canonicalizeTrustDirectory` (`src/utils/trust-directory.ts`) resolves each candidate to a real path (walking up to the nearest existing ancestor and `realpath`-ing that when the leaf doesn't exist yet, e.g. a repo not yet cloned) and drops anything that doesn't resolve under `/workspace` (`CLAUDE_TRUST_PRESEED_ROOT`). A task-controlled `clonePath` or `cwd` of `/etc`, or a symlink escaping the workspace root, is rejected rather than silently pre-trusted; the rejection is logged as a warning, not thrown.
+- **The write.** `preseedClaudeTrustDialog` (`src/providers/claude-adapter.ts`) read-merge-writes `$HOME/.claude.json`, setting `projects[dir].hasTrustDialogAccepted = true` and `hasCompletedProjectOnboarding = true` for every canonicalized directory in one pass. It's idempotent (no write when everything's already trusted), preserves the file's existing permission mode and every other top-level key (`userID`, `oauthAccount`, `history`, …), and backs up (never silently discards) a malformed or wrong-shaped existing file before starting fresh.
+- **Locking.** The read-merge-write is serialized across concurrent callers by a cross-process `mkdir`-based lock (`withClaudeJsonLock`) — every task's Claude session calls the pre-seed, so two sessions writing distinct directories concurrently is the normal case, not an edge case. A holder that crashes without releasing is reclaimed once its lock is stale; every creation, reclaim, and release of the lock is serialized behind a separate short-lived arbiter mutex so an in-flight reclaim can't be raced by a concurrent acquisition or another reclaim (closing the ABA and lost-update races a bare rename-based reclaim is prone to).
+- **Best-effort.** A pre-seed failure (lock timeout, canonicalization rejecting every candidate, a write error) is logged as a warning and never fails the session.
+
 ## Alt-binary: claude-bridge (subscription-pool variant)
 
 User-facing guide: [docs-site/.../guides/claude-bridge-experimental.mdx](../docs-site/content/docs/(documentation)/guides/claude-bridge-experimental.mdx). Engineering notes below.
@@ -266,12 +277,7 @@ The published npm package is `@desplega.ai/claude-bridge`; version `0.1.13` is p
 
 ### Prompt pre-clear
 
-The adapter runs the same `$HOME/.claude.json` project trust pre-seed for
-bridge mode that it uses for the legacy bridge compatibility path before
-spawning the binary. This is required because bridge mode launches interactive
-Claude Code inside `tmux`; if Claude hits the first-run "is this a project you
-trust?" prompt before the bridge is ready, the pane can exit or hang with no
-useful stderr.
+The adapter runs the same `$HOME/.claude.json` project trust pre-seed described in [Claude trust pre-seed](#claude-trust-pre-seed-claude_trust_preseed) above before spawning the binary. This matters especially for bridge mode, which launches interactive Claude Code inside `tmux`: if Claude hits the first-run "is this a project you trust?" prompt before the bridge is ready, the pane can exit or hang with no useful stderr.
 
 claude-bridge also handles first-run blocking prompts itself after startup:
 
@@ -300,7 +306,7 @@ The resolved raw string is parsed by `parseClaudeBinary`: trim + whitespace-spli
 | legacy bridge package command | deprecated no-install form |
 | legacy bridge npm command | deprecated npm form |
 
-The legacy compatibility gates remain unchanged: tmux fail-fast plus the shared `preseedClaudeTrustDialog(cwd, homeDir?)` helper, which writes `$HOME/.claude.json` to set `projects[cwd].hasTrustDialogAccepted = true` and `hasCompletedProjectOnboarding = true`. The helper is idempotent and read-merge-write. Bun's `os.homedir()` caches the real passwd entry and ignores `process.env.HOME` mutations, so the helper defaults to `process.env.HOME ?? homedir()` for testability.
+The legacy compatibility gates remain unchanged: tmux fail-fast plus the shared `preseedClaudeTrustDialog(directories, homeDir?)` helper described above. Bun's `os.homedir()` caches the real passwd entry and ignores `process.env.HOME` mutations, so the helper defaults to `process.env.HOME ?? homedir()` for testability.
 
 ### Auth
 
