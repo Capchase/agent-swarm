@@ -28,6 +28,7 @@ import { getTaskLink, MAX_SECTION_LENGTH } from "../slack/blocks";
 import {
   _resetSlackRenderV2ForTests,
   callSlackWithRetry,
+  childOutcomeContent,
   ensureSlackThreadTree,
   formatV2Duration,
   isSlackRenderV2Enabled,
@@ -1811,6 +1812,51 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     await processSlackRenderV2();
 
     expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+  });
+
+  test("re-reads slackReplySent inside streamOutcomeCard so a child card doesn't duplicate a late Slack reply", async () => {
+    const lead = await createAgent({
+      name: "Child Stale Snapshot Lead",
+      isLead: true,
+      status: "idle",
+    });
+    const worker = await createAgent({
+      name: "Child Stale Snapshot Worker",
+      isLead: false,
+      status: "idle",
+    });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CHILD_STALE_SNAPSHOT");
+    const ask = await createTaskExtended("ask with a child whose reply lands before its card", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const tree = await ensureSlackThreadTree([ask.id]);
+    const child = await createTaskExtended("child whose reply lands before its card", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "PRIVATE CHILD OUTPUT THAT MUST NOT DUPLICATE THE REPLY");
+    // Simulate the render loop's tick-start snapshot: fetched before slack-reply
+    // committed, same technique as the ask-level "stale snapshot" test above.
+    const staleChildSnapshot = { ...(await getTaskById(child.id))!, slackReplySent: false };
+    await markTaskSlackReplySent(child.id);
+    calls.length = 0;
+
+    const outcome = await streamOutcomeCard(staleChildSnapshot, tree!, {
+      buildContent: childOutcomeContent,
+    });
+
+    const started = calls.find((call) => call.method === "chat.startStream");
+    expect(started?.payload.markdown_text).toBe(`↳ ✅ ${worker.name} completed`);
+    expect(started?.payload.markdown_text).not.toContain("PRIVATE CHILD OUTPUT");
+    expect(outcome?.finalizedAt).toBeDefined();
   });
 
   test("5 simultaneous children post 3 then 2 across 2 ticks", async () => {

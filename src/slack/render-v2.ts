@@ -672,11 +672,23 @@ async function agentDisplayNameFor(task: AgentTask): Promise<string> {
  * A delegated (non-ask) task's own result card: `↳ ✅ <agent> — result` or
  * `↳ ❌ <agent> — failed`, per plan section 3.4. Eligibility already limits
  * callers to `completed` / `failed` children, so no cancelled/other branch.
+ *
+ * `slackReplySent` here is the fresh DB read `streamOutcomeCard` takes right
+ * before calling this, not the caller's tick-start snapshot: if `slack-reply`
+ * commits between the eligibility check and this call, the full result has
+ * already gone out by hand and this card must collapse rather than repeat it,
+ * mirroring `outcomeContent`'s slackReplySent branch above.
  */
-async function childOutcomeContent(task: AgentTask, _slackReplySent: boolean): Promise<string> {
+export async function childOutcomeContent(
+  task: AgentTask,
+  slackReplySent: boolean,
+): Promise<string> {
   const agentName = await agentDisplayNameFor(task);
   if (task.status === "failed") {
     return `↳ ❌ ${agentName} — failed\n\n${outcomeText(task.failureReason, "Task failed.")}`;
+  }
+  if (slackReplySent) {
+    return `↳ ✅ ${agentName} completed`;
   }
   return `↳ ✅ ${agentName} — result\n\n${outcomeText(task.output, "Task completed.")}`;
 }
