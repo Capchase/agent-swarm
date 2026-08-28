@@ -40,7 +40,7 @@ export async function finalizeSlackMessageReaction(
   client: SlackReactionClient,
   channel: string,
   timestamp: string,
-  outcome: "white_check_mark" | "x",
+  outcome: "white_check_mark" | "x" | "warning",
 ): Promise<void> {
   for (const name of ["eyes", "heavy_plus_sign", "zap", "speech_balloon"]) {
     try {
