@@ -4,8 +4,8 @@ import {
   cancelTask,
   closeDb,
   completeTask,
-  createLogEntry,
   createAgent,
+  createLogEntry,
   createTaskExtended,
   ensureSlackDelegationActivation,
   ensureSlackRenderV2Activation,
@@ -1979,19 +1979,26 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     const worker = await createAgent({ name: "Legacy Worker", isLead: false, status: "idle" });
     const { channelId, threadTs } = uniqueSlackAddress("C_LEGACY_ACTIVATION");
     const ask = await createTaskExtended("legacy ask", {
-      agentId: lead.id, source: "slack", slackChannelId: channelId, slackThreadTs: threadTs,
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
       contextKey: slackContextKey({ channelId, threadTs }),
     });
     await startTask(ask.id);
     const child = await createTaskExtended("legacy child", {
-      agentId: worker.id, source: "mcp", parentTaskId: ask.id, followUpConfig: { disabled: true },
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
     });
     await startTask(child.id);
     await completeTask(child.id, "Legacy child result.");
     await completeTask(ask.id, "Legacy ask result.");
-    await getDbClient().run(`UPDATE slack_render_v2_state SET delegation_activated_at = ? WHERE id = 1`, [
-      "2099-01-01T00:00:00.000Z",
-    ]);
+    await getDbClient().run(
+      `UPDATE slack_render_v2_state SET delegation_activated_at = ? WHERE id = 1`,
+      ["2099-01-01T00:00:00.000Z"],
+    );
 
     await processSlackRenderV2();
     expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeDefined();
@@ -2199,12 +2206,19 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     const { channelId, threadTs } = uniqueSlackAddress("C_CANCELLED_MEMBER");
     const triggerTs = `${slackAddressSequence}.9`;
     const ask = await createTaskExtended("cancelled member ask", {
-      agentId: lead.id, source: "slack", slackChannelId: channelId, slackThreadTs: threadTs,
-      slackTriggerMessageTs: triggerTs, contextKey: slackContextKey({ channelId, threadTs }),
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
     });
     await startTask(ask.id);
     const child = await createTaskExtended("cancelled member", {
-      agentId: worker.id, source: "mcp", parentTaskId: ask.id, followUpConfig: { disabled: true },
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
     });
     await cancelTask(child.id, "No longer needed.");
     await completeTask(ask.id, "Ask completed.");
@@ -2215,7 +2229,9 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     expect(await getSlackOutcomeMessage(child.id)).toBeNull();
     expect((await getSlackOutcomeMessage(ask.id))?.conclusionKind).toBe("complete");
     const conclusion = calls.find(
-      (call) => call.method === "chat.startStream" && String(call.payload.markdown_text).includes("**Results**"),
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
     );
     expect(String(conclusion?.payload.markdown_text)).toContain("Cancel Worker");
     expect(calls).toContainEqual({
@@ -2226,7 +2242,11 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
 
   test("a deferred conclusion finalizes the acknowledgement reaction on a steer message", async () => {
     const lead = await createAgent({ name: "Steer Reaction Lead", isLead: true, status: "idle" });
-    const worker = await createAgent({ name: "Steer Reaction Worker", isLead: false, status: "idle" });
+    const worker = await createAgent({
+      name: "Steer Reaction Worker",
+      isLead: false,
+      status: "idle",
+    });
     const { channelId, threadTs } = uniqueSlackAddress("C_STEER_REACTION");
     const ask = await createTaskExtended("steer reaction ask", {
       agentId: lead.id,
@@ -2260,7 +2280,11 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
 
     expect(calls).toContainEqual({
       method: "reactions.add",
-      payload: { channel: channelId, name: "white_check_mark", timestamp: `${slackAddressSequence}.8` },
+      payload: {
+        channel: channelId,
+        name: "white_check_mark",
+        timestamp: `${slackAddressSequence}.8`,
+      },
     });
   });
 
@@ -2591,7 +2615,9 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
       ),
     ).toHaveLength(4);
     const conclusion = calls.find(
-      (call) => call.method === "chat.startStream" && String(call.payload.markdown_text).includes("**Results**"),
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
     );
     expect(conclusion).toBeDefined();
     for (const child of children) {

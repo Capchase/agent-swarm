@@ -1210,7 +1210,8 @@ export async function processSlackRenderV2(): Promise<void> {
       // uncarded even though the closure itself is otherwise settled.
       let childCardPending = false;
       for (const member of closure) {
-        if (!isChildCardCandidate(member, delegationActivatedAt!) || member.slackReplySent) continue;
+        if (!isChildCardCandidate(member, delegationActivatedAt!) || member.slackReplySent)
+          continue;
         if (!(await getSlackOutcomeMessage(member.id))?.finalizedAt) {
           childCardPending = true;
           break;
