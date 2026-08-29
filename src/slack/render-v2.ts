@@ -648,6 +648,10 @@ function isOutcomeStatus(
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
+function isAskOutcomeStatus(status: AgentTask["status"]): boolean {
+  return isOutcomeStatus(status) || status === "in_progress";
+}
+
 function outcomeText(value: string | null | undefined, fallback: string): string {
   return value?.trim() ? value : fallback;
 }
@@ -716,7 +720,9 @@ function isChildCardCandidate(task: AgentTask, delegationActivatedAt: string): b
 }
 
 function taskNeedsAskOutcome(task: AgentTask, activatedAt: string): boolean {
-  return task.source === "slack" && isOutcomeStatus(task.status) && task.createdAt >= activatedAt;
+  return (
+    task.source === "slack" && isAskOutcomeStatus(task.status) && task.createdAt >= activatedAt
+  );
 }
 
 /**
@@ -946,7 +952,13 @@ export async function streamOutcomeCard(
   },
 ): Promise<SlackMessageRecord | null> {
   const app = getSlackApp();
-  if (!app || !task.slackChannelId || !task.slackThreadTs || !isOutcomeStatus(task.status))
+  const allowInProgress = options?.conclusionKind === "timeout";
+  if (
+    !app ||
+    !task.slackChannelId ||
+    !task.slackThreadTs ||
+    (!isOutcomeStatus(task.status) && !(allowInProgress && task.status === "in_progress"))
+  )
     return null;
   const existing = await getSlackOutcomeMessage(task.id);
   if (existing?.finalizedAt) return existing;
@@ -1096,7 +1108,10 @@ export async function processSlackRenderV2(): Promise<void> {
     let needsOutcome = false;
     for (const task of tasks) {
       if ((await getSlackOutcomeMessage(task.id))?.finalizedAt) continue;
-      const isAskCandidate = taskNeedsAskOutcome(task, activatedAt);
+      // In-progress asks are eligible only for the timeout backstop. They do
+      // not represent immediately active outcome work, so avoid waking an old
+      // tree solely to verify its permalink on every render tick.
+      const isAskCandidate = taskNeedsAskOutcome(task, activatedAt) && isOutcomeStatus(task.status);
       const isChildCandidate =
         delegationEnabled &&
         delegationActivatedAt !== null &&
@@ -1167,8 +1182,10 @@ export async function processSlackRenderV2(): Promise<void> {
       if ((await getSlackOutcomeMessage(task.id))?.finalizedAt) continue;
       if (!delegationEnabled || delegationActivatedAt === null) continue;
       if (!isChildCardCandidate(task, delegationActivatedAt) || task.slackReplySent) continue;
-      if (childCardsThisTick >= CHILD_CARDS_PER_TICK) continue;
       const askId = ownerAskId.get(task.id);
+      const ownerAsk = askId ? tasks.find((candidate) => candidate.id === askId) : undefined;
+      if (!ownerAsk || ownerAsk.createdAt < delegationActivatedAt) continue;
+      if (childCardsThisTick >= CHILD_CARDS_PER_TICK) continue;
       if (askId && (await childCardCountFor(askId)) >= CHILD_CARDS_PER_ASK) continue;
       try {
         const outcome = await streamOutcomeCard(task, tree, { buildContent: childOutcomeContent });
@@ -1187,7 +1204,7 @@ export async function processSlackRenderV2(): Promise<void> {
       if (!isSlackRenderV2Enabled()) return;
       if (task.source !== "slack") continue;
       if ((await getSlackOutcomeMessage(task.id))?.finalizedAt) continue;
-      if (!isOutcomeStatus(task.status) || task.createdAt < activatedAt) continue;
+      if (!isAskOutcomeStatus(task.status) || task.createdAt < activatedAt) continue;
       const deferByClosure =
         delegationEnabled &&
         delegationActivatedAt !== null &&
@@ -1209,9 +1226,13 @@ export async function processSlackRenderV2(): Promise<void> {
       // child has its card. The per-tick cap may leave overflow children
       // uncarded even though the closure itself is otherwise settled.
       let childCardPending = false;
+      const existingChildCards = await childCardCountFor(task.id);
       for (const member of closure) {
         if (!isChildCardCandidate(member, delegationActivatedAt!) || member.slackReplySent)
           continue;
+        // Once the per-ask cap is reached, remaining terminal children are
+        // represented in the conclusion digest rather than blocking it.
+        if (existingChildCards >= CHILD_CARDS_PER_ASK) break;
         if (!(await getSlackOutcomeMessage(member.id))?.finalizedAt) {
           childCardPending = true;
           break;
