@@ -4,6 +4,7 @@ import {
   cancelTask,
   closeDb,
   completeTask,
+  createLogEntry,
   createAgent,
   createTaskExtended,
   ensureSlackDelegationActivation,
@@ -2166,6 +2167,46 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
       payload: { channel: channelId, name: "x", timestamp: triggerTs },
     });
     expect((await getSlackOutcomeMessage(ask.id))?.conclusionKind).toBe("complete");
+  });
+
+  test("a deferred conclusion finalizes the acknowledgement reaction on a steer message", async () => {
+    const lead = await createAgent({ name: "Steer Reaction Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Steer Reaction Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_STEER_REACTION");
+    const ask = await createTaskExtended("steer reaction ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: `${slackAddressSequence}.9`,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("steer reaction child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "Child result.");
+    await completeTask(ask.id, "Ask result.");
+    await createLogEntry({
+      eventType: "task_steering",
+      taskId: ask.id,
+      newValue: "slack_reaction",
+      metadata: { slackChannelId: channelId, slackMessageTs: `${slackAddressSequence}.8` },
+    });
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "white_check_mark", timestamp: `${slackAddressSequence}.8` },
+    });
   });
 
   test("an abandoned child idle past the timeout concludes with timeout, warning, and the member listed", async () => {

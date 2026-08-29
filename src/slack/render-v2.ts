@@ -27,7 +27,11 @@ import { slackContextKey } from "../tasks/context-key";
 import type { AgentTask, TaskAttachment } from "../types";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { taskAttachmentDisplayUrl } from "../utils/task-attachment-links";
-import { finalizeSlackMessageReaction, finalizeTerminalSlackReactions } from "./ack";
+import {
+  finalizeSlackMessageReaction,
+  finalizeSlackSteerReactions,
+  finalizeTerminalSlackReactions,
+} from "./ack";
 import { getSlackApp } from "./app";
 import {
   getTaskLink,
@@ -1212,12 +1216,14 @@ export async function processSlackRenderV2(): Promise<void> {
         if (outcome) {
           const app = getSlackApp();
           if (app && task.slackChannelId && task.slackTriggerMessageTs) {
+            const reactionOutcome = conclusionReactionOutcome(state, task, closure);
             await finalizeSlackMessageReaction(
               app.client,
               task.slackChannelId,
               task.slackTriggerMessageTs,
-              conclusionReactionOutcome(state, task, closure),
+              reactionOutcome,
             );
+            await finalizeSlackSteerReactions([task], () => reactionOutcome);
           }
           await recordSlackDelivery(
             task,
