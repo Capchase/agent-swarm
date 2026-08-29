@@ -1974,6 +1974,30 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     expect(await getSlackOutcomeMessage(child.id)).toBeNull();
   });
 
+  test("does not apply delegation cards to tasks created before activation", async () => {
+    const lead = await createAgent({ name: "Legacy Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Legacy Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_LEGACY_ACTIVATION");
+    const ask = await createTaskExtended("legacy ask", {
+      agentId: lead.id, source: "slack", slackChannelId: channelId, slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("legacy child", {
+      agentId: worker.id, source: "mcp", parentTaskId: ask.id, followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "Legacy child result.");
+    await completeTask(ask.id, "Legacy ask result.");
+    await getDbClient().run(`UPDATE slack_render_v2_state SET delegation_activated_at = ? WHERE id = 1`, [
+      "2099-01-01T00:00:00.000Z",
+    ]);
+
+    await processSlackRenderV2();
+    expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeDefined();
+    expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+  });
+
   test("acceptance: 1 ask + 2 completed mcp children yields exactly 2 finalized child rows and 2 slack_delivery logs; re-tick adds nothing", async () => {
     const lead = await createAgent({ name: "Acceptance T3 Lead", isLead: true, status: "idle" });
     const workerA = await createAgent({
@@ -2167,6 +2191,37 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
       payload: { channel: channelId, name: "x", timestamp: triggerTs },
     });
     expect((await getSlackOutcomeMessage(ask.id))?.conclusionKind).toBe("complete");
+  });
+
+  test("cancelled closure members have no card, appear in Results, and do not fail the conclusion", async () => {
+    const lead = await createAgent({ name: "Cancel Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Cancel Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CANCELLED_MEMBER");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("cancelled member ask", {
+      agentId: lead.id, source: "slack", slackChannelId: channelId, slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs, contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("cancelled member", {
+      agentId: worker.id, source: "mcp", parentTaskId: ask.id, followUpConfig: { disabled: true },
+    });
+    await cancelTask(child.id, "No longer needed.");
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+    expect((await getSlackOutcomeMessage(ask.id))?.conclusionKind).toBe("complete");
+    const conclusion = calls.find(
+      (call) => call.method === "chat.startStream" && String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(String(conclusion?.payload.markdown_text)).toContain("Cancel Worker");
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },
+    });
   });
 
   test("a deferred conclusion finalizes the acknowledgement reaction on a steer message", async () => {
@@ -2488,5 +2543,61 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     expect(conclusionStream).toBeDefined();
     expect(String(conclusionStream?.payload.markdown_text)).toContain(childCard!.permalink);
     expect(String(conclusionStream?.payload.markdown_text)).not.toContain(getTaskLink(child.id));
+  });
+
+  test("defers a conclusion until overflow child cards are posted", async () => {
+    const lead = await createAgent({ name: "Overflow Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Overflow Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_OVERFLOW_ORDER");
+    const ask = await createTaskExtended("overflow ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const children = [];
+    for (let index = 0; index < 4; index++) {
+      const child = await createTaskExtended(`overflow child ${index}`, {
+        agentId: worker.id,
+        source: "mcp",
+        parentTaskId: ask.id,
+        followUpConfig: { disabled: true },
+      });
+      await startTask(child.id);
+      await completeTask(child.id, `Child ${index} result.`);
+      children.push(child);
+    }
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, ...children.map((child) => child.id)], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(ask.id)).toBeNull();
+    expect(
+      (await Promise.all(children.map((child) => getSlackOutcomeMessage(child.id)))).filter(
+        (card) => card?.finalizedAt,
+      ),
+    ).toHaveLength(3);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(
+      (await Promise.all(children.map((child) => getSlackOutcomeMessage(child.id)))).filter(
+        (card) => card?.finalizedAt,
+      ),
+    ).toHaveLength(4);
+    const conclusion = calls.find(
+      (call) => call.method === "chat.startStream" && String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(conclusion).toBeDefined();
+    for (const child of children) {
+      expect(String(conclusion?.payload.markdown_text)).toContain(
+        (await getSlackOutcomeMessage(child.id))?.permalink,
+      );
+    }
   });
 });

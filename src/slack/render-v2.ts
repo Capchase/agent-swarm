@@ -1205,6 +1205,18 @@ export async function processSlackRenderV2(): Promise<void> {
       }
 
       const closure = closuresByAskId.get(task.id) ?? buildAskClosure(task, tasks);
+      // A conclusion is immutable, so wait until every eligible terminal
+      // child has its card. The per-tick cap may leave overflow children
+      // uncarded even though the closure itself is otherwise settled.
+      let childCardPending = false;
+      for (const member of closure) {
+        if (!isChildCardCandidate(member, delegationActivatedAt!) || member.slackReplySent) continue;
+        if (!(await getSlackOutcomeMessage(member.id))?.finalizedAt) {
+          childCardPending = true;
+          break;
+        }
+      }
+      if (childCardPending) continue;
       const state = closureState(task, closure, new Date(), settleSec, timeoutMin);
       if (state === "open") continue;
       try {
