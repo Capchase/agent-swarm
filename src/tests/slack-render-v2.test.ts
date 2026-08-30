@@ -2332,6 +2332,33 @@ describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
     expect(String(conclusionStream?.payload.markdown_text)).toContain(getTaskLink(child.id));
   });
 
+  test("a stale in-progress ask times out without a completed outcome", async () => {
+    process.env.SLACK_CONCLUSION_TIMEOUT_MIN = "1";
+    const lead = await createAgent({ name: "Stale Ask Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_STALE_ASK_TIMEOUT");
+    const ask = await createTaskExtended("stale in-progress ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await backdateLastUpdated([ask.id], 120);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.conclusionKind).toBe("timeout");
+    const conclusionStream = calls.find((call) => call.method === "chat.startStream");
+    const body = String(conclusionStream?.payload.markdown_text);
+    expect(body).toContain("Concluded with unfinished work");
+    expect(body).toContain("Still in progress");
+    expect(body).toContain(getTaskLink(ask.id));
+    expect(body).not.toContain("✅");
+  });
+
   test("a superseded member's resume chain gates the conclusion until the resume ends", async () => {
     const lead = await createAgent({ name: "Resume Gate Lead", isLead: true, status: "idle" });
     const worker = await createAgent({ name: "Resume Gate Worker", isLead: false, status: "idle" });

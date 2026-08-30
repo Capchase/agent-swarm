@@ -778,7 +778,10 @@ async function askConclusionContent(
   state: Extract<ClosureState, "settled" | "timedOut">,
   slackReplySent: boolean,
 ): Promise<string> {
-  const body = await outcomeContent(task, slackReplySent);
+  const body =
+    state === "timedOut" && !isOutcomeStatus(task.status)
+      ? "⏳ **Still in progress**"
+      : await outcomeContent(task, slackReplySent);
   if (closure.length === 0 && state !== "timedOut") return body;
 
   const resultsLines = await conclusionResultsLines(closure);
