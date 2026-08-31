@@ -117,9 +117,11 @@ Sensitive exception messages, status messages, tool previews, and OTLP auth head
 
 Every API request is wrapped in a span named after its route, following the OpenTelemetry HTTP server semantic conventions: `{METHOD} {route-template}` — for example `GET /api/tasks/{id}` or `POST /api/tasks`.
 
-The route template is **low-cardinality**: a request to `/api/tasks/abc-123` and one to `/api/tasks/def-456` share the span name `GET /api/tasks/{id}`, so SigNoz can group and aggregate by endpoint without raw IDs fragmenting the data. Requests that don't match a registered route — core routes (`/health`, `/ping`, `/me`), the MCP transport, and 404s — fall back to `{METHOD} /{first-segment}` (e.g. `GET /health`, `POST /mcp`), or a bare `{METHOD}` for the root path. The full raw request path is always preserved on the `url.path` attribute.
+The route template is **low-cardinality**: a request to `/api/tasks/abc-123` and one to `/api/tasks/def-456` share the span name `GET /api/tasks/{id}`, so SigNoz can group and aggregate by endpoint without raw IDs fragmenting the data. A handful of static core paths that don't go through the `route()` factory — `/health`, `/openapi.json`, `/docs`, `/me`, `/cancelled-tasks`, `/internal/reload-config`, `/mcp`, `/mcp-user` — are still fixed literal paths, so they get their own `http.route` too (e.g. `GET /health`). Everything else that doesn't match a registered route, including the MCP transport at a deeper path and genuine 404s, falls back to `{METHOD} /{first-segment}` (e.g. `POST /mcp/session-xyz/messages` → `POST /mcp`), or a bare `{METHOD}` for the root path. The full raw request path is always preserved on the `url.path` attribute.
 
-The same route template is also published on the `http.route` span attribute, so SigNoz can group, filter, and aggregate by endpoint as a first-class field instead of parsing it out of the span name. `http.route` is **omitted** (not fabricated) for requests that don't match a registered route.
+The same route template is also published on the `http.route` span attribute, so SigNoz can group, filter, and aggregate by endpoint as a first-class field instead of parsing it out of the span name. `http.route` is **omitted** (not fabricated) for requests that don't match a registered route or one of the static core paths above.
+
+Inbound API request spans are emitted with span kind `SERVER` (`SpanKind.SERVER`). This matters specifically for Datadog: its APM resource-name derivation only appends `http.route` to the resource name for `SpanKindServer` spans, so a `SERVER`-kind span with `http.route` set resolves to a per-endpoint Datadog resource (e.g. `GET /api/tasks/{id}`) instead of every request collapsing into one resource per HTTP method. Every other span kind emitted by Agent Swarm — the `mcp.tool` spans and worker-side spans — stays `INTERNAL`, since Datadog's method-based resource-name shortcut only fires on the HTTP method attribute regardless of kind and internal spans aren't inbound HTTP requests.
 
 Request handling runs inside the HTTP server span's active context, so server-side spans created while serving the request — notably the `mcp.tool` spans from MCP tool calls — nest underneath it as children rather than appearing as disconnected root spans.
 
@@ -132,15 +134,24 @@ Common attributes:
 | Attribute | Description |
 |-----------|-------------|
 | `http.request.method` | HTTP method |
-| `http.route` | Low-cardinality route template, e.g. `/api/tasks/{id}`. Omitted for unmatched core/MCP/404 paths. |
+| `http.route` | Low-cardinality route template, e.g. `/api/tasks/{id}`. Also set for the static core paths (`/health`, `/mcp`, etc.). Omitted for genuinely unmatched paths. |
 | `url.path` | Raw request path (full path, including IDs) |
 | `url.scheme` | Request scheme — `https` or `http` (honors `X-Forwarded-Proto`) |
 | `server.address` | Request host with the port stripped (honors `X-Forwarded-Host`) |
 | `network.protocol.version` | HTTP protocol version, e.g. `1.1` or `2` |
 | `user_agent.original` | Raw `User-Agent` request header |
-| `http.response.status_code` | HTTP response status code (SigNoz surfaces this as the `responseStatusCode` column) |
+| `http.response.status_code` | HTTP response status code (SigNoz surfaces this as the `responseStatusCode` column). Omitted on the premature-close path when no headers were ever sent. |
 | `agentswarm.component` | `api` |
 | `agentswarm.http.duration_ms` | Server-side request duration |
+| `agentswarm.http.aborted` | `true` when the response connection closed before completion. Omitted (never `false`) otherwise. |
+
+#### Premature response close
+
+Node emits `close` on a `ServerResponse` for both a completed response and a connection terminated early, so this path establishes that the response did not complete — not that the client was the actor. Agent Swarm's policy for it:
+
+- `agentswarm.http.aborted` is set to `true`, and omitted entirely otherwise, so `agentswarm.http.aborted:true` is the query.
+- `http.response.status_code` is omitted when no headers were sent, rather than reporting the pre-`writeHead` default of `200` for a response that never went out.
+- The span status is left **Unset**. `close` gives the server no way to tell an intentional client cancellation from a response-write failure, and the dominant case here is the former: a normal SSE teardown on `/mcp` or `/mcp-user`. Marking every premature close an error would put routine traffic into the service error rate. This is a local policy choice, not a claim that such closes are never errors — filter on `agentswarm.http.aborted` rather than on span status to find them.
 
 Useful for:
 

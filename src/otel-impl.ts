@@ -5,7 +5,9 @@ import {
   propagation,
   ROOT_CONTEXT,
   type Span,
+  SpanKind,
   SpanStatusCode,
+  type Tracer,
   trace,
 } from "@opentelemetry/api";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
@@ -20,7 +22,7 @@ import { PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import pkg from "../package.json";
-import type { SwarmSpan } from "./otel";
+import type { SpanOptions, SwarmSpan, SwarmSpanKind } from "./otel";
 import { scrubSecrets } from "./utils/secret-scrubber";
 
 type AttributeValue = string | number | boolean | string[] | number[] | boolean[];
@@ -219,9 +221,21 @@ export async function withSpan<T>(
   });
 }
 
-export function startSpan(name: string, attributes?: Attributes): SwarmSpan {
-  const span = trace.getTracer(TRACER_NAME).startSpan(name, {
+const SPAN_KIND_MAP: Record<SwarmSpanKind, SpanKind> = {
+  internal: SpanKind.INTERNAL,
+  server: SpanKind.SERVER,
+  client: SpanKind.CLIENT,
+  producer: SpanKind.PRODUCER,
+  consumer: SpanKind.CONSUMER,
+};
+
+let tracerOverrideForTests: Tracer | undefined;
+
+export function startSpan(name: string, attributes?: Attributes, options?: SpanOptions): SwarmSpan {
+  const tracer = tracerOverrideForTests ?? trace.getTracer(TRACER_NAME);
+  const span = tracer.startSpan(name, {
     attributes: cleanAttributes(attributes),
+    kind: options?.kind ? SPAN_KIND_MAP[options.kind] : undefined,
   });
   return spanAdapter(span);
 }
@@ -325,4 +339,8 @@ export function _injectCountersForTests(
   costCounter = cost;
   tokenCounter = token;
   costDriftCounter = drift;
+}
+
+export function _injectTracerForTests(tracer: Tracer | undefined): void {
+  tracerOverrideForTests = tracer;
 }
