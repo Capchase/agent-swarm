@@ -299,10 +299,11 @@ const httpServer = createHttpServer(async (req, res) => {
       });
 
       // `close` fires after `finish` on the happy path (the `spanEnded` guard
-      // already covers that), but a client that disconnects mid-request fires
-      // neither `finish` nor `error` — without this, the span stays open and is
-      // never exported. Verified against Bun 1.4.0 (pinned): `close` fires on
-      // abort even with `headersSent === false`; Bun 1.3.14 never fires it.
+      // already covers that), but a response connection that terminates early
+      // fires neither `finish` nor `error` — without this, the span stays open
+      // and is never exported. Verified against Bun 1.4.0 (pinned): `close`
+      // fires on a premature close even with `headersSent === false`; Bun
+      // 1.3.14 never fires it.
       res.on("close", () => {
         if (spanEnded) return;
         spanEnded = true;
@@ -311,10 +312,12 @@ const httpServer = createHttpServer(async (req, res) => {
           "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
           "agentswarm.http.aborted": true,
         });
-        // Per OTel HTTP semconv, a client abort is not a server-side failure —
-        // leave the span status Unset. `agentswarm.http.aborted` already carries
-        // the signal; setting ERROR here would misclassify every normal SSE
-        // teardown on /mcp and /mcp-user as a server error.
+        // Status left Unset. `close` cannot distinguish an intentional client
+        // cancellation from a response-write failure, and the dominant case
+        // here is the former: a normal SSE teardown on /mcp or /mcp-user.
+        // Marking every premature close ERROR would put that routine traffic
+        // in the service error rate. `agentswarm.http.aborted` carries the
+        // signal instead. Revisit if a discriminator becomes available.
         span.end();
       });
     }

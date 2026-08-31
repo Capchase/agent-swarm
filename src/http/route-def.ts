@@ -179,15 +179,18 @@ export interface RequestRouteDescriptor {
    * `{METHOD} {route-template}`.
    *
    * - Matched `route()` handler: `GET /api/tasks/{id}`
-   * - Unmatched (core /health /ping /me, MCP transport, 404s): `GET /<first-segment>`
+   * - Static core path (see `CORE_ROUTE_TEMPLATES`): `GET /health`, `POST /mcp`
+   * - Otherwise unmatched (deeper MCP paths, 404s): `GET /<first-segment>`
    * - Root or empty path: bare `GET`
    */
   spanName: string;
   /**
    * Value for the `http.route` span attribute — the bounded-cardinality route
-   * template (e.g. `/api/tasks/{id}`). Set ONLY when a `route()` handler
-   * matched; left `undefined` for core/MCP/404 paths so callers omit the
-   * attribute rather than fabricating a value.
+   * template (e.g. `/api/tasks/{id}`). Set when a `route()` handler matched,
+   * or when the request matches a static core path in `CORE_ROUTE_TEMPLATES`
+   * on a method and query-string form that handler actually accepts. Left
+   * `undefined` for genuinely unmatched paths so callers omit the attribute
+   * rather than fabricating a value.
    */
   httpRoute?: string;
 }

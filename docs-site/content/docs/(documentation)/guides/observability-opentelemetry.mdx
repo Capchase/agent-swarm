@@ -140,10 +140,18 @@ Common attributes:
 | `server.address` | Request host with the port stripped (honors `X-Forwarded-Host`) |
 | `network.protocol.version` | HTTP protocol version, e.g. `1.1` or `2` |
 | `user_agent.original` | Raw `User-Agent` request header |
-| `http.response.status_code` | HTTP response status code (SigNoz surfaces this as the `responseStatusCode` column). Omitted when the client disconnected before any response was sent. |
+| `http.response.status_code` | HTTP response status code (SigNoz surfaces this as the `responseStatusCode` column). Omitted on the premature-close path when no headers were ever sent. |
 | `agentswarm.component` | `api` |
 | `agentswarm.http.duration_ms` | Server-side request duration |
-| `agentswarm.http.aborted` | `true` when the client disconnected before the response completed. The span status is deliberately left Unset in that case (a client abort is not a server-side failure), so this attribute is the signal to filter on. |
+| `agentswarm.http.aborted` | `true` when the response connection closed before completion. Omitted (never `false`) otherwise. |
+
+#### Premature response close
+
+Node emits `close` on a `ServerResponse` for both a completed response and a connection terminated early, so this path establishes that the response did not complete — not that the client was the actor. Agent Swarm's policy for it:
+
+- `agentswarm.http.aborted` is set to `true`, and omitted entirely otherwise, so `agentswarm.http.aborted:true` is the query.
+- `http.response.status_code` is omitted when no headers were sent, rather than reporting the pre-`writeHead` default of `200` for a response that never went out.
+- The span status is left **Unset**. `close` gives the server no way to tell an intentional client cancellation from a response-write failure, and the dominant case here is the former: a normal SSE teardown on `/mcp` or `/mcp-user`. Marking every premature close an error would put routine traffic into the service error rate. This is a local policy choice, not a claim that such closes are never errors — filter on `agentswarm.http.aborted` rather than on span status to find them.
 
 Useful for:
 

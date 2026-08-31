@@ -48,11 +48,15 @@ export function getPathSegments(url: string): string[] {
 }
 
 /**
- * `http.response.status_code` for a request span whose client disconnected
- * before the response completed. `statusCode` initializes to `200` and is
- * only ever updated by `writeHead` — on the abort path that never ran, so
- * reporting it verbatim would claim a 200 response was sent when none was.
+ * `http.response.status_code` for a request span whose response connection
+ * closed before completion. `statusCode` initializes to `200` and is only
+ * ever updated by `writeHead` — on the premature-close path that never ran,
+ * so reporting it verbatim would claim a 200 response was sent when none was.
  * Omitted (not fabricated) when `headersSent` is false.
+ *
+ * Node emits `close` for BOTH a completed response and a connection
+ * terminated early, so this path proves the response did not complete — not
+ * that the client was the actor.
  */
 export function abortedStatusCodeAttribute(
   headersSent: boolean,

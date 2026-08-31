@@ -22,6 +22,7 @@ import { abortedStatusCodeAttribute } from "../http/utils";
 const indexSourcePath = `${import.meta.dir}/../http/index.ts`;
 const indexSource = await Bun.file(indexSourcePath).text();
 const closeHandlerMatch = indexSource.match(/res\.on\("close", \(\) => \{[\s\S]*?\n {6}\}\);/);
+const finishHandlerMatch = indexSource.match(/res\.on\("finish", \(\) => \{[\s\S]*?\n {6}\}\);/);
 
 describe("abortedStatusCodeAttribute", () => {
   test("omits the status code when no response was ever sent", () => {
@@ -47,5 +48,12 @@ describe("close-handler span status (source check)", () => {
 
   test("the close handler still sets agentswarm.http.aborted", () => {
     expect(closeHandlerMatch?.[0]).toContain('"agentswarm.http.aborted": true');
+  });
+
+  // The docs promise `agentswarm.http.aborted` is omitted (never `false`) on a
+  // normal response, so `agentswarm.http.aborted:true` is a sound query.
+  test("the finish handler never sets agentswarm.http.aborted", () => {
+    expect(finishHandlerMatch).not.toBeNull();
+    expect(finishHandlerMatch?.[0]).not.toContain("agentswarm.http.aborted");
   });
 });
