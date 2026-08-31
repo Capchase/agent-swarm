@@ -108,6 +108,30 @@ describe("describeRequestRoute", () => {
     expect(desc.httpRoute).toBe("/internal/reload-config");
   });
 
+  test("POST /me is a 404 in handleCore (GET-only) and must not carry http.route", () => {
+    const desc = describeRequestRoute("POST", ["me"]);
+    expect(desc.spanName).toBe("POST /me");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("GET /internal/reload-config is a 404 in handleCore (POST-only) and must not carry http.route", () => {
+    const desc = describeRequestRoute("GET", ["internal", "reload-config"]);
+    expect(desc.spanName).toBe("GET /internal");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("PUT /mcp is a 404 in handleMcp (GET/POST/DELETE-only) and must not carry http.route", () => {
+    const desc = describeRequestRoute("PUT", ["mcp"]);
+    expect(desc.spanName).toBe("PUT /mcp");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("POST /health has no method gate in handleCore, so it still carries http.route", () => {
+    const desc = describeRequestRoute("POST", ["health"]);
+    expect(desc.spanName).toBe("POST /health");
+    expect(desc.httpRoute).toBe("/health");
+  });
+
   test("known path with unknown method omits http.route", () => {
     // No PATCH handler on /api/tasks — must not fabricate a template.
     const desc = describeRequestRoute("PATCH", ["api", "tasks"]);

@@ -202,20 +202,26 @@ export interface RequestRouteDescriptor {
  * leaving it in the anonymous `GET` bucket makes that bucket useless to
  * aggregate on.
  *
+ * `methods` mirrors the method gate `handleCore` actually applies to that
+ * path — `undefined` means `handleCore` has no method check there (the
+ * handler runs for any verb). A method NOT in this list is a path
+ * `handleCore` 404s, so it must not carry `http.route` either — otherwise the
+ * attribute lies about a request that never matched a real handler.
+ *
  * Keyed by the joined path segments (no leading slash, no query string) so a
  * deeper unmatched path under the same first segment — e.g.
  * `/mcp/<session>/messages` — does NOT match and correctly falls through to
  * the bounded first-segment fallback instead of fabricating a template.
  */
-const CORE_ROUTE_TEMPLATES: Record<string, string> = {
-  health: "/health",
-  "openapi.json": "/openapi.json",
-  docs: "/docs",
-  me: "/me",
-  "cancelled-tasks": "/cancelled-tasks",
-  "internal/reload-config": "/internal/reload-config",
-  mcp: "/mcp",
-  "mcp-user": "/mcp-user",
+const CORE_ROUTE_TEMPLATES: Record<string, { path: string; methods?: string[] }> = {
+  health: { path: "/health" },
+  "openapi.json": { path: "/openapi.json" },
+  docs: { path: "/docs" },
+  me: { path: "/me", methods: ["GET"] },
+  "cancelled-tasks": { path: "/cancelled-tasks", methods: ["GET"] },
+  "internal/reload-config": { path: "/internal/reload-config", methods: ["POST"] },
+  mcp: { path: "/mcp", methods: ["GET", "POST", "DELETE"] },
+  "mcp-user": { path: "/mcp-user", methods: ["GET", "POST", "DELETE"] },
 };
 
 /**
@@ -234,7 +240,9 @@ export function describeRequestRoute(
   const matched = findRoute(method, pathSegments);
   if (matched) return { spanName: `${m} ${matched.path}`, httpRoute: matched.path };
   const coreTemplate = CORE_ROUTE_TEMPLATES[pathSegments.join("/")];
-  if (coreTemplate) return { spanName: `${m} ${coreTemplate}`, httpRoute: coreTemplate };
+  if (coreTemplate && (!coreTemplate.methods || coreTemplate.methods.includes(m))) {
+    return { spanName: `${m} ${coreTemplate.path}`, httpRoute: coreTemplate.path };
+  }
   const first = pathSegments[0];
   return { spanName: first ? `${m} /${first}` : m };
 }
