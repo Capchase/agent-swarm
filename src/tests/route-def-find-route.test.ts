@@ -144,6 +144,36 @@ describe("describeRequestRoute", () => {
     expect(desc.httpRoute).toBe("/me");
   });
 
+  test("GET /health/ is a 404 in handleCore (strict URL equality) and must not carry http.route", () => {
+    const desc = describeRequestRoute("GET", ["health"], false, true);
+    expect(desc.spanName).toBe("GET /health");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("GET /openapi.json/ is a 404 in handleCore and must not carry http.route", () => {
+    const desc = describeRequestRoute("GET", ["openapi.json"], false, true);
+    expect(desc.spanName).toBe("GET /openapi.json");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("POST /mcp/ is a 404 in handleMcp (strict URL equality) and must not carry http.route", () => {
+    const desc = describeRequestRoute("POST", ["mcp"], false, true);
+    expect(desc.spanName).toBe("POST /mcp");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("GET /mcp-user/ is a 404 in handleCore (strict URL equality) and must not carry http.route", () => {
+    const desc = describeRequestRoute("GET", ["mcp-user"], false, true);
+    expect(desc.spanName).toBe("GET /mcp-user");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("GET /docs/ is the one intentional exception and keeps http.route", () => {
+    const desc = describeRequestRoute("GET", ["docs"], false, true);
+    expect(desc.spanName).toBe("GET /docs");
+    expect(desc.httpRoute).toBe("/docs");
+  });
+
   test("known path with unknown method omits http.route", () => {
     // No PATCH handler on /api/tasks — must not fabricate a template.
     const desc = describeRequestRoute("PATCH", ["api", "tasks"]);

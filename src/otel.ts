@@ -1,7 +1,7 @@
 export type AttributeValue = string | number | boolean | string[] | number[] | boolean[];
 export type Attributes = Record<string, AttributeValue | undefined>;
 
-type SpanStatus = {
+export type SpanStatus = {
   code: number;
   message?: string;
 };

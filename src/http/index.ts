@@ -103,12 +103,12 @@ import { handleTasks } from "./tasks";
 import { handleTrackers } from "./trackers";
 import { handleUsers } from "./users";
 import {
-  abortedStatusCodeAttribute,
   getPathSegments,
   httpServerSemconvAttributes,
   parseQueryParams,
   safeRequestUrlForLog,
   setCorsHeaders,
+  wireHttpSpanLifecycle,
 } from "./utils";
 import { handleWebhooks } from "./webhooks";
 import { handleWorkflowEvents } from "./workflow-events";
@@ -215,7 +215,6 @@ const transportActivityUser: McpTransportActivity = globalState.__transportActiv
 const httpServer = createHttpServer(async (req, res) => {
   const startTime = performance.now();
   let statusCode = 200;
-  let spanEnded = false;
 
   // Wrap writeHead to capture status code
   const originalWriteHead = res.writeHead.bind(res);
@@ -248,13 +247,19 @@ const httpServer = createHttpServer(async (req, res) => {
     const reqPath = req.url?.split("?")[0] ?? "";
     const pathSegments = getPathSegments(req.url || "");
     const hasQueryString = (req.url ?? "").includes("?");
+    const hasTrailingSlash = reqPath.length > 1 && reqPath.endsWith("/");
     const skipSpan = reqPath === "/api/poll" && !isPollTracingEnabled();
     // Per OTel HTTP semantic conventions: span name is `{METHOD} {route-template}`
     // and `http.route` carries the bounded-cardinality template so SigNoz can
     // group/filter/aggregate by endpoint as a first-class field. `http.route` is
     // omitted (not fabricated) for unmatched core/MCP/404 paths. Raw path stays
     // on `url.path`.
-    const { spanName, httpRoute } = describeRequestRoute(req.method, pathSegments, hasQueryString);
+    const { spanName, httpRoute } = describeRequestRoute(
+      req.method,
+      pathSegments,
+      hasQueryString,
+      hasTrailingSlash,
+    );
     // Standard OTel HTTP server semconv attributes — host, scheme, protocol
     // version, user-agent (the method/path/route/status are set inline below).
     const semconv = httpServerSemconvAttributes(req);
@@ -277,49 +282,7 @@ const httpServer = createHttpServer(async (req, res) => {
         );
 
     if (span) {
-      res.on("finish", () => {
-        if (spanEnded) return;
-        spanEnded = true;
-        span.setAttributes({
-          "http.response.status_code": statusCode,
-          "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
-        });
-        if (statusCode >= 500) {
-          span.setStatus({ code: 2, message: `HTTP ${statusCode}` });
-        }
-        span.end();
-      });
-
-      res.on("error", (err) => {
-        if (spanEnded) return;
-        spanEnded = true;
-        span.recordException(err);
-        span.setStatus({ code: 2, message: err.message });
-        span.end();
-      });
-
-      // `close` fires after `finish` on the happy path (the `spanEnded` guard
-      // already covers that), but a response connection that terminates early
-      // fires neither `finish` nor `error` — without this, the span stays open
-      // and is never exported. Verified against Bun 1.4.0 (pinned): `close`
-      // fires on a premature close even with `headersSent === false`; Bun
-      // 1.3.14 never fires it.
-      res.on("close", () => {
-        if (spanEnded) return;
-        spanEnded = true;
-        span.setAttributes({
-          "http.response.status_code": abortedStatusCodeAttribute(res.headersSent, statusCode),
-          "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
-          "agentswarm.http.aborted": true,
-        });
-        // Status left Unset. `close` cannot distinguish an intentional client
-        // cancellation from a response-write failure, and the dominant case
-        // here is the former: a normal SSE teardown on /mcp or /mcp-user.
-        // Marking every premature close ERROR would put that routine traffic
-        // in the service error rate. `agentswarm.http.aborted` carries the
-        // signal instead. Revisit if a discriminator becomes available.
-        span.end();
-      });
+      wireHttpSpanLifecycle(res, span, () => statusCode, startTime);
     }
 
     // Run request handling inside the HTTP span's active context so any spans

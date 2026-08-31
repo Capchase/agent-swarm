@@ -222,6 +222,14 @@ export interface RequestRouteDescriptor {
  * verified against every comparison in `src/http/core.ts`, `src/http/mcp.ts`,
  * and `src/http/mcp-user.ts`.
  *
+ * `toleratesTrailingSlash` mirrors the same strict-equality problem for a
+ * trailing `/`: `getPathSegments("/health/")` returns `["health"]` (trailing
+ * empty segment is filtered), so without this gate a `GET /health/` request —
+ * which `handleCore` 404s on `req.url === "/health"` strict equality — would
+ * still get `http.route: "/health"` fabricated onto its span. `docs` is the
+ * one intentional exception: `handleCore` explicitly accepts
+ * `req.url === "/docs" || req.url === "/docs/"`. Default is `false`.
+ *
  * Keyed by the joined path segments (no leading slash, no query string) so a
  * deeper unmatched path under the same first segment — e.g.
  * `/mcp/<session>/messages` — does NOT match and correctly falls through to
@@ -229,11 +237,16 @@ export interface RequestRouteDescriptor {
  */
 const CORE_ROUTE_TEMPLATES: Record<
   string,
-  { path: string; methods?: string[]; toleratesQueryString?: boolean }
+  {
+    path: string;
+    methods?: string[];
+    toleratesQueryString?: boolean;
+    toleratesTrailingSlash?: boolean;
+  }
 > = {
   health: { path: "/health" },
   "openapi.json": { path: "/openapi.json" },
-  docs: { path: "/docs" },
+  docs: { path: "/docs", toleratesTrailingSlash: true },
   me: { path: "/me", methods: ["GET"], toleratesQueryString: true },
   "cancelled-tasks": {
     path: "/cancelled-tasks",
@@ -258,11 +271,18 @@ const CORE_ROUTE_TEMPLATES: Record<
  * 404s once a query string is present (see `CORE_ROUTE_TEMPLATES`), so that
  * combination must not carry `http.route` either — same "omitted, never
  * fabricated" contract as the method-mismatch case above it.
+ *
+ * `hasTrailingSlash` reflects whether the raw request path (query string
+ * excluded) ended in `/` for a path with more than one character — i.e. `/`
+ * itself is not "trailing slash". A core-route entry without
+ * `toleratesTrailingSlash` is a path `handleCore` 404s once a trailing slash
+ * is present, so that combination must not carry `http.route` either.
  */
 export function describeRequestRoute(
   method: string | undefined,
   pathSegments: string[],
   hasQueryString = false,
+  hasTrailingSlash = false,
 ): RequestRouteDescriptor {
   const m = (method ?? "").toUpperCase() || "UNKNOWN";
   const matched = findRoute(method, pathSegments);
@@ -271,7 +291,8 @@ export function describeRequestRoute(
   if (
     coreTemplate &&
     (!coreTemplate.methods || coreTemplate.methods.includes(m)) &&
-    (!hasQueryString || coreTemplate.toleratesQueryString)
+    (!hasQueryString || coreTemplate.toleratesQueryString) &&
+    (!hasTrailingSlash || coreTemplate.toleratesTrailingSlash)
   ) {
     return { spanName: `${m} ${coreTemplate.path}`, httpRoute: coreTemplate.path };
   }
