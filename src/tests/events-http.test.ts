@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import type { Subprocess } from "bun";
-import { getFreePort, SERVER_BOOT_HOOK_TIMEOUT_MS, waitForServer } from "./test-net";
+import { getFreePort, SERVER_BOOT_HOOK_TIMEOUT_MS } from "./test-net";
 
 let TEST_PORT = 0;
 const TEST_DB_PATH = `/tmp/test-events-http-${Date.now()}.sqlite`;
@@ -9,6 +9,31 @@ let BASE = "";
 const TEST_API_KEY = "test-events-http-key";
 
 let serverProc: Subprocess;
+
+async function waitForEventsApi(timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${BASE}/api/events`, {
+        headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+      });
+      const body = (await response.json()) as { events?: unknown };
+      if (response.status === 200 && Array.isArray(body.events)) return;
+    } catch {
+      // The child may still be booting, or another parallel test may own the port.
+    }
+    await Bun.sleep(50);
+  }
+  throw new Error(`Events API did not become ready on ${BASE}`);
+}
+
+async function cleanupTestDb(): Promise<void> {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      await unlink(`${TEST_DB_PATH}${suffix}`);
+    } catch {}
+  }
+}
 
 async function api(
   method: string,
@@ -37,30 +62,39 @@ const get = (p: string) => api("GET", p);
 const post = (p: string, body?: unknown) => api("POST", p, { body });
 
 beforeAll(async () => {
-  TEST_PORT = await getFreePort();
-  BASE = `http://localhost:${TEST_PORT}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    TEST_PORT = await getFreePort();
+    BASE = `http://localhost:${TEST_PORT}`;
+    await cleanupTestDb();
 
-  try {
-    await unlink(TEST_DB_PATH);
-  } catch {}
+    serverProc = Bun.spawn(["bun", "src/http.ts"], {
+      cwd: `${import.meta.dir}/../..`,
+      env: {
+        ...process.env,
+        PORT: String(TEST_PORT),
+        DATABASE_PATH: TEST_DB_PATH,
+        API_KEY: TEST_API_KEY,
+        CAPABILITIES: "core",
+        SLACK_BOT_TOKEN: "",
+        GITHUB_WEBHOOK_SECRET: "",
+        AGENTMAIL_API_KEY: "",
+      },
+      stdout: "ignore",
+      stderr: "ignore",
+    });
 
-  serverProc = Bun.spawn(["bun", "src/http.ts"], {
-    cwd: `${import.meta.dir}/../..`,
-    env: {
-      ...process.env,
-      PORT: String(TEST_PORT),
-      DATABASE_PATH: TEST_DB_PATH,
-      API_KEY: TEST_API_KEY,
-      CAPABILITIES: "core",
-      SLACK_BOT_TOKEN: "",
-      GITHUB_WEBHOOK_SECRET: "",
-      AGENTMAIL_API_KEY: "",
-    },
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-
-  await waitForServer(`${BASE}/health`);
+    try {
+      // A generic /health response can come from another parallel test that
+      // claimed the released getFreePort() socket first. Verify this child
+      // serves the authenticated events route before the suite sends requests.
+      await waitForEventsApi();
+      return;
+    } catch (error) {
+      serverProc.kill();
+      await serverProc.exited.catch(() => {});
+      if (attempt === 3) throw error;
+    }
+  }
 }, SERVER_BOOT_HOOK_TIMEOUT_MS);
 
 afterAll(async () => {
@@ -71,11 +105,7 @@ afterAll(async () => {
     } catch {}
   }
   await Bun.sleep(50);
-  try {
-    await unlink(TEST_DB_PATH);
-    await unlink(`${TEST_DB_PATH}-wal`);
-    await unlink(`${TEST_DB_PATH}-shm`);
-  } catch {}
+  await cleanupTestDb();
 });
 
 describe("POST /api/events — single event", () => {

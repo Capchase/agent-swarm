@@ -36730,6 +36730,104 @@
                       "required": [
                         "total"
                       ]
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "sessionLogs": {
+                          "type": "object",
+                          "properties": {
+                            "at": {
+                              "type": "string"
+                            },
+                            "rowsDeleted": {
+                              "type": "number"
+                            },
+                            "batches": {
+                              "type": "number"
+                            },
+                            "durationMs": {
+                              "type": "number"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            },
+                            "cumulativeRowsDeleted": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "at",
+                            "rowsDeleted",
+                            "batches",
+                            "durationMs",
+                            "dryRun",
+                            "cumulativeRowsDeleted"
+                          ]
+                        },
+                        "agentLog": {
+                          "type": "object",
+                          "properties": {
+                            "at": {
+                              "type": "string"
+                            },
+                            "rowsDeleted": {
+                              "type": "number"
+                            },
+                            "batches": {
+                              "type": "number"
+                            },
+                            "durationMs": {
+                              "type": "number"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            },
+                            "cumulativeRowsDeleted": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "at",
+                            "rowsDeleted",
+                            "batches",
+                            "durationMs",
+                            "dryRun",
+                            "cumulativeRowsDeleted"
+                          ]
+                        },
+                        "events": {
+                          "type": "object",
+                          "properties": {
+                            "at": {
+                              "type": "string"
+                            },
+                            "rowsDeleted": {
+                              "type": "number"
+                            },
+                            "batches": {
+                              "type": "number"
+                            },
+                            "durationMs": {
+                              "type": "number"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            },
+                            "cumulativeRowsDeleted": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "at",
+                            "rowsDeleted",
+                            "batches",
+                            "durationMs",
+                            "dryRun",
+                            "cumulativeRowsDeleted"
+                          ]
+                        }
+                      }
                     }
                   },
                   "required": [
@@ -36738,7 +36836,8 @@
                     "workflows",
                     "pages",
                     "sessions",
-                    "skills"
+                    "skills",
+                    "retention"
                   ]
                 }
               }
