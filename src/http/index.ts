@@ -258,17 +258,21 @@ const httpServer = createHttpServer(async (req, res) => {
     const semconv = httpServerSemconvAttributes(req);
     const span = skipSpan
       ? null
-      : startSpan(spanName, {
-          "http.request.method": req.method ?? "",
-          "url.path": reqPath,
-          "url.scheme": semconv["url.scheme"],
-          "http.route": httpRoute,
-          "server.address": semconv["server.address"],
-          "network.protocol.version": semconv["network.protocol.version"],
-          "user_agent.original": semconv["user_agent.original"],
-          "agent.id": req.headers["x-agent-id"] as string | undefined,
-          "agentswarm.component": "api",
-        });
+      : startSpan(
+          spanName,
+          {
+            "http.request.method": req.method ?? "",
+            "url.path": reqPath,
+            "url.scheme": semconv["url.scheme"],
+            "http.route": httpRoute,
+            "server.address": semconv["server.address"],
+            "network.protocol.version": semconv["network.protocol.version"],
+            "user_agent.original": semconv["user_agent.original"],
+            "agent.id": req.headers["x-agent-id"] as string | undefined,
+            "agentswarm.component": "api",
+          },
+          { kind: "server" },
+        );
 
     if (span) {
       res.on("finish", () => {
@@ -289,6 +293,22 @@ const httpServer = createHttpServer(async (req, res) => {
         spanEnded = true;
         span.recordException(err);
         span.setStatus({ code: 2, message: err.message });
+        span.end();
+      });
+
+      // `close` fires after `finish` on the happy path (the `spanEnded` guard
+      // already covers that), but a client that disconnects mid-request fires
+      // neither `finish` nor `error` — without this, the span stays open and is
+      // never exported.
+      res.on("close", () => {
+        if (spanEnded) return;
+        spanEnded = true;
+        span.setAttributes({
+          "http.response.status_code": statusCode,
+          "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
+          "agentswarm.http.aborted": true,
+        });
+        span.setStatus({ code: 2, message: "client disconnected before response completed" });
         span.end();
       });
     }

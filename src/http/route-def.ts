@@ -193,6 +193,32 @@ export interface RequestRouteDescriptor {
 }
 
 /**
+ * Static literal paths handled outside the `route()` factory (core.ts, mcp.ts)
+ * that would otherwise fall through to the low-cardinality `{METHOD}
+ * /{first-segment}` fallback below. Each of these is a single, fixed path —
+ * not a template with params — so mapping it to `http.route` is not
+ * fabricating a value, just naming a route that doesn't happen to go through
+ * `route()`. `/health` in particular is high-volume liveness-probe traffic;
+ * leaving it in the anonymous `GET` bucket makes that bucket useless to
+ * aggregate on.
+ *
+ * Keyed by the joined path segments (no leading slash, no query string) so a
+ * deeper unmatched path under the same first segment — e.g.
+ * `/mcp/<session>/messages` — does NOT match and correctly falls through to
+ * the bounded first-segment fallback instead of fabricating a template.
+ */
+const CORE_ROUTE_TEMPLATES: Record<string, string> = {
+  health: "/health",
+  "openapi.json": "/openapi.json",
+  docs: "/docs",
+  me: "/me",
+  "cancelled-tasks": "/cancelled-tasks",
+  "internal/reload-config": "/internal/reload-config",
+  mcp: "/mcp",
+  "mcp-user": "/mcp-user",
+};
+
+/**
  * Describe an inbound HTTP request for OTel: a low-cardinality span name plus
  * the `http.route` attribute value (per the HTTP server semantic conventions).
  *
@@ -207,6 +233,8 @@ export function describeRequestRoute(
   const m = (method ?? "").toUpperCase() || "UNKNOWN";
   const matched = findRoute(method, pathSegments);
   if (matched) return { spanName: `${m} ${matched.path}`, httpRoute: matched.path };
+  const coreTemplate = CORE_ROUTE_TEMPLATES[pathSegments.join("/")];
+  if (coreTemplate) return { spanName: `${m} ${coreTemplate}`, httpRoute: coreTemplate };
   const first = pathSegments[0];
   return { spanName: first ? `${m} /${first}` : m };
 }

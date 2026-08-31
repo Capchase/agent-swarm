@@ -15,6 +15,15 @@ export type SwarmSpan = {
   end: () => void;
 };
 
+// Backend-agnostic mirror of OTel's `SpanKind`. Kept as a string union (not a
+// value import of `@opentelemetry/api`) so this dependency-free module, loaded
+// by every worker process, never eagerly pulls in the OTel API. `otel-impl.ts`
+// maps this onto the real `SpanKind` only when OTLP is configured.
+export type SwarmSpanKind = "internal" | "server" | "client" | "producer" | "consumer";
+export interface SpanOptions {
+  kind?: SwarmSpanKind;
+}
+
 // eslint-disable-next-line import/no-duplicates -- type-only import, no side-effects
 import type { SessionCostMetric } from "./otel-impl";
 export type { SessionCostMetric };
@@ -51,7 +60,9 @@ let realWithSpan:
       attributes?: Attributes,
     ) => Promise<T>)
   | undefined;
-let realStartSpan: ((name: string, attributes?: Attributes) => SwarmSpan) | undefined;
+let realStartSpan:
+  | ((name: string, attributes?: Attributes, options?: SpanOptions) => SwarmSpan)
+  | undefined;
 let realWithRemoteContext:
   | (<T>(carrier: Record<string, unknown>, fn: () => Promise<T> | T) => Promise<T>)
   | undefined;
@@ -102,11 +113,11 @@ export async function withSpan<T>(
   return realWithSpan(name, fn, attributes);
 }
 
-export function startSpan(name: string, attributes?: Attributes): SwarmSpan {
+export function startSpan(name: string, attributes?: Attributes, options?: SpanOptions): SwarmSpan {
   if (!otelConfigured() || !realStartSpan) {
     return NOOP_SPAN;
   }
-  return realStartSpan(name, attributes);
+  return realStartSpan(name, attributes, options);
 }
 
 export function withSpanContext<T>(span: SwarmSpan, fn: () => T): T {
