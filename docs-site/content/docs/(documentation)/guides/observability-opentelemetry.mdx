@@ -140,9 +140,10 @@ Common attributes:
 | `server.address` | Request host with the port stripped (honors `X-Forwarded-Host`) |
 | `network.protocol.version` | HTTP protocol version, e.g. `1.1` or `2` |
 | `user_agent.original` | Raw `User-Agent` request header |
-| `http.response.status_code` | HTTP response status code (SigNoz surfaces this as the `responseStatusCode` column) |
+| `http.response.status_code` | HTTP response status code (SigNoz surfaces this as the `responseStatusCode` column). Omitted when the client disconnected before any response was sent. |
 | `agentswarm.component` | `api` |
 | `agentswarm.http.duration_ms` | Server-side request duration |
+| `agentswarm.http.aborted` | `true` when the client disconnected before the response completed. The span status is deliberately left Unset in that case (a client abort is not a server-side failure), so this attribute is the signal to filter on. |
 
 Useful for:
 
