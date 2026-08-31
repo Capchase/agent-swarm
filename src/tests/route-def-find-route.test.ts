@@ -120,7 +120,7 @@ describe("describeRequestRoute", () => {
     expect(desc.httpRoute).toBeUndefined();
   });
 
-  test("PUT /mcp is a 404 in handleMcp (GET/POST/DELETE-only) and must not carry http.route", () => {
+  test("PUT /mcp is a 405 in handleMcp (GET/POST/DELETE-only) and must not carry http.route", () => {
     const desc = describeRequestRoute("PUT", ["mcp"]);
     expect(desc.spanName).toBe("PUT /mcp");
     expect(desc.httpRoute).toBeUndefined();
@@ -130,6 +130,18 @@ describe("describeRequestRoute", () => {
     const desc = describeRequestRoute("POST", ["health"]);
     expect(desc.spanName).toBe("POST /health");
     expect(desc.httpRoute).toBe("/health");
+  });
+
+  test("GET /health?t=123 is a 404 in handleCore (strict URL equality) and must not carry http.route", () => {
+    const desc = describeRequestRoute("GET", ["health"], true);
+    expect(desc.spanName).toBe("GET /health");
+    expect(desc.httpRoute).toBeUndefined();
+  });
+
+  test("GET /me?x=1 matches handleCore's `?`-suffixed form and keeps http.route", () => {
+    const desc = describeRequestRoute("GET", ["me"], true);
+    expect(desc.spanName).toBe("GET /me");
+    expect(desc.httpRoute).toBe("/me");
   });
 
   test("known path with unknown method omits http.route", () => {

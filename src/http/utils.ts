@@ -47,6 +47,20 @@ export function getPathSegments(url: string): string[] {
   return path.split("/").filter(Boolean);
 }
 
+/**
+ * `http.response.status_code` for a request span whose client disconnected
+ * before the response completed. `statusCode` initializes to `200` and is
+ * only ever updated by `writeHead` — on the abort path that never ran, so
+ * reporting it verbatim would claim a 200 response was sent when none was.
+ * Omitted (not fabricated) when `headersSent` is false.
+ */
+export function abortedStatusCodeAttribute(
+  headersSent: boolean,
+  statusCode: number,
+): number | undefined {
+  return headersSent ? statusCode : undefined;
+}
+
 export function safeRequestUrlForLog(rawUrl: string | undefined): string {
   if (!rawUrl) return "";
 

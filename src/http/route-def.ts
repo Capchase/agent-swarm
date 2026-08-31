@@ -208,17 +208,35 @@ export interface RequestRouteDescriptor {
  * `handleCore` 404s, so it must not carry `http.route` either — otherwise the
  * attribute lies about a request that never matched a real handler.
  *
+ * `toleratesQueryString` mirrors whether `handleCore` matches the path when
+ * the raw URL carries a `?`. Most of these entries compare the raw URL with
+ * strict equality (`req.url === "/health"` and similarly for
+ * `openapi.json`/`docs`/`internal/reload-config`/`mcp`/`mcp-user`), so
+ * `GET /health?t=123` 404s in `handleCore` even though `pathSegments` still
+ * resolves to `health`. `/me` and `/cancelled-tasks` explicitly accept the
+ * `?`-suffixed form (`req.url === "/me" || req.url?.startsWith("/me?")`), so
+ * those two tolerate a query string. Default is `false` (no tolerance) —
+ * verified against every comparison in `src/http/core.ts`, `src/http/mcp.ts`,
+ * and `src/http/mcp-user.ts`.
+ *
  * Keyed by the joined path segments (no leading slash, no query string) so a
  * deeper unmatched path under the same first segment — e.g.
  * `/mcp/<session>/messages` — does NOT match and correctly falls through to
  * the bounded first-segment fallback instead of fabricating a template.
  */
-const CORE_ROUTE_TEMPLATES: Record<string, { path: string; methods?: string[] }> = {
+const CORE_ROUTE_TEMPLATES: Record<
+  string,
+  { path: string; methods?: string[]; toleratesQueryString?: boolean }
+> = {
   health: { path: "/health" },
   "openapi.json": { path: "/openapi.json" },
   docs: { path: "/docs" },
-  me: { path: "/me", methods: ["GET"] },
-  "cancelled-tasks": { path: "/cancelled-tasks", methods: ["GET"] },
+  me: { path: "/me", methods: ["GET"], toleratesQueryString: true },
+  "cancelled-tasks": {
+    path: "/cancelled-tasks",
+    methods: ["GET"],
+    toleratesQueryString: true,
+  },
   "internal/reload-config": { path: "/internal/reload-config", methods: ["POST"] },
   mcp: { path: "/mcp", methods: ["GET", "POST", "DELETE"] },
   "mcp-user": { path: "/mcp-user", methods: ["GET", "POST", "DELETE"] },
@@ -231,16 +249,27 @@ const CORE_ROUTE_TEMPLATES: Record<string, { path: string; methods?: string[] }>
  * Never embeds raw path params or query strings — the goal is one span name and
  * one `http.route` value per endpoint so SigNoz can group/filter/aggregate by
  * them. The raw path is still preserved on the `url.path` attribute.
+ *
+ * `hasQueryString` reflects whether the raw request URL carried a `?`. A
+ * core-route entry without `toleratesQueryString` is a path `handleCore`
+ * 404s once a query string is present (see `CORE_ROUTE_TEMPLATES`), so that
+ * combination must not carry `http.route` either — same "omitted, never
+ * fabricated" contract as the method-mismatch case above it.
  */
 export function describeRequestRoute(
   method: string | undefined,
   pathSegments: string[],
+  hasQueryString = false,
 ): RequestRouteDescriptor {
   const m = (method ?? "").toUpperCase() || "UNKNOWN";
   const matched = findRoute(method, pathSegments);
   if (matched) return { spanName: `${m} ${matched.path}`, httpRoute: matched.path };
   const coreTemplate = CORE_ROUTE_TEMPLATES[pathSegments.join("/")];
-  if (coreTemplate && (!coreTemplate.methods || coreTemplate.methods.includes(m))) {
+  if (
+    coreTemplate &&
+    (!coreTemplate.methods || coreTemplate.methods.includes(m)) &&
+    (!hasQueryString || coreTemplate.toleratesQueryString)
+  ) {
     return { spanName: `${m} ${coreTemplate.path}`, httpRoute: coreTemplate.path };
   }
   const first = pathSegments[0];

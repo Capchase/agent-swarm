@@ -103,6 +103,7 @@ import { handleTasks } from "./tasks";
 import { handleTrackers } from "./trackers";
 import { handleUsers } from "./users";
 import {
+  abortedStatusCodeAttribute,
   getPathSegments,
   httpServerSemconvAttributes,
   parseQueryParams,
@@ -246,13 +247,14 @@ const httpServer = createHttpServer(async (req, res) => {
   await withRemoteContext(req.headers as Record<string, unknown>, async () => {
     const reqPath = req.url?.split("?")[0] ?? "";
     const pathSegments = getPathSegments(req.url || "");
+    const hasQueryString = (req.url ?? "").includes("?");
     const skipSpan = reqPath === "/api/poll" && !isPollTracingEnabled();
     // Per OTel HTTP semantic conventions: span name is `{METHOD} {route-template}`
     // and `http.route` carries the bounded-cardinality template so SigNoz can
     // group/filter/aggregate by endpoint as a first-class field. `http.route` is
     // omitted (not fabricated) for unmatched core/MCP/404 paths. Raw path stays
     // on `url.path`.
-    const { spanName, httpRoute } = describeRequestRoute(req.method, pathSegments);
+    const { spanName, httpRoute } = describeRequestRoute(req.method, pathSegments, hasQueryString);
     // Standard OTel HTTP server semconv attributes — host, scheme, protocol
     // version, user-agent (the method/path/route/status are set inline below).
     const semconv = httpServerSemconvAttributes(req);
@@ -299,16 +301,20 @@ const httpServer = createHttpServer(async (req, res) => {
       // `close` fires after `finish` on the happy path (the `spanEnded` guard
       // already covers that), but a client that disconnects mid-request fires
       // neither `finish` nor `error` — without this, the span stays open and is
-      // never exported.
+      // never exported. Verified against Bun 1.4.0 (pinned): `close` fires on
+      // abort even with `headersSent === false`; Bun 1.3.14 never fires it.
       res.on("close", () => {
         if (spanEnded) return;
         spanEnded = true;
         span.setAttributes({
-          "http.response.status_code": statusCode,
+          "http.response.status_code": abortedStatusCodeAttribute(res.headersSent, statusCode),
           "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
           "agentswarm.http.aborted": true,
         });
-        span.setStatus({ code: 2, message: "client disconnected before response completed" });
+        // Per OTel HTTP semconv, a client abort is not a server-side failure —
+        // leave the span status Unset. `agentswarm.http.aborted` already carries
+        // the signal; setting ERROR here would misclassify every normal SSE
+        // teardown on /mcp and /mcp-user as a server error.
         span.end();
       });
     }
