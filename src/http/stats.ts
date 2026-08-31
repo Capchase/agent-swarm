@@ -11,6 +11,7 @@ import {
   getTaskStats,
   withFavoriteFlags,
 } from "../be/db";
+import { getDbRetentionStats } from "../be/db-retention";
 import { isSteeringEnabled } from "../be/steering";
 import type { AgentLog } from "../types";
 import { AgentLogSchema, ScheduledTaskSchema, ServiceSchema } from "../types";
@@ -57,6 +58,38 @@ const SwarmMetricsSchema = z.object({
   pages: z.object({ total: z.number() }),
   sessions: z.object({ active: z.number() }),
   skills: z.object({ total: z.number() }),
+  retention: z.object({
+    sessionLogs: z
+      .object({
+        at: z.string(),
+        rowsDeleted: z.number(),
+        batches: z.number(),
+        durationMs: z.number(),
+        dryRun: z.boolean(),
+        cumulativeRowsDeleted: z.number(),
+      })
+      .optional(),
+    agentLog: z
+      .object({
+        at: z.string(),
+        rowsDeleted: z.number(),
+        batches: z.number(),
+        durationMs: z.number(),
+        dryRun: z.boolean(),
+        cumulativeRowsDeleted: z.number(),
+      })
+      .optional(),
+    events: z
+      .object({
+        at: z.string(),
+        rowsDeleted: z.number(),
+        batches: z.number(),
+        durationMs: z.number(),
+        dryRun: z.boolean(),
+        cumulativeRowsDeleted: z.number(),
+      })
+      .optional(),
+  }),
 });
 
 /** Mirrors `ConcurrentContext` (src/be/db.ts). */
@@ -242,7 +275,10 @@ export async function handleStats(
   }
 
   if (getMetrics.match(req.method, pathSegments)) {
-    getMetrics.respond(res, 200, await getSwarmMetrics());
+    getMetrics.respond(res, 200, {
+      ...(await getSwarmMetrics()),
+      retention: getDbRetentionStats(),
+    });
     return true;
   }
 

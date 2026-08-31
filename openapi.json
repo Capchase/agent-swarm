@@ -142,6 +142,7 @@
           "status": {
             "type": "string",
             "enum": [
+              "draft",
               "backlog",
               "unassigned",
               "offered",
@@ -8086,6 +8087,7 @@
                         "status": {
                           "type": "string",
                           "enum": [
+                            "draft",
                             "backlog",
                             "unassigned",
                             "offered",
@@ -31569,6 +31571,7 @@
                     "status": {
                       "type": "string",
                       "enum": [
+                        "draft",
                         "backlog",
                         "unassigned",
                         "offered",
@@ -32693,6 +32696,7 @@
                                   "status": {
                                     "type": "string",
                                     "enum": [
+                                      "draft",
                                       "backlog",
                                       "unassigned",
                                       "offered",
@@ -32844,6 +32848,7 @@
                           "latestStatus": {
                             "type": "string",
                             "enum": [
+                              "draft",
                               "backlog",
                               "unassigned",
                               "offered",
@@ -36731,6 +36736,104 @@
                       "required": [
                         "total"
                       ]
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "sessionLogs": {
+                          "type": "object",
+                          "properties": {
+                            "at": {
+                              "type": "string"
+                            },
+                            "rowsDeleted": {
+                              "type": "number"
+                            },
+                            "batches": {
+                              "type": "number"
+                            },
+                            "durationMs": {
+                              "type": "number"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            },
+                            "cumulativeRowsDeleted": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "at",
+                            "rowsDeleted",
+                            "batches",
+                            "durationMs",
+                            "dryRun",
+                            "cumulativeRowsDeleted"
+                          ]
+                        },
+                        "agentLog": {
+                          "type": "object",
+                          "properties": {
+                            "at": {
+                              "type": "string"
+                            },
+                            "rowsDeleted": {
+                              "type": "number"
+                            },
+                            "batches": {
+                              "type": "number"
+                            },
+                            "durationMs": {
+                              "type": "number"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            },
+                            "cumulativeRowsDeleted": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "at",
+                            "rowsDeleted",
+                            "batches",
+                            "durationMs",
+                            "dryRun",
+                            "cumulativeRowsDeleted"
+                          ]
+                        },
+                        "events": {
+                          "type": "object",
+                          "properties": {
+                            "at": {
+                              "type": "string"
+                            },
+                            "rowsDeleted": {
+                              "type": "number"
+                            },
+                            "batches": {
+                              "type": "number"
+                            },
+                            "durationMs": {
+                              "type": "number"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            },
+                            "cumulativeRowsDeleted": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "at",
+                            "rowsDeleted",
+                            "batches",
+                            "durationMs",
+                            "dryRun",
+                            "cumulativeRowsDeleted"
+                          ]
+                        }
+                      }
                     }
                   },
                   "required": [
@@ -36739,7 +36842,8 @@
                     "workflows",
                     "pages",
                     "sessions",
-                    "skills"
+                    "skills",
+                    "retention"
                   ]
                 }
               }
@@ -37771,6 +37875,7 @@
                               "status": {
                                 "type": "string",
                                 "enum": [
+                                  "draft",
                                   "backlog",
                                   "unassigned",
                                   "offered",
@@ -38045,6 +38150,9 @@
                       "xhigh",
                       "max"
                     ]
+                  },
+                  "draft": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -38067,6 +38175,62 @@
           },
           "400": {
             "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}/promote-draft": {
+      "post": {
+        "summary": "Promote a draft task out of the pre-dispatch draft state",
+        "description": "Transitions a `draft` task (#1240 — created with attachments still uploading) to its normal dispatch-eligible status: `offered` if it was offered to an agent, `pending` if it has an owning agent (the common case — UI-composer tasks default to Lead), otherwise `unassigned`. Called by the UI composer once its attachment upload batch settles, whether every file uploaded, some failed, or all failed — a draft must never be stranded by an upload error. Idempotent: calling it on a task that already left `draft` returns the current task unchanged rather than erroring, so a retried request is safe.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Task promoted (or already out of draft)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentTask"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this task",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -39406,6 +39570,7 @@
                     "resumeTaskStatus": {
                       "type": "string",
                       "enum": [
+                        "draft",
                         "backlog",
                         "unassigned",
                         "offered",
