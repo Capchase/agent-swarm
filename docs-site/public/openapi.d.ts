@@ -14489,29 +14489,49 @@ export interface paths {
                                 total: number;
                             };
                             retention: {
+                                lastTick?: {
+                                    startedAt: string;
+                                    finishedAt: string;
+                                    dryRun: boolean;
+                                };
                                 sessionLogs?: {
                                     at: string;
-                                    rowsDeleted: number;
+                                    /** @enum {string} */
+                                    status: "ok" | "failed";
+                                    rowsDeleted?: number;
                                     batches: number;
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    complete: boolean;
+                                    partialRowsMatched?: number;
+                                    error?: string;
                                 };
                                 agentLog?: {
                                     at: string;
-                                    rowsDeleted: number;
+                                    /** @enum {string} */
+                                    status: "ok" | "failed";
+                                    rowsDeleted?: number;
                                     batches: number;
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    complete: boolean;
+                                    partialRowsMatched?: number;
+                                    error?: string;
                                 };
                                 events?: {
                                     at: string;
-                                    rowsDeleted: number;
+                                    /** @enum {string} */
+                                    status: "ok" | "failed";
+                                    rowsDeleted?: number;
                                     batches: number;
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    complete: boolean;
+                                    partialRowsMatched?: number;
+                                    error?: string;
                                 };
                             };
                         };

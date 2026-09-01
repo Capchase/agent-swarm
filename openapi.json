@@ -36739,11 +36739,37 @@
                     "retention": {
                       "type": "object",
                       "properties": {
+                        "lastTick": {
+                          "type": "object",
+                          "properties": {
+                            "startedAt": {
+                              "type": "string"
+                            },
+                            "finishedAt": {
+                              "type": "string"
+                            },
+                            "dryRun": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "startedAt",
+                            "finishedAt",
+                            "dryRun"
+                          ]
+                        },
                         "sessionLogs": {
                           "type": "object",
                           "properties": {
                             "at": {
                               "type": "string"
+                            },
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "ok",
+                                "failed"
+                              ]
                             },
                             "rowsDeleted": {
                               "type": "number"
@@ -36759,15 +36785,25 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "complete": {
+                              "type": "boolean"
+                            },
+                            "partialRowsMatched": {
+                              "type": "number"
+                            },
+                            "error": {
+                              "type": "string"
                             }
                           },
                           "required": [
                             "at",
-                            "rowsDeleted",
+                            "status",
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "complete"
                           ]
                         },
                         "agentLog": {
@@ -36776,6 +36812,13 @@
                             "at": {
                               "type": "string"
                             },
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "ok",
+                                "failed"
+                              ]
+                            },
                             "rowsDeleted": {
                               "type": "number"
                             },
@@ -36790,15 +36833,25 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "complete": {
+                              "type": "boolean"
+                            },
+                            "partialRowsMatched": {
+                              "type": "number"
+                            },
+                            "error": {
+                              "type": "string"
                             }
                           },
                           "required": [
                             "at",
-                            "rowsDeleted",
+                            "status",
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "complete"
                           ]
                         },
                         "events": {
@@ -36807,6 +36860,13 @@
                             "at": {
                               "type": "string"
                             },
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "ok",
+                                "failed"
+                              ]
+                            },
                             "rowsDeleted": {
                               "type": "number"
                             },
@@ -36821,15 +36881,25 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "complete": {
+                              "type": "boolean"
+                            },
+                            "partialRowsMatched": {
+                              "type": "number"
+                            },
+                            "error": {
+                              "type": "string"
                             }
                           },
                           "required": [
                             "at",
-                            "rowsDeleted",
+                            "status",
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "complete"
                           ]
                         }
                       }
