@@ -399,18 +399,22 @@ Both counters share the same set of low-cardinality attributes:
 
 ### Database Retention Sweep
 
-The `src/be/db-retention.ts` sweep emits one metric point per table per tick, on both the success and the error path, so a failure is never silently absent from `retention: {}` on `GET /api/metrics` — it shows up as `outcome:error` here instead.
+The `src/be/db-retention.ts` sweep emits one metric point per table **attempt**, on both the success and the error path, so a failure is never silently absent from `retention: {}` on `GET /api/metrics` — it shows up as `outcome:error` here instead.
+
+A tick makes up to two passes: pass 1 gives every enabled table its slice, and pass 2 revisits the tables pass 1 left undrained while budget remains. A table can therefore emit two points in one tick. A dry run runs pass 1 only, so it emits exactly one point per table per tick. Aggregate by `table` before reading a rate.
+
+Emission is best-effort. Every span and metric call in the sweep is wrapped so a throwing exporter cannot fail a tick or turn a completed `DELETE` into a failed sweep.
 
 | Metric | Instrument | Unit | Emitted | Meaning |
 | --- | --- | --- | --- | --- |
 | `agentswarm.db.retention.sweeps` | Counter | `{sweep}` | once per table per tick, always | One point per table attempt. `outcome` tag carries the terminal state. |
-| `agentswarm.db.retention.rows_deleted` | Counter | `{row}` | once per table per tick | Rows deleted. Always 0 when `dry_run:true`. |
-| `agentswarm.db.retention.backlog` | Gauge | `{row}` | once per table per tick | Rows still older than the horizon at the end of the slice. |
-| `agentswarm.db.retention.batches` | Counter | `{batch}` | once per table per tick | DELETE statements issued. |
-| `agentswarm.db.retention.table_duration_ms` | Histogram | `ms` | once per table per tick | Wall clock of one table's slice. |
-| `agentswarm.db.retention.slowest_statement_ms` | Gauge | `ms` | once per table per tick | Slowest single DELETE in the slice. The event-loop stall signal. |
+| `agentswarm.db.retention.rows_deleted` | Counter | `{row}` | once per table attempt | Rows deleted. Always 0 when `dry_run:true`. |
+| `agentswarm.db.retention.backlog` | Gauge | `{row}` | once per table attempt | Rows still older than the horizon at the end of the slice. |
+| `agentswarm.db.retention.batches` | Counter | `{batch}` | once per table attempt | DELETE statements issued. |
+| `agentswarm.db.retention.table_duration_ms` | Histogram | `ms` | once per table attempt | Wall clock of one table's slice. |
+| `agentswarm.db.retention.slowest_statement_ms` | Gauge | `ms` | once per table attempt | Slowest single DELETE in the slice. The event-loop stall signal. |
 | `agentswarm.db.retention.statement_duration_ms` | Histogram | `ms` | once per DELETE | Distribution of statement durations. |
-| `agentswarm.db.retention.batch_size` | Gauge | `{row}` | once per table per tick | The adaptive batch size the table settled on. |
+| `agentswarm.db.retention.batch_size` | Gauge | `{row}` | once per table attempt | The adaptive batch size the table settled on. |
 
 Tags on every metric:
 

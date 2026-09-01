@@ -34,6 +34,16 @@ To add a table, change the closed descriptor list in `src/be/db-retention.ts`, a
 
 The sweep runs hourly once every enabled table is drained. While any table is undrained it runs again every `DB_RETENTION_CATCHUP_INTERVAL_MS` (default 60 s) instead of waiting for the next hourly tick. Each tick divides a `DB_RETENTION_TICK_BUDGET_MS` budget (default 30 s) evenly across the enabled tables, and rotates which table sweeps first each tick so one table's backlog cannot starve the others. Deletes go oldest-first through the table's `createdAt` index, in batches sized adaptively against `DB_RETENTION_MAX_STATEMENT_MS` (default 250 ms per statement).
 
+A tick makes up to two passes. Pass 1 gives every enabled table its even slice. Pass 2 revisits the tables pass 1 left undrained, for as long as tick budget remains. So a table can be swept twice in one tick, and **each attempt emits its own sweep metric point and its own `db.retention.table` span**. Read `agentswarm.db.retention.sweeps` as one point per attempt, not one point per tick.
+
+A table that pass 1 never reached — because a slower table ahead of it used the tick budget first — counts as undrained. It reports no sweep record for that tick, and it arms the catch-up tick. It never waits for the hourly timer.
+
+A dry run is different: it deletes nothing, so its backlog can never shrink. It runs pass 1 only, and it never arms catch-up. A dry-run table therefore emits exactly one sweep point per hourly tick. Turn dry run off to make the drain converge.
+
+A failed sweep stores its error message on `lastError` in `GET /api/metrics`. That message is passed through the shared secret scrubber first, so a credential inside a database error surfaces as `[REDACTED:<name>]`.
+
+Telemetry is best-effort. A broken OTLP exporter cannot fail a tick or turn a completed `DELETE` into a failed sweep: every span and metric call is wrapped, and a failure is logged once per tick and otherwise ignored.
+
 ## Monitoring
 
 | # | Monitor | Query | Catches |
@@ -48,8 +58,8 @@ The sweep runs hourly once every enabled table is drained. While any table is un
 Enable tables one at a time, watching the monitors above before moving to the next:
 
 1. Confirm the first table (see **Activate retention** above) is stable for at least 24 hours at steady state — its backlog stays near 0 across hourly ticks.
-2. Turn on the smallest remaining table next; it is the cheapest way to prove budget division across 2 tables. Confirm both tables report a sweep record every tick — neither starves the other.
-3. Turn on the third table at a conservative retention horizon first, and confirm all 3 tables report a sweep record every tick before narrowing that horizon. Narrowing a horizon after the fact is a data-loss decision, not a default — get an explicit sign-off before doing it on a table holding a large backlog.
+2. Turn on the smallest remaining table next; it is the cheapest way to prove budget division across 2 tables. Confirm both tables report a sweep record on the steady-state hourly ticks — neither starves the other. A table that reports no record for a tick was not reached inside the budget; it arms catch-up, so check that its backlog still falls across the following ticks.
+3. Turn on the third table at a conservative retention horizon first, and confirm all 3 tables report a sweep record on steady-state hourly ticks before narrowing that horizon. Narrowing a horizon after the fact is a data-loss decision, not a default — get an explicit sign-off before doing it on a table holding a large backlog.
 
 ## Disk space and SQLite vacuuming
 
