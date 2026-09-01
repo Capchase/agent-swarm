@@ -5,10 +5,13 @@ import { MAX_DB_RETENTION_DAYS } from "./swarm-config-guard";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETENTION_INTERVAL_MS = 60 * 60 * 1000;
-const BATCH_SIZE = 5_000;
-const PER_TABLE_BATCH_CAP = 40;
-const WALL_CLOCK_CAP_MS = 60_000;
-const YIELD_MS = 5;
+const DEFAULT_TICK_BUDGET_MS = 30_000;
+const DEFAULT_CATCHUP_INTERVAL_MS = 60_000;
+const DEFAULT_MAX_STATEMENT_MS = 250;
+const DEFAULT_BATCH_SIZE = 500;
+const MIN_BATCH_SIZE = 50;
+const MAX_BATCH_SIZE = 2_000;
+const YIELD_MS = 25;
 
 /**
  * This is deliberately a closed list. Neither table nor column names may come
@@ -34,10 +37,18 @@ export const DB_RETENTION_TABLES = [
     envKey: "EVENTS_RETENTION_DAYS",
     metricsKey: "events",
   },
-] as const;
+] as const satisfies ReadonlyArray<{
+  table: string;
+  timeColumn: string;
+  envKey: string;
+  metricsKey: string;
+  initialBatchSize?: number;
+}>;
 
 type RetentionTable = (typeof DB_RETENTION_TABLES)[number];
 type RetentionMetricsKey = RetentionTable["metricsKey"];
+
+export type DbRetentionOutcome = "converged" | "budget_exhausted" | "error";
 
 export type DbRetentionTableStats = {
   at: string;
@@ -47,23 +58,41 @@ export type DbRetentionTableStats = {
   durationMs: number;
   dryRun: boolean;
   cumulativeRowsDeleted: number;
+  outcome: DbRetentionOutcome;
+  drained: boolean;
+  backlogRemaining: number;
+  batchSize: number;
+  slowestStatementMs: number;
+  lastError?: string;
+  lastErrorAt?: string;
+  lastSuccessAt?: string;
 };
 
 export type DbRetentionStats = Partial<Record<RetentionMetricsKey, DbRetentionTableStats>>;
 
-/** Test-only controls; production callers always use the bounded defaults above. */
+/** Test-only controls; production callers always use the env-derived defaults. */
 export type DbRetentionTickOptions = {
   now?: Date;
-  batchSize?: number;
-  perTableBatchCap?: number;
-  wallClockCapMs?: number;
+};
+
+type SweepResult = {
+  rowsDeleted: number;
+  batches: number;
+  backlogRemaining: number;
+  drained: boolean;
+  slowestStatementMs: number;
+  batchSize: number;
 };
 
 let retentionTimer: ReturnType<typeof setInterval> | null = null;
+let catchupTimer: ReturnType<typeof setTimeout> | null = null;
 let retentionTickPromise: Promise<void> | null = null;
 let retentionAbortController: AbortController | null = null;
 let retentionStats: DbRetentionStats = {};
 let cumulativeRowsDeleted: Partial<Record<RetentionMetricsKey, number>> = {};
+let batchSizeByTable: Partial<Record<RetentionMetricsKey, number>> = {};
+let tickCount = 0;
+let lastSweepOrder: RetentionMetricsKey[] = [];
 
 // Timers must not inherit an open database transaction from their caller.
 const scheduleContextFree = AsyncLocalStorage.snapshot();
@@ -73,6 +102,20 @@ function readPositiveIntEnv(key: string, env: NodeJS.ProcessEnv = process.env): 
   if (!raw || !/^\d+$/.test(raw)) return null;
   const value = Number(raw);
   return Number.isSafeInteger(value) && value >= 1 && value <= MAX_DB_RETENTION_DAYS ? value : null;
+}
+
+/** Reject a non-digit string. A parsed-but-out-of-range value falls back rather than breaking the server. */
+function readBoundedIntEnv(
+  key: string,
+  min: number,
+  max: number,
+  fallback: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[key]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
 function yieldTick(): Promise<void> {
@@ -89,80 +132,77 @@ function dryRunEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isEnvFlagEnabled("DB_RETENTION_DRY_RUN", true, env);
 }
 
+async function indexedBacklogCount(table: RetentionTable, cutoff: string): Promise<number> {
+  const row = await getDbClient().get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM ${table.table} WHERE ${table.timeColumn} < ?`,
+    [cutoff],
+  );
+  return row?.n ?? 0;
+}
+
 async function sweepTable(
   table: RetentionTable,
   cutoff: string,
   dryRun: boolean,
   deadline: number,
-  batchSize: number,
-  perTableBatchCap: number,
   signal: AbortSignal,
-): Promise<{ rowsDeleted: number; batches: number; complete: boolean }> {
+  maxStatementMs: number,
+): Promise<SweepResult> {
   const client = getDbClient();
+
+  if (dryRun) {
+    const backlogRemaining = await indexedBacklogCount(table, cutoff);
+    return {
+      rowsDeleted: 0,
+      batches: 0,
+      backlogRemaining,
+      drained: backlogRemaining === 0,
+      slowestStatementMs: 0,
+      batchSize: batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE,
+    };
+  }
+
   let rowsDeleted = 0;
   let batches = 0;
-  let pagesFetched = 0;
-  let cursor: string | null = null;
-  let complete = true;
-  let exhausted = false;
-  // Bounded on pages fetched, not on delete batches: a sparse or no-match
-  // table would otherwise walk every primary-key page until the wall-clock
-  // deadline, since batches only increments when a page has expired rows.
-  const pageLimit = dryRun ? Number.POSITIVE_INFINITY : perTableBatchCap;
-  while (!signal.aborted && pagesFetched < pageLimit && Date.now() < deadline) {
-    // Page by the primary key, not by the retention predicate. A query that
-    // filters on createdAt while ordering by id can scan the whole PK index
-    // before finding LIMIT matches when eligible rows are sparse. This query
-    // visits at most batchSize rows per statement; cutoff filtering happens in
-    // memory and deletes are restricted to the IDs in that bounded page.
-    const page: Array<{ id: string; createdAt: string }> = await client.query<{
-      id: string;
-      createdAt: string;
-    }>(
-      `SELECT id, ${table.timeColumn} AS createdAt
-       FROM ${table.table}
-       ${cursor === null ? "" : "WHERE id > ?"}
-       ORDER BY id
-       LIMIT ?`,
-      cursor === null ? [batchSize] : [cursor, batchSize],
+  let slowestStatementMs = 0;
+  let drained = false;
+  let size = batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE;
+
+  while (!signal.aborted && Date.now() < deadline) {
+    const limitUsed = size;
+    const statementStartedAt = Date.now();
+    // Never wrap multiple batches in a transaction: one autocommit DELETE per
+    // batch, so the write lock and any event-loop stall end with each statement.
+    const result = await client.run(
+      `DELETE FROM ${table.table} WHERE rowid IN (
+         SELECT rowid FROM ${table.table} WHERE ${table.timeColumn} < ? ORDER BY ${table.timeColumn} LIMIT ?
+       )`,
+      [cutoff, limitUsed],
     );
-    pagesFetched += 1;
-    if (Date.now() >= deadline || signal.aborted) {
-      complete = false;
-      break;
-    }
-    if (page.length === 0) {
-      exhausted = true;
-      break;
+    const elapsed = Date.now() - statementStartedAt;
+    slowestStatementMs = Math.max(slowestStatementMs, elapsed);
+    rowsDeleted += result.changes;
+    batches += 1;
+
+    if (elapsed > maxStatementMs) {
+      size = Math.max(MIN_BATCH_SIZE, Math.floor(size / 2));
+    } else if (elapsed < maxStatementMs / 5) {
+      size = Math.min(MAX_BATCH_SIZE, size * 2);
     }
 
-    cursor = page[page.length - 1]?.id ?? null;
-    const expiredIds = page.filter((row) => row.createdAt < cutoff).map((row) => row.id);
-    if (expiredIds.length > 0) {
-      if (dryRun) {
-        rowsDeleted += expiredIds.length;
-      } else {
-        // IDs came directly from the bounded page and are placeholders, so
-        // this statement is bounded by the page size and remains retryable.
-        const placeholders = expiredIds.map(() => "?").join(", ");
-        const result = await client.run(
-          `DELETE FROM ${table.table} WHERE id IN (${placeholders})`,
-          expiredIds,
-        );
-        rowsDeleted += result.changes;
-      }
-      batches += 1;
-    }
-    if (page.length < batchSize) {
-      exhausted = true;
+    // A DELETE that changed fewer rows than the LIMIT it used proves no row
+    // above the horizon remains — the subquery ran out of matches.
+    if (result.changes < limitUsed) {
+      drained = true;
       break;
     }
+    if (signal.aborted || Date.now() >= deadline) break;
     await yieldTick();
   }
-  // A dry-run count is only useful if the full table was scanned. Never
-  // publish a partial count when the wall-clock budget or shutdown interrupted
-  // the keyset scan.
-  return { rowsDeleted, batches, complete: !dryRun || (complete && exhausted) };
+  batchSizeByTable[table.metricsKey] = size;
+
+  const backlogRemaining = await indexedBacklogCount(table, cutoff);
+  return { rowsDeleted, batches, backlogRemaining, drained, slowestStatementMs, batchSize: size };
 }
 
 /** Run one bounded sweep over every enabled table. Failures are isolated per table. */
@@ -173,45 +213,90 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
   retentionAbortController = abortController;
   const promise = Promise.resolve().then(async () => {
     try {
+      // Clear any pending catch-up timer at the start of a new tick so timers
+      // cannot accumulate.
+      if (catchupTimer) {
+        clearTimeout(catchupTimer);
+        catchupTimer = null;
+      }
+
+      tickCount += 1;
       const tickStartedAt = Date.now();
       const cutoffBase = options.now ?? new Date(tickStartedAt);
       const dryRun = dryRunEnabled();
-      const batchSize = options.batchSize ?? BATCH_SIZE;
-      const perTableBatchCap = options.perTableBatchCap ?? PER_TABLE_BATCH_CAP;
-      const deadline = tickStartedAt + (options.wallClockCapMs ?? WALL_CLOCK_CAP_MS);
+      const budget = readBoundedIntEnv(
+        "DB_RETENTION_TICK_BUDGET_MS",
+        1_000,
+        300_000,
+        DEFAULT_TICK_BUDGET_MS,
+      );
+      const catchupIntervalMs = readBoundedIntEnv(
+        "DB_RETENTION_CATCHUP_INTERVAL_MS",
+        5_000,
+        3_600_000,
+        DEFAULT_CATCHUP_INTERVAL_MS,
+      );
+      const maxStatementMs = readBoundedIntEnv(
+        "DB_RETENTION_MAX_STATEMENT_MS",
+        25,
+        5_000,
+        DEFAULT_MAX_STATEMENT_MS,
+      );
+
+      const tickDeadline = tickStartedAt + budget;
+      const enabled = DB_RETENTION_TABLES.filter((table) => retentionDays(table) !== null);
+      if (enabled.length === 0) {
+        lastSweepOrder = [];
+        return; // emit nothing; retention: {} stays honest
+      }
+
+      const slice = Math.floor(budget / enabled.length);
+      const startIndex = tickCount % enabled.length;
+      const order = [...enabled.slice(startIndex), ...enabled.slice(0, startIndex)];
+      lastSweepOrder = order.map((table) => table.metricsKey);
+
       let deletedAny = false;
+      const undrained = new Set<RetentionMetricsKey>();
 
-      for (const table of DB_RETENTION_TABLES) {
-        if (abortController.signal.aborted || Date.now() >= deadline) break;
+      const sweepOne = async (table: RetentionTable, tableDeadline: number): Promise<void> => {
         const days = retentionDays(table);
-        if (days === null) continue;
-
+        if (days === null) return;
         const startedAt = Date.now();
+        const previous = retentionStats[table.metricsKey];
         try {
           const cutoff = new Date(cutoffBase.getTime() - days * DAY_MS).toISOString();
           const result = await sweepTable(
             table,
             cutoff,
             dryRun,
-            deadline,
-            batchSize,
-            perTableBatchCap,
+            tableDeadline,
             abortController.signal,
+            maxStatementMs,
           );
-          if (dryRun && !result.complete) {
-            throw new Error("dry-run count stopped before completion");
-          }
           deletedAny ||= !dryRun && result.rowsDeleted > 0;
           const cumulative =
             (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);
           cumulativeRowsDeleted[table.metricsKey] = cumulative;
+          const outcome: DbRetentionOutcome = result.drained ? "converged" : "budget_exhausted";
+          if (result.drained) undrained.delete(table.metricsKey);
+          else undrained.add(table.metricsKey);
+
+          const nowIso = new Date().toISOString();
           retentionStats[table.metricsKey] = {
-            at: new Date().toISOString(),
+            at: nowIso,
             rowsDeleted: result.rowsDeleted,
             batches: result.batches,
             durationMs: Date.now() - startedAt,
             dryRun,
             cumulativeRowsDeleted: cumulative,
+            outcome,
+            drained: result.drained,
+            backlogRemaining: result.backlogRemaining,
+            batchSize: result.batchSize,
+            slowestStatementMs: result.slowestStatementMs,
+            lastError: previous?.lastError,
+            lastErrorAt: previous?.lastErrorAt,
+            lastSuccessAt: nowIso,
           };
           if (result.rowsDeleted > 0) {
             console.log(
@@ -219,8 +304,41 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             );
           }
         } catch (err) {
+          undrained.add(table.metricsKey);
+          const nowIso = new Date().toISOString();
+          retentionStats[table.metricsKey] = {
+            at: nowIso,
+            rowsDeleted: previous?.rowsDeleted ?? 0,
+            batches: previous?.batches ?? 0,
+            durationMs: Date.now() - startedAt,
+            dryRun,
+            cumulativeRowsDeleted:
+              previous?.cumulativeRowsDeleted ?? cumulativeRowsDeleted[table.metricsKey] ?? 0,
+            outcome: "error",
+            drained: false,
+            backlogRemaining: previous?.backlogRemaining ?? 0,
+            batchSize:
+              previous?.batchSize ?? batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE,
+            slowestStatementMs: previous?.slowestStatementMs ?? 0,
+            lastError: (err as Error).message,
+            lastErrorAt: nowIso,
+            lastSuccessAt: previous?.lastSuccessAt,
+          };
           console.error(`[db-retention] ${table.table} sweep failed:`, (err as Error).message);
         }
+      };
+
+      // Pass 1: every enabled table gets an even slice of the tick budget.
+      for (const table of order) {
+        if (abortController.signal.aborted || Date.now() >= tickDeadline) break;
+        const tableDeadline = Math.min(Date.now() + slice, tickDeadline);
+        await sweepOne(table, tableDeadline);
+      }
+      // Pass 2: catch-up within the same tick for tables pass 1 left undrained.
+      for (const table of order) {
+        if (abortController.signal.aborted || Date.now() >= tickDeadline) break;
+        if (!undrained.has(table.metricsKey)) continue;
+        await sweepOne(table, tickDeadline);
       }
 
       if (deletedAny && !abortController.signal.aborted) {
@@ -230,6 +348,13 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
         } catch (err) {
           console.error("[db-retention] incremental vacuum failed:", (err as Error).message);
         }
+      }
+
+      if (undrained.size > 0 && !abortController.signal.aborted) {
+        catchupTimer = scheduleContextFree(() =>
+          setTimeout(() => void runDbRetentionTick(), catchupIntervalMs),
+        );
+        if (typeof catchupTimer.unref === "function") catchupTimer.unref();
       }
     } finally {
       if (retentionAbortController === abortController) retentionAbortController = null;
@@ -242,6 +367,11 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
 
 export function getDbRetentionStats(): DbRetentionStats {
   return { ...retentionStats };
+}
+
+/** Test-only: the sweep order (by metricsKey) used on the most recent tick. */
+export function _getLastSweepOrderForTests(): RetentionMetricsKey[] {
+  return [...lastSweepOrder];
 }
 
 /** Start the hourly sweep. The first tick runs immediately. */
@@ -263,6 +393,10 @@ export async function stopDbRetention(): Promise<void> {
     clearInterval(retentionTimer);
     retentionTimer = null;
   }
+  if (catchupTimer) {
+    clearTimeout(catchupTimer);
+    catchupTimer = null;
+  }
   retentionAbortController?.abort();
   await retentionTickPromise;
 }
@@ -272,4 +406,7 @@ export async function resetDbRetentionForTests(): Promise<void> {
   await stopDbRetention();
   retentionStats = {};
   cumulativeRowsDeleted = {};
+  batchSizeByTable = {};
+  tickCount = 0;
+  lastSweepOrder = [];
 }
