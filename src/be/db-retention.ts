@@ -81,7 +81,7 @@ export type DbRetentionStats = Partial<Record<RetentionMetricsKey, DbRetentionTa
  * stays; the partial travels with it to the catch that records state.
  */
 class IncompleteDryRunError extends Error {
-  constructor(readonly partial: { rowsDeleted: number; batches: number }) {
+  constructor(public readonly partial: { rowsDeleted: number; batches: number }) {
     super("dry-run count stopped before completion");
     this.name = "IncompleteDryRunError";
   }
