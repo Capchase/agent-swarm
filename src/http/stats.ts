@@ -50,23 +50,34 @@ const DashboardStatsSchema = z.object({
   steeringEnabled: z.boolean(),
 });
 
-/**
- * Mirrors `DbRetentionTableStats` (src/be/db-retention.ts). `rowsDeleted` is
- * absent whenever the scan did not complete; the partial figure is reported
- * separately so it can never be read as a final total.
- */
-const RetentionTableStatsSchema = z.object({
+const RetentionTableStatsCommonSchema = z.object({
   at: z.string(),
-  status: z.enum(["ok", "failed"]),
-  rowsDeleted: z.number().optional(),
   batches: z.number(),
   durationMs: z.number(),
   dryRun: z.boolean(),
   cumulativeRowsDeleted: z.number(),
-  complete: z.boolean(),
-  partialRowsMatched: z.number().optional(),
-  error: z.string().optional(),
 });
+
+/**
+ * Mirrors `DbRetentionTableStats` (src/be/db-retention.ts): a completed sweep
+ * and a failed one are alternatives, not one object with optional fields.
+ * `rowsDeleted` is a final total and appears only on the `complete: true`
+ * branch; a `complete: false` branch can never carry it, only the interrupted
+ * scan's own `partialRowsMatched`.
+ */
+const RetentionTableStatsSchema = z.discriminatedUnion("complete", [
+  RetentionTableStatsCommonSchema.extend({
+    status: z.literal("ok"),
+    complete: z.literal(true),
+    rowsDeleted: z.number(),
+  }),
+  RetentionTableStatsCommonSchema.extend({
+    status: z.literal("failed"),
+    complete: z.literal(false),
+    partialRowsMatched: z.number().optional(),
+    error: z.string(),
+  }),
+]);
 
 /** Mirrors `SwarmMetrics` (src/be/db.ts). */
 const SwarmMetricsSchema = z.object({

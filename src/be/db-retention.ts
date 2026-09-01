@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isEnvFlagEnabled } from "../utils/env-flag";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { getDbClient } from "./db";
 import { MAX_DB_RETENTION_DAYS } from "./swarm-config-guard";
 
@@ -39,27 +40,41 @@ export const DB_RETENTION_TABLES = [
 type RetentionTable = (typeof DB_RETENTION_TABLES)[number];
 type RetentionMetricsKey = RetentionTable["metricsKey"];
 
-export type DbRetentionTableStats = {
+type DbRetentionTableStatsCommon = {
   at: string;
-  /** "failed" means the sweep threw. The table was neither swept nor counted. */
-  status: "ok" | "failed";
-  /**
-   * Deleted rows, or rows that would be deleted when dryRun is true. Present
-   * only when the sweep completed, because an operator reads this as a final
-   * total. An interrupted scan reports `partialRowsMatched` instead.
-   */
-  rowsDeleted?: number;
   batches: number;
   durationMs: number;
   dryRun: boolean;
   cumulativeRowsDeleted: number;
-  /** False when the scan stopped early. `rowsDeleted` is then absent. */
-  complete: boolean;
+};
+
+/** A completed sweep. `rowsDeleted` is a final total, safe to display as-is. */
+export type DbRetentionTableStatsOk = DbRetentionTableStatsCommon & {
+  status: "ok";
+  complete: true;
+  rowsDeleted: number;
+};
+
+/**
+ * A sweep that threw, whether from a real DB error or an interrupted dry-run
+ * count. `rowsDeleted` is never present here — an operator reads that field
+ * as a final total, and a partial scan must not be misread as one. The
+ * interrupted scan's own count, when there was one, is reported separately.
+ */
+export type DbRetentionTableStatsFailed = DbRetentionTableStatsCommon & {
+  status: "failed";
+  complete: false;
   /** Rows the interrupted scan matched before it stopped. Never a total. */
   partialRowsMatched?: number;
-  /** Failure reason when status is "failed". */
-  error?: string;
+  error: string;
 };
+
+/**
+ * `complete` is the discriminant an operator (and the response schema in
+ * src/http/stats.ts) must switch on: `rowsDeleted` and `partialRowsMatched`
+ * are alternatives, never both present, never both absent.
+ */
+export type DbRetentionTableStats = DbRetentionTableStatsOk | DbRetentionTableStatsFailed;
 
 /**
  * Written on every tick, whatever the per-table results are. A tick that swept
@@ -237,6 +252,9 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
           if (dryRun && !result.complete) {
             throw new IncompleteDryRunError(result);
           }
+          // Reaching here means result.complete was true: the throw above
+          // catches the only case where it isn't (an interrupted dry-run
+          // count). A non-dry-run sweep is always complete.
           deletedAny ||= !dryRun && result.rowsDeleted > 0;
           const cumulative =
             (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);
@@ -249,7 +267,7 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             durationMs: Date.now() - startedAt,
             dryRun,
             cumulativeRowsDeleted: cumulative,
-            complete: result.complete,
+            complete: true,
           };
           if (result.rowsDeleted > 0) {
             console.log(
@@ -257,7 +275,10 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             );
           }
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+          // Scrub once, at the egress point, before the message reaches either
+          // the log line or the stored state that GET /api/metrics republishes.
+          // A driver error can embed a connection string or a row value.
+          const message = scrubSecrets(err instanceof Error ? err.message : String(err));
           console.error(`[db-retention] ${table.table} sweep failed:`, message);
           // A failure that only reaches the log is invisible to an operator
           // reading GET /api/metrics: it looks identical to a tick that never
