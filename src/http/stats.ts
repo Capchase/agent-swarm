@@ -50,6 +50,24 @@ const DashboardStatsSchema = z.object({
   steeringEnabled: z.boolean(),
 });
 
+/**
+ * Mirrors `DbRetentionTableStats` (src/be/db-retention.ts). `rowsDeleted` is
+ * absent whenever the scan did not complete; the partial figure is reported
+ * separately so it can never be read as a final total.
+ */
+const RetentionTableStatsSchema = z.object({
+  at: z.string(),
+  status: z.enum(["ok", "failed"]),
+  rowsDeleted: z.number().optional(),
+  batches: z.number(),
+  durationMs: z.number(),
+  dryRun: z.boolean(),
+  cumulativeRowsDeleted: z.number(),
+  complete: z.boolean(),
+  partialRowsMatched: z.number().optional(),
+  error: z.string().optional(),
+});
+
 /** Mirrors `SwarmMetrics` (src/be/db.ts). */
 const SwarmMetricsSchema = z.object({
   tasks: z.object({ total: z.number(), by_status: z.record(z.string(), z.number()) }),
@@ -59,36 +77,14 @@ const SwarmMetricsSchema = z.object({
   sessions: z.object({ active: z.number() }),
   skills: z.object({ total: z.number() }),
   retention: z.object({
-    sessionLogs: z
-      .object({
-        at: z.string(),
-        rowsDeleted: z.number(),
-        batches: z.number(),
-        durationMs: z.number(),
-        dryRun: z.boolean(),
-        cumulativeRowsDeleted: z.number(),
-      })
+    // Present after any tick, even one that swept no table. This is what tells
+    // an operator that the hourly timer fired at all.
+    lastTick: z
+      .object({ startedAt: z.string(), finishedAt: z.string(), dryRun: z.boolean() })
       .optional(),
-    agentLog: z
-      .object({
-        at: z.string(),
-        rowsDeleted: z.number(),
-        batches: z.number(),
-        durationMs: z.number(),
-        dryRun: z.boolean(),
-        cumulativeRowsDeleted: z.number(),
-      })
-      .optional(),
-    events: z
-      .object({
-        at: z.string(),
-        rowsDeleted: z.number(),
-        batches: z.number(),
-        durationMs: z.number(),
-        dryRun: z.boolean(),
-        cumulativeRowsDeleted: z.number(),
-      })
-      .optional(),
+    sessionLogs: RetentionTableStatsSchema.optional(),
+    agentLog: RetentionTableStatsSchema.optional(),
+    events: RetentionTableStatsSchema.optional(),
   }),
 });
 

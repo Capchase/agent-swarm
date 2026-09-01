@@ -248,7 +248,12 @@ describe("DB retention", () => {
 
     await runDbRetentionTick({ now: NOW, batchSize: 100, wallClockCapMs: 1 });
 
-    expect(getDbRetentionStats().sessionLogs).toBeUndefined();
+    expect(getDbRetentionStats().sessionLogs).toMatchObject({
+      status: "failed",
+      complete: false,
+      partialRowsMatched: 0,
+    });
+    expect(getDbRetentionStats().sessionLogs?.rowsDeleted).toBeUndefined();
     expect(await countRows("session_logs")).toBe(10_000);
   });
 
@@ -297,7 +302,75 @@ describe("DB retention", () => {
 
     expect(Date.now() - startedAt).toBeLessThan(150);
     expect(await countRows("session_logs")).toBe(1000);
-    expect(getDbRetentionStats().sessionLogs).toBeUndefined();
+
+    // The sweep must not vanish from the reported state: before this, a failed
+    // tick and a tick that never ran both showed as `retention: {}`.
+    const stats = getDbRetentionStats();
+    expect(stats.sessionLogs).toMatchObject({
+      status: "failed",
+      dryRun: true,
+      complete: false,
+      error: "dry-run count stopped before completion",
+      cumulativeRowsDeleted: 0,
+    });
+    // A partial count must never occupy the field an operator reads as a total.
+    expect(stats.sessionLogs?.rowsDeleted).toBeUndefined();
+    expect(stats.sessionLogs?.partialRowsMatched).toBeGreaterThan(0);
+    expect(stats.sessionLogs?.partialRowsMatched).toBeLessThan(1000);
+    expect(stats.lastTick).toMatchObject({ dryRun: true });
+    expect(Date.parse(stats.lastTick?.finishedAt ?? "")).toBeGreaterThanOrEqual(
+      Date.parse(stats.lastTick?.startedAt ?? ""),
+    );
+  });
+
+  test("reports a tick marker even when every retention policy is disabled", async () => {
+    await runDbRetentionTick({ now: NOW });
+
+    const stats = getDbRetentionStats();
+    expect(stats.sessionLogs).toBeUndefined();
+    expect(stats.agentLog).toBeUndefined();
+    expect(stats.events).toBeUndefined();
+    expect(stats.lastTick).toMatchObject({ dryRun: false });
+    expect(new Date(stats.lastTick?.startedAt ?? "").toISOString()).toBe(
+      stats.lastTick?.startedAt ?? "",
+    );
+  });
+
+  test("advances the tick marker on every tick and keeps the dry-run flag current", async () => {
+    await runDbRetentionTick({ now: NOW });
+    const first = getDbRetentionStats().lastTick;
+    process.env.DB_RETENTION_DRY_RUN = "true";
+    await Bun.sleep(2);
+    await runDbRetentionTick({ now: NOW });
+    const second = getDbRetentionStats().lastTick;
+
+    expect(first?.dryRun).toBe(false);
+    expect(second?.dryRun).toBe(true);
+    expect(Date.parse(second?.startedAt ?? "")).toBeGreaterThan(Date.parse(first?.startedAt ?? ""));
+  });
+
+  test("reports a failed table sweep without stopping the tick or the later tables", async () => {
+    process.env.AGENT_LOG_RETENTION_DAYS = "1";
+    process.env.EVENTS_RETENTION_DAYS = "1";
+    await insertRow("events", "events-old", "2026-08-01T00:00:00.000Z");
+    const client = getDbClient();
+    // Force a real DB error inside one table's sweep. Renaming carries the
+    // indexes with it and is reversed below, so no other test observes this.
+    await client.run("ALTER TABLE agent_log RENAME TO agent_log_hidden");
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      await client.run("ALTER TABLE agent_log_hidden RENAME TO agent_log");
+    }
+
+    const stats = getDbRetentionStats();
+    expect(stats.agentLog).toMatchObject({ status: "failed", complete: false, batches: 0 });
+    expect(stats.agentLog?.error).toContain("agent_log");
+    expect(stats.agentLog?.rowsDeleted).toBeUndefined();
+    expect(stats.agentLog?.partialRowsMatched).toBeUndefined();
+    // A per-table failure stays isolated: the next table still sweeps.
+    expect(stats.events).toMatchObject({ status: "ok", rowsDeleted: 1, complete: true });
+    expect(stats.lastTick?.finishedAt).toBeString();
   });
 
   test("rejects an excessive window without aborting later table sweeps", async () => {

@@ -41,15 +41,51 @@ type RetentionMetricsKey = RetentionTable["metricsKey"];
 
 export type DbRetentionTableStats = {
   at: string;
-  /** Deleted rows, or rows that would be deleted when dryRun is true. */
-  rowsDeleted: number;
+  /** "failed" means the sweep threw. The table was neither swept nor counted. */
+  status: "ok" | "failed";
+  /**
+   * Deleted rows, or rows that would be deleted when dryRun is true. Present
+   * only when the sweep completed, because an operator reads this as a final
+   * total. An interrupted scan reports `partialRowsMatched` instead.
+   */
+  rowsDeleted?: number;
   batches: number;
   durationMs: number;
   dryRun: boolean;
   cumulativeRowsDeleted: number;
+  /** False when the scan stopped early. `rowsDeleted` is then absent. */
+  complete: boolean;
+  /** Rows the interrupted scan matched before it stopped. Never a total. */
+  partialRowsMatched?: number;
+  /** Failure reason when status is "failed". */
+  error?: string;
 };
 
-export type DbRetentionStats = Partial<Record<RetentionMetricsKey, DbRetentionTableStats>>;
+/**
+ * Written on every tick, whatever the per-table results are. A tick that swept
+ * nothing still proves to an operator that the timer fired.
+ */
+export type DbRetentionTickInfo = {
+  startedAt: string;
+  finishedAt: string;
+  dryRun: boolean;
+};
+
+export type DbRetentionStats = Partial<Record<RetentionMetricsKey, DbRetentionTableStats>> & {
+  lastTick?: DbRetentionTickInfo;
+};
+
+/**
+ * A partial dry-run count must never be published as a total, but the operator
+ * still needs the failure and what the interrupted scan did see. The throw
+ * stays; the partial travels with it to the catch that records state.
+ */
+class IncompleteDryRunError extends Error {
+  constructor(readonly partial: { rowsDeleted: number; batches: number }) {
+    super("dry-run count stopped before completion");
+    this.name = "IncompleteDryRunError";
+  }
+}
 
 /** Test-only controls; production callers always use the bounded defaults above. */
 export type DbRetentionTickOptions = {
@@ -171,11 +207,11 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
 
   const abortController = new AbortController();
   retentionAbortController = abortController;
+  const tickStartedAt = Date.now();
+  const dryRun = dryRunEnabled();
   const promise = Promise.resolve().then(async () => {
     try {
-      const tickStartedAt = Date.now();
       const cutoffBase = options.now ?? new Date(tickStartedAt);
-      const dryRun = dryRunEnabled();
       const batchSize = options.batchSize ?? BATCH_SIZE;
       const perTableBatchCap = options.perTableBatchCap ?? PER_TABLE_BATCH_CAP;
       const deadline = tickStartedAt + (options.wallClockCapMs ?? WALL_CLOCK_CAP_MS);
@@ -199,7 +235,7 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             abortController.signal,
           );
           if (dryRun && !result.complete) {
-            throw new Error("dry-run count stopped before completion");
+            throw new IncompleteDryRunError(result);
           }
           deletedAny ||= !dryRun && result.rowsDeleted > 0;
           const cumulative =
@@ -207,11 +243,13 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
           cumulativeRowsDeleted[table.metricsKey] = cumulative;
           retentionStats[table.metricsKey] = {
             at: new Date().toISOString(),
+            status: "ok",
             rowsDeleted: result.rowsDeleted,
             batches: result.batches,
             durationMs: Date.now() - startedAt,
             dryRun,
             cumulativeRowsDeleted: cumulative,
+            complete: result.complete,
           };
           if (result.rowsDeleted > 0) {
             console.log(
@@ -219,7 +257,23 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             );
           }
         } catch (err) {
-          console.error(`[db-retention] ${table.table} sweep failed:`, (err as Error).message);
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[db-retention] ${table.table} sweep failed:`, message);
+          // A failure that only reaches the log is invisible to an operator
+          // reading GET /api/metrics: it looks identical to a tick that never
+          // ran. Record the outcome so the two are distinguishable.
+          const partial = err instanceof IncompleteDryRunError ? err.partial : null;
+          retentionStats[table.metricsKey] = {
+            at: new Date().toISOString(),
+            status: "failed",
+            batches: partial?.batches ?? 0,
+            durationMs: Date.now() - startedAt,
+            dryRun,
+            cumulativeRowsDeleted: cumulativeRowsDeleted[table.metricsKey] ?? 0,
+            complete: false,
+            ...(partial ? { partialRowsMatched: partial.rowsDeleted } : {}),
+            error: message,
+          };
         }
       }
 
@@ -232,6 +286,11 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
         }
       }
     } finally {
+      retentionStats.lastTick = {
+        startedAt: new Date(tickStartedAt).toISOString(),
+        finishedAt: new Date().toISOString(),
+        dryRun,
+      };
       if (retentionAbortController === abortController) retentionAbortController = null;
       retentionTickPromise = null;
     }
