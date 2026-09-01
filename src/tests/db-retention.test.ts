@@ -373,6 +373,70 @@ describe("DB retention", () => {
     expect(stats.lastTick?.finishedAt).toBeString();
   });
 
+  test("clears a table's stale rowsDeleted when its next tick fails", async () => {
+    process.env.AGENT_LOG_RETENTION_DAYS = "1";
+    await insertRow("agent_log", "agent-log-old", "2026-08-01T00:00:00.000Z");
+
+    await runDbRetentionTick({ now: NOW });
+    expect(getDbRetentionStats().agentLog).toMatchObject({
+      status: "ok",
+      rowsDeleted: 1,
+      complete: true,
+    });
+
+    const client = getDbClient();
+    // Force a real DB error on the SAME table that just swept successfully.
+    await client.run("ALTER TABLE agent_log RENAME TO agent_log_hidden");
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      await client.run("ALTER TABLE agent_log_hidden RENAME TO agent_log");
+    }
+
+    // The producer replaces the outcome rather than merging it: the prior
+    // tick's rowsDeleted must not survive into a tick that failed.
+    const stats = getDbRetentionStats();
+    expect(stats.agentLog).toMatchObject({ status: "failed", complete: false });
+    expect(stats.agentLog?.rowsDeleted).toBeUndefined();
+    expect(Object.keys(stats.agentLog ?? {})).not.toContain("rowsDeleted");
+  });
+
+  test("scrubs a secret-shaped value out of a failed sweep's reported and logged error", async () => {
+    process.env.AGENT_LOG_RETENTION_DAYS = "1";
+    await insertRow("agent_log", "agent-log-old", "2026-08-01T00:00:00.000Z");
+
+    // A structural pattern (GitHub PAT shape), not an env-sourced value: this
+    // proves the regex pass runs on the message a DB driver could plausibly
+    // surface (e.g. a credential embedded in a connection string), not just
+    // secrets we already knew about from process.env.
+    const fakeToken = `github_pat_${"A1b2C3d4E5f6G7h8I9j0".repeat(2)}`;
+    const client = getDbClient();
+    await client.run(
+      `CREATE TEMP TRIGGER block_agent_log_delete BEFORE DELETE ON agent_log
+       BEGIN SELECT RAISE(ABORT, 'connection refused: token ${fakeToken} rejected'); END`,
+    );
+    const originalConsoleError = console.error;
+    const loggedMessages: string[] = [];
+    console.error = (...args: unknown[]) => {
+      loggedMessages.push(args.map(String).join(" "));
+    };
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      console.error = originalConsoleError;
+      await client.run("DROP TRIGGER block_agent_log_delete");
+    }
+
+    const stats = getDbRetentionStats();
+    expect(stats.agentLog?.status).toBe("failed");
+    expect(stats.agentLog?.error).toBeString();
+    expect(stats.agentLog?.error).not.toContain(fakeToken);
+    expect(stats.agentLog?.error).toContain("[REDACTED:github_pat]");
+    // The same scrubbed text reaches the log line, not just the stored state.
+    expect(loggedMessages.some((line) => line.includes(fakeToken))).toBe(false);
+    expect(loggedMessages.some((line) => line.includes("[REDACTED:github_pat]"))).toBe(true);
+  });
+
   test("rejects an excessive window without aborting later table sweeps", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = String(MAX_DB_RETENTION_DAYS + 1);
     process.env.AGENT_LOG_RETENTION_DAYS = "1";
