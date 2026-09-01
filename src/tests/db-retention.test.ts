@@ -448,6 +448,70 @@ describe("DB retention", () => {
     expect(Math.max(...sizes)).toBeLessThanOrEqual(2000);
   }, 10_000);
 
+  test("a table the tick budget never reached still arms catch-up", async () => {
+    // Regression: pass 1 breaks out at the global deadline, so tables behind a
+    // slow leading one are never entered. They used to be absent from the
+    // undrained set, which left catch-up unarmed and made them wait for the
+    // hourly timer.
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    process.env.AGENT_LOG_RETENTION_DAYS = "1";
+    process.env.EVENTS_RETENTION_DAYS = "1";
+    process.env.DB_RETENTION_TICK_BUDGET_MS = "1000"; // minimum allowed budget
+    process.env.DB_RETENTION_CATCHUP_INTERVAL_MS = "5000"; // minimum allowed interval
+
+    // tickCount becomes 1 on the tick below, so the rotation starts at index 1:
+    // [agent_log, events, session_logs].
+    const client = getDbClient();
+    // One row under the initial batch size, so agent_log drains in a single
+    // batch and never adds ITSELF to the undrained set. Catch-up can then only
+    // be armed by the tables pass 1 skipped — which is what this test is for.
+    for (let i = 0; i < 499; i++) {
+      await insertRow("agent_log", `slow-batch-${i}`, "2026-08-01T00:00:00.000Z");
+    }
+    await insertRow("events", "skipped-event", "2026-08-01T00:00:00.000Z");
+    await insertRow("session_logs", "skipped-log", "2026-08-01T00:00:00.000Z");
+
+    // Make agent_log's first DELETE batch overrun the whole tick budget on its
+    // own. Deterministic, not a sleep: every deleted row drives one unindexed
+    // LIKE scan over a 90k-row probe table that retention never touches. That
+    // measured ~2.9s for the batch against a 1000ms budget on CI-class
+    // hardware, so the overrun has roughly 3x of headroom.
+    await client.run(
+      "CREATE TABLE IF NOT EXISTS retention_slow_probe (id INTEGER PRIMARY KEY, payload TEXT)",
+    );
+    await client.run("DELETE FROM retention_slow_probe");
+    await client.run(
+      `WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 90000)
+       INSERT INTO retention_slow_probe (id, payload) SELECT value, 'payload-' || value FROM n`,
+    );
+    await client.run(
+      `CREATE TRIGGER agent_log_slow_probe BEFORE DELETE ON agent_log
+       BEGIN SELECT COUNT(*) FROM retention_slow_probe WHERE payload LIKE '%no-such-needle%'; END`,
+    );
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      // Dropping the trigger is what matters — it is the only thing that makes
+      // a later agent_log DELETE slow. The probe TABLE stays: bun:sqlite's
+      // cached DELETE statement still references it through the trigger, so
+      // DROP TABLE raises SQLITE_LOCKED. It is not a retention table, and
+      // afterAll deletes the whole test database anyway.
+      await client.run("DROP TRIGGER agent_log_slow_probe");
+    }
+
+    // The budget is gone by the time pass 1 reaches the tables behind
+    // agent_log: they are never entered, so they have no stats at all.
+    expect(_getLastSweepOrderForTests()[0]).toBe("agentLog");
+    expect(getDbRetentionStats().sessionLogs).toBeUndefined();
+    expect(await countRows("session_logs")).toBe(1);
+
+    // Catch-up must still be armed for them. The trigger is gone, so the
+    // catch-up tick (~5s out, plus its own budget) drains what pass 1 skipped.
+    await Bun.sleep(9_000);
+    expect(getDbRetentionStats().sessionLogs?.rowsDeleted).toBe(1);
+    expect(await countRows("session_logs")).toBe(0);
+  }, 40_000);
+
   test("catch-up scheduling runs a second tick without waiting for the hourly interval, and shutdown cancels a pending one", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = "1";
     process.env.DB_RETENTION_TICK_BUDGET_MS = "1000"; // minimum allowed budget

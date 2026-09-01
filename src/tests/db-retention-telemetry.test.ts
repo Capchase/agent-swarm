@@ -220,8 +220,16 @@ const recordDbRetentionStatementSpy = mock(
 );
 
 const actualOtel = await import("../otel");
+// Snapshot the real withSpan BEFORE mock.module runs: mock.module mutates the
+// live namespace object, so a later `actualOtel.withSpan` read returns the spy
+// and the spy would call itself forever.
+const realWithSpan = actualOtel.withSpan;
+// Delegates to the real (NOOP) withSpan unless a test overrides it, so the
+// throw-injection tests can fail `withSpan` itself and not just its body.
+const withSpanSpy = mock(realWithSpan);
 mock.module("../otel", () => ({
   ...actualOtel,
+  withSpan: withSpanSpy,
   startSpan: startSpanSpy,
   recordDbRetentionSweep: recordDbRetentionSweepSpy,
   recordDbRetentionStatement: recordDbRetentionStatementSpy,
@@ -278,6 +286,16 @@ describe("db-retention.ts telemetry wiring (integration)", () => {
     ]) {
       delete process.env[key];
     }
+    // Restore, not just clear: the throw-injection tests below replace these
+    // implementations, and a leaked throw would fail an unrelated test.
+    withSpanSpy.mockImplementation(realWithSpan);
+    startSpanSpy.mockImplementation(() => fakeTableSpan);
+    fakeTableSpan.setAttributes.mockImplementation(function (this: unknown) {
+      return this;
+    });
+    recordDbRetentionSweepSpy.mockImplementation(() => {});
+    recordDbRetentionStatementSpy.mockImplementation(() => {});
+    withSpanSpy.mockClear();
     startSpanSpy.mockClear();
     fakeTableSpan.recordException.mockClear();
     fakeTableSpan.setStatus.mockClear();
@@ -344,6 +362,87 @@ describe("db-retention.ts telemetry wiring (integration)", () => {
       backlogRemaining: 5,
       dryRun: true,
     });
+  });
+
+  // ── Throw injection: telemetry must never break the drain ────────────────
+
+  test("a throwing startSpan, span method and sweep metric still delete every row", async () => {
+    for (let i = 0; i < 5; i++) await insertRow(`throw-${i}`, "2026-08-01T00:00:00.000Z");
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+
+    // Every retention telemetry call throws, for the whole tick.
+    startSpanSpy.mockImplementation(() => {
+      throw new Error("otel startSpan exploded");
+    });
+    fakeTableSpan.setAttributes.mockImplementation(() => {
+      throw new Error("otel setAttributes exploded");
+    });
+    recordDbRetentionSweepSpy.mockImplementation(() => {
+      throw new Error("otel sweep metric exploded");
+    });
+    // A non-Error throw exercises the normalizer's non-Error branch.
+    recordDbRetentionStatementSpy.mockImplementation(() => {
+      throw "otel statement metric exploded";
+    });
+
+    // The tick must resolve, not reject.
+    await runDbRetentionTick({ now: NOW });
+
+    const remaining = await getDbClient().get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM session_logs",
+    );
+    expect(remaining?.n).toBe(0);
+    // A completed DELETE stays a success: telemetry failure is not sweep failure.
+    const stats = getDbRetentionStats().sessionLogs;
+    expect(stats?.outcome).toBe("converged");
+    expect(stats?.rowsDeleted).toBe(5);
+    expect(stats?.lastError).toBeUndefined();
+  });
+
+  test("a throwing withSpan still runs the sweep, without a tick span", async () => {
+    for (let i = 0; i < 3; i++) await insertRow(`nospan-${i}`, "2026-08-01T00:00:00.000Z");
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+
+    withSpanSpy.mockImplementation(() => {
+      throw new Error("otel withSpan exploded before it called the body");
+    });
+
+    await runDbRetentionTick({ now: NOW });
+
+    const remaining = await getDbClient().get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM session_logs",
+    );
+    expect(remaining?.n).toBe(0);
+    expect(getDbRetentionStats().sessionLogs?.outcome).toBe("converged");
+  });
+
+  test("a sweep error is scrubbed before it reaches retention stats", async () => {
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    await insertRow("secret-boom", "2026-08-01T00:00:00.000Z");
+    const client = getDbClient();
+    // A BEFORE DELETE trigger is the one way to control a real SQLite error
+    // message from the production DELETE path, with no module mocking.
+    const token = `sk-ant-${"a1B2c3D4e5".repeat(3)}`;
+    await client.run(
+      `CREATE TRIGGER session_logs_scrub_probe BEFORE DELETE ON session_logs
+       BEGIN SELECT RAISE(ABORT, 'connect failed with ${token}'); END`,
+    );
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      await client.run("DROP TRIGGER session_logs_scrub_probe");
+    }
+
+    const stats = getDbRetentionStats().sessionLogs;
+    expect(stats?.outcome).toBe("error");
+    expect(stats?.lastError).toContain("[REDACTED:anthropic_key]");
+    expect(stats?.lastError).not.toContain(token);
+    // The same scrubbed text, not the raw throw, goes onto the span status.
+    const statuses = fakeTableSpan.setStatus.mock.calls.map(
+      (call) => (call[0] as { message?: string }).message ?? "",
+    );
+    expect(statuses.length).toBeGreaterThan(0);
+    for (const message of statuses) expect(message).not.toContain(token);
   });
 
   test("recordDbRetentionStatement is called once per DELETE issued in the sweep", async () => {
