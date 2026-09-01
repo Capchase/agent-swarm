@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { recordDbRetentionStatement, recordDbRetentionSweep, startSpan, withSpan } from "../otel";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { getDbClient } from "./db";
 import { MAX_DB_RETENTION_DAYS } from "./swarm-config-guard";
@@ -180,6 +181,7 @@ async function sweepTable(
       [cutoff, limitUsed],
     );
     const elapsed = Date.now() - statementStartedAt;
+    recordDbRetentionStatement(table.table, dryRun, elapsed);
     slowestStatementMs = Math.max(slowestStatementMs, elapsed);
     rowsDeleted += result.changes;
     batches += 1;
@@ -243,119 +245,190 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
         DEFAULT_MAX_STATEMENT_MS,
       );
 
-      const tickDeadline = tickStartedAt + budget;
-      const enabled = DB_RETENTION_TABLES.filter((table) => retentionDays(table) !== null);
-      if (enabled.length === 0) {
-        lastSweepOrder = [];
-        return; // emit nothing; retention: {} stays honest
-      }
-
-      const slice = Math.floor(budget / enabled.length);
-      const startIndex = tickCount % enabled.length;
-      const order = [...enabled.slice(startIndex), ...enabled.slice(0, startIndex)];
-      lastSweepOrder = order.map((table) => table.metricsKey);
-
-      let deletedAny = false;
-      const undrained = new Set<RetentionMetricsKey>();
-
-      const sweepOne = async (table: RetentionTable, tableDeadline: number): Promise<void> => {
-        const days = retentionDays(table);
-        if (days === null) return;
-        const startedAt = Date.now();
-        const previous = retentionStats[table.metricsKey];
-        try {
-          const cutoff = new Date(cutoffBase.getTime() - days * DAY_MS).toISOString();
-          const result = await sweepTable(
-            table,
-            cutoff,
-            dryRun,
-            tableDeadline,
-            abortController.signal,
-            maxStatementMs,
-          );
-          deletedAny ||= !dryRun && result.rowsDeleted > 0;
-          const cumulative =
-            (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);
-          cumulativeRowsDeleted[table.metricsKey] = cumulative;
-          const outcome: DbRetentionOutcome = result.drained ? "converged" : "budget_exhausted";
-          if (result.drained) undrained.delete(table.metricsKey);
-          else undrained.add(table.metricsKey);
-
-          const nowIso = new Date().toISOString();
-          retentionStats[table.metricsKey] = {
-            at: nowIso,
-            rowsDeleted: result.rowsDeleted,
-            batches: result.batches,
-            durationMs: Date.now() - startedAt,
-            dryRun,
-            cumulativeRowsDeleted: cumulative,
-            outcome,
-            drained: result.drained,
-            backlogRemaining: result.backlogRemaining,
-            batchSize: result.batchSize,
-            slowestStatementMs: result.slowestStatementMs,
-            lastError: previous?.lastError,
-            lastErrorAt: previous?.lastErrorAt,
-            lastSuccessAt: nowIso,
-          };
-          if (result.rowsDeleted > 0) {
-            console.log(
-              `[db-retention] ${table.table}: ${dryRun ? "would delete" : "deleted"} ${result.rowsDeleted} row(s) in ${result.batches} batch(es) after ${Date.now() - startedAt}ms`,
-            );
+      await withSpan(
+        "db.retention.tick",
+        async (tickSpan) => {
+          const tickDeadline = tickStartedAt + budget;
+          const enabled = DB_RETENTION_TABLES.filter((table) => retentionDays(table) !== null);
+          if (enabled.length === 0) {
+            lastSweepOrder = [];
+            tickSpan.setAttributes({
+              "agentswarm.retention.tables_enabled": 0,
+              "agentswarm.retention.catchup": false,
+              "agentswarm.retention.duration_ms": Date.now() - tickStartedAt,
+              "agentswarm.retention.outcome": "converged",
+            });
+            return; // emit nothing; retention: {} stays honest
           }
-        } catch (err) {
-          undrained.add(table.metricsKey);
-          const nowIso = new Date().toISOString();
-          retentionStats[table.metricsKey] = {
-            at: nowIso,
-            rowsDeleted: previous?.rowsDeleted ?? 0,
-            batches: previous?.batches ?? 0,
-            durationMs: Date.now() - startedAt,
-            dryRun,
-            cumulativeRowsDeleted:
-              previous?.cumulativeRowsDeleted ?? cumulativeRowsDeleted[table.metricsKey] ?? 0,
-            outcome: "error",
-            drained: false,
-            backlogRemaining: previous?.backlogRemaining ?? 0,
-            batchSize:
-              previous?.batchSize ?? batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE,
-            slowestStatementMs: previous?.slowestStatementMs ?? 0,
-            lastError: (err as Error).message,
-            lastErrorAt: nowIso,
-            lastSuccessAt: previous?.lastSuccessAt,
+
+          const slice = Math.floor(budget / enabled.length);
+          const startIndex = tickCount % enabled.length;
+          const order = [...enabled.slice(startIndex), ...enabled.slice(0, startIndex)];
+          lastSweepOrder = order.map((table) => table.metricsKey);
+
+          let deletedAny = false;
+          let anyError = false;
+          const undrained = new Set<RetentionMetricsKey>();
+
+          const sweepOne = async (table: RetentionTable, tableDeadline: number): Promise<void> => {
+            const days = retentionDays(table);
+            if (days === null) return;
+            const startedAt = Date.now();
+            const previous = retentionStats[table.metricsKey];
+            const tableSpan = startSpan("db.retention.table", {
+              "agentswarm.retention.table": table.table,
+            });
+            try {
+              const cutoff = new Date(cutoffBase.getTime() - days * DAY_MS).toISOString();
+              const result = await sweepTable(
+                table,
+                cutoff,
+                dryRun,
+                tableDeadline,
+                abortController.signal,
+                maxStatementMs,
+              );
+              deletedAny ||= !dryRun && result.rowsDeleted > 0;
+              const cumulative =
+                (cumulativeRowsDeleted[table.metricsKey] ?? 0) + (dryRun ? 0 : result.rowsDeleted);
+              cumulativeRowsDeleted[table.metricsKey] = cumulative;
+              const outcome: DbRetentionOutcome = result.drained ? "converged" : "budget_exhausted";
+              if (result.drained) undrained.delete(table.metricsKey);
+              else undrained.add(table.metricsKey);
+
+              const durationMs = Date.now() - startedAt;
+              const nowIso = new Date().toISOString();
+              retentionStats[table.metricsKey] = {
+                at: nowIso,
+                rowsDeleted: result.rowsDeleted,
+                batches: result.batches,
+                durationMs,
+                dryRun,
+                cumulativeRowsDeleted: cumulative,
+                outcome,
+                drained: result.drained,
+                backlogRemaining: result.backlogRemaining,
+                batchSize: result.batchSize,
+                slowestStatementMs: result.slowestStatementMs,
+                lastError: previous?.lastError,
+                lastErrorAt: previous?.lastErrorAt,
+                lastSuccessAt: nowIso,
+              };
+              tableSpan.setAttributes({
+                "agentswarm.retention.rows_deleted": result.rowsDeleted,
+                "agentswarm.retention.backlog_remaining": result.backlogRemaining,
+                "agentswarm.retention.batches": result.batches,
+                "agentswarm.retention.duration_ms": durationMs,
+                "agentswarm.retention.slowest_statement_ms": result.slowestStatementMs,
+                "agentswarm.retention.batch_size": result.batchSize,
+                "agentswarm.retention.outcome": outcome,
+              });
+              recordDbRetentionSweep({
+                table: table.table,
+                dryRun,
+                outcome,
+                rowsDeleted: result.rowsDeleted,
+                backlogRemaining: result.backlogRemaining,
+                batches: result.batches,
+                tableDurationMs: durationMs,
+                slowestStatementMs: result.slowestStatementMs,
+                batchSize: result.batchSize,
+              });
+              if (result.rowsDeleted > 0) {
+                console.log(
+                  `[db-retention] ${table.table}: ${dryRun ? "would delete" : "deleted"} ${result.rowsDeleted} row(s) in ${result.batches} batch(es) after ${durationMs}ms`,
+                );
+              }
+            } catch (err) {
+              anyError = true;
+              undrained.add(table.metricsKey);
+              const durationMs = Date.now() - startedAt;
+              const nowIso = new Date().toISOString();
+              const batchSize =
+                previous?.batchSize ?? batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE;
+              const rowsDeleted = previous?.rowsDeleted ?? 0;
+              const backlogRemaining = previous?.backlogRemaining ?? 0;
+              const batches = previous?.batches ?? 0;
+              const slowestStatementMs = previous?.slowestStatementMs ?? 0;
+              retentionStats[table.metricsKey] = {
+                at: nowIso,
+                rowsDeleted,
+                batches,
+                durationMs,
+                dryRun,
+                cumulativeRowsDeleted:
+                  previous?.cumulativeRowsDeleted ?? cumulativeRowsDeleted[table.metricsKey] ?? 0,
+                outcome: "error",
+                drained: false,
+                backlogRemaining,
+                batchSize,
+                slowestStatementMs,
+                lastError: (err as Error).message,
+                lastErrorAt: nowIso,
+                lastSuccessAt: previous?.lastSuccessAt,
+              };
+              tableSpan.recordException(err);
+              tableSpan.setStatus({ code: 2, message: (err as Error).message });
+              recordDbRetentionSweep({
+                table: table.table,
+                dryRun,
+                outcome: "error",
+                rowsDeleted,
+                backlogRemaining,
+                batches,
+                tableDurationMs: durationMs,
+                slowestStatementMs,
+                batchSize,
+              });
+              console.error(`[db-retention] ${table.table} sweep failed:`, (err as Error).message);
+            } finally {
+              tableSpan.end();
+            }
           };
-          console.error(`[db-retention] ${table.table} sweep failed:`, (err as Error).message);
-        }
-      };
 
-      // Pass 1: every enabled table gets an even slice of the tick budget.
-      for (const table of order) {
-        if (abortController.signal.aborted || Date.now() >= tickDeadline) break;
-        const tableDeadline = Math.min(Date.now() + slice, tickDeadline);
-        await sweepOne(table, tableDeadline);
-      }
-      // Pass 2: catch-up within the same tick for tables pass 1 left undrained.
-      for (const table of order) {
-        if (abortController.signal.aborted || Date.now() >= tickDeadline) break;
-        if (!undrained.has(table.metricsKey)) continue;
-        await sweepOne(table, tickDeadline);
-      }
+          // Pass 1: every enabled table gets an even slice of the tick budget.
+          for (const table of order) {
+            if (abortController.signal.aborted || Date.now() >= tickDeadline) break;
+            const tableDeadline = Math.min(Date.now() + slice, tickDeadline);
+            await sweepOne(table, tableDeadline);
+          }
+          // Pass 2: catch-up within the same tick for tables pass 1 left undrained.
+          for (const table of order) {
+            if (abortController.signal.aborted || Date.now() >= tickDeadline) break;
+            if (!undrained.has(table.metricsKey)) continue;
+            await sweepOne(table, tickDeadline);
+          }
 
-      if (deletedAny && !abortController.signal.aborted) {
-        try {
-          // Harmless when auto_vacuum is not INCREMENTAL; never run a blocking VACUUM here.
-          await getDbClient().run("PRAGMA incremental_vacuum(2000)");
-        } catch (err) {
-          console.error("[db-retention] incremental vacuum failed:", (err as Error).message);
-        }
-      }
+          if (deletedAny && !abortController.signal.aborted) {
+            try {
+              // Harmless when auto_vacuum is not INCREMENTAL; never run a blocking VACUUM here.
+              await getDbClient().run("PRAGMA incremental_vacuum(2000)");
+            } catch (err) {
+              console.error("[db-retention] incremental vacuum failed:", (err as Error).message);
+            }
+          }
 
-      if (undrained.size > 0 && !abortController.signal.aborted) {
-        catchupTimer = scheduleContextFree(() =>
-          setTimeout(() => void runDbRetentionTick(), catchupIntervalMs),
-        );
-        if (typeof catchupTimer.unref === "function") catchupTimer.unref();
-      }
+          const catchupArmed = undrained.size > 0 && !abortController.signal.aborted;
+          if (catchupArmed) {
+            catchupTimer = scheduleContextFree(() =>
+              setTimeout(() => void runDbRetentionTick(), catchupIntervalMs),
+            );
+            if (typeof catchupTimer.unref === "function") catchupTimer.unref();
+          }
+
+          tickSpan.setAttributes({
+            "agentswarm.retention.tables_enabled": enabled.length,
+            "agentswarm.retention.catchup": catchupArmed,
+            "agentswarm.retention.duration_ms": Date.now() - tickStartedAt,
+            "agentswarm.retention.outcome": anyError
+              ? "error"
+              : undrained.size > 0
+                ? "budget_exhausted"
+                : "converged",
+          });
+        },
+        { "agentswarm.retention.dry_run": dryRun },
+      );
     } finally {
       if (retentionAbortController === abortController) retentionAbortController = null;
       retentionTickPromise = null;
