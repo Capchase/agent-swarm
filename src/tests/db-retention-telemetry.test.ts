@@ -336,9 +336,9 @@ describe("db-retention.ts telemetry wiring (integration)", () => {
     await runDbRetentionTick({ now: NOW });
 
     // A dry run never deletes, so a nonzero backlog can never become
-    // "drained" — pass 2 retries the same indexed count once more within
-    // the same tick, given ample remaining budget.
-    expect(recordDbRetentionSweepSpy).toHaveBeenCalledTimes(2);
+    // "drained". Pass 2 would only repeat the same indexed count, so the tick
+    // skips it: exactly one sweep point per table per dry-run tick.
+    expect(recordDbRetentionSweepSpy).toHaveBeenCalledTimes(1);
     expect(recordDbRetentionSweepSpy.mock.calls[0]![0]).toMatchObject({
       rowsDeleted: 0,
       backlogRemaining: 5,
