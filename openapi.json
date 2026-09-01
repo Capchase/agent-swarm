@@ -36759,147 +36759,294 @@
                           ]
                         },
                         "sessionLogs": {
-                          "type": "object",
-                          "properties": {
-                            "at": {
-                              "type": "string"
-                            },
-                            "status": {
-                              "type": "string",
-                              "enum": [
-                                "ok",
-                                "failed"
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "batches": {
+                                  "type": "number"
+                                },
+                                "durationMs": {
+                                  "type": "number"
+                                },
+                                "dryRun": {
+                                  "type": "boolean"
+                                },
+                                "cumulativeRowsDeleted": {
+                                  "type": "number"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": [
+                                    "ok"
+                                  ]
+                                },
+                                "complete": {
+                                  "type": "boolean",
+                                  "enum": [
+                                    true
+                                  ]
+                                },
+                                "rowsDeleted": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "batches",
+                                "durationMs",
+                                "dryRun",
+                                "cumulativeRowsDeleted",
+                                "status",
+                                "complete",
+                                "rowsDeleted"
                               ]
                             },
-                            "rowsDeleted": {
-                              "type": "number"
-                            },
-                            "batches": {
-                              "type": "number"
-                            },
-                            "durationMs": {
-                              "type": "number"
-                            },
-                            "dryRun": {
-                              "type": "boolean"
-                            },
-                            "cumulativeRowsDeleted": {
-                              "type": "number"
-                            },
-                            "complete": {
-                              "type": "boolean"
-                            },
-                            "partialRowsMatched": {
-                              "type": "number"
-                            },
-                            "error": {
-                              "type": "string"
+                            {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "batches": {
+                                  "type": "number"
+                                },
+                                "durationMs": {
+                                  "type": "number"
+                                },
+                                "dryRun": {
+                                  "type": "boolean"
+                                },
+                                "cumulativeRowsDeleted": {
+                                  "type": "number"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": [
+                                    "failed"
+                                  ]
+                                },
+                                "complete": {
+                                  "type": "boolean",
+                                  "enum": [
+                                    false
+                                  ]
+                                },
+                                "partialRowsMatched": {
+                                  "type": "number"
+                                },
+                                "error": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "batches",
+                                "durationMs",
+                                "dryRun",
+                                "cumulativeRowsDeleted",
+                                "status",
+                                "complete",
+                                "error"
+                              ]
                             }
-                          },
-                          "required": [
-                            "at",
-                            "status",
-                            "batches",
-                            "durationMs",
-                            "dryRun",
-                            "cumulativeRowsDeleted",
-                            "complete"
                           ]
                         },
                         "agentLog": {
-                          "type": "object",
-                          "properties": {
-                            "at": {
-                              "type": "string"
-                            },
-                            "status": {
-                              "type": "string",
-                              "enum": [
-                                "ok",
-                                "failed"
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "batches": {
+                                  "type": "number"
+                                },
+                                "durationMs": {
+                                  "type": "number"
+                                },
+                                "dryRun": {
+                                  "type": "boolean"
+                                },
+                                "cumulativeRowsDeleted": {
+                                  "type": "number"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": [
+                                    "ok"
+                                  ]
+                                },
+                                "complete": {
+                                  "type": "boolean",
+                                  "enum": [
+                                    true
+                                  ]
+                                },
+                                "rowsDeleted": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "batches",
+                                "durationMs",
+                                "dryRun",
+                                "cumulativeRowsDeleted",
+                                "status",
+                                "complete",
+                                "rowsDeleted"
                               ]
                             },
-                            "rowsDeleted": {
-                              "type": "number"
-                            },
-                            "batches": {
-                              "type": "number"
-                            },
-                            "durationMs": {
-                              "type": "number"
-                            },
-                            "dryRun": {
-                              "type": "boolean"
-                            },
-                            "cumulativeRowsDeleted": {
-                              "type": "number"
-                            },
-                            "complete": {
-                              "type": "boolean"
-                            },
-                            "partialRowsMatched": {
-                              "type": "number"
-                            },
-                            "error": {
-                              "type": "string"
+                            {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "batches": {
+                                  "type": "number"
+                                },
+                                "durationMs": {
+                                  "type": "number"
+                                },
+                                "dryRun": {
+                                  "type": "boolean"
+                                },
+                                "cumulativeRowsDeleted": {
+                                  "type": "number"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": [
+                                    "failed"
+                                  ]
+                                },
+                                "complete": {
+                                  "type": "boolean",
+                                  "enum": [
+                                    false
+                                  ]
+                                },
+                                "partialRowsMatched": {
+                                  "type": "number"
+                                },
+                                "error": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "batches",
+                                "durationMs",
+                                "dryRun",
+                                "cumulativeRowsDeleted",
+                                "status",
+                                "complete",
+                                "error"
+                              ]
                             }
-                          },
-                          "required": [
-                            "at",
-                            "status",
-                            "batches",
-                            "durationMs",
-                            "dryRun",
-                            "cumulativeRowsDeleted",
-                            "complete"
                           ]
                         },
                         "events": {
-                          "type": "object",
-                          "properties": {
-                            "at": {
-                              "type": "string"
-                            },
-                            "status": {
-                              "type": "string",
-                              "enum": [
-                                "ok",
-                                "failed"
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "batches": {
+                                  "type": "number"
+                                },
+                                "durationMs": {
+                                  "type": "number"
+                                },
+                                "dryRun": {
+                                  "type": "boolean"
+                                },
+                                "cumulativeRowsDeleted": {
+                                  "type": "number"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": [
+                                    "ok"
+                                  ]
+                                },
+                                "complete": {
+                                  "type": "boolean",
+                                  "enum": [
+                                    true
+                                  ]
+                                },
+                                "rowsDeleted": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "batches",
+                                "durationMs",
+                                "dryRun",
+                                "cumulativeRowsDeleted",
+                                "status",
+                                "complete",
+                                "rowsDeleted"
                               ]
                             },
-                            "rowsDeleted": {
-                              "type": "number"
-                            },
-                            "batches": {
-                              "type": "number"
-                            },
-                            "durationMs": {
-                              "type": "number"
-                            },
-                            "dryRun": {
-                              "type": "boolean"
-                            },
-                            "cumulativeRowsDeleted": {
-                              "type": "number"
-                            },
-                            "complete": {
-                              "type": "boolean"
-                            },
-                            "partialRowsMatched": {
-                              "type": "number"
-                            },
-                            "error": {
-                              "type": "string"
+                            {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "batches": {
+                                  "type": "number"
+                                },
+                                "durationMs": {
+                                  "type": "number"
+                                },
+                                "dryRun": {
+                                  "type": "boolean"
+                                },
+                                "cumulativeRowsDeleted": {
+                                  "type": "number"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": [
+                                    "failed"
+                                  ]
+                                },
+                                "complete": {
+                                  "type": "boolean",
+                                  "enum": [
+                                    false
+                                  ]
+                                },
+                                "partialRowsMatched": {
+                                  "type": "number"
+                                },
+                                "error": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "batches",
+                                "durationMs",
+                                "dryRun",
+                                "cumulativeRowsDeleted",
+                                "status",
+                                "complete",
+                                "error"
+                              ]
                             }
-                          },
-                          "required": [
-                            "at",
-                            "status",
-                            "batches",
-                            "durationMs",
-                            "dryRun",
-                            "cumulativeRowsDeleted",
-                            "complete"
                           ]
                         }
                       }

@@ -14496,42 +14496,75 @@ export interface paths {
                                 };
                                 sessionLogs?: {
                                     at: string;
-                                    /** @enum {string} */
-                                    status: "ok" | "failed";
-                                    rowsDeleted?: number;
                                     batches: number;
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
-                                    complete: boolean;
+                                    /** @enum {string} */
+                                    status: "ok";
+                                    /** @enum {boolean} */
+                                    complete: true;
+                                    rowsDeleted: number;
+                                } | {
+                                    at: string;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    status: "failed";
+                                    /** @enum {boolean} */
+                                    complete: false;
                                     partialRowsMatched?: number;
-                                    error?: string;
+                                    error: string;
                                 };
                                 agentLog?: {
                                     at: string;
-                                    /** @enum {string} */
-                                    status: "ok" | "failed";
-                                    rowsDeleted?: number;
                                     batches: number;
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
-                                    complete: boolean;
+                                    /** @enum {string} */
+                                    status: "ok";
+                                    /** @enum {boolean} */
+                                    complete: true;
+                                    rowsDeleted: number;
+                                } | {
+                                    at: string;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    status: "failed";
+                                    /** @enum {boolean} */
+                                    complete: false;
                                     partialRowsMatched?: number;
-                                    error?: string;
+                                    error: string;
                                 };
                                 events?: {
                                     at: string;
-                                    /** @enum {string} */
-                                    status: "ok" | "failed";
-                                    rowsDeleted?: number;
                                     batches: number;
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
-                                    complete: boolean;
+                                    /** @enum {string} */
+                                    status: "ok";
+                                    /** @enum {boolean} */
+                                    complete: true;
+                                    rowsDeleted: number;
+                                } | {
+                                    at: string;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    status: "failed";
+                                    /** @enum {boolean} */
+                                    complete: false;
                                     partialRowsMatched?: number;
-                                    error?: string;
+                                    error: string;
                                 };
                             };
                         };
