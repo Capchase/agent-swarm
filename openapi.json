@@ -36759,6 +36759,35 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "outcome": {
+                              "type": "string",
+                              "enum": [
+                                "converged",
+                                "budget_exhausted",
+                                "error"
+                              ]
+                            },
+                            "drained": {
+                              "type": "boolean"
+                            },
+                            "backlogRemaining": {
+                              "type": "number"
+                            },
+                            "batchSize": {
+                              "type": "number"
+                            },
+                            "slowestStatementMs": {
+                              "type": "number"
+                            },
+                            "lastError": {
+                              "type": "string"
+                            },
+                            "lastErrorAt": {
+                              "type": "string"
+                            },
+                            "lastSuccessAt": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -36767,7 +36796,12 @@
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "outcome",
+                            "drained",
+                            "backlogRemaining",
+                            "batchSize",
+                            "slowestStatementMs"
                           ]
                         },
                         "agentLog": {
@@ -36790,6 +36824,35 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "outcome": {
+                              "type": "string",
+                              "enum": [
+                                "converged",
+                                "budget_exhausted",
+                                "error"
+                              ]
+                            },
+                            "drained": {
+                              "type": "boolean"
+                            },
+                            "backlogRemaining": {
+                              "type": "number"
+                            },
+                            "batchSize": {
+                              "type": "number"
+                            },
+                            "slowestStatementMs": {
+                              "type": "number"
+                            },
+                            "lastError": {
+                              "type": "string"
+                            },
+                            "lastErrorAt": {
+                              "type": "string"
+                            },
+                            "lastSuccessAt": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -36798,7 +36861,12 @@
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "outcome",
+                            "drained",
+                            "backlogRemaining",
+                            "batchSize",
+                            "slowestStatementMs"
                           ]
                         },
                         "events": {
@@ -36821,6 +36889,35 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "outcome": {
+                              "type": "string",
+                              "enum": [
+                                "converged",
+                                "budget_exhausted",
+                                "error"
+                              ]
+                            },
+                            "drained": {
+                              "type": "boolean"
+                            },
+                            "backlogRemaining": {
+                              "type": "number"
+                            },
+                            "batchSize": {
+                              "type": "number"
+                            },
+                            "slowestStatementMs": {
+                              "type": "number"
+                            },
+                            "lastError": {
+                              "type": "string"
+                            },
+                            "lastErrorAt": {
+                              "type": "string"
+                            },
+                            "lastSuccessAt": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -36829,7 +36926,12 @@
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "outcome",
+                            "drained",
+                            "backlogRemaining",
+                            "batchSize",
+                            "slowestStatementMs"
                           ]
                         }
                       }

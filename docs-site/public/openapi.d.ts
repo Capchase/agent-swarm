@@ -14496,6 +14496,15 @@ export interface paths {
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
                                 };
                                 agentLog?: {
                                     at: string;
@@ -14504,6 +14513,15 @@ export interface paths {
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
                                 };
                                 events?: {
                                     at: string;
@@ -14512,6 +14530,15 @@ export interface paths {
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
                                 };
                             };
                         };
