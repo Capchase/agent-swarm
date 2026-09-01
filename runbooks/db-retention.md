@@ -20,19 +20,36 @@ The server sweeps only this closed code-reviewed list:
 
 Table and column names never come from configuration. An operator can set a retention duration only. An unset key disables that table's sweep. Values must be whole days from 1 through 1,000,000. Use at least seven days unless you have verified that a shorter window is suitable for your deployment.
 
-To add a table, change the closed descriptor list in `src/be/db-retention.ts`, add a validator, catalog entry, metrics field, docs row, and parameterized tests in the same PR. Add a table only when it has an index on its time column, no incoming foreign keys, and readers that safely tolerate missing old rows.
+To add a table, change the closed descriptor list in `src/be/db-retention.ts`, add a validator, catalog entry, metrics field, docs row, and parameterized tests in the same PR. Add a table only when it has an index on its time column, no incoming foreign keys, and readers that safely tolerate missing old rows. A new table also needs an `EXPLAIN QUERY PLAN` assertion in the retention tests, confirming the delete uses the index rather than a table scan.
 
 ## Activate retention
 
 1. Verify that database backups include the history you need.
 2. Set one retention key, for example `SESSION_LOG_RETENTION_DAYS=30`.
 3. Set `DB_RETENTION_DRY_RUN=true`.
-4. Wait for the hourly sweep. Inspect `[db-retention]` logs and authenticated `GET /api/metrics`.
+4. Wait for the hourly sweep. Watch `agentswarm.db.retention.backlog` and `agentswarm.db.retention.sweeps{outcome:error}` in Datadog, and `GET /api/metrics` for the same numbers. API stdout does **not** reach Datadog, so a `[db-retention]` log line is not a monitoring surface — it is a local debugging aid only.
 5. Confirm that the exact would-delete count and data-loss effect are acceptable.
 6. Set `DB_RETENTION_DRY_RUN=false`.
 7. Recheck the next sweep. Enable the remaining tables one at a time only after this is stable.
 
-The sweep runs hourly. It uses at most 40 batches of 5,000 rows per enabled table and stops after 60 seconds. A later tick continues an unfinished backlog.
+The sweep runs hourly once every enabled table is drained. While any table is undrained it runs again every `DB_RETENTION_CATCHUP_INTERVAL_MS` (default 60 s) instead of waiting for the next hourly tick. Each tick divides a `DB_RETENTION_TICK_BUDGET_MS` budget (default 30 s) evenly across the enabled tables, and rotates which table sweeps first each tick so one table's backlog cannot starve the others. Deletes go oldest-first through the table's `createdAt` index, in batches sized adaptively against `DB_RETENTION_MAX_STATEMENT_MS` (default 250 ms per statement).
+
+## Monitoring
+
+| # | Monitor | Query | Catches |
+| --- | --- | --- | --- |
+| 1 | Sweep errors | `sum(agentswarm.db.retention.sweeps{outcome:error}) by {table} > 0` over 2 h | A sweep that throws. Fires within 2 ticks. |
+| 2 | Backlog not draining | `max(agentswarm.db.retention.backlog) by {table}`; alert when the 6-hour change is ≥ 0 and the value is > 0 | Every silent non-completion: errors, a too-slow sweep, a regression to the old decay. Build this one first — it is stated in the operator's terms and does not depend on knowing the failure mode. |
+| 3 | Sweep absent | no data for `agentswarm.db.retention.sweeps` for 3 h | The sweep stopped running: crashed timer, lost config, a pod that never started it. |
+| 4 | Stall guard | `max(agentswarm.db.retention.slowest_statement_ms) by {table} > 2000` over 1 h | The adaptive sizer failing to hold the statement bound, before the 10-second liveness probe notices. |
+
+## Turn on the remaining tables
+
+Enable tables one at a time, watching the monitors above before moving to the next:
+
+1. Confirm the first table (see **Activate retention** above) is stable for at least 24 hours at steady state — its backlog stays near 0 across hourly ticks.
+2. Turn on the smallest remaining table next; it is the cheapest way to prove budget division across 2 tables. Confirm both tables report a sweep record every tick — neither starves the other.
+3. Turn on the third table at a conservative retention horizon first, and confirm all 3 tables report a sweep record every tick before narrowing that horizon. Narrowing a horizon after the fact is a data-loss decision, not a default — get an explicit sign-off before doing it on a table holding a large backlog.
 
 ## Disk space and SQLite vacuuming
 
@@ -49,4 +66,4 @@ For a smaller copy without changing the active file, plan an offline `VACUUM INT
 
 ## Rollback
 
-Unset the affected retention key. The table stops sweeping on its next hourly tick. Keep `DB_RETENTION_DRY_RUN=true` if you need to inspect candidates without deletion. Restoration of already-deleted rows requires an operator backup.
+Unset the affected retention key. The table stops sweeping on its next tick, and a pending catch-up tick finds nothing to do and cancels itself. Keep `DB_RETENTION_DRY_RUN=true` if you need to inspect candidates without deletion. Restoration of already-deleted rows requires an operator backup.
