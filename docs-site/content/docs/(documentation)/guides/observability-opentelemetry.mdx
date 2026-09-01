@@ -397,6 +397,31 @@ Both counters share the same set of low-cardinality attributes:
 |-----------|--------|-------------|
 | `token_type` | `input`, `output`, `cacheRead`, `cacheWrite`, `reasoning`, `thinking` | Token class. Only classes with a non-zero count are emitted. |
 
+### Database Retention Sweep
+
+The `src/be/db-retention.ts` sweep emits one metric point per table per tick, on both the success and the error path, so a failure is never silently absent from `retention: {}` on `GET /api/metrics` — it shows up as `outcome:error` here instead.
+
+| Metric | Instrument | Unit | Emitted | Meaning |
+| --- | --- | --- | --- | --- |
+| `agentswarm.db.retention.sweeps` | Counter | `{sweep}` | once per table per tick, always | One point per table attempt. `outcome` tag carries the terminal state. |
+| `agentswarm.db.retention.rows_deleted` | Counter | `{row}` | once per table per tick | Rows deleted. Always 0 when `dry_run:true`. |
+| `agentswarm.db.retention.backlog` | Gauge | `{row}` | once per table per tick | Rows still older than the horizon at the end of the slice. |
+| `agentswarm.db.retention.batches` | Counter | `{batch}` | once per table per tick | DELETE statements issued. |
+| `agentswarm.db.retention.table_duration_ms` | Histogram | `ms` | once per table per tick | Wall clock of one table's slice. |
+| `agentswarm.db.retention.slowest_statement_ms` | Gauge | `ms` | once per table per tick | Slowest single DELETE in the slice. The event-loop stall signal. |
+| `agentswarm.db.retention.statement_duration_ms` | Histogram | `ms` | once per DELETE | Distribution of statement durations. |
+| `agentswarm.db.retention.batch_size` | Gauge | `{row}` | once per table per tick | The adaptive batch size the table settled on. |
+
+Tags on every metric:
+
+| Tag | Values |
+| --- | --- |
+| `table` | `session_logs`, `agent_log`, `events` |
+| `dry_run` | `true`, `false` |
+| `outcome` (on `sweeps` and `table_duration_ms` only) | `converged`, `budget_exhausted`, `error` |
+
+`outcome` takes `converged` (the table's backlog is fully drained), `budget_exhausted` (the tick's time budget ran out before the table drained — expected during a large initial backlog), or `error` (the sweep threw). An error is also visible as an ERROR span status on the `db.retention.table` span, with the exception recorded on that span.
+
 ### Metric Temporality
 
 Temporality is NOT hardcoded. Set the following for Datadog or any delta-preferred backend:
@@ -405,7 +430,7 @@ Temporality is NOT hardcoded. Set the following for Datadog or any delta-preferr
 OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta
 ```
 
-Omit it for backends (SigNoz, Prometheus) that prefer cumulative temporality (the SDK default).
+Omit it for backends (SigNoz, Prometheus) that prefer cumulative temporality (the SDK default). The retention histograms (`table_duration_ms`, `statement_duration_ms`) depend on the backend's OTLP histogram mapping like any other histogram; `agentswarm.db.retention.slowest_statement_ms` is a plain gauge and does not.
 
 ### Example Dashboard Panels
 
@@ -418,6 +443,15 @@ Omit it for backends (SigNoz, Prometheus) that prefer cumulative temporality (th
 | Output tokens by model | `sum(agentswarm.tokens)` where `token_type = 'output'`, group by `model` |
 | Cache efficiency | `sum(agentswarm.tokens)` where `token_type = 'cacheRead'` ÷ `token_type = 'input'` |
 | Error session cost | `sum(agentswarm.cost.usd)` where `is_error = true` |
+
+### Retention Monitors
+
+| # | Monitor | Query | Catches |
+| --- | --- | --- | --- |
+| 1 | Sweep errors | `sum(agentswarm.db.retention.sweeps{outcome:error}) by {table} > 0` over 2 h | A sweep that throws. Fires within 2 ticks. |
+| 2 | Backlog not draining | `max(agentswarm.db.retention.backlog) by {table}`; alert when the 6-hour change is ≥ 0 and the value is > 0 | Every silent non-completion: errors, a too-slow sweep, a regression to the old decay. Build this one first — it is stated in the operator's terms and does not depend on knowing the failure mode. |
+| 3 | Sweep absent | no data for `agentswarm.db.retention.sweeps` for 3 h | The sweep stopped running: crashed timer, lost config, a pod that never started it. |
+| 4 | Stall guard | `max(agentswarm.db.retention.slowest_statement_ms) by {table} > 2000` over 1 h | The adaptive sizer failing to hold the statement bound, before the 10-second liveness probe notices. |
 
 ### Trace-derived Metrics
 
