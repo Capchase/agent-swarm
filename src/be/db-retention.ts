@@ -87,6 +87,36 @@ type SweepResult = {
   batchSize: number;
 };
 
+/** What a sweep had already committed when it failed. */
+type SweepProgress = {
+  rowsDeleted: number;
+  batches: number;
+  slowestStatementMs: number;
+  batchSize: number;
+};
+
+/**
+ * Carries the batches a failed sweep already committed out with its error.
+ *
+ * Every batch is its own autocommit DELETE, so a batch that returned has
+ * removed its rows for good — a later batch or the closing COUNT(*) failing
+ * does not bring them back. Reporting zero for that sweep left
+ * `cumulativeRowsDeleted` and the monotonic OTel counters permanently short of
+ * the rows retention really deleted.
+ *
+ * `sweepCause` (not `cause`) keeps the original throw reachable without
+ * depending on `Error.cause` being present in the configured TS lib.
+ */
+class SweepPartialProgressError extends Error {
+  constructor(
+    readonly sweepCause: unknown,
+    readonly progress: SweepProgress,
+  ) {
+    super("db-retention sweep failed partway through");
+    this.name = "SweepPartialProgressError";
+  }
+}
+
 let retentionTimer: ReturnType<typeof setInterval> | null = null;
 let catchupTimer: ReturnType<typeof setTimeout> | null = null;
 let retentionTickPromise: Promise<void> | null = null;
@@ -267,56 +297,74 @@ async function sweepTable(
   let slowestStatementMs = 0;
   let size = batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE;
 
-  while (!signal.aborted && Date.now() < deadline) {
-    const limitUsed = size;
-    const statementStartedAt = Date.now();
-    // Never wrap multiple batches in a transaction: one autocommit DELETE per
-    // batch, so the write lock and any event-loop stall end with each statement.
-    const result = await client.run(
-      `DELETE FROM ${table.table} WHERE rowid IN (
+  try {
+    while (!signal.aborted && Date.now() < deadline) {
+      const limitUsed = size;
+      // Never wrap multiple batches in a transaction: one autocommit DELETE per
+      // batch, so the write lock and any event-loop stall end with each statement.
+      const result = await client.runTimed(
+        `DELETE FROM ${table.table} WHERE rowid IN (
          SELECT rowid FROM ${table.table} WHERE ${table.timeColumn} < ? ORDER BY ${table.timeColumn} LIMIT ?
        )`,
-      [cutoff, limitUsed],
-    );
-    const elapsed = Date.now() - statementStartedAt;
-    bestEffortRecordStatement(table.table, dryRun, elapsed);
-    slowestStatementMs = Math.max(slowestStatementMs, elapsed);
-    rowsDeleted += result.changes;
-    batches += 1;
+        [cutoff, limitUsed],
+      );
+      // Execution time only. Wall time around the call also covers waiting for
+      // the client's FIFO lock and its BUSY backoff sleeps, neither of which
+      // this statement spent in the driver: charging those to the stall metric
+      // reported a responsive process as stalled and halved the batch size for
+      // queueing rather than for work. See DbClient.runTimed.
+      const elapsed = result.executionMs;
+      bestEffortRecordStatement(table.table, dryRun, elapsed);
+      slowestStatementMs = Math.max(slowestStatementMs, elapsed);
+      rowsDeleted += result.changes;
+      batches += 1;
 
-    if (elapsed > maxStatementMs) {
-      size = Math.max(MIN_BATCH_SIZE, Math.floor(size / 2));
-    } else if (elapsed < maxStatementMs / 5) {
-      size = Math.min(MAX_BATCH_SIZE, size * 2);
+      if (elapsed > maxStatementMs) {
+        size = Math.max(MIN_BATCH_SIZE, Math.floor(size / 2));
+      } else if (elapsed < maxStatementMs / 5) {
+        size = Math.min(MAX_BATCH_SIZE, size * 2);
+      }
+
+      // A DELETE that changed fewer rows than the LIMIT it used means the
+      // subquery ran out of matches, so there is nothing left to delete in this
+      // pass. It does NOT prove the table is drained: each DELETE autocommits,
+      // so another process can commit an already-expired row before the count
+      // below runs. Loop control only — `drained` comes from that count.
+      if (result.changes < limitUsed) break;
+      if (signal.aborted || Date.now() >= deadline) break;
+      await yieldTick();
     }
 
-    // A DELETE that changed fewer rows than the LIMIT it used means the
-    // subquery ran out of matches, so there is nothing left to delete in this
-    // pass. It does NOT prove the table is drained: each DELETE autocommits,
-    // so another process can commit an already-expired row before the count
-    // below runs. Loop control only — `drained` comes from that count.
-    if (result.changes < limitUsed) break;
-    if (signal.aborted || Date.now() >= deadline) break;
-    await yieldTick();
+    // `drained` is derived from this count, never from the last DELETE's row
+    // count. The two can disagree: a short final DELETE says "no matches left",
+    // but the statement autocommitted, so a concurrent writer can land another
+    // expired row before the COUNT(*) runs. Reporting drained: true alongside
+    // backlogRemaining > 0 drops the table from `undrained`, leaves catch-up
+    // unarmed, and publishes that contradiction on /api/metrics until the next
+    // hourly tick.
+    const backlogRemaining = await indexedBacklogCount(table, cutoff);
+    return {
+      rowsDeleted,
+      batches,
+      backlogRemaining,
+      drained: backlogRemaining === 0,
+      slowestStatementMs,
+      batchSize: size,
+    };
+  } catch (err) {
+    // A failing DELETE or a failing closing COUNT(*) must not erase the
+    // batches that already committed above.
+    throw new SweepPartialProgressError(err, {
+      rowsDeleted,
+      batches,
+      slowestStatementMs,
+      batchSize: size,
+    });
+  } finally {
+    // The adaptive size is learned per batch, so it survives a mid-sweep
+    // failure the same way the deleted rows do.
+    batchSizeByTable[table.metricsKey] = size;
   }
-  batchSizeByTable[table.metricsKey] = size;
-
-  // `drained` is derived from this count, never from the last DELETE's row
-  // count. The two can disagree: a short final DELETE says "no matches left",
-  // but the statement autocommitted, so a concurrent writer can land another
-  // expired row before the COUNT(*) runs. Reporting drained: true alongside
-  // backlogRemaining > 0 drops the table from `undrained`, leaves catch-up
-  // unarmed, and publishes that contradiction on /api/metrics until the next
-  // hourly tick.
-  const backlogRemaining = await indexedBacklogCount(table, cutoff);
-  return {
-    rowsDeleted,
-    batches,
-    backlogRemaining,
-    drained: backlogRemaining === 0,
-    slowestStatementMs,
-    batchSize: size,
-  };
 }
 
 /** Run one bounded sweep over every enabled table. Failures are isolated per table. */
@@ -454,29 +502,46 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
           } catch (err) {
             anyError = true;
             undrained.add(table.metricsKey);
-            const message = normalizeError(err);
+            // sweepTable wraps a mid-sweep failure so the batches it already
+            // committed survive the throw; anything else failed before the
+            // first batch and carries no progress.
+            const partial = err instanceof SweepPartialProgressError ? err : null;
+            const cause = partial ? partial.sweepCause : err;
+            const message = normalizeError(cause);
             const durationMs = Date.now() - startedAt;
             const nowIso = new Date().toISOString();
-            const batchSize =
-              previous?.batchSize ?? batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE;
             // rowsDeleted/batches feed monotonic Counters (recordDbRetentionSweep in
-            // src/otel-impl.ts) — a failed attempt made no confirmed progress, so it must
-            // emit a zero delta, never the previous tick's values, or the catch-up retry
-            // loop inflates the counters every DB_RETENTION_CATCHUP_INTERVAL_MS. backlogRemaining
-            // stays at the previous value (it is a gauge, not a counter): zeroing it would read
-            // as "drained" and blind the backlog-not-draining monitor.
-            const rowsDeleted = 0;
+            // src/otel-impl.ts), so this emission must be THIS attempt's real delta:
+            //  - never a previous sweep's value, or the catch-up retry loop inflates the
+            //    counters every DB_RETENTION_CATCHUP_INTERVAL_MS with no matching deletion,
+            //  - never a double count: a failed sweep returns no SweepResult, so no
+            //    success-path emission reports these batches as well,
+            //  - never zero when batches did commit. Each batch autocommits, so those rows
+            //    are gone from the table; dropping them left the counters and
+            //    cumulativeRowsDeleted permanently short of real deletions.
+            // backlogRemaining stays at the previous value (it is a gauge, not a counter):
+            // zeroing it would read as "drained" and blind the backlog-not-draining monitor.
+            const rowsDeleted = dryRun ? 0 : (partial?.progress.rowsDeleted ?? 0);
             const backlogRemaining = previous?.backlogRemaining ?? 0;
-            const batches = 0;
-            const slowestStatementMs = 0;
+            const batches = partial?.progress.batches ?? 0;
+            const slowestStatementMs = partial?.progress.slowestStatementMs ?? 0;
+            const batchSize =
+              partial?.progress.batchSize ??
+              previous?.batchSize ??
+              batchSizeByTable[table.metricsKey] ??
+              DEFAULT_BATCH_SIZE;
+            // Committed rows advance the running total and justify the vacuum,
+            // exactly as they would have on the success path.
+            const cumulative = (cumulativeRowsDeleted[table.metricsKey] ?? 0) + rowsDeleted;
+            cumulativeRowsDeleted[table.metricsKey] = cumulative;
+            deletedAny ||= rowsDeleted > 0;
             retentionStats[table.metricsKey] = {
               at: nowIso,
               rowsDeleted,
               batches,
               durationMs,
               dryRun,
-              cumulativeRowsDeleted:
-                previous?.cumulativeRowsDeleted ?? cumulativeRowsDeleted[table.metricsKey] ?? 0,
+              cumulativeRowsDeleted: cumulative,
               outcome: "error",
               drained: false,
               backlogRemaining,
@@ -486,7 +551,7 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
               lastErrorAt: nowIso,
               lastSuccessAt: previous?.lastSuccessAt,
             };
-            tableSpan.recordException(err);
+            tableSpan.recordException(cause);
             tableSpan.setStatus({ code: 2, message });
             bestEffortRecordSweep({
               table: table.table,

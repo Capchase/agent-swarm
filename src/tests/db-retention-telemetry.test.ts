@@ -263,6 +263,26 @@ async function insertRow(id: string, createdAt: string): Promise<void> {
   );
 }
 
+/** Bulk-insert via a recursive CTE — far cheaper than one INSERT per row. */
+async function bulkInsertRows(idPrefix: string, count: number, createdAt: string): Promise<void> {
+  await getDbClient().run(
+    `WITH RECURSIVE candidates(value) AS (
+       SELECT 1
+       UNION ALL
+       SELECT value + 1 FROM candidates WHERE value < ${count}
+     )
+     INSERT INTO session_logs (id, sessionId, iteration, cli, content, lineNumber, createdAt)
+     SELECT '${idPrefix}-' || value, '${idPrefix}-session', 0, 'bun', 'log', value, ?
+     FROM candidates`,
+    [createdAt],
+  );
+}
+
+async function countSessionLogs(): Promise<number> {
+  const row = await getDbClient().get<{ n: number }>("SELECT COUNT(*) AS n FROM session_logs");
+  return row?.n ?? 0;
+}
+
 describe("db-retention.ts telemetry wiring (integration)", () => {
   beforeAll(async () => {
     await removeDbFiles();
@@ -371,7 +391,11 @@ describe("db-retention.ts telemetry wiring (integration)", () => {
 
     // rowsDeleted/batches feed monotonic Counters: an error emission must
     // never replay the prior tick's 1 row / 1 batch, or the counters inflate
-    // on every catch-up retry without a matching real deletion.
+    // on every catch-up retry without a matching real deletion. Zero here is
+    // the delta THIS attempt committed — the table is gone, so its very first
+    // DELETE threw and no batch completed. It is not the error path forcing a
+    // zero: a failure after a committed batch reports that batch (see the
+    // sibling test below).
     expect(recordDbRetentionSweepSpy).toHaveBeenCalled();
     for (const call of recordDbRetentionSweepSpy.mock.calls) {
       expect(call[0]).toMatchObject({
@@ -385,6 +409,52 @@ describe("db-retention.ts telemetry wiring (integration)", () => {
     expect(stats?.rowsDeleted).toBe(0);
     expect(stats?.batches).toBe(0);
     expect(stats?.slowestStatementMs).toBe(0);
+    // The running total keeps the 1 row the successful tick really deleted,
+    // and the failure adds nothing to it.
+    expect(stats?.cumulativeRowsDeleted).toBe(1);
+  });
+
+  test("a failure after a committed batch reports that batch's rows, exactly once", async () => {
+    // Regression: sweepTable accumulated each autocommitted DELETE, but a
+    // later DELETE or the closing COUNT(*) failing skipped the return and the
+    // catch emitted rowsDeleted: 0 / batches: 0. Those rows are gone from the
+    // table, so the monotonic counters and cumulativeRowsDeleted stayed
+    // permanently short of the rows retention really deleted.
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    const client = getDbClient();
+    // Exactly one initial batch (500) of older rows, then 100 newer ones. The
+    // first DELETE changes as many rows as it requested, so the loop does NOT
+    // treat it as the last batch and goes round again — into the trigger.
+    await bulkInsertRows("ok", 500, "2026-08-01T00:00:00.000Z");
+    await bulkInsertRows("boom", 100, "2026-08-02T00:00:00.000Z");
+    await client.run(
+      `CREATE TRIGGER session_logs_second_batch_fails BEFORE DELETE ON session_logs
+       WHEN OLD.id LIKE 'boom-%'
+       BEGIN SELECT RAISE(ABORT, 'injected second-batch failure'); END`,
+    );
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      await client.run("DROP TRIGGER session_logs_second_batch_fails");
+    }
+
+    // Batch 1 autocommitted: its 500 rows are gone for good, and the aborted
+    // batch left its own 100 rows in place.
+    expect(await countSessionLogs()).toBe(100);
+
+    const emissions = recordDbRetentionSweepSpy.mock.calls.map(
+      (call) => call[0] as { outcome: string; rowsDeleted: number; batches: number },
+    );
+    expect(emissions.length).toBeGreaterThan(0);
+    for (const emission of emissions) expect(emission.outcome).toBe("error");
+    // The failing attempt carries the batch it committed instead of zero.
+    expect(emissions[0]).toMatchObject({ rowsDeleted: 500, batches: 1 });
+    // Summed over every emission this tick, the counters advance by exactly
+    // the rows that left the table: no under-report, and no double count when
+    // pass 2 retries the still-undrained table and commits nothing.
+    expect(emissions.reduce((sum, emission) => sum + emission.rowsDeleted, 0)).toBe(500);
+    expect(emissions.reduce((sum, emission) => sum + emission.batches, 0)).toBe(1);
+    expect(getDbRetentionStats().sessionLogs?.cumulativeRowsDeleted).toBe(500);
   });
 
   test("a dry run emits rows_deleted: 0 and the indexed backlog count", async () => {
