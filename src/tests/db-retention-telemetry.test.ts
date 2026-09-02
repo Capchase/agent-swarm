@@ -346,6 +346,47 @@ describe("db-retention.ts telemetry wiring (integration)", () => {
     }
   });
 
+  test("a failed tick after a successful one emits rowsDeleted: 0, not the previous tick's counter value", async () => {
+    await insertRow("old", "2026-08-01T00:00:00.000Z");
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+
+    await runDbRetentionTick({ now: NOW });
+    expect(recordDbRetentionSweepSpy).toHaveBeenCalledTimes(1);
+    expect(recordDbRetentionSweepSpy.mock.calls[0]![0]).toMatchObject({
+      outcome: "converged",
+      rowsDeleted: 1,
+      batches: 1,
+    });
+    recordDbRetentionSweepSpy.mockClear();
+
+    // Force the next tick to fail on the same table, the way the sibling
+    // "a failed sweep" test above does.
+    const client = getDbClient();
+    await client.run("ALTER TABLE session_logs RENAME TO session_logs_test_hidden");
+    try {
+      await runDbRetentionTick({ now: NOW });
+    } finally {
+      await client.run("ALTER TABLE session_logs_test_hidden RENAME TO session_logs");
+    }
+
+    // rowsDeleted/batches feed monotonic Counters: an error emission must
+    // never replay the prior tick's 1 row / 1 batch, or the counters inflate
+    // on every catch-up retry without a matching real deletion.
+    expect(recordDbRetentionSweepSpy).toHaveBeenCalled();
+    for (const call of recordDbRetentionSweepSpy.mock.calls) {
+      expect(call[0]).toMatchObject({
+        outcome: "error",
+        rowsDeleted: 0,
+        batches: 0,
+        slowestStatementMs: 0,
+      });
+    }
+    const stats = getDbRetentionStats().sessionLogs;
+    expect(stats?.rowsDeleted).toBe(0);
+    expect(stats?.batches).toBe(0);
+    expect(stats?.slowestStatementMs).toBe(0);
+  });
+
   test("a dry run emits rows_deleted: 0 and the indexed backlog count", async () => {
     for (let i = 0; i < 5; i++) await insertRow(`dry-${i}`, "2026-08-01T00:00:00.000Z");
     process.env.SESSION_LOG_RETENTION_DAYS = "1";

@@ -38,9 +38,11 @@ A tick makes up to two passes. Pass 1 gives every enabled table its even slice. 
 
 A table that pass 1 never reached — because a slower table ahead of it used the tick budget first — counts as undrained. It reports no sweep record for that tick, and it arms the catch-up tick. It never waits for the hourly timer.
 
-A dry run is different: it deletes nothing, so its backlog can never shrink. It runs pass 1 only, and it never arms catch-up. A dry-run table therefore emits exactly one sweep point per hourly tick. Turn dry run off to make the drain converge.
+A dry run is different: it deletes nothing, so its backlog can never shrink. It runs pass 1 only, and it never arms catch-up. A dry-run table therefore emits at most one sweep point per hourly tick — a table the tick budget never reached that hour emits none. Turn dry run off to make the drain converge.
 
 A failed sweep stores its error message on `lastError` in `GET /api/metrics`. That message is passed through the shared secret scrubber first, so a credential inside a database error surfaces as `[REDACTED:<name>]`.
+
+An errored table counts as undrained, the same as a table pass 1 never reached. It retries in pass 2 of the same tick, and again every `DB_RETENTION_CATCHUP_INTERVAL_MS` until it succeeds — there is no backoff. A persistent error therefore produces about two `outcome:error` sweep points per minute and a DELETE attempt against the database every catch-up interval, for as long as the error lasts.
 
 Telemetry is best-effort. A broken OTLP exporter cannot fail a tick or turn a completed `DELETE` into a failed sweep: every span and metric call is wrapped, and a failure is logged once per tick and otherwise ignored.
 
@@ -48,10 +50,10 @@ Telemetry is best-effort. A broken OTLP exporter cannot fail a tick or turn a co
 
 | # | Monitor | Query | Catches |
 | --- | --- | --- | --- |
-| 1 | Sweep errors | `sum(agentswarm.db.retention.sweeps{outcome:error}) by {table} > 0` over 2 h | A sweep that throws. Fires within 2 ticks. |
-| 2 | Backlog not draining | `max(agentswarm.db.retention.backlog) by {table}`; alert when the 6-hour change is ≥ 0 and the value is > 0 | Every silent non-completion: errors, a too-slow sweep, a regression to the old decay. Build this one first — it is stated in the operator's terms and does not depend on knowing the failure mode. |
+| 1 | Sweep errors | sum of `agentswarm.db.retention.sweeps` where `outcome = error`, grouped by `table`, above 0 over 2 h | A sweep that throws. Fires within 2 ticks. |
+| 2 | Backlog not draining | max of `agentswarm.db.retention.backlog`, grouped by `table`; alert when the 6-hour change is ≥ 0 and the value is > 0 | Every silent non-completion: errors, a too-slow sweep, a regression to the old decay. Build this one first — it is stated in the operator's terms and does not depend on knowing the failure mode. |
 | 3 | Sweep absent | no data for `agentswarm.db.retention.sweeps` for 3 h | The sweep stopped running: crashed timer, lost config, a pod that never started it. |
-| 4 | Stall guard | `max(agentswarm.db.retention.slowest_statement_ms) by {table} > 2000` over 1 h | The adaptive sizer failing to hold the statement bound, before the 10-second liveness probe notices. |
+| 4 | Stall guard | max of `agentswarm.db.retention.slowest_statement_ms`, grouped by `table`, above 2000 over 1 h | The adaptive sizer failing to hold the statement bound, before the 10-second liveness probe notices. |
 
 ## Turn on the remaining tables
 

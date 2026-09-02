@@ -55,7 +55,7 @@ export type DbRetentionOutcome = "converged" | "budget_exhausted" | "error";
 
 export type DbRetentionTableStats = {
   at: string;
-  /** Deleted rows, or rows that would be deleted when dryRun is true. */
+  /** Deleted rows. Always 0 when dryRun is true — the would-delete count is in backlogRemaining. */
   rowsDeleted: number;
   batches: number;
   durationMs: number;
@@ -446,10 +446,16 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
             const nowIso = new Date().toISOString();
             const batchSize =
               previous?.batchSize ?? batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE;
-            const rowsDeleted = previous?.rowsDeleted ?? 0;
+            // rowsDeleted/batches feed monotonic Counters (recordDbRetentionSweep in
+            // src/otel-impl.ts) — a failed attempt made no confirmed progress, so it must
+            // emit a zero delta, never the previous tick's values, or the catch-up retry
+            // loop inflates the counters every DB_RETENTION_CATCHUP_INTERVAL_MS. backlogRemaining
+            // stays at the previous value (it is a gauge, not a counter): zeroing it would read
+            // as "drained" and blind the backlog-not-draining monitor.
+            const rowsDeleted = 0;
             const backlogRemaining = previous?.backlogRemaining ?? 0;
-            const batches = previous?.batches ?? 0;
-            const slowestStatementMs = previous?.slowestStatementMs ?? 0;
+            const batches = 0;
+            const slowestStatementMs = 0;
             retentionStats[table.metricsKey] = {
               at: nowIso,
               rowsDeleted,
