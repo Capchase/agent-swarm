@@ -265,7 +265,6 @@ async function sweepTable(
   let rowsDeleted = 0;
   let batches = 0;
   let slowestStatementMs = 0;
-  let drained = false;
   let size = batchSizeByTable[table.metricsKey] ?? DEFAULT_BATCH_SIZE;
 
   while (!signal.aborted && Date.now() < deadline) {
@@ -291,19 +290,33 @@ async function sweepTable(
       size = Math.min(MAX_BATCH_SIZE, size * 2);
     }
 
-    // A DELETE that changed fewer rows than the LIMIT it used proves no row
-    // above the horizon remains — the subquery ran out of matches.
-    if (result.changes < limitUsed) {
-      drained = true;
-      break;
-    }
+    // A DELETE that changed fewer rows than the LIMIT it used means the
+    // subquery ran out of matches, so there is nothing left to delete in this
+    // pass. It does NOT prove the table is drained: each DELETE autocommits,
+    // so another process can commit an already-expired row before the count
+    // below runs. Loop control only — `drained` comes from that count.
+    if (result.changes < limitUsed) break;
     if (signal.aborted || Date.now() >= deadline) break;
     await yieldTick();
   }
   batchSizeByTable[table.metricsKey] = size;
 
+  // `drained` is derived from this count, never from the last DELETE's row
+  // count. The two can disagree: a short final DELETE says "no matches left",
+  // but the statement autocommitted, so a concurrent writer can land another
+  // expired row before the COUNT(*) runs. Reporting drained: true alongside
+  // backlogRemaining > 0 drops the table from `undrained`, leaves catch-up
+  // unarmed, and publishes that contradiction on /api/metrics until the next
+  // hourly tick.
   const backlogRemaining = await indexedBacklogCount(table, cutoff);
-  return { rowsDeleted, batches, backlogRemaining, drained, slowestStatementMs, batchSize: size };
+  return {
+    rowsDeleted,
+    batches,
+    backlogRemaining,
+    drained: backlogRemaining === 0,
+    slowestStatementMs,
+    batchSize: size,
+  };
 }
 
 /** Run one bounded sweep over every enabled table. Failures are isolated per table. */

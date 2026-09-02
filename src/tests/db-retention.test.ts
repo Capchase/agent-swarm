@@ -512,6 +512,51 @@ describe("DB retention", () => {
     expect(await countRows("session_logs")).toBe(0);
   }, 40_000);
 
+  test("a row that lands after a sub-limit delete keeps the table undrained and arms catch-up", async () => {
+    // Regression: `drained` used to be derived from the last DELETE's row
+    // count ("changed fewer rows than the LIMIT it used"). Every batch
+    // autocommits, so a concurrent writer can commit an already-expired row
+    // between that DELETE and the COUNT(*). The sweep then published
+    // drained: true next to backlogRemaining > 0, dropped the table from the
+    // undrained set, and left catch-up unarmed until the hourly tick.
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    process.env.DB_RETENTION_CATCHUP_INTERVAL_MS = "5000"; // minimum allowed interval
+    const client = getDbClient();
+    await insertRow("session_logs", "race-seed", "2026-08-01T00:00:00.000Z");
+
+    // Stands in for that concurrent writer, deterministically: every
+    // autocommitted retention DELETE lands one fresh expired row. Each batch
+    // stays sub-limit (1 deleted < 500 requested) while the indexed backlog
+    // is never empty — exactly the disagreement the finding describes.
+    await client.run(
+      `CREATE TRIGGER session_logs_late_arrival AFTER DELETE ON session_logs
+       BEGIN
+         INSERT INTO session_logs (id, sessionId, iteration, cli, content, lineNumber, createdAt)
+         VALUES ('race-late-' || hex(randomblob(8)), 'race-session', 0, 'bun', 'log', 1, '2026-08-01T00:00:00.000Z');
+       END`,
+    );
+    try {
+      await runDbRetentionTick({ now: NOW });
+
+      const stats = getDbRetentionStats().sessionLogs;
+      expect(stats?.backlogRemaining).toBeGreaterThan(0);
+      expect(stats?.drained).toBe(false);
+      // The invariant the finding is about: the two can never disagree.
+      expect(stats?.drained).toBe(stats?.backlogRemaining === 0);
+      const afterFirstTick = stats?.at;
+
+      // Still undrained means catch-up is armed. A second tick must run on the
+      // 5s catch-up interval — no hourly timer, no manual runDbRetentionTick.
+      await Bun.sleep(7_500);
+      expect(getDbRetentionStats().sessionLogs?.at).not.toBe(afterFirstTick);
+    } finally {
+      // Stop the (permanently undrained) catch-up loop before removing the
+      // trigger that every later DELETE on this table would otherwise fire.
+      await stopDbRetention();
+      await client.run("DROP TRIGGER session_logs_late_arrival");
+    }
+  }, 25_000);
+
   test("catch-up scheduling runs a second tick without waiting for the hourly interval, and shutdown cancels a pending one", async () => {
     process.env.SESSION_LOG_RETENTION_DAYS = "1";
     process.env.DB_RETENTION_TICK_BUDGET_MS = "1000"; // minimum allowed budget
