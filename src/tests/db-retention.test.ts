@@ -483,6 +483,66 @@ describe("DB retention", () => {
     expect(Math.max(...sizes)).toBeLessThanOrEqual(2000);
   }, 10_000);
 
+  test("slowestStatementMs and batch sizing reflect execution-only time under in-process lock contention, not the FIFO-lock wait", async () => {
+    // Regression this guards: DbClient.runTimed's own unit tests exercise the
+    // seam in isolation, so they would still pass if sweepTable went back to
+    // caller-side wall timing (Date.now() around client.run) — they never put
+    // a real caller behind real contention. This test does: it queues the
+    // retention DELETE behind another in-process caller holding the client's
+    // FIFO lock, so wall time and execution time actually diverge.
+    process.env.SESSION_LOG_RETENTION_DAYS = "1";
+    process.env.DB_RETENTION_MAX_STATEMENT_MS = "25"; // the valid minimum
+    await insertRow("session_logs", "contended", "2026-08-01T00:00:00.000Z");
+
+    const client = getDbClient();
+    // Holds the client's FIFO lock for a comfortably long, deterministic
+    // interval: one synchronous, computation-only statement (no table
+    // touched, so no SQLite-level lock contention muddies the signal) whose
+    // driver call itself takes ~400-600ms on typical hardware. A single
+    // statement holds the lock for its whole execution with no async gap
+    // in which it could release early, unlike an awaited sleep inside
+    // client.transaction() (which does not hold the lock reliably here).
+    const holder = client.run(
+      `WITH RECURSIVE spin(x) AS (
+         SELECT 1
+         UNION ALL
+         SELECT x + 1 FROM spin WHERE x < 2000000
+       )
+       SELECT COUNT(*) FROM spin`,
+    );
+
+    const tickStartedAt = Date.now();
+    // client.ts serializes every top-level operation through the same FIFO
+    // lock, so the retention DELETE below cannot start executing until the
+    // holder above releases: real in-process contention, not a simulated one.
+    await runDbRetentionTick({ now: NOW });
+    const tickWallMs = Date.now() - tickStartedAt;
+    await holder;
+
+    const stats = getDbRetentionStats().sessionLogs;
+    expect(stats?.outcome).toBe("converged");
+    expect(stats?.rowsDeleted).toBe(1);
+    expect(stats?.batches).toBe(1);
+
+    // Sanity check that contention really happened. The spin CTE costs
+    // ~400-600ms on typical hardware; 150ms is a comfortable margin below
+    // that, not a tight equality, so ordinary scheduler jitter cannot trip it.
+    expect(tickWallMs).toBeGreaterThan(150);
+
+    // Self-calibrating: compared against tickWallMs, the wall time THIS run
+    // actually measured, never a pinned constant. A single DELETE against a
+    // near-empty table executes in low single-digit milliseconds; caller-side
+    // wall timing would instead report something close to tickWallMs.
+    expect(stats!.slowestStatementMs).toBeLessThan(tickWallMs / 4);
+
+    // 25ms is far below tickWallMs but comfortably above the real execution
+    // time, so execution-only timing grows the batch size (elapsed <
+    // maxStatementMs / 5) while wall-clock timing would have halved it
+    // (elapsed > maxStatementMs). Assert the observable batch behaviour:
+    // contention alone must never shrink it below the 500 default.
+    expect(stats!.batchSize).toBeGreaterThanOrEqual(500);
+  });
+
   test("a table the tick budget never reached still arms catch-up", async () => {
     // Regression: pass 1 breaks out at the global deadline, so tables behind a
     // slow leading one are never entered. They used to be absent from the
