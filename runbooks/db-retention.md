@@ -27,7 +27,7 @@ To add a table, change the closed descriptor list in `src/be/db-retention.ts`, a
 1. Verify that database backups include the history you need.
 2. Set one retention key, for example `SESSION_LOG_RETENTION_DAYS=30`.
 3. Set `DB_RETENTION_DRY_RUN=true`.
-4. Wait for the hourly sweep. Watch `agentswarm.db.retention.backlog` and `agentswarm.db.retention.sweeps{outcome:error}` in Datadog, and `GET /api/metrics` for the same numbers. API stdout does **not** reach Datadog, so a `[db-retention]` log line is not a monitoring surface — it is a local debugging aid only.
+4. Wait for the hourly sweep. Watch `agentswarm.db.retention.backlog` and `agentswarm.db.retention.sweeps{outcome:error}` in your OTLP metrics backend, and `GET /api/metrics` for the same numbers. API stdout is not exported through OTLP, so a `[db-retention]` log line is not a monitoring surface — it is a local debugging aid only.
 5. Confirm that the exact would-delete count and data-loss effect are acceptable.
 6. Set `DB_RETENTION_DRY_RUN=false`.
 7. Recheck the next sweep. Enable the remaining tables one at a time only after this is stable.
