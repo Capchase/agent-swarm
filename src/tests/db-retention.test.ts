@@ -10,7 +10,11 @@ import {
   startDbRetention,
   stopDbRetention,
 } from "../be/db-retention";
-import { MAX_DB_RETENTION_DAYS, validateConfigValue } from "../be/swarm-config-guard";
+import {
+  DB_RETENTION_TUNING_BOUNDS,
+  MAX_DB_RETENTION_DAYS,
+  validateConfigValue,
+} from "../be/swarm-config-guard";
 
 const TEST_DB_PATH = "./test-db-retention.sqlite";
 const NOW = new Date("2026-08-23T12:00:00.000Z");
@@ -116,6 +120,37 @@ describe("DB retention", () => {
       expect(validateConfigValue(key, "abc")).toContain("integer");
       expect(validateConfigValue(key, String(MAX_DB_RETENTION_DAYS))).toBeNull();
       expect(validateConfigValue(key, String(MAX_DB_RETENTION_DAYS + 1))).toContain("between");
+    }
+  });
+
+  test("pins the tuning ranges the config API and the sweep share", () => {
+    // Both sides read this constant, so a deliberate range change has to land
+    // here too — and an accidental one cannot pass unnoticed.
+    expect(DB_RETENTION_TUNING_BOUNDS).toEqual({
+      DB_RETENTION_TICK_BUDGET_MS: { min: 1_000, max: 300_000 },
+      DB_RETENTION_CATCHUP_INTERVAL_MS: { min: 5_000, max: 3_600_000 },
+      DB_RETENTION_MAX_STATEMENT_MS: { min: 25, max: 5_000 },
+    });
+    // TUNING_KEYS drives this file's env cleanup; keep it covering every knob.
+    expect(TUNING_KEYS.slice().sort()).toEqual(Object.keys(DB_RETENTION_TUNING_BOUNDS).sort());
+  });
+
+  test("rejects a tuning value the sweep would silently replace with its default", () => {
+    // Regression: these three were validated as "integer >= 1" while the sweep
+    // clamps each to its own range and falls back outside it. An operator could
+    // save a 500ms tick budget, see it accepted, and have the sweep keep
+    // running for the default 30000ms.
+    for (const [key, { min, max }] of Object.entries(DB_RETENTION_TUNING_BOUNDS)) {
+      // Both bounds are inclusive and accepted.
+      expect(validateConfigValue(key, String(min))).toBeNull();
+      expect(validateConfigValue(key, String(max))).toBeNull();
+      // One step outside either bound is rejected, not silently substituted.
+      expect(validateConfigValue(key, String(min - 1))).toContain(`between ${min} and ${max}`);
+      expect(validateConfigValue(key, String(max + 1))).toContain(`between ${min} and ${max}`);
+      // Non-integers stay rejected.
+      expect(validateConfigValue(key, "abc")).toContain("integer");
+      expect(validateConfigValue(key, "-1")).toContain("integer");
+      expect(validateConfigValue(key, "1.5")).toContain("integer");
     }
   });
 

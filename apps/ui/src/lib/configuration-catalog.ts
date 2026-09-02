@@ -368,7 +368,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "DB_RETENTION_TICK_BUDGET_MS",
         label: "Retention tick budget (ms)",
         description:
-          "Wall-clock budget for one retention sweep tick, shared evenly across enabled tables.",
+          "Wall-clock budget for one retention sweep tick, shared evenly across enabled tables. Accepts 1000 to 300000.",
         kind: "number",
         defaultValue: "30000",
         placeholder: "30000",
@@ -378,7 +378,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "DB_RETENTION_CATCHUP_INTERVAL_MS",
         label: "Retention catch-up interval (ms)",
         description:
-          "Delay before the next retention tick when a table is still undrained. The normal cadence stays hourly once every enabled table is drained.",
+          "Delay before the next retention tick when a table is still undrained. The normal cadence stays hourly once every enabled table is drained. Accepts 5000 to 3600000.",
         kind: "number",
         defaultValue: "60000",
         placeholder: "60000",
@@ -388,7 +388,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "DB_RETENTION_MAX_STATEMENT_MS",
         label: "Retention statement target (ms)",
         description:
-          "Target ceiling for one retention DELETE statement. The adaptive batch sizer tunes its batch size against this.",
+          "Target ceiling for one retention DELETE statement, measured as driver execution time. The adaptive batch sizer tunes its batch size against this. Accepts 25 to 5000.",
         kind: "number",
         defaultValue: "250",
         placeholder: "250",

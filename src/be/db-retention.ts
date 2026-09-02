@@ -4,7 +4,7 @@ import { recordDbRetentionStatement, recordDbRetentionSweep, startSpan, withSpan
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { getDbClient } from "./db";
-import { MAX_DB_RETENTION_DAYS } from "./swarm-config-guard";
+import { DB_RETENTION_TUNING_BOUNDS, MAX_DB_RETENTION_DAYS } from "./swarm-config-guard";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETENTION_INTERVAL_MS = 60 * 60 * 1000;
@@ -248,6 +248,15 @@ function readBoundedIntEnv(
   return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
+/**
+ * Read a tuning knob against the shared bounds the config API validates
+ * against, so neither side can drift into accepting what the other ignores.
+ */
+function readTuningEnv(key: keyof typeof DB_RETENTION_TUNING_BOUNDS, fallback: number): number {
+  const { min, max } = DB_RETENTION_TUNING_BOUNDS[key];
+  return readBoundedIntEnv(key, min, max, fallback);
+}
+
 function yieldTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, YIELD_MS));
 }
@@ -387,22 +396,13 @@ export function runDbRetentionTick(options: DbRetentionTickOptions = {}): Promis
       const tickStartedAt = Date.now();
       const cutoffBase = options.now ?? new Date(tickStartedAt);
       const dryRun = dryRunEnabled();
-      const budget = readBoundedIntEnv(
-        "DB_RETENTION_TICK_BUDGET_MS",
-        1_000,
-        300_000,
-        DEFAULT_TICK_BUDGET_MS,
-      );
-      const catchupIntervalMs = readBoundedIntEnv(
+      const budget = readTuningEnv("DB_RETENTION_TICK_BUDGET_MS", DEFAULT_TICK_BUDGET_MS);
+      const catchupIntervalMs = readTuningEnv(
         "DB_RETENTION_CATCHUP_INTERVAL_MS",
-        5_000,
-        3_600_000,
         DEFAULT_CATCHUP_INTERVAL_MS,
       );
-      const maxStatementMs = readBoundedIntEnv(
+      const maxStatementMs = readTuningEnv(
         "DB_RETENTION_MAX_STATEMENT_MS",
-        25,
-        5_000,
         DEFAULT_MAX_STATEMENT_MS,
       );
 
