@@ -1261,6 +1261,7 @@
               "tool.end",
               "skill.invoke",
               "skill.complete",
+              "skill.outcome",
               "session.start",
               "session.end",
               "session.resume",
@@ -1299,7 +1300,8 @@
               "api",
               "hook",
               "scheduler",
-              "cli"
+              "cli",
+              "slack"
             ]
           },
           "agentId": {
@@ -14398,6 +14400,7 @@
                       "tool.end",
                       "skill.invoke",
                       "skill.complete",
+                      "skill.outcome",
                       "session.start",
                       "session.end",
                       "session.resume",
@@ -14436,7 +14439,8 @@
                       "api",
                       "hook",
                       "scheduler",
-                      "cli"
+                      "cli",
+                      "slack"
                     ]
                   },
                   "agentId": {
@@ -14545,6 +14549,7 @@
                 "tool.end",
                 "skill.invoke",
                 "skill.complete",
+                "skill.outcome",
                 "session.start",
                 "session.end",
                 "session.resume",
@@ -14593,7 +14598,8 @@
                 "api",
                 "hook",
                 "scheduler",
-                "cli"
+                "cli",
+                "slack"
               ]
             },
             "required": false,
@@ -14725,6 +14731,7 @@
                             "tool.end",
                             "skill.invoke",
                             "skill.complete",
+                            "skill.outcome",
                             "session.start",
                             "session.end",
                             "session.resume",
@@ -14763,7 +14770,8 @@
                             "api",
                             "hook",
                             "scheduler",
-                            "cli"
+                            "cli",
+                            "slack"
                           ]
                         },
                         "agentId": {
@@ -14882,7 +14890,8 @@
                 "api",
                 "hook",
                 "scheduler",
-                "cli"
+                "cli",
+                "slack"
               ]
             },
             "required": false,

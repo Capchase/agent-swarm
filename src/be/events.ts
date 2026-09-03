@@ -171,6 +171,20 @@ export async function getEventCounts(): Promise<Array<{ event: string; count: nu
   );
 }
 
+/**
+ * Distinct skill names invoked by a task, read from `skill.invoke` events.
+ * Ledger read path for the Slack reaction listener — see src/slack/reactions.ts.
+ */
+export async function getInvokedSkillNamesForTask(taskId: string): Promise<string[]> {
+  const rows = await getDbClient().query<{ skill: string | null }>(
+    `SELECT DISTINCT json_extract(data, '$.skillName') AS skill
+     FROM events
+     WHERE category = 'skill' AND event = 'skill.invoke' AND taskId = ?`,
+    [taskId],
+  );
+  return rows.map((row) => row.skill).filter((skill): skill is string => !!skill);
+}
+
 export async function getEventCountsForAgent(
   agentId: string,
 ): Promise<Array<{ event: string; count: number }>> {

@@ -2684,6 +2684,22 @@ export async function getInProgressTasksByContextKey(
   return rows.map(rowToAgentTask);
 }
 
+/**
+ * Resolve a task by a Slack message timestamp matching either the progress
+ * message or the tree root message, for the skills-ledger Slack reaction
+ * listener (src/slack/reactions.ts). Pairs with getLatestTaskByContextKey
+ * (below) for the other steps of that listener's task-resolution cascade.
+ */
+export async function getTaskBySlackMessageTs(messageTs: string): Promise<AgentTask | null> {
+  const row = await getDbClient().get<AgentTaskRow>(
+    `SELECT * FROM agent_tasks
+       WHERE slackProgressMessageTs = ? OR slackTreeRootMessageTs = ?
+       ORDER BY createdAt DESC LIMIT 1`,
+    [messageTs, messageTs],
+  );
+  return row ? rowToAgentTask(row) : null;
+}
+
 export type ExistingTrackerContextWorkReason = "active_task" | "linked_open_pr";
 
 export type ExistingTrackerContextWork = {
