@@ -1202,29 +1202,39 @@ export async function buildRoutingAffinityFromAgent(
  * either side is treated as INELIGIBLE — never fail-open to "anyone" — so a
  * capability-only requirement (no `role` set) can only ever be claimed by
  * its `sourceAgentId`, and otherwise queues until the starvation escalation
- * hands it to the Lead.
+ * hands it to the Lead. Lead-only work is different: any Lead may claim it
+ * (subject to explicitly required capabilities), because its source/role is
+ * only recovery provenance and must not turn a worker's old role into a
+ * constraint on the Lead pool.
  */
 export function isAgentEligibleForTask(
-  agent: Pick<Agent, "id" | "role" | "capabilities">,
-  task: Pick<AgentTask, "routingAffinity">,
+  agent: Pick<Agent, "id" | "isLead" | "role" | "capabilities">,
+  task: Pick<AgentTask, "routingAffinity" | "routingAffinityInvalid">,
 ): boolean {
-  if (!isPoolAffinityEnforcementEnabled()) return true;
-
   const affinity = task.routingAffinity;
+  // A malformed persisted blob is a security boundary failure, not an
+  // untagged task. Quarantine it from every assignment/claim path.
+  if (task.routingAffinityInvalid) return false;
   if (!affinity) return true; // Untagged task — unchanged behavior.
+
+  const requiredCapabilities = affinity.capabilities ?? [];
+  const hasRequiredCapabilities = () => {
+    const agentCapabilities = new Set(agent.capabilities ?? []);
+    return requiredCapabilities.every((cap) => agentCapabilities.has(cap));
+  };
+  // Lead-only is an authorization boundary, never a best-effort pool hint or
+  // a source-agent exception. Its explicit capability requirements remain
+  // enforced even if the role/capability affinity kill-switch is enabled.
+  // Do not require an unrelated worker role/source to match a Lead-only task.
+  if (affinity.leadOnly) return agent.isLead && hasRequiredCapabilities();
+  if (!isPoolAffinityEnforcementEnabled()) return true;
 
   if (affinity.sourceAgentId && affinity.sourceAgentId === agent.id) return true; // Own work.
 
   if (!agent.role || !affinity.role) return false; // Missing role data — no fail-open.
   if (agent.role !== affinity.role) return false;
 
-  const requiredCapabilities = affinity.capabilities ?? [];
-  if (requiredCapabilities.length > 0) {
-    const agentCapabilities = new Set(agent.capabilities ?? []);
-    if (!requiredCapabilities.every((cap) => agentCapabilities.has(cap))) return false;
-  }
-
-  return true;
+  return hasRequiredCapabilities();
 }
 
 // ============================================================================
@@ -1329,20 +1339,23 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
   }
 
   let routingAffinity: RoutingAffinity | undefined;
+  let routingAffinityInvalid = false;
   if (row.routingAffinity) {
     try {
       const parsed = RoutingAffinitySchema.safeParse(JSON.parse(row.routingAffinity));
       if (parsed.success) {
         routingAffinity = parsed.data;
       } else {
+        routingAffinityInvalid = true;
         console.warn(
-          `[db] Ignoring invalid agent_tasks.routingAffinity for task ${row.id}:`,
+          `[db] Quarantining invalid agent_tasks.routingAffinity for task ${row.id}:`,
           parsed.error.message,
         );
       }
     } catch (error) {
+      routingAffinityInvalid = true;
       console.warn(
-        `[db] Ignoring malformed agent_tasks.routingAffinity for task ${row.id}:`,
+        `[db] Quarantining malformed agent_tasks.routingAffinity for task ${row.id}:`,
         error instanceof Error ? error.message : String(error),
       );
     }
@@ -1422,6 +1435,7 @@ function rowToAgentTask(row: AgentTaskRow): AgentTask {
     harnessVariantMeta: row.harnessVariantMeta ? JSON.parse(row.harnessVariantMeta) : undefined,
     totalCostUsd: row.totalCostUsd ?? undefined,
     routingAffinity,
+    routingAffinityInvalid: routingAffinityInvalid || undefined,
   };
 }
 
@@ -1513,13 +1527,16 @@ export async function getPendingTaskForAgent(agentId: string): Promise<AgentTask
     [agentId],
   );
 
-  // Find the first task whose dependencies are met
+  const agent = await getAgentById(agentId);
+  if (!agent) return null;
+
+  // A persisted legacy task may already be pending on an unauthorized agent.
+  // Do not dispatch it merely because it bypassed creation-time checks.
   for (const row of rows) {
     const task = rowToAgentTask(row);
+    if (!isAgentEligibleForTask(agent, task)) continue;
     const { ready } = await checkDependencies(task.id);
-    if (ready) {
-      return task;
-    }
+    if (ready) return task;
   }
 
   return null;
@@ -1529,22 +1546,22 @@ export async function assignUnassignedTaskPending(
   taskId: string,
   agentId: string,
 ): Promise<AgentTask | null> {
-  // Eligibility pre-check (routing affinity) — defense in depth for the
-  // heartbeat's `autoAssignPoolTasks`, which already filters candidates via
-  // `isAgentEligibleForTask` before calling this, but any other caller gets
-  // the same guard for free.
-  if (isPoolAffinityEnforcementEnabled()) {
+  // This guard is always needed for lead-only tasks; the predicate itself
+  // handles the optional role/capability kill-switch.
+  {
     const task = await getTaskById(taskId);
     const agent = await getAgentById(agentId);
-    if (task && agent && !isAgentEligibleForTask(agent, task)) {
+    if (task && (!agent || !isAgentEligibleForTask(agent, task))) {
       try {
         await createLogEntry({
           eventType: "task_claim_rejected_affinity",
           agentId,
           taskId,
           metadata: {
-            agentRole: agent.role ?? null,
+            agentRole: agent?.role ?? null,
             requiredRole: task.routingAffinity?.role ?? null,
+            leadOnly: task.routingAffinity?.leadOnly === true,
+            agentIsLead: agent?.isLead ?? false,
           },
         });
       } catch {}
@@ -2665,6 +2682,22 @@ export async function getInProgressTasksByContextKey(
     [contextKey, ...statuses],
   );
   return rows.map(rowToAgentTask);
+}
+
+/**
+ * Resolve a task by a Slack message timestamp matching either the progress
+ * message or the tree root message, for the skills-ledger Slack reaction
+ * listener (src/slack/reactions.ts). Pairs with getLatestTaskByContextKey
+ * (below) for the other steps of that listener's task-resolution cascade.
+ */
+export async function getTaskBySlackMessageTs(messageTs: string): Promise<AgentTask | null> {
+  const row = await getDbClient().get<AgentTaskRow>(
+    `SELECT * FROM agent_tasks
+       WHERE slackProgressMessageTs = ? OR slackTreeRootMessageTs = ?
+       ORDER BY createdAt DESC LIMIT 1`,
+    [messageTs, messageTs],
+  );
+  return row ? rowToAgentTask(row) : null;
 }
 
 export type ExistingTrackerContextWorkReason = "active_task" | "linked_open_pr";
@@ -4932,8 +4965,34 @@ export async function createTaskExtended(
       if (parent.followUpConfig && !options.followUpConfig) {
         options.followUpConfig = parent.followUpConfig;
       }
-      if (parent.routingAffinity && !options.routingAffinity) {
-        options.routingAffinity = parent.routingAffinity;
+      if (parent.routingAffinityInvalid) {
+        // Never let a corrupt parent affinity create an apparently untagged
+        // continuation. This is a fail-closed quarantine, including recovery.
+        throw new Error(`Cannot continue task ${parent.id}: routing affinity is invalid.`);
+      }
+      if (parent.routingAffinity) {
+        // Privilege cannot be shed by a continuation. A child can narrow or
+        // replace ordinary routing provenance, but a Lead-only parent always
+        // stamps Lead-only onto the child (including callers that supplied
+        // requiredCapabilities and therefore built a fresh affinity object).
+        if (!options.routingAffinity) {
+          options.routingAffinity = parent.routingAffinity;
+        } else if (parent.routingAffinity.leadOnly) {
+          // Child-supplied affinity may add requirements, but never remove an
+          // authorization-affecting requirement inherited from a Lead-only
+          // parent. This includes public continuations that default their
+          // requiredCapabilities to an empty array.
+          options.routingAffinity = {
+            ...options.routingAffinity,
+            capabilities: [
+              ...new Set([
+                ...(parent.routingAffinity.capabilities ?? []),
+                ...(options.routingAffinity.capabilities ?? []),
+              ]),
+            ],
+            leadOnly: true,
+          };
+        }
       }
     }
   }
@@ -5012,6 +5071,32 @@ export async function createTaskExtended(
         );
         options.slackThreadTs = finalSlackContext.threadTs;
       }
+    }
+  }
+
+  // Direct assignment and offers bypass the pool claim gate, so enforce the
+  // complete structured affinity here. This is after parent inheritance so
+  // continuations cannot shed a Lead-only boundary or its capabilities.
+  const targetAgentId = options.agentId ?? options.offeredTo;
+  if (options.routingAffinity && targetAgentId) {
+    const target = await getAgentById(targetAgentId);
+    if (!target || !isAgentEligibleForTask(target, { routingAffinity: options.routingAffinity })) {
+      try {
+        await createLogEntry({
+          eventType: "task_authorization_rejected",
+          agentId: options.creatorAgentId,
+          metadata: {
+            leadOnly: options.routingAffinity.leadOnly === true,
+            targetAgentId,
+            decision: "reject_ineligible_assignment",
+          },
+        });
+      } catch {}
+      throw new Error(
+        options.routingAffinity.leadOnly
+          ? `Lead-only task routing affinity does not authorize assignment or offer to agent "${targetAgentId}".`
+          : `Task routing affinity does not authorize assignment or offer to agent "${targetAgentId}".`,
+      );
     }
   }
 
@@ -5115,7 +5200,13 @@ export async function createTaskExtended(
       agentId: options?.creatorAgentId,
       taskId: id,
       newValue: status,
-      metadata: { source: options?.source ?? "mcp" },
+      metadata: {
+        source: options?.source ?? "mcp",
+        leadOnly: options?.routingAffinity?.leadOnly === true,
+        authorization: options?.routingAffinity?.leadOnly
+          ? { decision: "authorized", targetAgentId: options.agentId ?? options.offeredTo ?? null }
+          : undefined,
+      },
     });
   } catch {}
 
@@ -5156,21 +5247,22 @@ export async function createTaskExtended(
 }
 
 export async function claimTask(taskId: string, agentId: string): Promise<AgentTask | null> {
-  // Eligibility pre-check (routing affinity): static per (agent, task), so
-  // pre-filtering here does NOT reopen the claim race — the atomic UPDATE
-  // below still arbitrates concurrent claims by eligible agents.
-  if (isPoolAffinityEnforcementEnabled()) {
+  // Static per (agent, task), so this pre-check does not reopen the atomic
+  // claim race. It always applies to lead-only authorization.
+  {
     const task = await getTaskById(taskId);
     const agent = await getAgentById(agentId);
-    if (task && agent && !isAgentEligibleForTask(agent, task)) {
+    if (task && (!agent || !isAgentEligibleForTask(agent, task))) {
       try {
         await createLogEntry({
           eventType: "task_claim_rejected_affinity",
           agentId,
           taskId,
           metadata: {
-            agentRole: agent.role ?? null,
+            agentRole: agent?.role ?? null,
             requiredRole: task.routingAffinity?.role ?? null,
+            leadOnly: task.routingAffinity?.leadOnly === true,
+            agentIsLead: agent?.isLead ?? false,
           },
         });
       } catch {}
@@ -5240,6 +5332,25 @@ export async function releaseTask(taskId: string): Promise<AgentTask | null> {
 export async function acceptTask(taskId: string, agentId: string): Promise<AgentTask | null> {
   const task = await getTaskById(taskId);
   if (!task) return null;
+  const agent = await getAgentById(agentId);
+  if (
+    (task.routingAffinity?.leadOnly || task.routingAffinityInvalid) &&
+    (!agent || !isAgentEligibleForTask(agent, task))
+  ) {
+    try {
+      await createLogEntry({
+        eventType: "task_claim_rejected_affinity",
+        agentId,
+        taskId,
+        metadata: {
+          leadOnly: true,
+          agentIsLead: agent?.isLead ?? false,
+          decision: "reject_offer_accept",
+        },
+      });
+    } catch {}
+    return null;
+  }
   // Accept both 'offered' and 'reviewing' statuses
   if (!(task.status === "offered" || task.status === "reviewing") || task.offeredTo !== agentId)
     return null;
@@ -5499,6 +5610,25 @@ export async function claimOfferedTask(taskId: string, agentId: string): Promise
   const task = await getTaskById(taskId);
   if (!task) return null;
   if (task.status !== "offered" || task.offeredTo !== agentId) return null;
+  const agent = await getAgentById(agentId);
+  if (
+    (task.routingAffinity?.leadOnly || task.routingAffinityInvalid) &&
+    (!agent || !isAgentEligibleForTask(agent, task))
+  ) {
+    try {
+      await createLogEntry({
+        eventType: "task_claim_rejected_affinity",
+        agentId,
+        taskId,
+        metadata: {
+          leadOnly: true,
+          agentIsLead: agent?.isLead ?? false,
+          decision: "reject_offer_claim",
+        },
+      });
+    } catch {}
+    return null;
+  }
 
   const now = new Date().toISOString();
   const row = await getDbClient().get<AgentTaskRow>(
@@ -11357,10 +11487,11 @@ export interface ApprovalRequest {
   workflowRunStepId: string | null;
   sourceTaskId: string | null;
   approvers: unknown;
-  status: "pending" | "approved" | "rejected" | "timeout";
+  status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
   responses: unknown | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
+  resolutionReason: string | null;
   timeoutSeconds: number | null;
   expiresAt: string | null;
   notificationChannels: unknown[] | null;
@@ -11381,6 +11512,8 @@ interface ApprovalRequestRow {
   responses: string | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
+  resolutionReason: string | null;
+  cancellationNotificationClaims: string | null;
   timeoutSeconds: number | null;
   expiresAt: string | null;
   notificationChannels: string | null;
@@ -11402,6 +11535,7 @@ function rowToApprovalRequest(row: ApprovalRequestRow): ApprovalRequest {
     responses: row.responses ? JSON.parse(row.responses) : null,
     resolvedBy: row.resolvedBy,
     resolvedAt: normalizeDate(row.resolvedAt),
+    resolutionReason: row.resolutionReason,
     timeoutSeconds: row.timeoutSeconds,
     expiresAt: normalizeDate(row.expiresAt),
     notificationChannels: row.notificationChannels ? JSON.parse(row.notificationChannels) : null,
@@ -11422,32 +11556,55 @@ export async function createApprovalRequest(data: {
   timeoutSeconds?: number;
   notificationChannels?: unknown[];
   createdBy?: string;
+  requireActionableWorkflow?: boolean;
 }): Promise<ApprovalRequest> {
   const now = new Date().toISOString();
   const expiresAt = data.timeoutSeconds
     ? new Date(Date.now() + data.timeoutSeconds * 1000).toISOString()
     : null;
 
-  const row = await getDbClient().get<ApprovalRequestRow>(
-    `INSERT INTO approval_requests (id, title, questions, workflowRunId, workflowRunStepId, sourceTaskId, approvers, timeoutSeconds, expiresAt, notificationChannels, created_by, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  const row = await getDbClient().transaction(async () => {
+    let status: ApprovalRequest["status"] = "pending";
+    let resolutionReason: string | null = null;
+    if (data.requireActionableWorkflow && data.workflowRunId && data.workflowRunStepId) {
+      const run = await getWorkflowRun(data.workflowRunId);
+      const step = await getWorkflowRunStep(data.workflowRunStepId);
+      if (!run || (run.status !== "running" && run.status !== "waiting")) {
+        status = "cancelled";
+        resolutionReason = run?.error ?? `Workflow run is ${run?.status ?? "missing"}`;
+      } else if (!step || step.runId !== run.id || step.status !== "running") {
+        status = "cancelled";
+        resolutionReason = `Human-in-the-loop step is ${step?.status ?? "missing"}`;
+      }
+    }
+
+    return getDbClient().get<ApprovalRequestRow>(
+      `INSERT INTO approval_requests
+         (id, title, questions, workflowRunId, workflowRunStepId, sourceTaskId,
+          approvers, status, resolutionReason, resolvedAt, timeoutSeconds, expiresAt,
+          notificationChannels, created_by, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        RETURNING *`,
-    [
-      data.id,
-      data.title,
-      JSON.stringify(data.questions),
-      data.workflowRunId ?? null,
-      data.workflowRunStepId ?? null,
-      data.sourceTaskId ?? null,
-      JSON.stringify(data.approvers),
-      data.timeoutSeconds ?? null,
-      expiresAt,
-      data.notificationChannels ? JSON.stringify(data.notificationChannels) : null,
-      data.createdBy ?? null,
-      now,
-      now,
-    ],
-  );
+      [
+        data.id,
+        data.title,
+        JSON.stringify(data.questions),
+        data.workflowRunId ?? null,
+        data.workflowRunStepId ?? null,
+        data.sourceTaskId ?? null,
+        JSON.stringify(data.approvers),
+        status,
+        resolutionReason,
+        status === "cancelled" ? now : null,
+        data.timeoutSeconds ?? null,
+        expiresAt,
+        data.notificationChannels ? JSON.stringify(data.notificationChannels) : null,
+        data.createdBy ?? null,
+        now,
+        now,
+      ],
+    );
+  });
 
   return rowToApprovalRequest(row!);
 }
@@ -11467,12 +11624,32 @@ export async function resolveApprovalRequest(
     responses?: unknown;
     resolvedBy?: string;
   },
+  options?: { requireActionableWorkflow?: boolean },
 ): Promise<ApprovalRequest | null> {
   const now = new Date().toISOString();
+  const actionableWorkflowClause = options?.requireActionableWorkflow
+    ? `AND (
+         workflowRunId IS NULL
+         OR (
+           EXISTS (
+             SELECT 1 FROM workflow_runs
+             WHERE id = approval_requests.workflowRunId
+               AND status IN ('running', 'waiting')
+           )
+           AND EXISTS (
+           SELECT 1 FROM workflow_run_steps
+             WHERE id = approval_requests.workflowRunStepId
+               AND runId = approval_requests.workflowRunId
+               AND status = 'waiting'
+           )
+         )
+       )`
+    : "";
   const row = await getDbClient().get<ApprovalRequestRow>(
     `UPDATE approval_requests
        SET status = ?, responses = ?, resolvedBy = ?, resolvedAt = ?, updatedAt = ?
        WHERE id = ? AND status = 'pending'
+         ${actionableWorkflowClause}
        RETURNING *`,
     [
       data.status,
@@ -11484,6 +11661,130 @@ export async function resolveApprovalRequest(
     ],
   );
   return row ? rowToApprovalRequest(row) : null;
+}
+
+export async function cancelPendingApprovalRequestsForRun(
+  workflowRunId: string,
+  reason: string,
+): Promise<ApprovalRequest[]> {
+  const now = new Date().toISOString();
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `UPDATE approval_requests
+       SET status = 'cancelled', resolutionReason = ?, resolvedAt = ?, updatedAt = ?
+       WHERE workflowRunId = ? AND status = 'pending'
+       RETURNING *`,
+    [reason, now, now, workflowRunId],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+export async function listCancelledApprovalRequestsForRun(
+  workflowRunId: string,
+): Promise<ApprovalRequest[]> {
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `SELECT * FROM approval_requests
+       WHERE workflowRunId = ? AND status = 'cancelled'`,
+    [workflowRunId],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+export async function listCancelledApprovalRequestsForStep(
+  workflowRunStepId: string,
+): Promise<ApprovalRequest[]> {
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `SELECT * FROM approval_requests
+       WHERE workflowRunStepId = ? AND status = 'cancelled'`,
+    [workflowRunStepId],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+export async function claimApprovalCancellationNotification(
+  id: string,
+  notificationKey: string,
+): Promise<{ approval: ApprovalRequest; leaseToken: string } | null> {
+  return getDbClient().transaction(async () => {
+    const row = await getDbClient().get<ApprovalRequestRow>(
+      "SELECT * FROM approval_requests WHERE id = ? AND status = 'cancelled'",
+      [id],
+    );
+    if (!row) return null;
+    const claims = row.cancellationNotificationClaims
+      ? (JSON.parse(row.cancellationNotificationClaims) as Record<
+          string,
+          "delivered" | { claimedAt: string; leaseToken: string }
+        >)
+      : {};
+    const existing = claims[notificationKey];
+    if (existing === "delivered") return null;
+    if (
+      existing &&
+      typeof existing !== "string" &&
+      Date.now() - new Date(existing.claimedAt).getTime() < 60_000
+    ) {
+      return null;
+    }
+
+    const now = new Date().toISOString();
+    const leaseToken = crypto.randomUUID();
+    claims[notificationKey] = { claimedAt: now, leaseToken };
+    await getDbClient().run(
+      `UPDATE approval_requests
+         SET cancellationNotificationClaims = ?, updatedAt = ?
+         WHERE id = ? AND status = 'cancelled'`,
+      [JSON.stringify(claims), now, id],
+    );
+    return { approval: rowToApprovalRequest(row), leaseToken };
+  });
+}
+
+export async function completeApprovalCancellationNotificationClaim(
+  id: string,
+  notificationKey: string,
+  leaseToken: string,
+): Promise<void> {
+  await updateApprovalCancellationNotificationClaim(id, notificationKey, leaseToken, "delivered");
+}
+
+export async function releaseApprovalCancellationNotificationClaim(
+  id: string,
+  notificationKey: string,
+  leaseToken: string,
+): Promise<void> {
+  await updateApprovalCancellationNotificationClaim(id, notificationKey, leaseToken, null);
+}
+
+async function updateApprovalCancellationNotificationClaim(
+  id: string,
+  notificationKey: string,
+  leaseToken: string,
+  value: "delivered" | null,
+): Promise<void> {
+  await getDbClient().transaction(async () => {
+    const row = await getDbClient().get<{ claims: string | null }>(
+      "SELECT cancellationNotificationClaims AS claims FROM approval_requests WHERE id = ?",
+      [id],
+    );
+    const claims = row?.claims
+      ? (JSON.parse(row.claims) as Record<
+          string,
+          "delivered" | { claimedAt: string; leaseToken: string }
+        >)
+      : {};
+    const current = claims[notificationKey];
+    if (!current || typeof current === "string" || current.leaseToken !== leaseToken) {
+      return;
+    }
+    if (value === null) delete claims[notificationKey];
+    else claims[notificationKey] = value;
+    await getDbClient().run(
+      `UPDATE approval_requests
+         SET cancellationNotificationClaims = ?, updatedAt = ?
+         WHERE id = ? AND status = 'cancelled'`,
+      [JSON.stringify(claims), new Date().toISOString(), id],
+    );
+  });
 }
 
 export async function updateApprovalRequestNotifications(

@@ -2987,12 +2987,13 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3103,12 +3104,13 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3199,12 +3201,13 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3308,12 +3311,13 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -5158,9 +5162,9 @@ export interface paths {
             parameters: {
                 query?: {
                     category?: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
-                    event?: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+                    event?: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "skill.outcome" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
                     status?: "ok" | "error" | "timeout" | "skipped";
-                    source?: "worker" | "api" | "hook" | "scheduler" | "cli";
+                    source?: "worker" | "api" | "hook" | "scheduler" | "cli" | "slack";
                     agentId?: string;
                     taskId?: string;
                     sessionId?: string;
@@ -5203,11 +5207,11 @@ export interface paths {
                         /** @enum {string} */
                         category: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
                         /** @enum {string} */
-                        event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+                        event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "skill.outcome" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
                         /** @enum {string} */
                         status?: "ok" | "error" | "timeout" | "skipped";
                         /** @enum {string} */
-                        source: "worker" | "api" | "hook" | "scheduler" | "cli";
+                        source: "worker" | "api" | "hook" | "scheduler" | "cli" | "slack";
                         agentId?: string;
                         taskId?: string;
                         sessionId?: string;
@@ -5275,11 +5279,11 @@ export interface paths {
                             /** @enum {string} */
                             category: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
                             /** @enum {string} */
-                            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+                            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "skill.outcome" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
                             /** @enum {string} */
                             status?: "ok" | "error" | "timeout" | "skipped";
                             /** @enum {string} */
-                            source: "worker" | "api" | "hook" | "scheduler" | "cli";
+                            source: "worker" | "api" | "hook" | "scheduler" | "cli" | "slack";
                             agentId?: string;
                             taskId?: string;
                             sessionId?: string;
@@ -5336,7 +5340,7 @@ export interface paths {
             parameters: {
                 query?: {
                     category?: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
-                    source?: "worker" | "api" | "hook" | "scheduler" | "cli";
+                    source?: "worker" | "api" | "hook" | "scheduler" | "cli" | "slack";
                     agentId?: string;
                     taskId?: string;
                     sessionId?: string;
@@ -7004,6 +7008,7 @@ export interface paths {
                                 /** @enum {string} */
                                 scope: "agent" | "swarm";
                                 tags: string[];
+                                accessCount: number;
                             }[];
                         };
                     };
@@ -14496,6 +14501,15 @@ export interface paths {
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
                                 };
                                 agentLog?: {
                                     at: string;
@@ -14504,6 +14518,15 @@ export interface paths {
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
                                 };
                                 events?: {
                                     at: string;
@@ -14512,6 +14535,15 @@ export interface paths {
                                     durationMs: number;
                                     dryRun: boolean;
                                     cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
                                 };
                             };
                         };
@@ -19790,6 +19822,7 @@ export interface components {
             };
             totalCostUsd?: number;
             routingAffinity?: components["schemas"]["RoutingAffinity"];
+            routingAffinityInvalid?: boolean;
         };
         FollowUpConfig: {
             disabled?: boolean;
@@ -19803,6 +19836,7 @@ export interface components {
             harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
             /** @default [] */
             capabilities: string[];
+            leadOnly?: boolean;
         };
         AgentCredStatus: {
             ready: boolean;
@@ -20001,11 +20035,11 @@ export interface components {
             /** @enum {string} */
             category: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
             /** @enum {string} */
-            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "skill.outcome" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
             /** @enum {string} */
             status: "ok" | "error" | "timeout" | "skipped";
             /** @enum {string} */
-            source: "worker" | "api" | "hook" | "scheduler" | "cli";
+            source: "worker" | "api" | "hook" | "scheduler" | "cli" | "slack";
             agentId?: string;
             taskId?: string;
             sessionId?: string;
@@ -20534,7 +20568,7 @@ export interface components {
             /** Format: uuid */
             id: string;
             /** @enum {string} */
-            eventType: "agent_joined" | "agent_status_change" | "agent_left" | "task_created" | "task_status_change" | "task_progress" | "task_steering" | "task_offered" | "task_accepted" | "task_rejected" | "task_claimed" | "task_claim_rejected_affinity" | "task_released" | "channel_message" | "service_registered" | "service_unregistered" | "service_status_change" | "budget.upserted" | "budget.deleted" | "pricing.inserted" | "pricing.deleted" | "pricing.refresh" | "pricing.refresh.failed" | "task_superseded";
+            eventType: "agent_joined" | "agent_status_change" | "agent_left" | "task_created" | "task_status_change" | "task_progress" | "task_steering" | "task_offered" | "task_accepted" | "task_rejected" | "task_claimed" | "task_claim_rejected_affinity" | "task_authorization_rejected" | "task_recovery_authorization" | "task_released" | "channel_message" | "service_registered" | "service_unregistered" | "service_status_change" | "budget.upserted" | "budget.deleted" | "pricing.inserted" | "pricing.deleted" | "pricing.refresh" | "pricing.refresh.failed" | "task_superseded";
             agentId?: string;
             taskId?: string;
             oldValue?: string;

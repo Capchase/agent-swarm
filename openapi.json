@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Agent Swarm API",
-    "version": "1.136.0",
+    "version": "1.137.0",
     "description": "Multi-agent orchestration API for Claude Code, Codex, and Gemini CLI. Enables task distribution, agent communication, and service discovery.\n\nMCP tools are documented separately in [MCP.md](./MCP.md)."
   },
   "servers": [
@@ -426,6 +426,9 @@
           },
           "routingAffinity": {
             "$ref": "#/components/schemas/RoutingAffinity"
+          },
+          "routingAffinityInvalid": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -481,6 +484,9 @@
               "type": "string"
             },
             "default": []
+          },
+          "leadOnly": {
+            "type": "boolean"
           }
         }
       },
@@ -1255,6 +1261,7 @@
               "tool.end",
               "skill.invoke",
               "skill.complete",
+              "skill.outcome",
               "session.start",
               "session.end",
               "session.resume",
@@ -1293,7 +1300,8 @@
               "api",
               "hook",
               "scheduler",
-              "cli"
+              "cli",
+              "slack"
             ]
           },
           "agentId": {
@@ -3407,6 +3415,8 @@
               "task_rejected",
               "task_claimed",
               "task_claim_rejected_affinity",
+              "task_authorization_rejected",
+              "task_recovery_authorization",
               "task_released",
               "channel_message",
               "service_registered",
@@ -10454,7 +10464,8 @@
                             "pending",
                             "approved",
                             "rejected",
-                            "timeout"
+                            "timeout",
+                            "cancelled"
                           ]
                         },
                         "responses": {
@@ -10471,6 +10482,12 @@
                           ]
                         },
                         "resolvedAt": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "resolutionReason": {
                           "type": [
                             "string",
                             "null"
@@ -10538,6 +10555,7 @@
                         "responses",
                         "resolvedBy",
                         "resolvedAt",
+                        "resolutionReason",
                         "timeoutSeconds",
                         "expiresAt",
                         "notificationChannels",
@@ -10768,7 +10786,8 @@
                               "pending",
                               "approved",
                               "rejected",
-                              "timeout"
+                              "timeout",
+                              "cancelled"
                             ]
                           },
                           "responses": {
@@ -10785,6 +10804,12 @@
                             ]
                           },
                           "resolvedAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "resolutionReason": {
                             "type": [
                               "string",
                               "null"
@@ -10852,6 +10877,7 @@
                           "responses",
                           "resolvedBy",
                           "resolvedAt",
+                          "resolutionReason",
                           "timeoutSeconds",
                           "expiresAt",
                           "notificationChannels",
@@ -11055,7 +11081,8 @@
                             "pending",
                             "approved",
                             "rejected",
-                            "timeout"
+                            "timeout",
+                            "cancelled"
                           ]
                         },
                         "responses": {
@@ -11072,6 +11099,12 @@
                           ]
                         },
                         "resolvedAt": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "resolutionReason": {
                           "type": [
                             "string",
                             "null"
@@ -11139,6 +11172,7 @@
                         "responses",
                         "resolvedBy",
                         "resolvedAt",
+                        "resolutionReason",
                         "timeoutSeconds",
                         "expiresAt",
                         "notificationChannels",
@@ -11372,7 +11406,8 @@
                             "pending",
                             "approved",
                             "rejected",
-                            "timeout"
+                            "timeout",
+                            "cancelled"
                           ]
                         },
                         "responses": {
@@ -11389,6 +11424,12 @@
                           ]
                         },
                         "resolvedAt": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "resolutionReason": {
                           "type": [
                             "string",
                             "null"
@@ -11456,6 +11497,7 @@
                         "responses",
                         "resolvedBy",
                         "resolvedAt",
+                        "resolutionReason",
                         "timeoutSeconds",
                         "expiresAt",
                         "notificationChannels",
@@ -14358,6 +14400,7 @@
                       "tool.end",
                       "skill.invoke",
                       "skill.complete",
+                      "skill.outcome",
                       "session.start",
                       "session.end",
                       "session.resume",
@@ -14396,7 +14439,8 @@
                       "api",
                       "hook",
                       "scheduler",
-                      "cli"
+                      "cli",
+                      "slack"
                     ]
                   },
                   "agentId": {
@@ -14505,6 +14549,7 @@
                 "tool.end",
                 "skill.invoke",
                 "skill.complete",
+                "skill.outcome",
                 "session.start",
                 "session.end",
                 "session.resume",
@@ -14553,7 +14598,8 @@
                 "api",
                 "hook",
                 "scheduler",
-                "cli"
+                "cli",
+                "slack"
               ]
             },
             "required": false,
@@ -14685,6 +14731,7 @@
                             "tool.end",
                             "skill.invoke",
                             "skill.complete",
+                            "skill.outcome",
                             "session.start",
                             "session.end",
                             "session.resume",
@@ -14723,7 +14770,8 @@
                             "api",
                             "hook",
                             "scheduler",
-                            "cli"
+                            "cli",
+                            "slack"
                           ]
                         },
                         "agentId": {
@@ -14842,7 +14890,8 @@
                 "api",
                 "hook",
                 "scheduler",
-                "cli"
+                "cli",
+                "slack"
               ]
             },
             "required": false,
@@ -17250,6 +17299,9 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "accessCount": {
+                            "type": "number"
                           }
                         },
                         "required": [
@@ -17259,7 +17311,8 @@
                           "similarity",
                           "source",
                           "scope",
-                          "tags"
+                          "tags",
+                          "accessCount"
                         ]
                       }
                     }
@@ -36759,6 +36812,35 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "outcome": {
+                              "type": "string",
+                              "enum": [
+                                "converged",
+                                "budget_exhausted",
+                                "error"
+                              ]
+                            },
+                            "drained": {
+                              "type": "boolean"
+                            },
+                            "backlogRemaining": {
+                              "type": "number"
+                            },
+                            "batchSize": {
+                              "type": "number"
+                            },
+                            "slowestStatementMs": {
+                              "type": "number"
+                            },
+                            "lastError": {
+                              "type": "string"
+                            },
+                            "lastErrorAt": {
+                              "type": "string"
+                            },
+                            "lastSuccessAt": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -36767,7 +36849,12 @@
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "outcome",
+                            "drained",
+                            "backlogRemaining",
+                            "batchSize",
+                            "slowestStatementMs"
                           ]
                         },
                         "agentLog": {
@@ -36790,6 +36877,35 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "outcome": {
+                              "type": "string",
+                              "enum": [
+                                "converged",
+                                "budget_exhausted",
+                                "error"
+                              ]
+                            },
+                            "drained": {
+                              "type": "boolean"
+                            },
+                            "backlogRemaining": {
+                              "type": "number"
+                            },
+                            "batchSize": {
+                              "type": "number"
+                            },
+                            "slowestStatementMs": {
+                              "type": "number"
+                            },
+                            "lastError": {
+                              "type": "string"
+                            },
+                            "lastErrorAt": {
+                              "type": "string"
+                            },
+                            "lastSuccessAt": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -36798,7 +36914,12 @@
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "outcome",
+                            "drained",
+                            "backlogRemaining",
+                            "batchSize",
+                            "slowestStatementMs"
                           ]
                         },
                         "events": {
@@ -36821,6 +36942,35 @@
                             },
                             "cumulativeRowsDeleted": {
                               "type": "number"
+                            },
+                            "outcome": {
+                              "type": "string",
+                              "enum": [
+                                "converged",
+                                "budget_exhausted",
+                                "error"
+                              ]
+                            },
+                            "drained": {
+                              "type": "boolean"
+                            },
+                            "backlogRemaining": {
+                              "type": "number"
+                            },
+                            "batchSize": {
+                              "type": "number"
+                            },
+                            "slowestStatementMs": {
+                              "type": "number"
+                            },
+                            "lastError": {
+                              "type": "string"
+                            },
+                            "lastErrorAt": {
+                              "type": "string"
+                            },
+                            "lastSuccessAt": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -36829,7 +36979,12 @@
                             "batches",
                             "durationMs",
                             "dryRun",
-                            "cumulativeRowsDeleted"
+                            "cumulativeRowsDeleted",
+                            "outcome",
+                            "drained",
+                            "backlogRemaining",
+                            "batchSize",
+                            "slowestStatementMs"
                           ]
                         }
                       }

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import pkg from "../../package.json";
 import { getApiKey } from "../utils/api-key.ts";
 import { buildOnboardDashboardUrl } from "./onboard/dashboard-url.ts";
+import { resolveNonInteractiveProvider } from "./onboard/non-interactive.ts";
 import { getAgentSummary, getPresetById, PRESETS } from "./onboard/presets.ts";
 import { CoreCredentialsStep } from "./onboard/steps/core-credentials.tsx";
 import { CustomTemplatesStep } from "./onboard/steps/custom-templates.tsx";
@@ -26,6 +27,7 @@ import { StartStep } from "./onboard/steps/start.tsx";
 import {
   getStepProgress,
   INITIAL_STATE,
+  isPullPolicy,
   type LogLine,
   nextStep,
   type OnboardProps,
@@ -41,12 +43,20 @@ const BANNER = `   _                    _     ____
 /_/   \\_\\__, |\\___|_| |_|\\__| |____/ \\_/\\_/ \\__,_|_|  |_| |_| |_|
        |___/`;
 
-export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
+export function Onboard({ dryRun = false, yes = false, preset, pullPolicy }: OnboardProps) {
   const { exit } = useApp();
   const [state, setState] = useState<OnboardState>(() => {
     const initial = { ...INITIAL_STATE };
     if (preset) {
       initial.presetId = preset;
+    }
+    if (pullPolicy !== undefined) {
+      if (!isPullPolicy(pullPolicy)) {
+        initial.step = "error";
+        initial.error = `Invalid pull policy "${pullPolicy}". Options: always, missing, never`;
+        return initial;
+      }
+      initial.pullPolicy = pullPolicy;
     }
     return initial;
   });
@@ -137,16 +147,12 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
       return;
     }
 
-    const claudeToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || "";
-    const anthropicKey = process.env.ANTHROPIC_API_KEY || "";
-    if (!claudeToken && !anthropicKey) {
-      goToError(
-        "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY environment variable is required in non-interactive mode",
-      );
+    const providerConfig = resolveNonInteractiveProvider(process.env);
+    if (!providerConfig.ok) {
+      goToError(providerConfig.error);
       return;
     }
 
-    const credentialType = anthropicKey ? "api_key" : "oauth";
     const apiKey = getApiKey() || crypto.randomBytes(16).toString("hex");
 
     const agentIds: Record<string, string> = {};
@@ -171,7 +177,9 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
     addLog(
       `Preset: ${selectedPreset.name} (${selectedPreset.services.reduce((s, e) => s + e.count, 0)} agents)`,
     );
-    addLog(`Harness: claude (${credentialType === "api_key" ? "API key" : "OAuth token"})`);
+    addLog(
+      `Provider: ${providerConfig.state.provider} → ${providerConfig.state.harness} (${providerConfig.credentialLabel})`,
+    );
     if (Object.values(integrations).some(Boolean)) {
       const enabled = Object.entries(integrations)
         .filter(([, v]) => v)
@@ -184,10 +192,7 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
       deployType: "local",
       presetId: selectedPreset.id,
       services: selectedPreset.services,
-      harness: "claude",
-      claudeOAuthToken: claudeToken,
-      anthropicApiKey: anthropicKey,
-      credentialType,
+      ...providerConfig.state,
       apiKey,
       agentIds,
       integrations,

@@ -138,7 +138,7 @@ Check [our templates](https://templates.agent-swarm.dev) for a quick start.
 - **Typed script API connections** — lead-managed OpenAPI, GraphQL, and MCP connections generate `ctx.api.*` / `ctx.mcp.*` clients for scripts, with credential bindings and OAuth-backed auth kept server-side. [Guide →](https://docs.agent-swarm.dev/docs/guides/script-connections)
 - **Swarm Apps** — agents build versioned, schema-backed dashboard apps with reusable UI elements, named queries and actions, per-user settings, RBAC, history, and safe rollback. Models can also sync source-backed rows through owner-scoped script connections. [Apps API →](https://docs.agent-swarm.dev/docs/api-reference/apps)
 - **E2B-backed eval harness** — run a scenario × harness-config matrix against real swarm stacks, capture transcripts/artifacts, and grade outcomes with deterministic checks plus LLM or agentic judges. [Guide →](https://docs.agent-swarm.dev/docs/guides/evals-harness)
-- **Harness & LLM agnostic** — run with Claude Code, Claude Bridge, OpenAI Codex, pi-mono (Anthropic, OpenRouter, or Amazon Bedrock), Devin, Claude Managed Agents, raw LLMs, or opencode. The dashboard model picker follows a live models.dev catalog (with a bundled snapshot fallback), so newly released provider models appear without a redeploy. Route every OpenRouter-backed harness, workflow, and summarizer through an OpenAI-compatible gateway with `OPENROUTER_BASE_URL`. Tasks, schedules, and workflow agent-task nodes can use portable `modelTier` intent (`smol`, `regular`, `smart`, `ultra`), and operators can set per-agent reasoning effort (`off` → `max`, where supported) without changing task payloads. [Harness config →](https://docs.agent-swarm.dev/docs/guides/harness-configuration) · [Add a new provider →](https://docs.agent-swarm.dev/docs/guides/harness-providers)
+- **Harness & LLM agnostic** — run with Claude Code, Claude Bridge, OpenAI Codex, pi-mono (Anthropic, OpenRouter, or Amazon Bedrock), Devin, Claude Managed Agents, raw LLMs, or opencode. The dashboard model picker follows a live models.dev catalog (with a bundled snapshot fallback), and the direct Claude catalog includes Fable 5.1 and Mythos 5.1. Route every OpenRouter-backed harness, workflow, and summarizer through an OpenAI-compatible gateway with `OPENROUTER_BASE_URL`. Tasks, schedules, and workflow agent-task nodes can use portable `modelTier` intent (`smol`, `regular`, `smart`, `ultra`), and operators can set per-agent reasoning effort (`off` → `max`, where supported) without changing task payloads. [Harness config →](https://docs.agent-swarm.dev/docs/guides/harness-configuration) · [Add a new provider →](https://docs.agent-swarm.dev/docs/guides/harness-providers)
 - **Published release artifacts** — every release publishes multi-architecture API, full-worker, and slim-worker images alongside versioned E2B templates, the npm CLI package, and the Helm chart. [Artifact inventory →](https://docs.agent-swarm.dev/docs/guides/published-artifacts)
 - **OpenTelemetry traces plus OTLP cost/token metrics** — export API + worker traces and finalized session cost/token counters through the same OTLP pipeline for dashboarding in SigNoz, Datadog, Tempo, or another compatible backend. [Observability →](https://docs.agent-swarm.dev/docs/guides/observability-opentelemetry)
 - **Follow-up continuity across all harnesses** — child tasks inherit a bounded prior-task context preamble built from the task chain, so continuity survives restarts and works the same across every provider. [Task lifecycle →](https://docs.agent-swarm.dev/docs/concepts/task-lifecycle)
@@ -153,7 +153,16 @@ Check [our templates](https://templates.agent-swarm.dev) for a quick start.
 
 Need help? Contact us at [contact@desplega.sh](mailto:contact@desplega.sh).
 
-**Prerequisites:** [Docker](https://docker.com) and at least one supported harness credential. The default quick start assumes a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) OAuth token (`claude setup-token`), but pi-mono / Bedrock, Codex, Devin, and other provider setups are also supported.
+**Prerequisites:** [Docker](https://docker.com) and one supported harness credential. Claude remains the default, or choose one of these install-time mappings:
+
+| Provider | `HARNESS_PROVIDER` | Credential/configuration |
+| --- | --- | --- |
+| Claude Code | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` |
+| OpenAI | `codex` | `OPENAI_API_KEY` |
+| OpenRouter | `pi` | `OPENROUTER_API_KEY` and a `MODEL_OVERRIDE` |
+| AWS Bedrock (alpha) | `pi` | `AWS_REGION`, a Bedrock `MODEL_OVERRIDE`, and AWS credentials or profile |
+
+Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock. See [model providers and gateways](https://docs.agent-swarm.dev/docs/guides/provider-auth/model-gateways) and [what each provider supports](https://docs.agent-swarm.dev/docs/guides/provider-capability-matrix).
 
 The fastest way is the onboarding wizard — it collects credentials, picks presets, and generates a working `docker-compose.yml`:
 
@@ -168,7 +177,7 @@ Prefer manual setup? Clone and run with Docker Compose:
 git clone https://github.com/desplega-ai/agent-swarm.git
 cd agent-swarm
 cp .env.docker.example .env
-# edit .env — set API_KEY plus the credential for your chosen harness (for example CLAUDE_CODE_OAUTH_TOKEN)
+# edit .env — set API_KEY, HARNESS_PROVIDER, and one credential set from the table above
 docker compose -f docker-compose.example.yml --env-file .env up -d
 ```
 
