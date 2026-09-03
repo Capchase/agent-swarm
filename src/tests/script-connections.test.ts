@@ -553,6 +553,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "137_memory_retrieval_composite_index.sql");
       // 140 rebuilds approval_requests, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "140_approval_request_cancelled_status.sql");
+      // 141 seeds a dashboard row into metrics, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "141_skills_ledger_dashboard.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
