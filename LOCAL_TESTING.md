@@ -5,6 +5,7 @@ Reference doc for everything Claude (or any agent) needs to test Agent Swarm loc
 Quick index:
 
 - [Unit tests](#unit-tests)
+- [Black-box E2E](#black-box-e2e-bun-run-e2e)
 - [E2E with Docker](#e2e-with-docker) — full flow lives in the `swarm-local-e2e` skill
 - [Docker entrypoint changes](#docker-entrypoint-changes)
 - [MCP tool testing over HTTP](#mcp-tool-testing-over-http)
@@ -43,6 +44,43 @@ Two RBAC suites spawn the **real** server as a subprocess (exception to the mini
 
 - `bun run test:root -- src/tests/rbac-wire-e2e.test.ts` — gate matrix over a real MCP handshake + HTTP, plus audit-trail fidelity. Runs in the default root test command (CI).
 - `RBAC_LIFECYCLE_E2E=1 bun run test:root -- src/tests/rbac-lifecycle-e2e.test.ts` — audit lifecycle (burst flush, SIGTERM drain, kill-switch, retention purge, boot-race, stdio). Env-gated, ~20s, multiple server boots; run on demand / pre-release. Skipped without the flag.
+
+## Black-box E2E (bun run e2e)
+
+`bun run e2e` starts the real API on a free port with a fresh SQLite database.
+It runs deterministic HTTP and MCP scenarios with simulated agents. It does not use Docker or an LLM.
+The runner discovers route and MCP tool coverage from the running server.
+It writes `./e2e-results.json` by default.
+
+Every run also boots an in-process `@desplega.ai/slack-mock` before the API and starts the server with `NODE_ENV=test`,
+so Bolt connects to the mock over Socket Mode (the socket-mode guard refuses `NODE_ENV=development`).
+Scenarios drive that Slack workspace through `ctx.slack` (see `slack-mention`: mention, eyes reaction, task, threaded outcome).
+`ctx.db` is a read-only SQLite handle on the SUT database for assertions only; seed every fixture through the API.
+
+```bash
+bun run e2e
+bun run e2e --list
+bun run e2e --only health,auth
+bun run e2e --only slack-mention
+bun run e2e --skip workflow-script-node
+bun run e2e --json /tmp/e2e.json --summary-md /tmp/e2e.md
+bun run e2e --min-route-coverage 4 --min-tool-coverage 3
+bun run e2e --keep
+```
+
+Use `--harness claude,codex,pi,opencode` to add real worker legs after the contract layer.
+Claude needs `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+Codex needs `CODEX_OAUTH` or `OPENAI_API_KEY`. Pi needs `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`.
+Opencode needs `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
+Override models with `E2E_MODEL_CLAUDE`, `E2E_MODEL_CODEX`, `E2E_MODEL_PI`, or `E2E_MODEL_OPENCODE`.
+Create a Codex blob with `bun scripts/e2e/codex-oauth-blob.ts /path/to/.codex/auth.json | gh secret set E2E_CODEX_OAUTH`.
+Use a dedicated Codex login for that blob. CI refresh rotates the token and can break a main login.
+The blob goes stale after its first refresh, about ten days after issue.
+Set `E2E_HARNESS_TIMEOUT_MS` to change the five-minute harness timeout.
+
+The same command runs locally, in GitHub Actions, and inside a swarm worker container.
+Coverage only includes traffic sent through the runner's recording client.
+Worker traffic from harness legs does not increase the MVP coverage numbers.
 
 ## E2E with Docker
 
