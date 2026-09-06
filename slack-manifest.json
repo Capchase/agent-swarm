@@ -71,6 +71,7 @@
         "im:history",
         "im:read",
         "im:write",
+        "reactions:read",
         "reactions:write",
         "users:read",
         "users:read.email"
@@ -85,7 +86,9 @@
         "message.channels",
         "message.groups",
         "message.im",
-        "assistant_thread_started"
+        "assistant_thread_started",
+        "reaction_added",
+        "reaction_removed"
       ]
     },
     "interactivity": {

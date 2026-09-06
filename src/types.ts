@@ -1454,7 +1454,7 @@ export const EventCategorySchema = z.enum([
 
 export const EventStatusSchema = z.enum(["ok", "error", "timeout", "skipped"]);
 
-export const EventSourceSchema = z.enum(["worker", "api", "hook", "scheduler", "cli"]);
+export const EventSourceSchema = z.enum(["worker", "api", "hook", "scheduler", "cli", "slack"]);
 
 export const EventNameSchema = z.enum([
   // Tool events
@@ -1463,6 +1463,7 @@ export const EventNameSchema = z.enum([
   // Skill events
   "skill.invoke",
   "skill.complete",
+  "skill.outcome",
   // Session events
   "session.start",
   "session.end",
