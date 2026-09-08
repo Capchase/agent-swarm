@@ -95,6 +95,22 @@ export const slackReactionOverride: Scenario = {
           `delete config ${configId}`,
         );
       }
+      // The delete reloads process.env on the same debounce as the upsert.
+      // Wait until the defaults are live again so a later scenario that
+      // expects the code-default reaction names never observes the override.
+      const reset = await pollUntil(async () => {
+        const response = await ctx.api(
+          "GET",
+          `/api/config/env-presence?keys=${acceptedKey},${completedKey}`,
+        );
+        expectStatus(response, [200], `check ${acceptedKey}/${completedKey} absence`);
+        const presence = asRecord(response.json).presence as Record<string, boolean> | undefined;
+        return presence?.[acceptedKey] === false && presence?.[completedKey] === false;
+      }, 10_000);
+      expect(
+        reset,
+        `${acceptedKey}/${completedKey} were still visible in process.env 10 seconds after deletion`,
+      );
     }
   },
 };
