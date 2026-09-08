@@ -38,25 +38,8 @@ export function normalizeSlackReactionShortcode(raw: unknown): string | null {
   return normalized;
 }
 
-const ACCEPTANCE_EVENTS = ["accepted", "buffered", "now", "steered"] as const;
-
 export function reactionName(event: SlackReactionEvent): string {
   const raw = process.env[SLACK_REACTION_CONFIG_KEYS[event]];
   const normalized = normalizeSlackReactionShortcode(raw);
   return normalized ?? SLACK_REACTION_DEFAULTS[event];
-}
-
-/**
- * Best-effort fallback candidates for `finalizeSlackMessageReaction`: every
- * code default plus whatever each acceptance event's config key currently
- * names. This alone would miss a name that was applied under a config value
- * since changed or reloaded away — the primary mechanism cleanup relies on
- * is discovering the bot's own reaction straight from Slack (`reactions.get`
- * on the message), which reads live state instead of process memory and so
- * is correct across restarts and any number of config reloads.
- */
-export function acceptanceReactionNames(): string[] {
-  const names = new Set<string>(ACCEPTANCE_EVENTS.map((event) => SLACK_REACTION_DEFAULTS[event]));
-  for (const event of ACCEPTANCE_EVENTS) names.add(reactionName(event));
-  return [...names];
 }
