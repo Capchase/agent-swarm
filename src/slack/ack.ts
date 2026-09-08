@@ -93,7 +93,7 @@ async function discoverAppliedReactionNames(
   if (!botUserId) {
     console.log(
       scrubSecrets(
-        "[Slack] could not resolve bot user id via auth.test; skipping live reaction discovery and relying on configured reaction names only",
+        "[Slack] could not resolve bot user id via auth.test; skipping live reaction discovery and reaction cleanup for this message",
       ),
     );
     return [];
