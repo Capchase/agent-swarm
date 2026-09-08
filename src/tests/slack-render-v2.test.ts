@@ -273,7 +273,11 @@ describe("Slack renderer v2", () => {
     await processSlackRenderV2();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(calls.filter((call) => call.method === "reactions.remove")).toHaveLength(4);
+    // auth.test in this suite's mock never returns a user_id, so the bot's own
+    // id can't be resolved; per the fixed cleanup contract that skips live
+    // reaction discovery entirely rather than trial-removing every configured
+    // name -- see the "could not resolve bot user id" branch in ack.ts.
+    expect(calls.filter((call) => call.method === "reactions.remove")).toHaveLength(0);
     expect(calls).toContainEqual({
       method: "reactions.add",
       payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },

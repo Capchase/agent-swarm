@@ -636,7 +636,11 @@ describe("processTreeMessages", () => {
     expect(_getTaskToTree().has(task.id)).toBe(false);
     expect(_getLastRenderedTree().has(messageTs)).toBe(false);
     expect(_getTreeLastUpdateTime().has(messageTs)).toBe(false);
-    expect(mockReactionRemove).toHaveBeenCalledTimes(8);
+    // This suite's mock client has no `auth.test`, so the bot's own user id
+    // can't be resolved; per the fixed cleanup contract that skips live
+    // reaction discovery entirely rather than trial-removing every configured
+    // name -- see the "could not resolve bot user id" branch in ack.ts.
+    expect(mockReactionRemove).toHaveBeenCalledTimes(0);
     expect(mockReactionAdd).toHaveBeenCalledWith({
       channel: "C_TERM1",
       name: "white_check_mark",
