@@ -430,6 +430,34 @@ describe("reaction-shortcode.ts", () => {
     );
   });
 
+  test("a reactions.get failure with missing_scope (reactions:read not yet granted on a pre-existing install) falls back to the configured acceptance names only, without throwing", async () => {
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+    const get = async () => {
+      // Shape thrown by the Slack SDK for a scope the app was never granted —
+      // distinct from `ratelimited` above: this failure is permanent until
+      // the app is reinstalled with the `reactions:read` scope (see
+      // DEPLOYMENT.md), not transient.
+      throw { data: { ok: false, error: "missing_scope", needed: "reactions:read" } };
+    };
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove: removeSpy, get }, auth } as never,
+      "C_MISSING_SCOPE_TEST",
+      "1000.0019",
+      "white_check_mark",
+    );
+
+    // Same fallback as any other reactions.get failure: only the code-default
+    // acceptance names were attempted, and finalization completed without
+    // throwing despite the authorization failure.
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames.sort()).toEqual(
+      ["eyes", "heavy_plus_sign", "zap", "speech_balloon"].sort(),
+    );
+  });
+
   test("when the bot's own user id can't be resolved, live discovery is skipped and only configured names are removed", async () => {
     const logSpy = spyOn(console, "log");
     logSpy.mockClear();
