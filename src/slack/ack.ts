@@ -44,7 +44,9 @@ export async function ackSlackMessage(
     if (slackErrorCode(error) === "invalid_name") {
       const keyLabel = event ? SLACK_REACTION_CONFIG_KEYS[event] : "the SLACK_REACTION_* key";
       console.error(
-        `[Slack] reaction "${scrubSecrets(name)}" for event ${event ?? "unknown"} rejected by Slack (invalid_name); check ${keyLabel}`,
+        scrubSecrets(
+          `[Slack] reaction "${name}" for event ${event ?? "unknown"} rejected by Slack (invalid_name); check ${keyLabel}`,
+        ),
       );
       recordSlackReactionInvalidName(event ?? "unknown");
       // Always attempt the one default fallback, even when the rejected name
@@ -56,13 +58,17 @@ export async function ackSlackMessage(
         await client.reactions.add({ channel, name: fallback, timestamp });
       } catch (fallbackError) {
         console.log(
-          `[Slack] ${fallback} acknowledgement reaction failed: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`,
+          scrubSecrets(
+            `[Slack] ${fallback} acknowledgement reaction failed: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`,
+          ),
         );
       }
       return;
     }
     console.log(
-      `[Slack] ${scrubSecrets(name)} acknowledgement reaction failed: ${error instanceof Error ? error.message : error}`,
+      scrubSecrets(
+        `[Slack] ${name} acknowledgement reaction failed: ${error instanceof Error ? error.message : error}`,
+      ),
     );
   }
 }
@@ -83,7 +89,9 @@ export async function finalizeSlackMessageReaction(
       if (code === "no_reaction" || code === "message_not_found" || code === "invalid_name")
         continue;
       console.log(
-        `[Slack] ${scrubSecrets(name)} acknowledgement reaction removal failed: ${error instanceof Error ? error.message : error}`,
+        scrubSecrets(
+          `[Slack] ${name} acknowledgement reaction removal failed: ${error instanceof Error ? error.message : error}`,
+        ),
       );
     }
   }

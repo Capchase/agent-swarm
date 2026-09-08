@@ -10,7 +10,6 @@ import {
   SLACK_REACTION_DEFAULTS,
   type SlackReactionEvent,
 } from "../slack/reaction-shortcode";
-import * as secretScrubberModule from "../utils/secret-scrubber";
 
 const ALL_EVENTS: SlackReactionEvent[] = [
   "accepted",
@@ -143,11 +142,12 @@ describe("reaction-shortcode.ts", () => {
     expect(names).not.toContain("shortcode_0");
   });
 
-  test("a generic (non-invalid_name) add failure scrubs the configured name before logging", async () => {
-    const spy = spyOn(secretScrubberModule, "scrubSecrets");
-    spy.mockClear();
+  test("a generic (non-invalid_name) add failure redacts a secret-shaped error message in the emitted log", async () => {
+    const logSpy = spyOn(console, "log");
+    logSpy.mockClear();
+    const leaked = "github_pat_11B4WKYAA0Qe95fajGmt3o_ABCDEF1234567890abcdef";
     const add = async () => {
-      throw new Error("rate_limited");
+      throw new Error(`rate_limited: ${leaked}`);
     };
     await ackSlackMessage(
       { reactions: { add } } as never,
@@ -156,14 +156,19 @@ describe("reaction-shortcode.ts", () => {
       "swarm_eyes",
       "accepted",
     );
-    expect(spy).toHaveBeenCalledWith("swarm_eyes");
+    const emitted = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(emitted).toContain("[REDACTED:github_pat]");
+    expect(emitted).not.toContain(leaked);
   });
 
-  test("a generic (non-invalid_name/no_reaction) remove failure scrubs the configured name before logging", async () => {
-    const spy = spyOn(secretScrubberModule, "scrubSecrets");
-    spy.mockClear();
+  test("a generic (non-invalid_name/no_reaction) remove failure redacts a secret-shaped error message in the emitted log", async () => {
+    const logSpy = spyOn(console, "log");
+    logSpy.mockClear();
+    const leaked = "github_pat_11B4WKYAA0Qe95fajGmt3o_ABCDEF1234567890abcdef";
     const remove = async () => {
-      throw { data: { error: "rate_limited" } };
+      const error = new Error(`rate_limited: ${leaked}`) as Error & { data: unknown };
+      error.data = { error: "rate_limited" };
+      throw error;
     };
     const add = async () => ({ ok: true });
     await finalizeSlackMessageReaction(
@@ -172,7 +177,48 @@ describe("reaction-shortcode.ts", () => {
       "1000.0004",
       "white_check_mark",
     );
-    expect(spy.mock.calls.map((call) => call[0])).toContain("eyes");
+    const emitted = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(emitted).toContain("[REDACTED:github_pat]");
+    expect(emitted).not.toContain(leaked);
+  });
+
+  test("an invalid_name add failure redacts a secret-shaped reaction name in the emitted log", async () => {
+    const errorSpy = spyOn(console, "error");
+    errorSpy.mockClear();
+    const leaked = "github_pat_11B4WKYAA0Qe95fajGmt3o_ABCDEF1234567890abcdef";
+    const add = async () => {
+      throw { data: { error: "invalid_name" } };
+    };
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_TEST",
+      "1000.0005",
+      leaked,
+      "accepted",
+    );
+    const emitted = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(emitted).toContain("[REDACTED:github_pat]");
+    expect(emitted).not.toContain(leaked);
+  });
+
+  test("a fallback add failure after invalid_name redacts a secret-shaped error message in the emitted log", async () => {
+    const logSpy = spyOn(console, "log");
+    logSpy.mockClear();
+    const leaked = "github_pat_11B4WKYAA0Qe95fajGmt3o_ABCDEF1234567890abcdef";
+    const add = async ({ name }: { name: string }) => {
+      if (name === "not_a_real_emoji") throw { data: { error: "invalid_name" } };
+      throw new Error(`rate_limited: ${leaked}`);
+    };
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_TEST",
+      "1000.0006",
+      "not_a_real_emoji",
+      "accepted",
+    );
+    const emitted = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(emitted).toContain("[REDACTED:github_pat]");
+    expect(emitted).not.toContain(leaked);
   });
 
   test("finalize cleanup removes a reaction applied under a config value the current config no longer names", async () => {
