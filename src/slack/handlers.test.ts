@@ -678,13 +678,13 @@ describe("Slack accepted-message acknowledgements", () => {
     expect(firstCall).toMatchObject({ name: "nope" });
     expect(secondCall).toMatchObject({ name: "white_check_mark" });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith("completed", "nope");
+    expect(spy).toHaveBeenCalledWith("completed");
   });
 
-  test("invalid_name on add with the default name skips and counts once", async () => {
+  test("invalid_name on add with the default name still attempts the one fallback retry", async () => {
     const spy = spyOn(otelModule, "recordSlackReactionInvalidName");
     spy.mockClear();
-    const add = mock(async () => {
+    const add = mock(async (_args: { name: string }) => {
       throw { data: { error: "invalid_name" } };
     });
 
@@ -698,15 +698,22 @@ describe("Slack accepted-message acknowledgements", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(add).toHaveBeenCalledTimes(1);
+    // The rejected name already equals the default, but the fallback attempt
+    // still fires — this is the message's last chance at a reaction.
+    expect(add).toHaveBeenCalledTimes(2);
+    expect(add.mock.calls[0]![0]).toMatchObject({ name: "white_check_mark" });
+    expect(add.mock.calls[1]![0]).toMatchObject({ name: "white_check_mark" });
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  test("invalid_name on add with no event skips and counts once", async () => {
+  test("invalid_name on add with no event still falls back to a defined default", async () => {
     const spy = spyOn(otelModule, "recordSlackReactionInvalidName");
     spy.mockClear();
-    const add = mock(async () => {
-      throw { data: { error: "invalid_name" } };
+    let calls = 0;
+    const add = mock(async ({ name }: { name: string }) => {
+      calls += 1;
+      if (calls === 1) throw { data: { error: "invalid_name" } };
+      return { ok: true, name };
     });
 
     await expect(
@@ -718,9 +725,13 @@ describe("Slack accepted-message acknowledgements", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(add).toHaveBeenCalledTimes(1);
+    // No event to look up a per-event default, but the message still ends up
+    // with a reaction instead of none at all.
+    expect(add).toHaveBeenCalledTimes(2);
+    expect(add.mock.calls[0]![0]).toMatchObject({ name: "nope" });
+    expect(add.mock.calls[1]![0]).toMatchObject({ name: "white_check_mark" });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith("unknown", "nope");
+    expect(spy).toHaveBeenCalledWith("unknown");
   });
 
   test("invalid_name on remove is treated like no_reaction", async () => {

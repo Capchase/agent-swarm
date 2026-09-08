@@ -2,6 +2,7 @@ import type { WebClient } from "@slack/web-api";
 import { getLogsByTaskIdChronological, getSlackTasksInThread } from "../be/db";
 import { recordSlackReactionInvalidName } from "../otel";
 import { type AgentTask, isTerminalTaskStatus } from "../types";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { getSlackApp } from "./app";
 import {
   acceptanceReactionNames,
@@ -43,18 +44,20 @@ export async function ackSlackMessage(
     if (slackErrorCode(error) === "invalid_name") {
       const keyLabel = event ? SLACK_REACTION_CONFIG_KEYS[event] : "the SLACK_REACTION_* key";
       console.error(
-        `[Slack] reaction "${name}" for event ${event ?? "unknown"} rejected by Slack (invalid_name); check ${keyLabel}`,
+        `[Slack] reaction "${scrubSecrets(name)}" for event ${event ?? "unknown"} rejected by Slack (invalid_name); check ${keyLabel}`,
       );
-      recordSlackReactionInvalidName(event ?? "unknown", name);
-      const fallback = event ? SLACK_REACTION_DEFAULTS[event] : undefined;
-      if (fallback && fallback !== name) {
-        try {
-          await client.reactions.add({ channel, name: fallback, timestamp });
-        } catch (fallbackError) {
-          console.log(
-            `[Slack] ${fallback} acknowledgement reaction failed: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`,
-          );
-        }
+      recordSlackReactionInvalidName(event ?? "unknown");
+      // Always attempt the one default fallback, even when the rejected name
+      // already equals it (Slack's rejection isn't assumed to be permanent)
+      // and even when `event` is unknown (fall back to a universally-valid
+      // built-in reaction rather than leaving the message with none at all).
+      const fallback = event ? SLACK_REACTION_DEFAULTS[event] : SLACK_REACTION_DEFAULTS.completed;
+      try {
+        await client.reactions.add({ channel, name: fallback, timestamp });
+      } catch (fallbackError) {
+        console.log(
+          `[Slack] ${fallback} acknowledgement reaction failed: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`,
+        );
       }
       return;
     }

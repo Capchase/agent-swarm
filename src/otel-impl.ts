@@ -411,9 +411,13 @@ export function recordDbRetentionStatement(
   retentionStatementDurationHistogram!.record(durationMs, { table, dry_run: dryRun });
 }
 
-export function recordSlackReactionInvalidName(event: string, name: string): void {
+export function recordSlackReactionInvalidName(event: string): void {
   ensureInstruments();
-  slackReactionInvalidNameCounter!.add(1, { event, name });
+  // `event` is one of the 6 known SlackReactionEvent literals or "unknown" —
+  // bounded cardinality. The operator-configured shortcode that was rejected
+  // must never become a metric label (unbounded) or reach this attribute set;
+  // callers log it separately, through the secret scrubber.
+  slackReactionInvalidNameCounter!.add(1, { event, verdict: "invalid_name" });
 }
 
 export function _injectCountersForTests(

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as otelModule from "../otel";
-import { ackSlackMessage } from "../slack/ack";
+import { ackSlackMessage, finalizeSlackMessageReaction } from "../slack/ack";
 import {
+  _resetAcceptanceReactionHistoryForTests,
   acceptanceReactionNames,
   normalizeSlackReactionShortcode,
   reactionName,
@@ -24,8 +25,14 @@ function clearReactionEnv() {
 }
 
 describe("reaction-shortcode.ts", () => {
-  beforeEach(clearReactionEnv);
-  afterEach(clearReactionEnv);
+  beforeEach(() => {
+    clearReactionEnv();
+    _resetAcceptanceReactionHistoryForTests();
+  });
+  afterEach(() => {
+    clearReactionEnv();
+    _resetAcceptanceReactionHistoryForTests();
+  });
 
   test("reactionName returns the default for every event when env is unset", () => {
     for (const event of ALL_EVENTS) {
@@ -92,7 +99,7 @@ describe("reaction-shortcode.ts", () => {
   test("recordSlackReactionInvalidName is a no-op when OTel is not configured", () => {
     delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
     otelModule._resetOtelForTests();
-    expect(otelModule.recordSlackReactionInvalidName("completed", "nope")).toBeUndefined();
+    expect(otelModule.recordSlackReactionInvalidName("completed")).toBeUndefined();
   });
 
   test("a configured invalid name falls back to the default for every event and counts once per event", async () => {
@@ -118,5 +125,42 @@ describe("reaction-shortcode.ts", () => {
     }
 
     expect(spy).toHaveBeenCalledTimes(ALL_EVENTS.length);
+  });
+
+  test("finalize cleanup removes a reaction applied under a config value the current config no longer names", async () => {
+    // Acceptance happens while SLACK_REACTION_ACCEPTED names a custom shortcode.
+    process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";
+    const acceptedName = reactionName("accepted");
+    expect(acceptedName).toBe("swarm_eyes");
+    const addOnAccept = async () => ({ ok: true });
+    await ackSlackMessage(
+      { reactions: { add: addOnAccept } } as never,
+      "C_RELOAD_TEST",
+      "1000.0002",
+      acceptedName,
+      "accepted",
+    );
+
+    // The config reloads to a different value before the task finalizes —
+    // the shortcode actually applied to the message is now unnamed by both
+    // the live config and the code defaults.
+    process.env.SLACK_REACTION_ACCEPTED = "totally_different";
+
+    const removed: string[] = [];
+    const remove = async ({ name }: { name: string }) => {
+      removed.push(name);
+      if (name !== "swarm_eyes") throw { data: { error: "no_reaction" } };
+    };
+    const add = async () => ({ ok: true });
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove } } as never,
+      "C_RELOAD_TEST",
+      "1000.0002",
+      "white_check_mark",
+    );
+
+    // The message ends clean: the reaction that was really applied got removed.
+    expect(removed).toContain("swarm_eyes");
   });
 });
