@@ -21,12 +21,12 @@ Enable Slack for task creation, agent communication, and interactive workflows v
    - `groups:history`, `groups:read`, `groups:write`
    - `im:history`, `im:read`, `im:write`
    - `mpim:history`, `mpim:read`, `mpim:write`
-   - `reactions:read`, `reactions:write`
+   - `reactions:write`
    - `users:read`
 6. Subscribe to bot events: `app_mention`, `assistant_thread_started`, `assistant_thread_context_changed`, `message.channels`, `message.groups`, `message.im`, `message.mpim`
 7. Install to your workspace and copy tokens
 
-A ready-to-use `slack-manifest.json` is included in the repository root — import it directly in the Slack App configuration page to set up all scopes, events, and features automatically. After adding channel-management scopes or `reactions:read` to an existing app, reinstall the app to the workspace so Slack grants them to the bot token. `reactions:read` is required for the acceptance-reaction cleanup in `src/slack/ack.ts` to read the message's current reactions (`reactions.get`); an app installed before this scope was added must be reinstalled, or `reactions.get` fails with `missing_scope` and cleanup is skipped entirely for that message.
+A ready-to-use `slack-manifest.json` is included in the repository root — import it directly in the Slack App configuration page to set up all scopes, events, and features automatically. After adding channel-management scopes to an existing app, reinstall the app to the workspace so Slack grants them to the bot token.
 
 ## Configuration
 
@@ -78,7 +78,7 @@ A value is trimmed, has at most one leading and one trailing colon stripped, and
 
 If Slack rejects a configured name with `invalid_name` (the emoji does not exist in the workspace), the bot logs one error-level line, increments an OTel counter, and retries once with the default for that event before giving up on the reaction. Task state and the outcome card never depend on a reaction landing. A terminal reaction (`completed` or `failed`) is never removed once added.
 
-When a task finalizes, the bot removes the acceptance reaction it applied and adds the terminal reaction. The removal candidates are the names this API process recorded when it applied them, bound to the bot identity that applied them, and intersected with the bot's live reactions on the message (`reactions.get`). The bot never removes a reaction it did not record, and never removes a reaction another bot identity applied. That record lives in process memory only. If the API restarts between acceptance and finalization, the record is lost: finalize removes nothing, the terminal reaction is still added, and the acceptance reaction stays beside it. This is a deliberate trade, agreed with the maintainer, against removing a reaction the swarm never applied.
+When a task finalizes, the bot removes the acceptance-stage reactions and adds the terminal reaction. The removal list is the configured name for each of the four acceptance-stage events (`SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`). With no configuration, that list is `eyes`, `heavy_plus_sign`, `zap` and `speech_balloon`, the same fixed list the bot removed before these keys existed. The bot keeps no record of which reaction it applied to which message, so an API restart between acceptance and finalization does not change the result. `reactions.remove` only removes the bot's own reaction, so a reaction that a person or another bot applied with the same name stays in place. If you change an acceptance-stage key while a task is active, the bot removes the new name at finalization and the old reaction stays on the message.
 
 ### Thread Follow-up Routing
 

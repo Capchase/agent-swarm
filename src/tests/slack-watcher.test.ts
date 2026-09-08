@@ -19,8 +19,6 @@ import {
   startTask,
   updateTaskProgress,
 } from "../be/db";
-import { ackSlackMessage } from "../slack/ack";
-import { getSlackApp } from "../slack/app";
 import { getAgentDisplayName, getAgentEmoji } from "../slack/responses";
 import {
   _getLastRenderedTree,
@@ -510,21 +508,6 @@ const mockChatPostMessage = mock(() => Promise.resolve({ ok: true, ts: "mock.dm.
 const mockSetStatus = mock(() => Promise.resolve({ ok: true }));
 const mockReactionAdd = mock(() => Promise.resolve({ ok: true }));
 const mockReactionRemove = mock(() => Promise.resolve({ ok: true }));
-const WATCHER_BOT_USER_ID = "U_WATCHER_BOT";
-const mockAuthTest = mock(() => Promise.resolve({ ok: true, user_id: WATCHER_BOT_USER_ID }));
-// Slack reports both acceptance-stage names as owned by this bot on every
-// message; per-message provenance decides which one is removed where.
-const mockReactionGet = mock(() =>
-  Promise.resolve({
-    ok: true,
-    message: {
-      reactions: [
-        { name: "eyes", users: [WATCHER_BOT_USER_ID] },
-        { name: "speech_balloon", users: [WATCHER_BOT_USER_ID] },
-      ],
-    },
-  }),
-);
 
 mock.module("../slack/app", () => ({
   getSlackApp: () => ({
@@ -538,11 +521,9 @@ mock.module("../slack/app", () => ({
           setStatus: mockSetStatus,
         },
       },
-      auth: { test: mockAuthTest },
       reactions: {
         add: mockReactionAdd,
         remove: mockReactionRemove,
-        get: mockReactionGet,
       },
     },
   }),
@@ -806,12 +787,6 @@ describe("processTreeMessages", () => {
       newValue: "slack_reaction",
       metadata: { slackChannelId: "C_TERM1", slackMessageTs: "4040404040.000004" },
     });
-    // Acceptance recorded "eyes" on the trigger message and "speech_balloon"
-    // on the steering message, through the same bot identity the watcher
-    // finalizes with (mockAuthTest resolves WATCHER_BOT_USER_ID).
-    const slackClient = getSlackApp()!.client as never;
-    await ackSlackMessage(slackClient, "C_TERM1", "4040404040.000003", "eyes", "accepted");
-    await ackSlackMessage(slackClient, "C_TERM1", "4040404040.000004", "speech_balloon", "steered");
     await completeTask(task.id, "All done");
 
     const messageTs = "4040404040.000002";
@@ -822,7 +797,6 @@ describe("processTreeMessages", () => {
     _getLastRenderedTree().delete(messageTs);
     mockReactionAdd.mockClear();
     mockReactionRemove.mockClear();
-    mockReactionGet.mockClear();
 
     await processTreeMessages();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -832,21 +806,7 @@ describe("processTreeMessages", () => {
     expect(_getTaskToTree().has(task.id)).toBe(false);
     expect(_getLastRenderedTree().has(messageTs)).toBe(false);
     expect(_getTreeLastUpdateTime().has(messageTs)).toBe(false);
-    // Successful auth.test + successful reactions.get: each message loses
-    // exactly the acceptance-stage name recorded for it -- not the other
-    // bot-owned name Slack also reports on it -- before the outcome lands.
-    expect(mockReactionGet).toHaveBeenCalledTimes(2);
-    expect(mockReactionRemove).toHaveBeenCalledTimes(2);
-    expect(mockReactionRemove).toHaveBeenCalledWith({
-      channel: "C_TERM1",
-      name: "eyes",
-      timestamp: "4040404040.000003",
-    });
-    expect(mockReactionRemove).toHaveBeenCalledWith({
-      channel: "C_TERM1",
-      name: "speech_balloon",
-      timestamp: "4040404040.000004",
-    });
+    expect(mockReactionRemove).toHaveBeenCalledTimes(8);
     expect(mockReactionAdd).toHaveBeenCalledWith({
       channel: "C_TERM1",
       name: "white_check_mark",
