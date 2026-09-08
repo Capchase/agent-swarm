@@ -21,12 +21,12 @@ Enable Slack for task creation, agent communication, and interactive workflows v
    - `groups:history`, `groups:read`, `groups:write`
    - `im:history`, `im:read`, `im:write`
    - `mpim:history`, `mpim:read`, `mpim:write`
-   - `reactions:write`
+   - `reactions:read`, `reactions:write`
    - `users:read`
 6. Subscribe to bot events: `app_mention`, `assistant_thread_started`, `assistant_thread_context_changed`, `message.channels`, `message.groups`, `message.im`, `message.mpim`
 7. Install to your workspace and copy tokens
 
-A ready-to-use `slack-manifest.json` is included in the repository root — import it directly in the Slack App configuration page to set up all scopes, events, and features automatically. After adding channel-management scopes to an existing app, reinstall the app to the workspace so Slack grants them to the bot token.
+A ready-to-use `slack-manifest.json` is included in the repository root — import it directly in the Slack App configuration page to set up all scopes, events, and features automatically. After adding channel-management scopes or `reactions:read` to an existing app, reinstall the app to the workspace so Slack grants them to the bot token. `reactions:read` is required for the acceptance-reaction cleanup in `src/slack/ack.ts` to read the message's current reactions (`reactions.get`); an app installed before this scope was added must be reinstalled, or `reactions.get` fails with `missing_scope` and cleanup silently falls back to the configured reaction names only.
 
 ## Configuration
 
