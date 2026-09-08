@@ -2031,48 +2031,6 @@ export async function getSlackMessageByChannelTs(
   return row ? rowToSlackMessage(row) : null;
 }
 
-/**
- * Record that this feature applied `reactionName` to a Slack message.
- * Durable across process restarts and config reloads, so finalization can
- * later intersect this with the bot's live reaction list on the message and
- * remove only the reaction this feature actually added -- never an unrelated
- * reaction the same bot happens to own.
- */
-export async function recordAppliedSlackReaction(
-  channelId: string,
-  messageTs: string,
-  reactionName: string,
-): Promise<void> {
-  await getDbClient().run(
-    `INSERT INTO slack_applied_reactions (channel_id, message_ts, reaction_name)
-       VALUES (?, ?, ?)
-       ON CONFLICT(channel_id, message_ts, reaction_name) DO NOTHING`,
-    [channelId, messageTs, reactionName],
-  );
-}
-
-export async function getAppliedSlackReactionNames(
-  channelId: string,
-  messageTs: string,
-): Promise<string[]> {
-  const rows = await getDbClient().query<{ reaction_name: string }>(
-    `SELECT reaction_name FROM slack_applied_reactions WHERE channel_id = ? AND message_ts = ?`,
-    [channelId, messageTs],
-  );
-  return rows.map((row) => row.reaction_name);
-}
-
-export async function deleteAppliedSlackReaction(
-  channelId: string,
-  messageTs: string,
-  reactionName: string,
-): Promise<void> {
-  await getDbClient().run(
-    `DELETE FROM slack_applied_reactions WHERE channel_id = ? AND message_ts = ? AND reaction_name = ?`,
-    [channelId, messageTs, reactionName],
-  );
-}
-
 export async function getSlackTasksInThread(
   channelId: string,
   threadTs: string,
