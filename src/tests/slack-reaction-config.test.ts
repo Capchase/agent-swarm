@@ -10,6 +10,7 @@ import {
   SLACK_REACTION_DEFAULTS,
   type SlackReactionEvent,
 } from "../slack/reaction-shortcode";
+import * as secretScrubberModule from "../utils/secret-scrubber";
 
 const ALL_EVENTS: SlackReactionEvent[] = [
   "accepted",
@@ -140,6 +141,38 @@ describe("reaction-shortcode.ts", () => {
     expect(recentSurvivors.length).toBeLessThanOrEqual(8);
     expect(names).toContain("shortcode_49");
     expect(names).not.toContain("shortcode_0");
+  });
+
+  test("a generic (non-invalid_name) add failure scrubs the configured name before logging", async () => {
+    const spy = spyOn(secretScrubberModule, "scrubSecrets");
+    spy.mockClear();
+    const add = async () => {
+      throw new Error("rate_limited");
+    };
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_TEST",
+      "1000.0003",
+      "swarm_eyes",
+      "accepted",
+    );
+    expect(spy).toHaveBeenCalledWith("swarm_eyes");
+  });
+
+  test("a generic (non-invalid_name/no_reaction) remove failure scrubs the configured name before logging", async () => {
+    const spy = spyOn(secretScrubberModule, "scrubSecrets");
+    spy.mockClear();
+    const remove = async () => {
+      throw { data: { error: "rate_limited" } };
+    };
+    const add = async () => ({ ok: true });
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove } } as never,
+      "C_TEST",
+      "1000.0004",
+      "white_check_mark",
+    );
+    expect(spy.mock.calls.map((call) => call[0])).toContain("eyes");
   });
 
   test("finalize cleanup removes a reaction applied under a config value the current config no longer names", async () => {

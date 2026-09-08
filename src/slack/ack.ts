@@ -62,7 +62,7 @@ export async function ackSlackMessage(
       return;
     }
     console.log(
-      `[Slack] ${name} acknowledgement reaction failed: ${error instanceof Error ? error.message : error}`,
+      `[Slack] ${scrubSecrets(name)} acknowledgement reaction failed: ${error instanceof Error ? error.message : error}`,
     );
   }
 }
@@ -83,7 +83,7 @@ export async function finalizeSlackMessageReaction(
       if (code === "no_reaction" || code === "message_not_found" || code === "invalid_name")
         continue;
       console.log(
-        `[Slack] ${name} acknowledgement reaction removal failed: ${error instanceof Error ? error.message : error}`,
+        `[Slack] ${scrubSecrets(name)} acknowledgement reaction removal failed: ${error instanceof Error ? error.message : error}`,
       );
     }
   }
