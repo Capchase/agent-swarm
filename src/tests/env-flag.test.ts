@@ -61,6 +61,33 @@ describe("swarm-config-guard: Configuration-page value validation", () => {
     expect(validateConfigValue("SLACK_THREAD_STEERING_MODE", "now")).toContain("must be one of");
   });
 
+  test("Slack reaction shortcode keys accept bare and colon-wrapped names", () => {
+    const keys = [
+      "SLACK_REACTION_ACCEPTED",
+      "SLACK_REACTION_BUFFERED",
+      "SLACK_REACTION_NOW",
+      "SLACK_REACTION_STEERED",
+      "SLACK_REACTION_COMPLETED",
+      "SLACK_REACTION_FAILED",
+    ];
+    for (const key of keys) {
+      expect(validateConfigValue(key, "thumbsup")).toBeNull();
+      expect(validateConfigValue(key, ":thumbsup:")).toBeNull();
+      expect(validateConfigValue(key, "+1")).toBeNull();
+    }
+  });
+
+  test("Slack reaction shortcode keys reject spaces, upper case, unicode and empty", () => {
+    // "Heavy Check" (not "Heavy" alone): normalisation lowercases before the format
+    // check (section 2.3), so a bare case difference alone is not rejected — only
+    // the space is. Matches T4's own acceptance check value.
+    for (const value of ["heavy check", "Heavy Check", "✅", "", ":"]) {
+      expect(validateConfigValue("SLACK_REACTION_COMPLETED", value)).toContain(
+        "Invalid SLACK_REACTION_COMPLETED",
+      );
+    }
+  });
+
   test("interval and count keys require positive integers", () => {
     expect(validateConfigValue("HEARTBEAT_INTERVAL_MS", "90000")).toBeNull();
     expect(validateConfigValue("HEARTBEAT_INTERVAL_MS", "0")).toContain("integer >= 1");

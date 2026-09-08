@@ -1,5 +1,16 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
 import * as dbModule from "../be/db";
+import * as otelModule from "../otel";
 import * as siblingAwarenessModule from "../tasks/sibling-awareness";
 import { ackSlackMessage, finalizeSlackMessageReaction } from "./ack";
 import { createAssistant } from "./assistant";
@@ -15,6 +26,7 @@ import {
   registerMessageHandler,
   type UserFilterConfig,
 } from "./handlers";
+import { SLACK_REACTION_CONFIG_KEYS } from "./reaction-shortcode";
 
 describe("checkUserAccess", () => {
   describe("when filtering is disabled (empty config)", () => {
@@ -478,6 +490,12 @@ describe("Slack accepted-message acknowledgements", () => {
     getLatestLeadTaskInThreadSpy.mockImplementation(() => completedTask as never);
     getMostRecentTaskInThreadSpy.mockImplementation(() => completedTask as never);
     resolveSlackUserIdSpy.mockImplementation(async () => undefined);
+
+    for (const key of Object.values(SLACK_REACTION_CONFIG_KEYS)) delete process.env[key];
+  });
+
+  afterEach(() => {
+    for (const key of Object.values(SLACK_REACTION_CONFIG_KEYS)) delete process.env[key];
   });
 
   afterAll(() => {
@@ -516,7 +534,7 @@ describe("Slack accepted-message acknowledgements", () => {
   test("direct steering wires its timestamp, reaction, and early exit", async () => {
     const source = await Bun.file(new URL("handlers.ts", import.meta.url)).text();
     expect(source).toContain("messageTimestamps: [msg.ts]");
-    expect(source).toMatch(/if \(steering\) \{[\s\S]*?"speech_balloon"[\s\S]*?continue;/);
+    expect(source).toMatch(/if \(steering\) \{[\s\S]*?reactionName\("steered"\)[\s\S]*?continue;/);
   });
 
   test("assistant thread reply after the last task completed gets an eyes reaction", async () => {
@@ -586,5 +604,138 @@ describe("Slack accepted-message acknowledgements", () => {
       name: "white_check_mark",
       timestamp: "2100000000.000004",
     });
+  });
+
+  test("finalization uses SLACK_REACTION_COMPLETED when set and strips colons", async () => {
+    process.env.SLACK_REACTION_COMPLETED = ":ThumbsUp:";
+    const remove = mock(async () => {
+      throw { data: { error: "no_reaction" } };
+    });
+    const add = mock(async () => {});
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove } } as never,
+      "D_THREAD_ACK_TEST",
+      "2100000000.000005",
+      "thumbsup",
+      "completed",
+    );
+
+    expect(add).toHaveBeenCalledWith({
+      channel: "D_THREAD_ACK_TEST",
+      name: "thumbsup",
+      timestamp: "2100000000.000005",
+    });
+  });
+
+  test("finalization removes the union of default and configured acceptance reactions", async () => {
+    process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";
+    process.env.SLACK_REACTION_NOW = "zap";
+    const remove = mock(async (_args: { name: string }) => {
+      throw { data: { error: "no_reaction" } };
+    });
+    const add = mock(async () => {});
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove } } as never,
+      "D_THREAD_ACK_TEST",
+      "2100000000.000006",
+      "white_check_mark",
+    );
+
+    expect(remove.mock.calls.map(([call]) => call.name)).toEqual([
+      "eyes",
+      "heavy_plus_sign",
+      "zap",
+      "speech_balloon",
+      "swarm_eyes",
+    ]);
+  });
+
+  test("invalid_name on add falls back to the code default and counts once", async () => {
+    const spy = spyOn(otelModule, "recordSlackReactionInvalidName");
+    spy.mockClear();
+    let calls = 0;
+    const add = mock(async ({ name }: { name: string }) => {
+      calls += 1;
+      if (calls === 1) throw { data: { error: "invalid_name" } };
+      return { ok: true, name };
+    });
+
+    await expect(
+      ackSlackMessage(
+        { reactions: { add } } as never,
+        "D_THREAD_ACK_TEST",
+        "2100000000.000007",
+        "nope",
+        "completed",
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(add).toHaveBeenCalledTimes(2);
+    const [firstCall] = add.mock.calls[0]!;
+    const [secondCall] = add.mock.calls[1]!;
+    expect(firstCall).toMatchObject({ name: "nope" });
+    expect(secondCall).toMatchObject({ name: "white_check_mark" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("completed", "nope");
+  });
+
+  test("invalid_name on add with the default name skips and counts once", async () => {
+    const spy = spyOn(otelModule, "recordSlackReactionInvalidName");
+    spy.mockClear();
+    const add = mock(async () => {
+      throw { data: { error: "invalid_name" } };
+    });
+
+    await expect(
+      ackSlackMessage(
+        { reactions: { add } } as never,
+        "D_THREAD_ACK_TEST",
+        "2100000000.000008",
+        "white_check_mark",
+        "completed",
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  test("invalid_name on add with no event skips and counts once", async () => {
+    const spy = spyOn(otelModule, "recordSlackReactionInvalidName");
+    spy.mockClear();
+    const add = mock(async () => {
+      throw { data: { error: "invalid_name" } };
+    });
+
+    await expect(
+      ackSlackMessage(
+        { reactions: { add } } as never,
+        "D_THREAD_ACK_TEST",
+        "2100000000.000009",
+        "nope",
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("unknown", "nope");
+  });
+
+  test("invalid_name on remove is treated like no_reaction", async () => {
+    const remove = mock(async () => {
+      throw { data: { error: "invalid_name" } };
+    });
+    const add = mock(async () => {});
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove } } as never,
+      "D_THREAD_ACK_TEST",
+      "2100000000.000010",
+      "white_check_mark",
+    );
+
+    expect(add).toHaveBeenCalledTimes(1);
   });
 });
