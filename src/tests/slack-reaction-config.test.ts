@@ -1,6 +1,10 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as otelModule from "../otel";
-import { ackSlackMessage, finalizeSlackMessageReaction } from "../slack/ack";
+import {
+  _resetBotUserIdCacheForTests,
+  ackSlackMessage,
+  finalizeSlackMessageReaction,
+} from "../slack/ack";
 import {
   acceptanceReactionNames,
   normalizeSlackReactionShortcode,
@@ -23,6 +27,9 @@ function clearReactionEnv() {
   for (const key of Object.values(SLACK_REACTION_CONFIG_KEYS)) delete process.env[key];
 }
 
+const BOT_USER_ID = "U_BOT";
+const auth = { test: async () => ({ user_id: BOT_USER_ID }) };
+
 describe("reaction-shortcode.ts", () => {
   // Snapshot so this suite's env writes never leak into a later test file
   // sharing the same process (see the OTel test below, which also mutates
@@ -36,6 +43,7 @@ describe("reaction-shortcode.ts", () => {
 
   beforeEach(() => {
     clearReactionEnv();
+    _resetBotUserIdCacheForTests();
   });
   afterAll(() => {
     for (const [key, value] of Object.entries(previousEnv)) {
@@ -167,10 +175,12 @@ describe("reaction-shortcode.ts", () => {
       if (name !== "swarm_eyes") throw { data: { error: "no_reaction" } };
     };
     const add = async () => ({ ok: true });
-    const get = async () => ({ message: { reactions: [{ name: "swarm_eyes" }] } });
+    const get = async () => ({
+      message: { reactions: [{ name: "swarm_eyes", users: [BOT_USER_ID] }] },
+    });
 
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove, get } } as never,
+      { reactions: { add, remove, get }, auth } as never,
       "C_RESTART_TEST",
       "1000.0012",
       "white_check_mark",
@@ -199,10 +209,12 @@ describe("reaction-shortcode.ts", () => {
       if (name !== "shortcode_11") throw { data: { error: "no_reaction" } };
     };
     const add = async () => ({ ok: true });
-    const get = async () => ({ message: { reactions: [{ name: "shortcode_11" }] } });
+    const get = async () => ({
+      message: { reactions: [{ name: "shortcode_11", users: [BOT_USER_ID] }] },
+    });
 
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove, get } } as never,
+      { reactions: { add, remove, get }, auth } as never,
       "C_CHURN_TEST",
       "1000.0013",
       "white_check_mark",
@@ -316,10 +328,12 @@ describe("reaction-shortcode.ts", () => {
       if (name !== "swarm_eyes") throw { data: { error: "no_reaction" } };
     };
     const add = async () => ({ ok: true });
-    const get = async () => ({ message: { reactions: [{ name: "swarm_eyes" }] } });
+    const get = async () => ({
+      message: { reactions: [{ name: "swarm_eyes", users: [BOT_USER_ID] }] },
+    });
 
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove, get } } as never,
+      { reactions: { add, remove, get }, auth } as never,
       "C_RELOAD_TEST",
       "1000.0002",
       "white_check_mark",
@@ -327,5 +341,116 @@ describe("reaction-shortcode.ts", () => {
 
     // The message ends clean: the reaction that was really applied got removed.
     expect(removed).toContain("swarm_eyes");
+  });
+
+  test("discoverAppliedReactionNames requests the complete reaction list via full: true", async () => {
+    const getArgs: Array<Record<string, unknown>> = [];
+    const get = async (args: Record<string, unknown>) => {
+      getArgs.push(args);
+      return { message: { reactions: [] } };
+    };
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove, get }, auth } as never,
+      "C_FULL_TEST",
+      "1000.0014",
+      "white_check_mark",
+    );
+
+    expect(getArgs).toHaveLength(1);
+    expect(getArgs[0].full).toBe(true);
+  });
+
+  test("finalize only attempts removal for reactions this bot owns, never a human's", async () => {
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+    const get = async () => ({
+      message: {
+        reactions: [
+          { name: "swarm_eyes", users: [BOT_USER_ID] },
+          { name: "thumbsup", users: ["U_HUMAN"] },
+        ],
+      },
+    });
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove: removeSpy, get }, auth } as never,
+      "C_MULTI_TEST",
+      "1000.0015",
+      "white_check_mark",
+    );
+
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames).toContain("swarm_eyes");
+    expect(removedNames).not.toContain("thumbsup");
+  });
+
+  test("a reaction entry missing users (an incomplete/default response) is never treated as bot-owned", async () => {
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+    const get = async () => ({
+      message: { reactions: [{ name: "swarm_eyes" }] }, // no `users` field
+    });
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove: removeSpy, get }, auth } as never,
+      "C_INCOMPLETE_TEST",
+      "1000.0016",
+      "white_check_mark",
+    );
+
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames).not.toContain("swarm_eyes");
+  });
+
+  test("a reactions.get failure (e.g. rate-limited) falls back to the configured acceptance names only", async () => {
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+    const get = async () => {
+      throw { data: { error: "ratelimited" } };
+    };
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove: removeSpy, get }, auth } as never,
+      "C_GET_FAIL_TEST",
+      "1000.0017",
+      "white_check_mark",
+    );
+
+    // No live discovery landed, so only the code-default acceptance names
+    // (accepted/buffered/now/steered) were attempted — never a crash.
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames.sort()).toEqual(
+      ["eyes", "heavy_plus_sign", "zap", "speech_balloon"].sort(),
+    );
+  });
+
+  test("when the bot's own user id can't be resolved, live discovery is skipped and only configured names are removed", async () => {
+    const logSpy = spyOn(console, "log");
+    logSpy.mockClear();
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+    const get = async () => ({
+      message: { reactions: [{ name: "some_stray_reaction", users: ["U_HUMAN"] }] },
+    });
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await finalizeSlackMessageReaction(
+      // No `auth` on this client at all — auth.test() can't be called.
+      { reactions: { add, remove: removeSpy, get } } as never,
+      "C_NO_AUTH_TEST",
+      "1000.0018",
+      "white_check_mark",
+    );
+
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames).not.toContain("some_stray_reaction");
+    const emitted = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(emitted).toContain("could not resolve bot user id");
   });
 });

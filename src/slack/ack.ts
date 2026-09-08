@@ -14,7 +14,7 @@ import {
 
 export { reactionName, type SlackReactionEvent } from "./reaction-shortcode";
 
-type SlackReactionClient = Pick<WebClient, "reactions">;
+type SlackReactionClient = Pick<WebClient, "reactions" | "auth">;
 
 function slackErrorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
@@ -23,23 +23,60 @@ function slackErrorCode(error: unknown): string | undefined {
   return typeof data.error === "string" ? data.error : undefined;
 }
 
+// Cached across calls within a process; only a resolved id is memoized so a
+// transient auth.test failure is retried rather than permanently disabling
+// discovery.
+let cachedBotUserId: string | null = null;
+
+async function getBotUserId(client: SlackReactionClient): Promise<string | null> {
+  if (cachedBotUserId) return cachedBotUserId;
+  try {
+    const result = await client.auth?.test();
+    const userId = typeof result?.user_id === "string" ? result.user_id : null;
+    if (userId) cachedBotUserId = userId;
+    return userId;
+  } catch {
+    return null;
+  }
+}
+
+/** Test-only: clear the memoized bot user id so each test controls its own auth.test mock. */
+export function _resetBotUserIdCacheForTests(): void {
+  cachedBotUserId = null;
+}
+
 /**
- * Ask Slack which reaction names are currently on the message, rather than
- * guessing from process memory or the live config. `reactions.remove` only
- * ever removes the calling (bot) user's own reaction, so unioning this list
- * into the removal candidates is safe even when another user reacted with
- * the same emoji — Slack no-ops (`no_reaction`) on a name the bot never
- * applied. This is what makes cleanup correct across a process restart or
- * any number of config reloads between acceptance and finalization.
+ * Ask Slack which reaction names this bot currently has on the message,
+ * rather than guessing from process memory or the live config. `full: true`
+ * is required for Slack to return the complete reaction list, and each
+ * candidate is checked against the bot's own user id (from `auth.test`) so
+ * a human's reaction never triggers a needless `reactions.remove` call and
+ * an unrelated bot reaction is never swept up by mistake. This is what makes
+ * cleanup correct across a process restart or any number of config reloads
+ * between acceptance and finalization.
+ *
+ * If the bot's own user id can't be resolved, live discovery is skipped
+ * entirely (rather than falling back to trial-removing every returned name)
+ * and cleanup relies only on the configured acceptance names.
  */
 async function discoverAppliedReactionNames(
   client: SlackReactionClient,
   channel: string,
   timestamp: string,
 ): Promise<string[]> {
+  const botUserId = await getBotUserId(client);
+  if (!botUserId) {
+    console.log(
+      scrubSecrets(
+        "[Slack] could not resolve bot user id via auth.test; skipping live reaction discovery and relying on configured reaction names only",
+      ),
+    );
+    return [];
+  }
   try {
-    const result = await client.reactions.get({ channel, timestamp });
+    const result = await client.reactions.get({ channel, timestamp, full: true });
     return (result.message?.reactions ?? [])
+      .filter((reaction) => reaction.users?.includes(botUserId))
       .map((reaction) => reaction.name)
       .filter((name): name is string => typeof name === "string");
   } catch {

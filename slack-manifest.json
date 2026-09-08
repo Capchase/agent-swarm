@@ -71,6 +71,7 @@
         "im:history",
         "im:read",
         "im:write",
+        "reactions:read",
         "reactions:write",
         "users:read",
         "users:read.email"
