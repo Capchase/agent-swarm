@@ -1,7 +1,17 @@
 import type { WebClient } from "@slack/web-api";
 import { getLogsByTaskIdChronological, getSlackTasksInThread } from "../be/db";
+import { recordSlackReactionInvalidName } from "../otel";
 import { type AgentTask, isTerminalTaskStatus } from "../types";
 import { getSlackApp } from "./app";
+import {
+  acceptanceReactionNames,
+  reactionName,
+  SLACK_REACTION_CONFIG_KEYS,
+  SLACK_REACTION_DEFAULTS,
+  type SlackReactionEvent,
+} from "./reaction-shortcode";
+
+export { reactionName, type SlackReactionEvent } from "./reaction-shortcode";
 
 type SlackReactionClient = Pick<WebClient, "reactions">;
 
@@ -24,11 +34,30 @@ export async function ackSlackMessage(
   channel: string,
   timestamp: string,
   name: string,
+  event?: SlackReactionEvent,
 ): Promise<void> {
   try {
     await client.reactions.add({ channel, name, timestamp });
   } catch (error) {
     if (slackErrorCode(error) === "already_reacted") return;
+    if (slackErrorCode(error) === "invalid_name") {
+      const keyLabel = event ? SLACK_REACTION_CONFIG_KEYS[event] : "the SLACK_REACTION_* key";
+      console.error(
+        `[Slack] reaction "${name}" for event ${event ?? "unknown"} rejected by Slack (invalid_name); check ${keyLabel}`,
+      );
+      recordSlackReactionInvalidName(event ?? "unknown", name);
+      const fallback = event ? SLACK_REACTION_DEFAULTS[event] : undefined;
+      if (fallback && fallback !== name) {
+        try {
+          await client.reactions.add({ channel, name: fallback, timestamp });
+        } catch (fallbackError) {
+          console.log(
+            `[Slack] ${fallback} acknowledgement reaction failed: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`,
+          );
+        }
+      }
+      return;
+    }
     console.log(
       `[Slack] ${name} acknowledgement reaction failed: ${error instanceof Error ? error.message : error}`,
     );
@@ -40,21 +69,23 @@ export async function finalizeSlackMessageReaction(
   client: SlackReactionClient,
   channel: string,
   timestamp: string,
-  outcome: "white_check_mark" | "x",
+  outcome: string,
+  event?: SlackReactionEvent,
 ): Promise<void> {
-  for (const name of ["eyes", "heavy_plus_sign", "zap", "speech_balloon"]) {
+  for (const name of acceptanceReactionNames()) {
     try {
       await client.reactions.remove({ channel, name, timestamp });
     } catch (error) {
       const code = slackErrorCode(error);
-      if (code === "no_reaction" || code === "message_not_found") continue;
+      if (code === "no_reaction" || code === "message_not_found" || code === "invalid_name")
+        continue;
       console.log(
         `[Slack] ${name} acknowledgement reaction removal failed: ${error instanceof Error ? error.message : error}`,
       );
     }
   }
 
-  await ackSlackMessage(client, channel, timestamp, outcome);
+  await ackSlackMessage(client, channel, timestamp, outcome, event);
 }
 
 export async function finalizeTerminalSlackReactions(tasks: AgentTask[]): Promise<void> {
@@ -82,20 +113,32 @@ export async function finalizeTerminalSlackReactions(tasks: AgentTask[]): Promis
     ) {
       continue;
     }
-    const outcome = linkedTasks.every((task) => task.status === "completed")
-      ? "white_check_mark"
-      : "x";
-    void finalizeSlackMessageReaction(app.client, channelId, timestamp, outcome).catch((error) =>
+    const event: SlackReactionEvent = linkedTasks.every((task) => task.status === "completed")
+      ? "completed"
+      : "failed";
+    void finalizeSlackMessageReaction(
+      app.client,
+      channelId,
+      timestamp,
+      reactionName(event),
+      event,
+    ).catch((error) =>
       console.error(`[Slack] Failed to finalize reaction for ${channelId}/${timestamp}:`, error),
     );
   }
 
   for (const task of tasks) {
-    const outcome = task.status === "completed" ? "white_check_mark" : "x";
+    const event: SlackReactionEvent = task.status === "completed" ? "completed" : "failed";
     for (const log of await getLogsByTaskIdChronological(task.id)) {
       if (log.eventType !== "task_steering" || log.newValue !== "slack_reaction") continue;
       const { slackChannelId: channelId, slackMessageTs: timestamp } = JSON.parse(log.metadata!);
-      void finalizeSlackMessageReaction(app.client, channelId, timestamp, outcome).catch((error) =>
+      void finalizeSlackMessageReaction(
+        app.client,
+        channelId,
+        timestamp,
+        reactionName(event),
+        event,
+      ).catch((error) =>
         console.error(
           `[Slack] Failed to finalize steer reaction for ${channelId}/${timestamp}:`,
           error,
