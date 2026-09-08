@@ -77,6 +77,25 @@ describe("swarm-config-guard: Configuration-page value validation", () => {
     }
   });
 
+  test("Slack reaction shortcode keys accept a skin-tone suffix, bare or colon-wrapped", () => {
+    expect(validateConfigValue("SLACK_REACTION_ACCEPTED", "thumbsup::skin-tone-6")).toBeNull();
+    expect(validateConfigValue("SLACK_REACTION_ACCEPTED", ":thumbsup::skin-tone-6:")).toBeNull();
+    expect(validateConfigValue("SLACK_REACTION_ACCEPTED", "+1::skin-tone-2")).toBeNull();
+  });
+
+  test("Slack reaction shortcode keys reject an out-of-range or malformed skin-tone suffix", () => {
+    for (const value of [
+      "thumbsup::skin-tone-1",
+      "thumbsup::skin-tone-7",
+      "thumbsup:::skin-tone-6",
+      "thumbsup::skin-tone-6::skin-tone-6",
+    ]) {
+      expect(validateConfigValue("SLACK_REACTION_ACCEPTED", value)).toContain(
+        "Invalid SLACK_REACTION_ACCEPTED",
+      );
+    }
+  });
+
   test("Slack reaction shortcode keys reject spaces, upper case, unicode and empty", () => {
     // "Heavy Check" (not "Heavy" alone): normalisation lowercases before the format
     // check (section 2.3), so a bare case difference alone is not rejected — only

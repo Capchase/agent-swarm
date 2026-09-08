@@ -1,8 +1,7 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as otelModule from "../otel";
 import { ackSlackMessage, finalizeSlackMessageReaction } from "../slack/ack";
 import {
-  _resetAcceptanceReactionHistoryForTests,
   acceptanceReactionNames,
   normalizeSlackReactionShortcode,
   reactionName,
@@ -25,13 +24,24 @@ function clearReactionEnv() {
 }
 
 describe("reaction-shortcode.ts", () => {
+  // Snapshot so this suite's env writes never leak into a later test file
+  // sharing the same process (see the OTel test below, which also mutates
+  // OTEL_EXPORTER_OTLP_ENDPOINT).
+  const previousEnv: Record<string, string | undefined> = {
+    OTEL_EXPORTER_OTLP_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+  };
+  for (const key of Object.values(SLACK_REACTION_CONFIG_KEYS)) {
+    previousEnv[key] = process.env[key];
+  }
+
   beforeEach(() => {
     clearReactionEnv();
-    _resetAcceptanceReactionHistoryForTests();
   });
-  afterEach(() => {
-    clearReactionEnv();
-    _resetAcceptanceReactionHistoryForTests();
+  afterAll(() => {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   });
 
   test("reactionName returns the default for every event when env is unset", () => {
@@ -60,6 +70,23 @@ describe("reaction-shortcode.ts", () => {
     expect(normalizeSlackReactionShortcode("thumbsup")).toBe("thumbsup");
     expect(normalizeSlackReactionShortcode("o'clock")).toBe("o'clock");
     expect(normalizeSlackReactionShortcode("e-mail")).toBe("e-mail");
+  });
+
+  test("normalizeSlackReactionShortcode accepts one optional ::skin-tone-[2-6] suffix", () => {
+    expect(normalizeSlackReactionShortcode("thumbsup::skin-tone-6")).toBe("thumbsup::skin-tone-6");
+    expect(normalizeSlackReactionShortcode(":thumbsup::skin-tone-6:")).toBe(
+      "thumbsup::skin-tone-6",
+    );
+    expect(normalizeSlackReactionShortcode("THUMBSUP::SKIN-TONE-2")).toBe("thumbsup::skin-tone-2");
+    expect(normalizeSlackReactionShortcode("+1::skin-tone-3")).toBe("+1::skin-tone-3");
+  });
+
+  test("normalizeSlackReactionShortcode rejects an out-of-range, malformed, or doubled skin-tone suffix", () => {
+    expect(normalizeSlackReactionShortcode("thumbsup::skin-tone-1")).toBeNull();
+    expect(normalizeSlackReactionShortcode("thumbsup::skin-tone-7")).toBeNull();
+    expect(normalizeSlackReactionShortcode("thumbsup::skin-tone-")).toBeNull();
+    expect(normalizeSlackReactionShortcode("thumbsup:::skin-tone-6")).toBeNull();
+    expect(normalizeSlackReactionShortcode("thumbsup::skin-tone-6::skin-tone-6")).toBeNull();
   });
 
   test("acceptanceReactionNames returns the 4 defaults when env is unset", () => {
@@ -127,19 +154,61 @@ describe("reaction-shortcode.ts", () => {
     expect(spy).toHaveBeenCalledTimes(ALL_EVENTS.length);
   });
 
-  test("reactionName caps per-event history so a long-lived process cannot leak memory", () => {
-    // Reconfigure "accepted" far past the eviction bound.
-    for (let i = 0; i < 50; i++) {
+  test("finalize cleanup removes the applied reaction after a simulated process restart", async () => {
+    // Acceptance happened under a custom shortcode in a process that no
+    // longer exists — nothing in this test process ever called reactionName
+    // for "accepted", so there is no in-memory trail to consult. The only
+    // way to find "swarm_eyes" is to ask Slack what's really on the message.
+    process.env.SLACK_REACTION_ACCEPTED = "totally_different";
+
+    const removed: string[] = [];
+    const remove = async ({ name }: { name: string }) => {
+      removed.push(name);
+      if (name !== "swarm_eyes") throw { data: { error: "no_reaction" } };
+    };
+    const add = async () => ({ ok: true });
+    const get = async () => ({ message: { reactions: [{ name: "swarm_eyes" }] } });
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove, get } } as never,
+      "C_RESTART_TEST",
+      "1000.0012",
+      "white_check_mark",
+    );
+
+    expect(removed).toContain("swarm_eyes");
+  });
+
+  test("finalize cleanup still finds the applied reaction after many config reloads while the task was active", async () => {
+    // Reconfigure "accepted" far more times than any bounded in-memory
+    // history could plausibly retain.
+    let acceptedName = "";
+    for (let i = 0; i < 12; i++) {
       process.env.SLACK_REACTION_ACCEPTED = `shortcode_${i}`;
-      reactionName("accepted");
+      acceptedName = reactionName("accepted");
     }
-    const names = acceptanceReactionNames();
-    // Only the default plus the most recent entries within the bound survive;
-    // history never grows past that bound regardless of how many reconfigures ran.
-    const recentSurvivors = names.filter((name) => name.startsWith("shortcode_"));
-    expect(recentSurvivors.length).toBeLessThanOrEqual(8);
-    expect(names).toContain("shortcode_49");
-    expect(names).not.toContain("shortcode_0");
+    expect(acceptedName).toBe("shortcode_11");
+
+    // One more reload happens before finalization, past every name seen
+    // during the churn above.
+    process.env.SLACK_REACTION_ACCEPTED = "final_config_value";
+
+    const removed: string[] = [];
+    const remove = async ({ name }: { name: string }) => {
+      removed.push(name);
+      if (name !== "shortcode_11") throw { data: { error: "no_reaction" } };
+    };
+    const add = async () => ({ ok: true });
+    const get = async () => ({ message: { reactions: [{ name: "shortcode_11" }] } });
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove, get } } as never,
+      "C_CHURN_TEST",
+      "1000.0013",
+      "white_check_mark",
+    );
+
+    expect(removed).toContain("shortcode_11");
   });
 
   test("a generic (non-invalid_name) add failure redacts a secret-shaped error message in the emitted log", async () => {
@@ -237,7 +306,8 @@ describe("reaction-shortcode.ts", () => {
 
     // The config reloads to a different value before the task finalizes —
     // the shortcode actually applied to the message is now unnamed by both
-    // the live config and the code defaults.
+    // the live config and the code defaults. Only Slack's live message state
+    // (queried via reactions.get) still knows what was really applied.
     process.env.SLACK_REACTION_ACCEPTED = "totally_different";
 
     const removed: string[] = [];
@@ -246,9 +316,10 @@ describe("reaction-shortcode.ts", () => {
       if (name !== "swarm_eyes") throw { data: { error: "no_reaction" } };
     };
     const add = async () => ({ ok: true });
+    const get = async () => ({ message: { reactions: [{ name: "swarm_eyes" }] } });
 
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove } } as never,
+      { reactions: { add, remove, get } } as never,
       "C_RELOAD_TEST",
       "1000.0002",
       "white_check_mark",

@@ -24,6 +24,30 @@ function slackErrorCode(error: unknown): string | undefined {
 }
 
 /**
+ * Ask Slack which reaction names are currently on the message, rather than
+ * guessing from process memory or the live config. `reactions.remove` only
+ * ever removes the calling (bot) user's own reaction, so unioning this list
+ * into the removal candidates is safe even when another user reacted with
+ * the same emoji — Slack no-ops (`no_reaction`) on a name the bot never
+ * applied. This is what makes cleanup correct across a process restart or
+ * any number of config reloads between acceptance and finalization.
+ */
+async function discoverAppliedReactionNames(
+  client: SlackReactionClient,
+  channel: string,
+  timestamp: string,
+): Promise<string[]> {
+  try {
+    const result = await client.reactions.get({ channel, timestamp });
+    return (result.message?.reactions ?? [])
+      .map((reaction) => reaction.name)
+      .filter((name): name is string => typeof name === "string");
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Acknowledge that the swarm accepted a Slack message.
  *
  * Reactions are best-effort feedback only: Slack API failures must never block
@@ -81,7 +105,12 @@ export async function finalizeSlackMessageReaction(
   outcome: string,
   event?: SlackReactionEvent,
 ): Promise<void> {
-  for (const name of acceptanceReactionNames()) {
+  const candidateNames = new Set(acceptanceReactionNames());
+  for (const name of await discoverAppliedReactionNames(client, channel, timestamp)) {
+    candidateNames.add(name);
+  }
+
+  for (const name of candidateNames) {
     try {
       await client.reactions.remove({ channel, name, timestamp });
     } catch (error) {
