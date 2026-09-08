@@ -127,6 +127,21 @@ describe("reaction-shortcode.ts", () => {
     expect(spy).toHaveBeenCalledTimes(ALL_EVENTS.length);
   });
 
+  test("reactionName caps per-event history so a long-lived process cannot leak memory", () => {
+    // Reconfigure "accepted" far past the eviction bound.
+    for (let i = 0; i < 50; i++) {
+      process.env.SLACK_REACTION_ACCEPTED = `shortcode_${i}`;
+      reactionName("accepted");
+    }
+    const names = acceptanceReactionNames();
+    // Only the default plus the most recent entries within the bound survive;
+    // history never grows past that bound regardless of how many reconfigures ran.
+    const recentSurvivors = names.filter((name) => name.startsWith("shortcode_"));
+    expect(recentSurvivors.length).toBeLessThanOrEqual(8);
+    expect(names).toContain("shortcode_49");
+    expect(names).not.toContain("shortcode_0");
+  });
+
   test("finalize cleanup removes a reaction applied under a config value the current config no longer names", async () => {
     // Acceptance happens while SLACK_REACTION_ACCEPTED names a custom shortcode.
     process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";

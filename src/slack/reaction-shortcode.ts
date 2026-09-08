@@ -41,13 +41,20 @@ function isAcceptanceEvent(event: SlackReactionEvent): event is AcceptanceEvent 
 }
 
 /**
- * Every name `reactionName()` has ever resolved for an acceptance event
+ * Every name `reactionName()` has recently resolved for an acceptance event
  * during this process's lifetime. Config can reload live (a swarm_config
  * upsert rewrites process.env), so the value a message was actually
  * acknowledged with can differ from what the key names by the time
  * cleanup runs. Cleanup unions this history with the current live config
- * and the code defaults so it always finds the reaction it needs to remove.
+ * and the code defaults so it usually finds the reaction it needs to remove.
+ *
+ * Bounded to MAX_SEEN_NAMES_PER_EVENT per event (FIFO eviction: `Set`
+ * preserves insertion order) so a long-lived process cannot leak memory if a
+ * key is reconfigured many times. A name applied further back than the
+ * eviction bound falls out of `acceptanceReactionNames()`'s union and is left
+ * un-removed on cleanup — a bounded staleness window, not full correctness.
  */
+const MAX_SEEN_NAMES_PER_EVENT = 8;
 const seenAcceptanceReactionNames = new Map<AcceptanceEvent, Set<string>>();
 
 export function reactionName(event: SlackReactionEvent): string {
@@ -60,7 +67,15 @@ export function reactionName(event: SlackReactionEvent): string {
       seen = new Set();
       seenAcceptanceReactionNames.set(event, seen);
     }
+    // Re-inserting moves `name` to the most-recently-used end so an eviction
+    // never drops a name that is still in active use.
+    seen.delete(name);
     seen.add(name);
+    while (seen.size > MAX_SEEN_NAMES_PER_EVENT) {
+      const oldest = seen.values().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
   }
   return name;
 }
