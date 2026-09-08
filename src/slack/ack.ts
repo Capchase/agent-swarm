@@ -1,5 +1,11 @@
 import type { WebClient } from "@slack/web-api";
-import { getLogsByTaskIdChronological, getSlackTasksInThread } from "../be/db";
+import {
+  deleteAppliedSlackReaction,
+  getAppliedSlackReactionNames,
+  getLogsByTaskIdChronological,
+  getSlackTasksInThread,
+  recordAppliedSlackReaction,
+} from "../be/db";
 import { recordSlackReactionInvalidName } from "../otel";
 import { type AgentTask, isTerminalTaskStatus } from "../types";
 import { scrubSecrets } from "../utils/secret-scrubber";
@@ -23,17 +29,23 @@ function slackErrorCode(error: unknown): string | undefined {
   return typeof data.error === "string" ? data.error : undefined;
 }
 
-// Cached across calls within a process; only a resolved id is memoized so a
+// Keyed by client instance, not process-global: `src/http/core.ts` replaces
+// the Slack `WebClient` whenever config reloads (e.g. `SLACK_BOT_TOKEN`
+// changes), and a process-global cache would keep filtering discovery with
+// the *previous* client's bot user id until restart. A WeakMap scopes the
+// memoized id to the exact client that resolved it, so a client/token swap
+// naturally gets a fresh lookup. Only a resolved id is memoized so a
 // transient auth.test failure is retried rather than permanently disabling
 // discovery.
-let cachedBotUserId: string | null = null;
+let botUserIdCache = new WeakMap<SlackReactionClient, string>();
 
 async function getBotUserId(client: SlackReactionClient): Promise<string | null> {
-  if (cachedBotUserId) return cachedBotUserId;
+  const cached = botUserIdCache.get(client);
+  if (cached) return cached;
   try {
     const result = await client.auth?.test();
     const userId = typeof result?.user_id === "string" ? result.user_id : null;
-    if (userId) cachedBotUserId = userId;
+    if (userId) botUserIdCache.set(client, userId);
     return userId;
   } catch {
     return null;
@@ -42,18 +54,25 @@ async function getBotUserId(client: SlackReactionClient): Promise<string | null>
 
 /** Test-only: clear the memoized bot user id so each test controls its own auth.test mock. */
 export function _resetBotUserIdCacheForTests(): void {
-  cachedBotUserId = null;
+  botUserIdCache = new WeakMap();
 }
 
 /**
- * Ask Slack which reaction names this bot currently has on the message,
- * rather than guessing from process memory or the live config. `full: true`
- * is required for Slack to return the complete reaction list, and each
- * candidate is checked against the bot's own user id (from `auth.test`) so
- * a human's reaction never triggers a needless `reactions.remove` call and
- * an unrelated bot reaction is never swept up by mistake. This is what makes
- * cleanup correct across a process restart or any number of config reloads
- * between acceptance and finalization.
+ * Ask Slack which reaction names this bot currently has on the message, then
+ * narrow that list to only the names durably recorded (in
+ * `slack_applied_reactions`) as ones this feature actually applied.
+ *
+ * `full: true` is required for Slack to return the complete reaction list,
+ * and each candidate is checked against the bot's own user id (from
+ * `auth.test`) so a human's reaction never triggers a needless
+ * `reactions.remove` call. The bot-owned check alone is not a sufficient
+ * discriminator: the same bot user may own a reaction this feature never
+ * applied (added by unrelated automation), and that reaction must never be
+ * swept up. Intersecting live bot-owned names with the durable provenance
+ * table is what makes cleanup precise across a process restart or any
+ * number of config reloads between acceptance and finalization -- the
+ * provenance table records exactly what THIS feature applied, independent
+ * of process memory or the live config.
  *
  * If the bot's own user id can't be resolved, live discovery is skipped
  * entirely (rather than falling back to trial-removing every returned name)
@@ -73,14 +92,40 @@ async function discoverAppliedReactionNames(
     );
     return [];
   }
+  let appliedByThisFeature: Set<string>;
+  try {
+    appliedByThisFeature = new Set(await getAppliedSlackReactionNames(channel, timestamp));
+  } catch {
+    appliedByThisFeature = new Set();
+  }
   try {
     const result = await client.reactions.get({ channel, timestamp, full: true });
     return (result.message?.reactions ?? [])
       .filter((reaction) => reaction.users?.includes(botUserId))
       .map((reaction) => reaction.name)
-      .filter((name): name is string => typeof name === "string");
+      .filter((name): name is string => typeof name === "string")
+      .filter((name) => appliedByThisFeature.has(name));
   } catch {
     return [];
+  }
+}
+
+/** Best-effort: record that this feature applied `name`, swallowing DB errors
+ * so a provenance-write failure never blocks the Slack acknowledgement it
+ * describes (reactions remain best-effort feedback, per `ackSlackMessage`). */
+async function trackAppliedReaction(
+  channel: string,
+  timestamp: string,
+  name: string,
+): Promise<void> {
+  try {
+    await recordAppliedSlackReaction(channel, timestamp, name);
+  } catch (error) {
+    console.log(
+      scrubSecrets(
+        `[Slack] failed to record applied-reaction provenance for ${name}: ${error instanceof Error ? error.message : error}`,
+      ),
+    );
   }
 }
 
@@ -100,8 +145,12 @@ export async function ackSlackMessage(
 ): Promise<void> {
   try {
     await client.reactions.add({ channel, name, timestamp });
+    await trackAppliedReaction(channel, timestamp, name);
   } catch (error) {
-    if (slackErrorCode(error) === "already_reacted") return;
+    if (slackErrorCode(error) === "already_reacted") {
+      await trackAppliedReaction(channel, timestamp, name);
+      return;
+    }
     if (slackErrorCode(error) === "invalid_name") {
       const keyLabel = event ? SLACK_REACTION_CONFIG_KEYS[event] : "the SLACK_REACTION_* key";
       console.error(
@@ -117,6 +166,7 @@ export async function ackSlackMessage(
       const fallback = event ? SLACK_REACTION_DEFAULTS[event] : SLACK_REACTION_DEFAULTS.completed;
       try {
         await client.reactions.add({ channel, name: fallback, timestamp });
+        await trackAppliedReaction(channel, timestamp, fallback);
       } catch (fallbackError) {
         console.log(
           scrubSecrets(
@@ -150,6 +200,9 @@ export async function finalizeSlackMessageReaction(
   for (const name of candidateNames) {
     try {
       await client.reactions.remove({ channel, name, timestamp });
+      // Bound the provenance table's growth: a name recorded as applied and
+      // now confirmed removed no longer needs to be tracked for this message.
+      await deleteAppliedSlackReaction(channel, timestamp, name).catch(() => {});
     } catch (error) {
       const code = slackErrorCode(error);
       if (code === "no_reaction" || code === "message_not_found" || code === "invalid_name")

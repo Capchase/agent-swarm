@@ -164,9 +164,18 @@ describe("reaction-shortcode.ts", () => {
 
   test("finalize cleanup removes the applied reaction after a simulated process restart", async () => {
     // Acceptance happened under a custom shortcode in a process that no
-    // longer exists — nothing in this test process ever called reactionName
-    // for "accepted", so there is no in-memory trail to consult. The only
-    // way to find "swarm_eyes" is to ask Slack what's really on the message.
+    // longer exists — nothing in *this* test process ever called
+    // reactionName for "accepted". Provenance survives the restart anyway
+    // because it is durably recorded in slack_applied_reactions, not held
+    // only in process memory.
+    process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";
+    await ackSlackMessage(
+      { reactions: { add: async () => ({ ok: true }) } } as never,
+      "C_RESTART_TEST",
+      "1000.0012",
+      "swarm_eyes",
+      "accepted",
+    );
     process.env.SLACK_REACTION_ACCEPTED = "totally_different";
 
     const removed: string[] = [];
@@ -198,6 +207,15 @@ describe("reaction-shortcode.ts", () => {
       acceptedName = reactionName("accepted");
     }
     expect(acceptedName).toBe("shortcode_11");
+
+    // Acceptance actually happened at shortcode_11 — recorded durably.
+    await ackSlackMessage(
+      { reactions: { add: async () => ({ ok: true }) } } as never,
+      "C_CHURN_TEST",
+      "1000.0013",
+      "shortcode_11",
+      "accepted",
+    );
 
     // One more reload happens before finalization, past every name seen
     // during the churn above.
@@ -376,10 +394,56 @@ describe("reaction-shortcode.ts", () => {
     });
     const removeSpy = spyOn({ remove }, "remove");
 
+    // This feature actually applied swarm_eyes at acceptance time -- that's
+    // what makes it a valid removal candidate under durable provenance.
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_MULTI_TEST",
+      "1000.0015",
+      "swarm_eyes",
+      "accepted",
+    );
+
     await finalizeSlackMessageReaction(
       { reactions: { add, remove: removeSpy, get }, auth } as never,
       "C_MULTI_TEST",
       "1000.0015",
+      "white_check_mark",
+    );
+
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames).toContain("swarm_eyes");
+    expect(removedNames).not.toContain("thumbsup");
+  });
+
+  test("finalize preserves a bot-owned reaction this feature never applied, even though the bot owns it", async () => {
+    const remove = async () => ({ ok: true });
+    const add = async () => ({ ok: true });
+    const get = async () => ({
+      message: {
+        reactions: [
+          { name: "swarm_eyes", users: [BOT_USER_ID] },
+          // Owned by the same bot user, but applied by unrelated automation --
+          // this feature never called ackSlackMessage for it, so it must not
+          // be swept up by finalize's cleanup.
+          { name: "thumbsup", users: [BOT_USER_ID] },
+        ],
+      },
+    });
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_BOT_UNRELATED_TEST",
+      "1000.0020",
+      "swarm_eyes",
+      "accepted",
+    );
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove: removeSpy, get }, auth } as never,
+      "C_BOT_UNRELATED_TEST",
+      "1000.0020",
       "white_check_mark",
     );
 
@@ -480,5 +544,67 @@ describe("reaction-shortcode.ts", () => {
     expect(removedNames).not.toContain("some_stray_reaction");
     const emitted = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
     expect(emitted).toContain("could not resolve bot user id");
+  });
+
+  test("a client/token replacement (config reload) resolves the new bot user id instead of reusing the old client's", async () => {
+    // src/http/core.ts replaces the Slack WebClient on every config reload.
+    // A process-global cache would keep filtering with the OLD client's bot
+    // user id until process restart; scoping the cache to the client
+    // instance means a brand-new client always gets a fresh auth.test.
+    const oldClient = {
+      reactions: {
+        add: async () => ({ ok: true }),
+        remove: async () => ({ ok: true }),
+        get: async () => ({ message: {} }),
+      },
+      auth: { test: async () => ({ user_id: "U_OLD_BOT" }) },
+    };
+    // Priming call: resolves and (in the buggy version) globally memoizes
+    // U_OLD_BOT via a finalize on an unrelated message.
+    await finalizeSlackMessageReaction(
+      oldClient as never,
+      "C_TOKEN_SWAP_TEST_OLD",
+      "1000.0021",
+      "white_check_mark",
+    );
+
+    // The config reloads: SLACK_BOT_TOKEN changes and a brand-new WebClient
+    // is constructed. This feature applies (and durably records) a reaction
+    // through it before finalizing.
+    const newClient = {
+      auth: { test: async () => ({ user_id: "U_NEW_BOT" }) },
+    };
+    await ackSlackMessage(
+      { reactions: { add: async () => ({ ok: true }) } } as never,
+      "C_TOKEN_SWAP_TEST_NEW",
+      "1000.0022",
+      "new_bot_reaction",
+      "accepted",
+    );
+
+    const removed: string[] = [];
+    await finalizeSlackMessageReaction(
+      {
+        reactions: {
+          add: async () => ({ ok: true }),
+          remove: async ({ name }: { name: string }) => {
+            removed.push(name);
+            return { ok: true };
+          },
+          // Slack reports the reaction as owned by the NEW bot user id --
+          // discovery only finds it if it resolves U_NEW_BOT for this
+          // client rather than reusing the memoized U_OLD_BOT.
+          get: async () => ({
+            message: { reactions: [{ name: "new_bot_reaction", users: ["U_NEW_BOT"] }] },
+          }),
+        },
+        ...newClient,
+      } as never,
+      "C_TOKEN_SWAP_TEST_NEW",
+      "1000.0022",
+      "white_check_mark",
+    );
+
+    expect(removed).toContain("new_bot_reaction");
   });
 });
