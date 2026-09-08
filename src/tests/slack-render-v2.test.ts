@@ -21,6 +21,8 @@ import {
   startTask,
   upsertSwarmConfig,
 } from "../be/db";
+import { ackSlackMessage } from "../slack/ack";
+import { getSlackApp } from "../slack/app";
 import { getTaskLink, MAX_SECTION_LENGTH } from "../slack/blocks";
 import {
   _resetSlackRenderV2ForTests,
@@ -38,7 +40,11 @@ import type { AgentTask } from "../types";
 import { clearVolatileSecretsForTesting } from "../utils/secret-scrubber";
 
 const TEST_DB_PATH = "./test-slack-render-v2.sqlite";
+const RENDER_BOT_USER_ID = "U_RENDER_BOT";
 const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+/** Live reaction state of the mock Slack, keyed by `${channel}:${timestamp}`,
+ * so `reactions.get` reflects what `reactions.add` / `reactions.remove` did. */
+const remoteReactionsByMessage = new Map<string, Set<string>>();
 let treeCounter = 0;
 let outcomeCounter = 0;
 let stopCallsUntilFailure: number | undefined;
@@ -197,7 +203,28 @@ const mockApiCall = mock(async (method: string, payload: Record<string, unknown>
     message.text = String(payload.text ?? "");
     return { ok: true };
   }
-  if (method === "auth.test") return { ok: true, team_id: "T_TEST" };
+  if (method === "auth.test") return { ok: true, team_id: "T_TEST", user_id: RENDER_BOT_USER_ID };
+  if (method === "reactions.add") {
+    const key = `${payload.channel}:${payload.timestamp}`;
+    const names = remoteReactionsByMessage.get(key) ?? new Set<string>();
+    names.add(String(payload.name));
+    remoteReactionsByMessage.set(key, names);
+    return { ok: true };
+  }
+  if (method === "reactions.remove") {
+    remoteReactionsByMessage
+      .get(`${payload.channel}:${payload.timestamp}`)
+      ?.delete(String(payload.name));
+    return { ok: true };
+  }
+  if (method === "reactions.get") {
+    const names =
+      remoteReactionsByMessage.get(`${payload.channel}:${payload.timestamp}`) ?? new Set();
+    return {
+      ok: true,
+      message: { reactions: [...names].map((name) => ({ name, users: [RENDER_BOT_USER_ID] })) },
+    };
+  }
   return { ok: true };
 });
 
@@ -205,9 +232,11 @@ mock.module("../slack/app", () => ({
   getSlackApp: () => ({
     client: {
       apiCall: mockApiCall,
+      auth: { test: () => mockApiCall("auth.test", {}) },
       reactions: {
         add: (payload: Record<string, unknown>) => mockApiCall("reactions.add", payload),
         remove: (payload: Record<string, unknown>) => mockApiCall("reactions.remove", payload),
+        get: (payload: Record<string, unknown>) => mockApiCall("reactions.get", payload),
       },
     },
   }),
@@ -234,6 +263,7 @@ beforeEach(async () => {
   await ensureSlackRenderV2Activation();
   calls.length = 0;
   remoteMessages.clear();
+  remoteReactionsByMessage.clear();
   treeCounter = 0;
   outcomeCounter = 0;
   mockApiCall.mockClear();
@@ -266,6 +296,10 @@ describe("Slack renderer v2", () => {
       contextKey: slackContextKey({ channelId, threadTs }),
     });
     await startTask(ask.id);
+    // Acceptance applied and recorded "eyes" through the same bot identity
+    // the renderer will finalize with (auth.test resolves RENDER_BOT_USER_ID).
+    await ackSlackMessage(getSlackApp()!.client as never, channelId, triggerTs, "eyes", "accepted");
+    expect(remoteReactionsByMessage.get(`${channelId}:${triggerTs}`)).toEqual(new Set(["eyes"]));
     await ensureSlackThreadTree([ask.id]);
     await completeTask(ask.id, "Done");
     calls.length = 0;
@@ -273,15 +307,23 @@ describe("Slack renderer v2", () => {
     await processSlackRenderV2();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    // auth.test in this suite's mock never returns a user_id, so the bot's own
-    // id can't be resolved; per the fixed cleanup contract that skips live
-    // reaction discovery entirely rather than trial-removing every configured
-    // name -- see the "could not resolve bot user id" branch in ack.ts.
-    expect(calls.filter((call) => call.method === "reactions.remove")).toHaveLength(0);
+    // Successful auth.test + successful reactions.get: the recorded
+    // acceptance reaction is discovered live and removed, then the terminal
+    // outcome is added. The message ends with only the terminal reaction.
+    expect(calls.filter((call) => call.method === "reactions.get")).toHaveLength(1);
+    expect(calls.filter((call) => call.method === "reactions.remove")).toEqual([
+      {
+        method: "reactions.remove",
+        payload: { channel: channelId, name: "eyes", timestamp: triggerTs },
+      },
+    ]);
     expect(calls).toContainEqual({
       method: "reactions.add",
       payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },
     });
+    expect(remoteReactionsByMessage.get(`${channelId}:${triggerTs}`)).toEqual(
+      new Set(["white_check_mark"]),
+    );
   });
 
   test("defaults off and accepts an explicit opt-in", () => {

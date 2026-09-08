@@ -78,6 +78,8 @@ A value is trimmed, has at most one leading and one trailing colon stripped, and
 
 If Slack rejects a configured name with `invalid_name` (the emoji does not exist in the workspace), the bot logs one error-level line, increments an OTel counter, and retries once with the default for that event before giving up on the reaction. Task state and the outcome card never depend on a reaction landing. A terminal reaction (`completed` or `failed`) is never removed once added.
 
+When a task finalizes, the bot removes the acceptance reaction it applied and adds the terminal reaction. The removal candidates are the names this API process recorded when it applied them, bound to the bot identity that applied them, and intersected with the bot's live reactions on the message (`reactions.get`). The bot never removes a reaction it did not record, and never removes a reaction another bot identity applied. That record lives in process memory only. If the API restarts between acceptance and finalization, the record is lost: finalize removes nothing, the terminal reaction is still added, and the acceptance reaction stays beside it. This is a deliberate trade, agreed with the maintainer, against removing a reaction the swarm never applied.
+
 ### Thread Follow-up Routing
 
 When you @mention the bot in a thread where a worker is already handling a task, the message routes directly to that worker — no lead delegation needed. This keeps conversations flowing naturally.

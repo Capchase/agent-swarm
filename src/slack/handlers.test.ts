@@ -602,7 +602,7 @@ describe("Slack accepted-message acknowledgements", () => {
     // applied.
     for (const name of ["eyes", "heavy_plus_sign", "zap", "speech_balloon"]) {
       await ackSlackMessage(
-        { reactions: { add } } as never,
+        { reactions: { add }, auth } as never,
         "D_THREAD_ACK_TEST",
         "2100000000.000004",
         name,
@@ -662,7 +662,7 @@ describe("Slack accepted-message acknowledgements", () => {
     // "zap" was never applied or recorded, so it must not be a removal
     // candidate merely because it's currently configured.
     await ackSlackMessage(
-      { reactions: { add } } as never,
+      { reactions: { add }, auth } as never,
       "D_THREAD_ACK_TEST",
       "2100000000.000006",
       "swarm_eyes",
