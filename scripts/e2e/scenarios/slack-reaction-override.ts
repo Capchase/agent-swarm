@@ -14,26 +14,43 @@ import {
 export const slackReactionOverride: Scenario = {
   name: "slack-reaction-override",
   async run(ctx) {
-    const key = "SLACK_REACTION_ACCEPTED";
-    const configuredName = "eyeglasses";
-    const upsert = await ctx.api("PUT", "/api/config", {
-      body: { scope: "global", scopeId: null, key, value: configuredName, isSecret: false },
-    });
-    expectStatus(upsert, [200], `configure ${key}`);
-    const configId = asRecord(upsert.json).id;
-    expect(typeof configId === "string", `Config upsert for ${key} has no id`);
+    const acceptedKey = "SLACK_REACTION_ACCEPTED";
+    const completedKey = "SLACK_REACTION_COMPLETED";
+    const configuredAccepted = "eyeglasses";
+    const configuredCompleted = "tada";
+    const overrides: Array<{ key: string; value: string }> = [
+      { key: acceptedKey, value: configuredAccepted },
+      { key: completedKey, value: configuredCompleted },
+    ];
+    const upserts = await Promise.all(
+      overrides.map(async ({ key, value }) => {
+        const upsert = await ctx.api("PUT", "/api/config", {
+          body: { scope: "global", scopeId: null, key, value, isSecret: false },
+        });
+        expectStatus(upsert, [200], `configure ${key}`);
+        const configId = asRecord(upsert.json).id;
+        expect(typeof configId === "string", `Config upsert for ${key} has no id`);
+        return String(configId);
+      }),
+    );
 
     try {
       // A global config write reloads process.env and restarts the Slack app
       // on a ~250ms debounce — wait for the override to actually be live
       // before driving a message through it.
       const live = await pollUntil(async () => {
-        const response = await ctx.api("GET", `/api/config/env-presence?keys=${key}`);
-        expectStatus(response, [200], `check ${key} presence`);
+        const response = await ctx.api(
+          "GET",
+          `/api/config/env-presence?keys=${acceptedKey},${completedKey}`,
+        );
+        expectStatus(response, [200], `check ${acceptedKey}/${completedKey} presence`);
         const presence = asRecord(response.json).presence as Record<string, boolean> | undefined;
-        return presence?.[key] === true;
+        return presence?.[acceptedKey] === true && presence?.[completedKey] === true;
       }, 10_000);
-      expect(live, `${key} never became visible in process.env within 10 seconds`);
+      expect(
+        live,
+        `${acceptedKey}/${completedKey} never became visible in process.env within 10 seconds`,
+      );
 
       // Registering a lead guarantees one exists when this scenario runs on
       // its own; when other Slack scenarios ran first, the swarm may still
@@ -46,7 +63,7 @@ export const slackReactionOverride: Scenario = {
 
       // The configured shortcode is what gets applied for acceptance, not
       // the "eyes" code default.
-      await waitForReaction(ctx, message.ts, configuredName);
+      await waitForReaction(ctx, message.ts, configuredAccepted);
 
       const task = await findSlackTask(ctx, message.ts);
       const taskId = String(task.id);
@@ -57,11 +74,27 @@ export const slackReactionOverride: Scenario = {
 
       await waitForOutcome(ctx, message.ts, output);
       // Finalization must replace the configured acceptance reaction with
-      // the terminal outcome, not leave the two sitting side by side.
-      await waitForReaction(ctx, message.ts, "white_check_mark");
-      await waitForReactionAbsence(ctx, message.ts, configuredName);
+      // the configured terminal outcome, not leave the two sitting side by
+      // side, and not fall back to either code default.
+      await waitForReaction(ctx, message.ts, configuredCompleted);
+      await waitForReactionAbsence(ctx, message.ts, configuredAccepted);
+
+      const addedNames = ctx.slack
+        .apiCalls("reactions.add")
+        .filter((call) => call.args.timestamp === message.ts)
+        .map((call) => call.args.name);
+      expect(
+        !addedNames.includes("eyes") && !addedNames.includes("white_check_mark"),
+        `Expected only configured reaction names on ${message.ts}, got: ${addedNames.join(", ")}`,
+      );
     } finally {
-      await ctx.api("DELETE", `/api/config/${configId}`);
+      for (const configId of upserts) {
+        expectStatus(
+          await ctx.api("DELETE", `/api/config/${configId}`),
+          [200],
+          `delete config ${configId}`,
+        );
+      }
     }
   },
 };

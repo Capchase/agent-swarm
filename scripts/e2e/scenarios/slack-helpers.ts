@@ -48,14 +48,14 @@ export async function waitForReactionAbsence(
   name: string,
   timeoutMs = 30_000,
 ): Promise<void> {
-  const gone = await pollUntil(
-    () =>
-      ctx.slack
-        .messages("general")
-        .find((message) => message.ts === ts)
-        ?.reactions?.some((reaction) => reaction.name === name) !== true,
-    timeoutMs,
-  );
+  const gone = await pollUntil(() => {
+    const message = ctx.slack.messages("general").find((candidate) => candidate.ts === ts);
+    expect(
+      message !== undefined,
+      `Message ${ts} not found in general while waiting for the ${name} reaction to clear`,
+    );
+    return message.reactions?.some((reaction) => reaction.name === name) !== true;
+  }, timeoutMs);
   expect(gone, `Message ${ts} in general still had a ${name} reaction after ${timeoutMs}ms`);
 }
 
