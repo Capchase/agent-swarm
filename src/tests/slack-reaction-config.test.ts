@@ -162,12 +162,12 @@ describe("reaction-shortcode.ts", () => {
     expect(spy).toHaveBeenCalledTimes(ALL_EVENTS.length);
   });
 
-  test("finalize cleanup removes the applied reaction after a simulated process restart", async () => {
-    // Acceptance happened under a custom shortcode in a process that no
-    // longer exists — nothing in *this* test process ever called
-    // reactionName for "accepted". Provenance survives the restart anyway
-    // because it is durably recorded in slack_applied_reactions, not held
-    // only in process memory.
+  test("finalize cleanup removes the applied reaction after a config reload post-acceptance", async () => {
+    // Provenance is in-process memory only (see `appliedReactionsByMessage`
+    // in ack.ts) -- it does NOT survive an actual server restart. This test
+    // covers the reload-without-restart case: acceptance recorded
+    // "swarm_eyes", the config then changes before finalization, and the
+    // in-memory record still lets finalize find and remove the right name.
     process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";
     await ackSlackMessage(
       { reactions: { add: async () => ({ ok: true }) } } as never,
@@ -270,8 +270,22 @@ describe("reaction-shortcode.ts", () => {
       throw error;
     };
     const add = async () => ({ ok: true });
+    const get = async () => ({
+      message: { reactions: [{ name: "swarm_eyes", users: [BOT_USER_ID] }] },
+    });
+
+    // A removal attempt only happens for a recorded, bot-owned name -- seed
+    // one so this test actually reaches the failing `reactions.remove` call.
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_TEST",
+      "1000.0004",
+      "swarm_eyes",
+      "accepted",
+    );
+
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove } } as never,
+      { reactions: { add, remove, get }, auth } as never,
       "C_TEST",
       "1000.0004",
       "white_check_mark",
@@ -370,6 +384,17 @@ describe("reaction-shortcode.ts", () => {
     const remove = async () => ({ ok: true });
     const add = async () => ({ ok: true });
 
+    // A recorded applied reaction is what makes discovery consult Slack at
+    // all -- with nothing recorded for this message, finalize skips
+    // `reactions.get` entirely (see the empty-record guard clause).
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_FULL_TEST",
+      "1000.0014",
+      "swarm_eyes",
+      "accepted",
+    );
+
     await finalizeSlackMessageReaction(
       { reactions: { add, remove, get }, auth } as never,
       "C_FULL_TEST",
@@ -452,6 +477,49 @@ describe("reaction-shortcode.ts", () => {
     expect(removedNames).not.toContain("thumbsup");
   });
 
+  test("finalize's removal candidates ignore a config value that now collides with an unrelated bot-owned reaction", async () => {
+    // This feature applies and records "swarm_eyes".
+    process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";
+    const add = async () => ({ ok: true });
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_CONFIG_COLLISION_TEST",
+      "1000.0024",
+      "swarm_eyes",
+      "accepted",
+    );
+
+    // Unrelated automation on the same bot owns "thumbsup" -- this feature
+    // never called ackSlackMessage for it, so it was never recorded. Then
+    // SLACK_REACTION_ACCEPTED changes to that exact name before
+    // finalization: a naive implementation that seeds removal candidates
+    // from the *current* configured names (rather than only this process's
+    // recorded provenance) would wrongly treat "thumbsup" as removable too.
+    process.env.SLACK_REACTION_ACCEPTED = "thumbsup";
+
+    const remove = async () => ({ ok: true });
+    const get = async () => ({
+      message: {
+        reactions: [
+          { name: "swarm_eyes", users: [BOT_USER_ID] },
+          { name: "thumbsup", users: [BOT_USER_ID] },
+        ],
+      },
+    });
+    const removeSpy = spyOn({ remove }, "remove");
+
+    await finalizeSlackMessageReaction(
+      { reactions: { add, remove: removeSpy, get }, auth } as never,
+      "C_CONFIG_COLLISION_TEST",
+      "1000.0024",
+      "white_check_mark",
+    );
+
+    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
+    expect(removedNames).toContain("swarm_eyes");
+    expect(removedNames).not.toContain("thumbsup");
+  });
+
   test("a reaction entry missing users (an incomplete/default response) is never treated as bot-owned", async () => {
     const remove = async () => ({ ok: true });
     const add = async () => ({ ok: true });
@@ -459,6 +527,14 @@ describe("reaction-shortcode.ts", () => {
       message: { reactions: [{ name: "swarm_eyes" }] }, // no `users` field
     });
     const removeSpy = spyOn({ remove }, "remove");
+
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_INCOMPLETE_TEST",
+      "1000.0016",
+      "swarm_eyes",
+      "accepted",
+    );
 
     await finalizeSlackMessageReaction(
       { reactions: { add, remove: removeSpy, get }, auth } as never,
@@ -471,13 +547,21 @@ describe("reaction-shortcode.ts", () => {
     expect(removedNames).not.toContain("swarm_eyes");
   });
 
-  test("a reactions.get failure (e.g. rate-limited) falls back to the configured acceptance names only", async () => {
+  test("a reactions.get failure (e.g. rate-limited) removes nothing, never a crash", async () => {
     const remove = async () => ({ ok: true });
     const add = async () => ({ ok: true });
     const get = async () => {
       throw { data: { error: "ratelimited" } };
     };
     const removeSpy = spyOn({ remove }, "remove");
+
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_GET_FAIL_TEST",
+      "1000.0017",
+      "eyes",
+      "accepted",
+    );
 
     await finalizeSlackMessageReaction(
       { reactions: { add, remove: removeSpy, get }, auth } as never,
@@ -486,15 +570,13 @@ describe("reaction-shortcode.ts", () => {
       "white_check_mark",
     );
 
-    // No live discovery landed, so only the code-default acceptance names
-    // (accepted/buffered/now/steered) were attempted — never a crash.
-    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
-    expect(removedNames.sort()).toEqual(
-      ["eyes", "heavy_plus_sign", "zap", "speech_balloon"].sort(),
-    );
+    // No live discovery landed, and the configured acceptance names are
+    // never a removal candidate on their own -- so nothing is removed, even
+    // though this feature did record applying "eyes" earlier.
+    expect(removeSpy.mock.calls).toHaveLength(0);
   });
 
-  test("a reactions.get failure with missing_scope (reactions:read not yet granted on a pre-existing install) falls back to the configured acceptance names only, without throwing", async () => {
+  test("a reactions.get failure with missing_scope (reactions:read not yet granted on a pre-existing install) removes nothing, without throwing", async () => {
     const remove = async () => ({ ok: true });
     const add = async () => ({ ok: true });
     const get = async () => {
@@ -506,6 +588,14 @@ describe("reaction-shortcode.ts", () => {
     };
     const removeSpy = spyOn({ remove }, "remove");
 
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "C_MISSING_SCOPE_TEST",
+      "1000.0019",
+      "eyes",
+      "accepted",
+    );
+
     await finalizeSlackMessageReaction(
       { reactions: { add, remove: removeSpy, get }, auth } as never,
       "C_MISSING_SCOPE_TEST",
@@ -513,16 +603,13 @@ describe("reaction-shortcode.ts", () => {
       "white_check_mark",
     );
 
-    // Same fallback as any other reactions.get failure: only the code-default
-    // acceptance names were attempted, and finalization completed without
-    // throwing despite the authorization failure.
-    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
-    expect(removedNames.sort()).toEqual(
-      ["eyes", "heavy_plus_sign", "zap", "speech_balloon"].sort(),
-    );
+    // Same as any other reactions.get failure: no live discovery landed, so
+    // nothing is removed, and finalization completed without throwing
+    // despite the authorization failure.
+    expect(removeSpy.mock.calls).toHaveLength(0);
   });
 
-  test("when the bot's own user id can't be resolved, live discovery is skipped and only configured names are removed", async () => {
+  test("when the bot's own user id can't be resolved, live discovery is skipped and nothing is removed", async () => {
     const logSpy = spyOn(console, "log");
     logSpy.mockClear();
     const remove = async () => ({ ok: true });
@@ -540,8 +627,9 @@ describe("reaction-shortcode.ts", () => {
       "white_check_mark",
     );
 
-    const removedNames = removeSpy.mock.calls.map((call) => (call[0] as { name: string }).name);
-    expect(removedNames).not.toContain("some_stray_reaction");
+    // The configured acceptance names are never a removal candidate on their
+    // own, so a failed bot-id resolution leaves nothing to remove at all.
+    expect(removeSpy.mock.calls).toHaveLength(0);
     const emitted = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
     expect(emitted).toContain("could not resolve bot user id");
   });

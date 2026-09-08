@@ -1,17 +1,10 @@
 import type { WebClient } from "@slack/web-api";
-import {
-  deleteAppliedSlackReaction,
-  getAppliedSlackReactionNames,
-  getLogsByTaskIdChronological,
-  getSlackTasksInThread,
-  recordAppliedSlackReaction,
-} from "../be/db";
+import { getLogsByTaskIdChronological, getSlackTasksInThread } from "../be/db";
 import { recordSlackReactionInvalidName } from "../otel";
 import { type AgentTask, isTerminalTaskStatus } from "../types";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { getSlackApp } from "./app";
 import {
-  acceptanceReactionNames,
   reactionName,
   SLACK_REACTION_CONFIG_KEYS,
   SLACK_REACTION_DEFAULTS,
@@ -58,9 +51,24 @@ export function _resetBotUserIdCacheForTests(): void {
 }
 
 /**
+ * Which reaction names THIS process applied to a given message, keyed by
+ * `${channel}:${timestamp}`. In-memory only -- deliberately not persisted.
+ * A restart mid-task loses the record for any message that hadn't finalized
+ * yet, so cleanup removes nothing for it: leaving a stale reaction behind is
+ * the correct trade against deleting a reaction this feature never applied.
+ * Entries are deleted at finalize (see `finalizeSlackMessageReaction`) so
+ * the map cannot grow without bound.
+ */
+const appliedReactionsByMessage = new Map<string, Set<string>>();
+
+function messageKey(channel: string, timestamp: string): string {
+  return `${channel}:${timestamp}`;
+}
+
+/**
  * Ask Slack which reaction names this bot currently has on the message, then
- * narrow that list to only the names durably recorded (in
- * `slack_applied_reactions`) as ones this feature actually applied.
+ * narrow that list to only the names this process recorded (in
+ * `appliedReactionsByMessage`) as ones this feature actually applied.
  *
  * `full: true` is required for Slack to return the complete reaction list,
  * and each candidate is checked against the bot's own user id (from
@@ -68,15 +76,13 @@ export function _resetBotUserIdCacheForTests(): void {
  * `reactions.remove` call. The bot-owned check alone is not a sufficient
  * discriminator: the same bot user may own a reaction this feature never
  * applied (added by unrelated automation), and that reaction must never be
- * swept up. Intersecting live bot-owned names with the durable provenance
- * table is what makes cleanup precise across a process restart or any
- * number of config reloads between acceptance and finalization -- the
- * provenance table records exactly what THIS feature applied, independent
- * of process memory or the live config.
+ * swept up. Intersecting live bot-owned names with this process's own
+ * provenance record is what makes cleanup precise across any number of
+ * config reloads between acceptance and finalization -- the record tracks
+ * exactly what THIS feature applied, independent of the live config.
  *
  * If the bot's own user id can't be resolved, live discovery is skipped
- * entirely (rather than falling back to trial-removing every returned name)
- * and cleanup relies only on the configured acceptance names.
+ * entirely (rather than falling back to trial-removing every returned name).
  */
 async function discoverAppliedReactionNames(
   client: SlackReactionClient,
@@ -92,12 +98,8 @@ async function discoverAppliedReactionNames(
     );
     return [];
   }
-  let appliedByThisFeature: Set<string>;
-  try {
-    appliedByThisFeature = new Set(await getAppliedSlackReactionNames(channel, timestamp));
-  } catch {
-    appliedByThisFeature = new Set();
-  }
+  const appliedByThisFeature = appliedReactionsByMessage.get(messageKey(channel, timestamp));
+  if (!appliedByThisFeature || appliedByThisFeature.size === 0) return [];
   try {
     const result = await client.reactions.get({ channel, timestamp, full: true });
     return (result.message?.reactions ?? [])
@@ -110,23 +112,17 @@ async function discoverAppliedReactionNames(
   }
 }
 
-/** Best-effort: record that this feature applied `name`, swallowing DB errors
- * so a provenance-write failure never blocks the Slack acknowledgement it
- * describes (reactions remain best-effort feedback, per `ackSlackMessage`). */
-async function trackAppliedReaction(
-  channel: string,
-  timestamp: string,
-  name: string,
-): Promise<void> {
-  try {
-    await recordAppliedSlackReaction(channel, timestamp, name);
-  } catch (error) {
-    console.log(
-      scrubSecrets(
-        `[Slack] failed to record applied-reaction provenance for ${name}: ${error instanceof Error ? error.message : error}`,
-      ),
-    );
+/** Record that this feature applied `name` to `channel`/`timestamp`, so
+ * finalize's cleanup knows this exact name is a removal candidate for this
+ * message (see `discoverAppliedReactionNames`). */
+function trackAppliedReaction(channel: string, timestamp: string, name: string): void {
+  const key = messageKey(channel, timestamp);
+  let names = appliedReactionsByMessage.get(key);
+  if (!names) {
+    names = new Set();
+    appliedReactionsByMessage.set(key, names);
   }
+  names.add(name);
 }
 
 /**
@@ -145,10 +141,10 @@ export async function ackSlackMessage(
 ): Promise<void> {
   try {
     await client.reactions.add({ channel, name, timestamp });
-    await trackAppliedReaction(channel, timestamp, name);
+    trackAppliedReaction(channel, timestamp, name);
   } catch (error) {
     if (slackErrorCode(error) === "already_reacted") {
-      await trackAppliedReaction(channel, timestamp, name);
+      trackAppliedReaction(channel, timestamp, name);
       return;
     }
     if (slackErrorCode(error) === "invalid_name") {
@@ -166,7 +162,7 @@ export async function ackSlackMessage(
       const fallback = event ? SLACK_REACTION_DEFAULTS[event] : SLACK_REACTION_DEFAULTS.completed;
       try {
         await client.reactions.add({ channel, name: fallback, timestamp });
-        await trackAppliedReaction(channel, timestamp, fallback);
+        trackAppliedReaction(channel, timestamp, fallback);
       } catch (fallbackError) {
         console.log(
           scrubSecrets(
@@ -184,7 +180,17 @@ export async function ackSlackMessage(
   }
 }
 
-/** Replace this bot's acceptance reaction with the terminal task outcome. */
+/**
+ * Replace this bot's acceptance reaction with the terminal task outcome.
+ *
+ * The removal candidate set is exactly this process's recorded
+ * applied-reaction names intersected with the bot's live reactions on the
+ * message (`discoverAppliedReactionNames`) -- never the currently configured
+ * acceptance names on their own. A configured name is not, by itself, proof
+ * this feature ever applied it: `SLACK_REACTION_ACCEPTED` could change
+ * between acceptance and finalization to a name some unrelated automation
+ * already owns on this bot, and that reaction must never be swept up.
+ */
 export async function finalizeSlackMessageReaction(
   client: SlackReactionClient,
   channel: string,
@@ -192,17 +198,11 @@ export async function finalizeSlackMessageReaction(
   outcome: string,
   event?: SlackReactionEvent,
 ): Promise<void> {
-  const candidateNames = new Set(acceptanceReactionNames());
-  for (const name of await discoverAppliedReactionNames(client, channel, timestamp)) {
-    candidateNames.add(name);
-  }
+  const candidateNames = await discoverAppliedReactionNames(client, channel, timestamp);
 
   for (const name of candidateNames) {
     try {
       await client.reactions.remove({ channel, name, timestamp });
-      // Bound the provenance table's growth: a name recorded as applied and
-      // now confirmed removed no longer needs to be tracked for this message.
-      await deleteAppliedSlackReaction(channel, timestamp, name).catch(() => {});
     } catch (error) {
       const code = slackErrorCode(error);
       if (code === "no_reaction" || code === "message_not_found" || code === "invalid_name")
@@ -214,6 +214,10 @@ export async function finalizeSlackMessageReaction(
       );
     }
   }
+
+  // This message's provenance is only needed for one finalize pass; clear it
+  // so the map can't grow without bound.
+  appliedReactionsByMessage.delete(messageKey(channel, timestamp));
 
   await ackSlackMessage(client, channel, timestamp, outcome, event);
 }

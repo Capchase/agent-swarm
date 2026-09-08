@@ -579,26 +579,46 @@ describe("Slack accepted-message acknowledgements", () => {
     ).resolves.toBeUndefined();
   });
 
-  test("finalization removes every acceptance reaction before adding the outcome", async () => {
+  test("finalization removes every reaction this feature recorded, discovered live, before adding the outcome", async () => {
     const remove = mock(async ({ name }: { name: string }) => {
       if (name !== "zap")
         throw { data: { error: name === "eyes" ? "no_reaction" : "message_not_found" } };
     });
     const add = mock(async () => {});
+    const get = mock(async () => ({
+      message: {
+        reactions: [
+          { name: "eyes", users: ["U_SWARM_BOT"] },
+          { name: "heavy_plus_sign", users: ["U_SWARM_BOT"] },
+          { name: "zap", users: ["U_SWARM_BOT"] },
+          { name: "speech_balloon", users: ["U_SWARM_BOT"] },
+        ],
+      },
+    }));
+    const auth = { test: async () => ({ user_id: "U_SWARM_BOT" }) };
+
+    // A message can accumulate all four acceptance-stage reactions over its
+    // lifetime (accepted -> buffered -> now -> steered), each recorded when
+    // applied.
+    for (const name of ["eyes", "heavy_plus_sign", "zap", "speech_balloon"]) {
+      await ackSlackMessage(
+        { reactions: { add } } as never,
+        "D_THREAD_ACK_TEST",
+        "2100000000.000004",
+        name,
+      );
+    }
 
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove } } as never,
+      { reactions: { add, remove, get }, auth } as never,
       "D_THREAD_ACK_TEST",
       "2100000000.000004",
       "white_check_mark",
     );
 
-    expect(remove.mock.calls.map(([call]) => call.name)).toEqual([
-      "eyes",
-      "heavy_plus_sign",
-      "zap",
-      "speech_balloon",
-    ]);
+    expect(remove.mock.calls.map(([call]) => call.name).sort()).toEqual(
+      ["eyes", "heavy_plus_sign", "zap", "speech_balloon"].sort(),
+    );
     expect(add).toHaveBeenCalledWith({
       channel: "D_THREAD_ACK_TEST",
       name: "white_check_mark",
@@ -628,28 +648,38 @@ describe("Slack accepted-message acknowledgements", () => {
     });
   });
 
-  test("finalization removes the union of default and configured acceptance reactions", async () => {
+  test("finalization removes only the reaction this feature actually applied, not merely-configured or default names", async () => {
     process.env.SLACK_REACTION_ACCEPTED = "swarm_eyes";
     process.env.SLACK_REACTION_NOW = "zap";
     const remove = mock(async (_args: { name: string }) => {
       throw { data: { error: "no_reaction" } };
     });
     const add = mock(async () => {});
+    const auth = { test: async () => ({ user_id: "U_SWARM_BOT" }) };
+
+    // Acceptance actually applied "swarm_eyes". SLACK_REACTION_NOW is
+    // reconfigured to "zap", but this task never reached the "now" event --
+    // "zap" was never applied or recorded, so it must not be a removal
+    // candidate merely because it's currently configured.
+    await ackSlackMessage(
+      { reactions: { add } } as never,
+      "D_THREAD_ACK_TEST",
+      "2100000000.000006",
+      "swarm_eyes",
+      "accepted",
+    );
+    const get = mock(async () => ({
+      message: { reactions: [{ name: "swarm_eyes", users: ["U_SWARM_BOT"] }] },
+    }));
 
     await finalizeSlackMessageReaction(
-      { reactions: { add, remove } } as never,
+      { reactions: { add, remove, get }, auth } as never,
       "D_THREAD_ACK_TEST",
       "2100000000.000006",
       "white_check_mark",
     );
 
-    expect(remove.mock.calls.map(([call]) => call.name)).toEqual([
-      "eyes",
-      "heavy_plus_sign",
-      "zap",
-      "speech_balloon",
-      "swarm_eyes",
-    ]);
+    expect(remove.mock.calls.map(([call]) => call.name)).toEqual(["swarm_eyes"]);
   });
 
   test("invalid_name on add falls back to the code default and counts once", async () => {
