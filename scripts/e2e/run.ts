@@ -23,6 +23,7 @@ import { mcpSurface } from "./scenarios/mcp-surface";
 import { slackFailedTask } from "./scenarios/slack-failed-task";
 import { slackFollowUp } from "./scenarios/slack-follow-up";
 import { slackMention } from "./scenarios/slack-mention";
+import { slackReactionOverride } from "./scenarios/slack-reaction-override";
 import { taskLifecycle } from "./scenarios/task-lifecycle";
 import { workflowScriptNode } from "./scenarios/workflow-script-node";
 import { type SlackHarness, startSlackMock, stopSlackMock } from "./slack";
@@ -51,6 +52,7 @@ const scenarios: Scenario[] = [
   slackMention,
   slackFollowUp,
   slackFailedTask,
+  slackReactionOverride,
 ];
 
 type ThreadMark = { scenario: string; label: string; channel: string; ts: string };
