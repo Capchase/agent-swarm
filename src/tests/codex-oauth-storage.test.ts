@@ -5,6 +5,7 @@ import {
   codexOAuthKeyForSlot,
   deleteCodexOAuth,
   getValidCodexOAuth,
+  isNonRetryableRefreshRejection,
   loadAllCodexOAuthSlots,
   loadCodexOAuth,
   storeCodexOAuth,
@@ -560,6 +561,128 @@ describe("getValidCodexOAuth", () => {
     expect(err.slot).toBe(0);
   });
 
+  /** Builds a mocked `globalThis.fetch` for the quarantine-on-refresh-rejection tests below. */
+  function mockFetchWithDeleteTracking(
+    expiredCreds: CodexOAuthCredentials,
+    onDelete: (url: string) => void,
+  ) {
+    return async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      const method = init?.method || "GET";
+
+      if (
+        method === "DELETE" &&
+        urlStr.includes("/api/config/") &&
+        !urlStr.includes("refresh-locks")
+      ) {
+        onDelete(urlStr);
+        return new Response(null, { status: 204 });
+      }
+
+      if (urlStr.includes("config/resolved")) {
+        return new Response(
+          JSON.stringify({
+            configs: [{ id: "cfg-1", key: "codex_oauth_0", value: JSON.stringify(expiredCreds) }],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (urlStr.includes("/api/oauth/refresh-locks/")) {
+        const lockRes = mockLockResponse(method);
+        if (lockRes) return lockRes;
+      }
+
+      return new Response("Not Found", { status: 404 });
+    };
+  }
+
+  it("quarantines (deletes) the slot when the empty-string refresh_token variant is rejected with 400", async () => {
+    const expiredCreds = { ...mockCreds, expires: Date.now() - 1000 };
+    let deletedUrl = "";
+    globalThis.fetch = mockFetchWithDeleteTracking(expiredCreds, (url) => {
+      deletedUrl = url;
+    });
+
+    setFetchForTesting(
+      () =>
+        new Response(
+          "Invalid 'refresh_token': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+          { status: 400 },
+        ),
+    );
+
+    let caught: unknown;
+    try {
+      await getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(CodexOAuthRefreshError);
+    expect(deletedUrl).toContain("cfg-1");
+  });
+
+  it("quarantines (deletes) the slot on a generic 4xx refresh rejection, not just revoked/empty-string", async () => {
+    const expiredCreds = { ...mockCreds, expires: Date.now() - 1000 };
+    let deletedUrl = "";
+    globalThis.fetch = mockFetchWithDeleteTracking(expiredCreds, (url) => {
+      deletedUrl = url;
+    });
+
+    setFetchForTesting(() => new Response("Bad Request", { status: 400 }));
+
+    let caught: unknown;
+    try {
+      await getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(CodexOAuthRefreshError);
+    expect(deletedUrl).toContain("cfg-1");
+  });
+
+  it("does NOT quarantine the slot on a transient 5xx refresh failure", async () => {
+    const expiredCreds = { ...mockCreds, expires: Date.now() - 1000 };
+    let deleteCalled = false;
+    globalThis.fetch = mockFetchWithDeleteTracking(expiredCreds, () => {
+      deleteCalled = true;
+    });
+
+    setFetchForTesting(() => new Response("Internal Server Error", { status: 503 }));
+
+    let caught: unknown;
+    try {
+      await getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(CodexOAuthRefreshError);
+    expect((caught as CodexOAuthRefreshError).status).toBe(503);
+    expect(deleteCalled).toBe(false);
+  });
+
+  it("does NOT quarantine the slot on a network-level refresh failure (no HTTP status)", async () => {
+    const expiredCreds = { ...mockCreds, expires: Date.now() - 1000 };
+    let deleteCalled = false;
+    globalThis.fetch = mockFetchWithDeleteTracking(expiredCreds, () => {
+      deleteCalled = true;
+    });
+
+    setFetchForTesting(() => {
+      throw new Error("network timeout");
+    });
+
+    let caught: unknown;
+    try {
+      await getValidCodexOAuth(MOCK_API_URL, MOCK_API_KEY);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(CodexOAuthRefreshError);
+    expect((caught as CodexOAuthRefreshError).status).toBeUndefined();
+    expect(deleteCalled).toBe(false);
+  });
+
   it("treats a token older than maxAgeMs as needing refresh even though it isn't near expiry", async () => {
     // Issued ~9 days ago (expires derived as issuedAt + 10d TTL): comfortably
     // past the default 5min-turned-12h REFRESH_SKEW_MS, but well past a
@@ -682,5 +805,33 @@ describe("getValidCodexOAuth", () => {
     // getValidCodexOAuth (12h skew) already refreshed a token a zero-skew
     // check would still call valid — it wins the race by construction.
     expect(exchanged).toBe(true);
+  });
+});
+
+// ─── isNonRetryableRefreshRejection ───────────────────────────────────────────
+
+describe("isNonRetryableRefreshRejection", () => {
+  it("returns false when no status is present (network/timeout failure)", () => {
+    expect(isNonRetryableRefreshRejection(undefined)).toBe(false);
+  });
+
+  it("returns true for 400 (e.g. empty-string or malformed refresh_token)", () => {
+    expect(isNonRetryableRefreshRejection(400)).toBe(true);
+  });
+
+  it("returns true for 401 (e.g. revoked/invalid_grant)", () => {
+    expect(isNonRetryableRefreshRejection(401)).toBe(true);
+  });
+
+  it("returns true for 499", () => {
+    expect(isNonRetryableRefreshRejection(499)).toBe(true);
+  });
+
+  it("returns false for 500 (transient server error)", () => {
+    expect(isNonRetryableRefreshRejection(500)).toBe(false);
+  });
+
+  it("returns false for 503", () => {
+    expect(isNonRetryableRefreshRejection(503)).toBe(false);
   });
 });
