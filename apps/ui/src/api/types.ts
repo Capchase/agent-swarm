@@ -34,6 +34,23 @@ export type ReasoningEffortLevel = (typeof REASONING_EFFORT_LEVELS)[number];
 
 export type AcpTarget = "opencode" | "custom";
 
+export type ClaudeTransport = "cli" | "sdk";
+
+export interface ClaudeRuntimeConfig {
+  /** `null` clears the agent override. Omission leaves it unchanged. */
+  transport?: ClaudeTransport | null;
+}
+
+export interface AgentRuntimeResponse {
+  claude: {
+    /** The agent-scoped override. `null` means inherit. */
+    transport: ClaudeTransport | null;
+    effectiveTransport: ClaudeTransport;
+    inheritedTransport: ClaudeTransport;
+    bridgeEffective: boolean;
+  };
+}
+
 export interface AcpRuntimeConfig {
   target: AcpTarget;
   command?: string | null;
@@ -122,6 +139,12 @@ export interface Agent {
    * worker hasn't booted yet, or `CRED_CHECK_DISABLE=1` opted it out.
    */
   credStatus?: AgentCredStatus | null;
+  /**
+   * Effective `CLAUDE_TRANSPORT` (global → agent precedence) for Claude
+   * agents. Absent for other harnesses. Reflects the next session, not
+   * necessarily the last one that ran.
+   */
+  claudeTransport?: ClaudeTransport;
   createdAt: string;
   lastUpdatedAt: string;
 }
@@ -235,7 +258,7 @@ export interface AgentTask {
   credentialKeyType?: string;
   swarmVersion?: string;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
   harnessVariant?: string;
   harnessVariantMeta?: { version?: string; failureArtifact?: string };
   peakContextPercent?: number;
@@ -276,6 +299,10 @@ export type DevinProviderMeta = {
   sessionUrl: string;
   maxAcuLimit?: number;
   acuCostUsd?: number;
+};
+/** Persisted by the worker at session init (`providerMeta.transport`). */
+export type ClaudeProviderMeta = {
+  transport?: ClaudeTransport;
 };
 
 // ============================================================================
