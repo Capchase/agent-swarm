@@ -138,6 +138,12 @@ export const sendTaskInputSchema = z
     followUpConfig: FollowUpConfigSchema.optional().describe(
       "Control the lead follow-up created when this task finishes. When to use `followUpConfig`: set `disabled: true` when you'll wait for this task to complete inline and no follow-up is needed; set `onCompleted` / `onFailed` with specific instructions when you need to follow up effectively on a particular outcome of a long-running flow; for normal one-shot tasks, leave it unset because defaults are fine. It is most valuable for long-running / complex flows.",
     ),
+    outputSchema: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        "Optional JSON Schema the assignee's final output must satisfy. store-progress rejects a completion that does not match. Supported keywords: type, required, properties, enum, const, items.",
+      ),
   })
   .superRefine((data, ctx) => {
     const hasChannel = !!data.slackChannelId;
@@ -218,6 +224,7 @@ export async function sendTaskHandler(
     overrideSlackContext,
     requestedByUserId: inputRequestedByUserId,
     followUpConfig,
+    outputSchema,
   }: SendTaskArgs,
 ): Promise<SwarmToolResult> {
   if (ctx.kind === "owner" && !ctx.agentId) {
@@ -436,6 +443,7 @@ export async function sendTaskHandler(
         slackUserId,
         overrideSlackContext,
         followUpConfig,
+        outputSchema,
         routingAffinity:
           effectiveLeadOnly || requiredCapabilities?.length
             ? { leadOnly: effectiveLeadOnly, capabilities: requiredCapabilities ?? [] }
@@ -502,6 +510,7 @@ export async function sendTaskHandler(
         slackUserId,
         overrideSlackContext,
         followUpConfig,
+        outputSchema,
         routingAffinity:
           effectiveLeadOnly || requiredCapabilities?.length
             ? { leadOnly: effectiveLeadOnly, capabilities: requiredCapabilities ?? [] }
@@ -542,6 +551,7 @@ export async function sendTaskHandler(
       slackUserId,
       overrideSlackContext,
       followUpConfig,
+      outputSchema,
       routingAffinity:
         effectiveLeadOnly || requiredCapabilities?.length
           ? { leadOnly: effectiveLeadOnly, capabilities: requiredCapabilities ?? [] }
