@@ -42,7 +42,7 @@ type UserToolAdmissionConfig = {
   rbac?: AdmissionRbac;
 };
 
-const userSendTaskInputSchema = z
+export const userSendTaskInputSchema = z
   .object({
     task: z.string().min(1).describe("The task description to send."),
     taskType: z
