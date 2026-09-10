@@ -32,7 +32,25 @@ import {
   ReasoningEffortSchema,
   splitLegacyModelAlias,
 } from "@/types";
+import { findJsonSchemaShapeErrors } from "@/workflows/json-schema-validator";
 import { looseAgentTaskOutputSchema } from "./get-task-details";
+
+/**
+ * Shared by `sendTaskInputSchema` (owner MCP) and `userSendTaskInputSchema`
+ * (`/mcp-user`, see src/server-user.ts) so a malformed nested `outputSchema`
+ * (e.g. `{ properties: { answer: null } }`) is rejected at ingress on both
+ * surfaces instead of reaching `store-progress` completion validation, where
+ * the hand-rolled validator would throw reading `null.type`.
+ */
+export function checkOutputSchemaShape(
+  outputSchema: Record<string, unknown> | undefined,
+  ctx: z.RefinementCtx,
+): void {
+  if (outputSchema === undefined) return;
+  for (const message of findJsonSchemaShapeErrors(outputSchema)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message, path: ["outputSchema"] });
+  }
+}
 
 export const sendTaskInputSchema = z
   .object({
@@ -155,6 +173,7 @@ export const sendTaskInputSchema = z
         path: [hasChannel ? "slackThreadTs" : "slackChannelId"],
       });
     }
+    checkOutputSchemaShape(data.outputSchema, ctx);
   });
 
 export const sendTaskOutputSchema = swarmToolOutputSchema({
