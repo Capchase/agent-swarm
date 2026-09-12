@@ -252,6 +252,9 @@ async function listSwarmAutostashes(clonePath: string, role: string): Promise<Sw
  *    src/tasks/worker-follow-up.ts after a task completes/fails or needs
  *    re-delegation; they inherit the parent's vcsRepo/branch context via
  *    createTaskExtended's parentTaskId inheritance (src/be/db.ts).
+ *  - "deferred": the wake-up task a `defer-task` schedule creates
+ *    (src/tools/defer-task.ts) — it carries the deferred task as its
+ *    `parentTaskId` and resumes that work on the same clone.
  *  - "agentmail-reply": AgentMail follow-up on an EXISTING thread
  *    (src/agentmail/handlers.ts) — always carries `parentTaskId` pointing at
  *    the task it's continuing (as opposed to "agentmail-message", which fires
@@ -263,6 +266,10 @@ async function listSwarmAutostashes(clonePath: string, role: string): Promise<Sw
  */
 const CONTINUATION_TASK_TYPES = new Set([
   "resume",
+  // "deferred": a `defer-task` wake-up continues the parent's work on the same
+  // clone. The parent is already `completed`, so the parent-status check alone
+  // would read this as a first kickoff and hard-reset the clone.
+  "deferred",
   "follow-up",
   "reroute-decision",
   "agentmail-reply",
@@ -2007,11 +2014,13 @@ async function pauseTaskViaAPI(config: ApiConfig, role: string, taskId: string):
 }
 
 /** Fetch paused tasks from API for this agent */
-async function getPausedTasksFromAPI(config: ApiConfig): Promise<
+export async function getPausedTasksFromAPI(config: ApiConfig): Promise<
   Array<{
     id: string;
     task: string;
     progress?: string;
+    attachments?: unknown[];
+    outputSchema?: Record<string, unknown>;
     claudeSessionId?: string;
     provider?: ProviderName;
     providerMeta?: Record<string, unknown>;
@@ -2047,6 +2056,8 @@ async function getPausedTasksFromAPI(config: ApiConfig): Promise<
         id: string;
         task: string;
         progress?: string;
+        attachments?: unknown[];
+        outputSchema?: Record<string, unknown>;
         claudeSessionId?: string;
         provider?: ProviderName;
         providerMeta?: Record<string, unknown>;
@@ -2088,20 +2099,26 @@ async function resumeTaskViaAPI(config: ApiConfig, taskId: string): Promise<bool
 }
 
 /** Build prompt for a resumed task */
-async function buildResumePrompt(
-  task: { id: string; task: string; progress?: string },
+export async function buildResumePrompt(
+  task: {
+    id: string;
+    task: string;
+    progress?: string;
+    attachments?: unknown[];
+    outputSchema?: Record<string, unknown>;
+  },
   fmt: (cmd: string) => string = (cmd) => `/${cmd}`,
   options?: { hasMcp?: boolean },
 ): Promise<string> {
   const hasMcp = options?.hasMcp !== false;
-  const completionInstructions = hasMcp
-    ? '\n\nWhen done, use `store-progress` with status: "completed" and include your output.'
-    : "";
+  const completionInstructions = await buildTaskOutputInstructions(task.outputSchema, hasMcp);
+  const attachmentsSection = buildAttachmentsSection(task.id, task.attachments);
   if (task.progress) {
     const result = await resolveTemplateAsync("task.resumption.with_progress", {
       work_on_task_cmd: hasMcp ? fmt("work-on-task") : "",
       task_id: hasMcp ? task.id : "",
       task_description: task.task,
+      attachments_section: attachmentsSection,
       progress: task.progress,
       completion_instructions: completionInstructions,
     });
@@ -2112,6 +2129,7 @@ async function buildResumePrompt(
     work_on_task_cmd: hasMcp ? fmt("work-on-task") : "",
     task_id: hasMcp ? task.id : "",
     task_description: task.task,
+    attachments_section: attachmentsSection,
     completion_instructions: completionInstructions,
   });
   return result.text;
@@ -2779,6 +2797,8 @@ interface Trigger {
   }>;
   cursorUpdates?: Array<{ channelId: string; ts: string }>; // Deferred cursor commits for channel_activity
   requestedBy?: {
+    /** `users.id`; absent for the UNKNOWN-identity sentinel (Slack-only requester). */
+    id?: string;
     name: string;
     email?: string;
     role?: string;
@@ -2978,6 +2998,21 @@ async function pollForTriggerOnce(opts: PollOptions): Promise<Trigger | null> {
   return null; // Timeout reached, no trigger found
 }
 
+/** Share the output contract between initial dispatch and deployment resume. */
+async function buildTaskOutputInstructions(
+  outputSchema: unknown,
+  hasMcp: boolean,
+): Promise<string> {
+  if (!hasMcp) return "";
+  const result =
+    outputSchema && typeof outputSchema === "object"
+      ? await resolveTemplateAsync("task.output.schema", {
+          schema: JSON.stringify(outputSchema, null, 2),
+        })
+      : await resolveTemplateAsync("task.output.generic", {});
+  return result.text;
+}
+
 /** Build prompt based on trigger type */
 async function buildPromptForTrigger(
   trigger: Trigger,
@@ -2998,20 +3033,16 @@ async function buildPromptForTrigger(
       // Build output instructions — use outputSchema if present, otherwise generic.
       // Skip store-progress references for providers without MCP (e.g. Devin).
       const taskObj = trigger.task as Record<string, unknown> | undefined;
-      let outputInstructions: string;
-      if (!hasMcp) {
-        outputInstructions = "";
-      } else if (taskObj?.outputSchema && typeof taskObj.outputSchema === "object") {
-        outputInstructions = `\n\n**Required Output Format**: When completing this task, you MUST call store-progress with output that is valid JSON conforming to this schema:\n\`\`\`json\n${JSON.stringify(taskObj.outputSchema, null, 2)}\n\`\`\`\nCall store-progress with status "completed" and your JSON output. If your output doesn't match the schema, the tool call will fail and you should fix and retry.`;
-      } else {
-        outputInstructions =
-          '\n\nWhen done, use `store-progress` with status: "completed" and include your output.';
-      }
+      const outputInstructions = await buildTaskOutputInstructions(taskObj?.outputSchema, hasMcp);
 
       // Include requesting user info if available from the poll trigger
       const requestedBy = trigger.requestedBy;
+      const requesterDetails = [
+        requestedBy?.email,
+        requestedBy?.id ? `user ${requestedBy.id}` : undefined,
+      ].filter(Boolean);
       const requestedBySection = requestedBy
-        ? `\n\nRequested by: ${requestedBy.name}${requestedBy.email ? ` (${requestedBy.email})` : ""}`
+        ? `\n\nRequested by: ${requestedBy.name}${requesterDetails.length > 0 ? ` (${requesterDetails.join(", ")})` : ""}`
         : "";
 
       const attachmentsSection = buildAttachmentsSection(trigger.taskId, taskObj?.attachments);
