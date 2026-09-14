@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, createAgent, initDb } from "../be/db";
+import { closeDb, createAgent, getDbClient, initDb } from "../be/db";
 import {
   createEvent,
   createEventsBatch,
@@ -276,6 +276,20 @@ describe("getEventCountsFiltered", () => {
   test("returns empty for non-matching filters", async () => {
     const counts = await getEventCountsFiltered({ agentId: "nonexistent-agent-id" });
     expect(counts.length).toBe(0);
+  });
+});
+
+describe("getEventsFiltered query plan", () => {
+  test("event + agentId + dataField seeks the composite index without a temp B-tree sort", async () => {
+    const plan = await getDbClient().query<{ detail: string }>(
+      `EXPLAIN QUERY PLAN SELECT * FROM events
+       WHERE event = ? AND agentId = ? AND json_extract(data, '$.field') = ?
+       ORDER BY createdAt DESC LIMIT ?`,
+      ["tool.start", testAgent.id, "value", 100],
+    );
+    const detail = plan.map((row) => row.detail).join("\n");
+    expect(detail).toContain("USING INDEX idx_events_event_agent_created");
+    expect(detail).not.toContain("TEMP B-TREE");
   });
 });
 

@@ -387,6 +387,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}guides/deployment#database-retention`,
       },
       {
+        key: "TASK_CONTEXT_SNAPSHOT_RETENTION_DAYS",
+        label: "Task context snapshot retention (days)",
+        description:
+          "Delete task_context_snapshots rows older than this many days. Leave unset to disable this table's sweep. Deletion permanently removes progressive context-usage history.",
+        kind: "number",
+        placeholder: "30",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
         key: "DB_RETENTION_DRY_RUN",
         label: "Database retention dry run",
         description:
