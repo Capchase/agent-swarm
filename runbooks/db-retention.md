@@ -7,6 +7,7 @@ Database retention permanently deletes rows. Unsetting a retention key stops fut
 - `session_logs` deletion removes the line-by-line session transcript. Old task log views and resume preambles become empty.
 - `agent_log` deletion removes task and agent state-transition history. Old activity timelines become empty.
 - `events` deletion removes telemetry. Aggregate event counters become retention-window totals, not all-time totals. A newer event can retain a `parentEventId` for a deleted older event.
+- `task_context_snapshots` deletion removes progressive context-usage history. Old context-usage graphs for a task lose their early data points; the task's aggregate columns on `agent_tasks` (`compactionCount`, `peakContextPercent`, etc.) are unaffected because they are computed once and stored separately.
 
 ## Scope and safety boundary
 
@@ -17,6 +18,7 @@ The server sweeps only this closed code-reviewed list:
 | `session_logs` | `SESSION_LOG_RETENTION_DAYS` | Session transcripts |
 | `agent_log` | `AGENT_LOG_RETENTION_DAYS` | Task and agent history |
 | `events` | `EVENTS_RETENTION_DAYS` | Telemetry events |
+| `task_context_snapshots` | `TASK_CONTEXT_SNAPSHOT_RETENTION_DAYS` | Progressive context-usage snapshots |
 
 Table and column names never come from configuration. An operator can set a retention duration only. An unset key disables that table's sweep. Values must be whole days from 1 through 1,000,000. Use at least seven days unless you have verified that a shorter window is suitable for your deployment.
 

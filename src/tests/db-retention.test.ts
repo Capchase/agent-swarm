@@ -30,6 +30,22 @@ async function removeDbFiles(): Promise<void> {
     await unlink(`${TEST_DB_PATH}${suffix}`).catch(() => undefined);
 }
 
+const FIXTURE_AGENT_ID = "retention-fixture-agent";
+const FIXTURE_TASK_ID = "retention-fixture-task";
+
+/** task_context_snapshots has NOT NULL FKs to agents/agent_tasks; every test shares this pair. */
+async function ensureSnapshotFixtureRows(): Promise<void> {
+  const client = getDbClient();
+  await client.run(
+    "INSERT OR IGNORE INTO agents (id, name, status, createdAt, lastUpdatedAt) VALUES (?, 'Retention Fixture', 'idle', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+    [FIXTURE_AGENT_ID],
+  );
+  await client.run(
+    "INSERT OR IGNORE INTO agent_tasks (id, task, status, source, createdAt, lastUpdatedAt) VALUES (?, 'retention fixture', 'completed', 'mcp', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+    [FIXTURE_TASK_ID],
+  );
+}
+
 async function insertRow(
   table: (typeof DB_RETENTION_TABLES)[number]["table"],
   id: string,
@@ -48,6 +64,14 @@ async function insertRow(
       id,
       createdAt,
     ]);
+    return;
+  }
+  if (table === "task_context_snapshots") {
+    await ensureSnapshotFixtureRows();
+    await client.run(
+      "INSERT INTO task_context_snapshots (id, taskId, agentId, sessionId, eventType, createdAt) VALUES (?, ?, ?, ?, 'progress', ?)",
+      [id, FIXTURE_TASK_ID, FIXTURE_AGENT_ID, `session-${id}`, createdAt],
+    );
     return;
   }
   await client.run(
@@ -104,11 +128,12 @@ afterEach(async () => {
 });
 
 describe("DB retention", () => {
-  test("keeps the closed allowlist limited to the three approved tables", () => {
+  test("keeps the closed allowlist limited to the four approved tables", () => {
     expect(DB_RETENTION_TABLES.map((table) => table.table)).toEqual([
       "session_logs",
       "agent_log",
       "events",
+      "task_context_snapshots",
     ]);
   });
 
@@ -396,12 +421,11 @@ describe("DB retention", () => {
   });
 
   test("rotation: each table sweeps first across an equal share of ticks", async () => {
-    process.env.SESSION_LOG_RETENTION_DAYS = "1";
-    process.env.AGENT_LOG_RETENTION_DAYS = "1";
-    process.env.EVENTS_RETENTION_DAYS = "1";
+    for (const table of DB_RETENTION_TABLES) process.env[table.envKey] = "1";
 
     const firstCounts: Partial<Record<string, number>> = {};
-    for (let tick = 0; tick < 6; tick++) {
+    const ticks = DB_RETENTION_TABLES.length * 2;
+    for (let tick = 0; tick < ticks; tick++) {
       await runDbRetentionTick({ now: NOW });
       const order = _getLastSweepOrderForTests();
       const first = order[0]!;

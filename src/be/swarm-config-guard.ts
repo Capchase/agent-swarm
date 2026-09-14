@@ -317,7 +317,12 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // sweep keep running for the default 30000ms.
   ...boundedIntegerValidatorsFor(DB_RETENTION_TUNING_BOUNDS),
   ...boundedIntegerValidators(
-    ["SESSION_LOG_RETENTION_DAYS", "AGENT_LOG_RETENTION_DAYS", "EVENTS_RETENTION_DAYS"],
+    [
+      "SESSION_LOG_RETENTION_DAYS",
+      "AGENT_LOG_RETENTION_DAYS",
+      "EVENTS_RETENTION_DAYS",
+      "TASK_CONTEXT_SNAPSHOT_RETENTION_DAYS",
+    ],
     1,
     MAX_DB_RETENTION_DAYS,
   ),

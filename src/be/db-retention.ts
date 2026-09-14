@@ -40,6 +40,12 @@ export const DB_RETENTION_TABLES = [
     envKey: "EVENTS_RETENTION_DAYS",
     metricsKey: "events",
   },
+  {
+    table: "task_context_snapshots",
+    timeColumn: "createdAt",
+    envKey: "TASK_CONTEXT_SNAPSHOT_RETENTION_DAYS",
+    metricsKey: "taskContextSnapshots",
+  },
 ] as const satisfies ReadonlyArray<{
   table: string;
   timeColumn: string;
