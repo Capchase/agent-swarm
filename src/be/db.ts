@@ -126,6 +126,7 @@ import {
 import { deriveProviderFromKeyType } from "../utils/credentials";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
 import { extractGitHubPullRequestUrls } from "../utils/github-pull-request";
+import { validateHeartbeatExpiry } from "../utils/heartbeat-expiry";
 import {
   type BudgetedIdentityField,
   checkIdentityFieldBudget,
@@ -3224,6 +3225,10 @@ export async function updateAgentProfile(
       );
       delete writable[field];
       guard?.onConflict?.({ field, expectedHash, currentHash });
+    }
+
+    if (writable.heartbeatMd !== undefined) {
+      validateHeartbeatExpiry(current.heartbeatMd ?? "", writable.heartbeatMd);
     }
 
     for (const field of BUDGETED_IDENTITY_FIELDS) {
