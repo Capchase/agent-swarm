@@ -566,6 +566,10 @@ describe("script connections", () => {
       markMigrationApplied(database, "147_scheduled_tasks_parent_task.sql");
       // 148 rebuilds pages, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "148_pages_svg.sql");
+      // 150 indexes events, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "150_events_type_agent_created_index.sql");
+      // 151 indexes task_context_snapshots, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "151_task_context_snapshots_created_index.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
