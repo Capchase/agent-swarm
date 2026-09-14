@@ -104,6 +104,10 @@ export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
   console.log(`Database initialized at ${dbPath}`);
 
   const database = db;
+  // auto_vacuum is a file-format property fixed at creation time and cannot
+  // be changed once the connection is in WAL mode (the pragma is silently
+  // ignored, with no error). This line MUST stay above journal_mode = WAL.
+  database.run("PRAGMA auto_vacuum = INCREMENTAL;");
   database.run("PRAGMA journal_mode = WAL;");
   database.run("PRAGMA busy_timeout = 5000;");
   database.run("PRAGMA foreign_keys = ON;");

@@ -53,6 +53,25 @@ describe("database runtime facade", () => {
     expect(await client.get("SELECT value FROM runtime_probe")).toEqual({ value: "second" });
   });
 
+  test("sets auto_vacuum = INCREMENTAL on a freshly created database", () => {
+    // Regression guard: auto_vacuum is a file-format property fixed at
+    // creation time and is silently ignored once journal_mode is WAL, so a
+    // later reordering of the pragma block would pass every other test while
+    // quietly losing this setting on every new deployment.
+    const globals = globalThis as typeof globalThis & { __testMigrationTemplate?: Uint8Array };
+    const template = globals.__testMigrationTemplate;
+    runtime.closeDb();
+    globals.__testMigrationTemplate = undefined;
+    try {
+      const database = runtime.initDb(":memory:");
+      const row = database.query("PRAGMA auto_vacuum;").get() as { auto_vacuum: number };
+      expect(row.auto_vacuum).toBe(2); // 2 == INCREMENTAL
+    } finally {
+      runtime.closeDb();
+      globals.__testMigrationTemplate = template;
+    }
+  });
+
   test("cold initialization still seeds templates", () => {
     const globals = globalThis as typeof globalThis & { __testMigrationTemplate?: Uint8Array };
     const template = globals.__testMigrationTemplate;
