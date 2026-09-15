@@ -17,6 +17,12 @@ import dailyStatusReportConfig from "../../../templates/schedules/daily-status-r
 import dailyStatusReportContent from "../../../templates/schedules/daily-status-report/content.md" with {
   type: "text",
 };
+import dailySwarmUpdateCheckConfig from "../../../templates/schedules/daily-swarm-update-check/config.json" with {
+  type: "text",
+};
+import dailySwarmUpdateCheckContent from "../../../templates/schedules/daily-swarm-update-check/content.md" with {
+  type: "text",
+};
 import dailyWorkflowHealthAuditConfig from "../../../templates/schedules/daily-workflow-health-audit/config.json" with {
   type: "text",
 };
@@ -54,6 +60,7 @@ import {
   getScheduledTaskByName,
   updateScheduledTask,
 } from "../db";
+import { resolveSeededEnabled } from "./automation-toggle";
 import type { Seeder, SeedItem } from "./types";
 import { canonicalJson } from "./workflows-seeder";
 
@@ -64,6 +71,8 @@ type ScheduleTemplateConfig = {
   placeholders?: string[];
   requires?: AutomationIntegrationId[];
   runAllSeedersCandidate?: boolean;
+  /** Explicit, reviewed opt-in into the auto-enable policy — see ./automation-toggle. */
+  autoEnableCandidate?: boolean;
   tags?: string[];
 };
 
@@ -100,6 +109,10 @@ const BUILT_IN_SCHEDULE_SOURCES: readonly ScheduleTemplateSource[] = [
   },
   { config: asText(dailyStatusReportConfig), content: asText(dailyStatusReportContent) },
   {
+    config: asText(dailySwarmUpdateCheckConfig),
+    content: asText(dailySwarmUpdateCheckContent),
+  },
+  {
     config: asText(dailyWorkflowHealthAuditConfig),
     content: asText(dailyWorkflowHealthAuditContent),
   },
@@ -134,21 +147,30 @@ function parseScheduleSource(source: ScheduleTemplateSource): SeedSchedule | nul
     .trim();
   if (!taskTemplate) throw new Error(`Schedule template ${config.name} has no task prompt`);
 
+  const requires = config.requires ?? [];
+  const requiredParams = config.placeholders ?? [];
   return {
     name: config.name,
     description: config.description,
     cronExpression: block.cron,
     timezone: block.timezone ?? "UTC",
-    // Boot seeding inventories the automation, but activation is always an
-    // explicit operator action. The template's enabled flag still documents
-    // its recommended state for manual installs.
-    enabled: false,
+    // Boot seeding always inventories the automation. Whether it also arrives
+    // enabled is gated by the operator switch (SEED_AUTOMATIONS_ENABLED), the
+    // item being zero-config (no requires/placeholders), the template's own
+    // explicit autoEnableCandidate opt-in, and the template not explicitly
+    // recommending it stay off. See ./automation-toggle.
+    enabled: resolveSeededEnabled({
+      requires,
+      requiredParams,
+      autoEnableCandidate: config.autoEnableCandidate === true,
+      templateRecommendsEnabled: block.enabled !== false,
+    }),
     taskTemplate,
     taskType: config.title,
     tags: config.tags ?? [],
     params: {},
-    requiredParams: config.placeholders ?? [],
-    requires: config.requires ?? [],
+    requiredParams,
+    requires,
   };
 }
 

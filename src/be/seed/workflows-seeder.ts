@@ -56,6 +56,7 @@ import type {
 } from "../../types";
 import { validateDefinition } from "../../workflows/definition";
 import { computeContentHash, createWorkflow, listWorkflows, updateWorkflow } from "../db";
+import { resolveSeededEnabled } from "./automation-toggle";
 import type { Seeder, SeedItem } from "./types";
 
 type AutomationTemplateConfig = {
@@ -64,6 +65,8 @@ type AutomationTemplateConfig = {
   placeholders?: string[];
   requires?: AutomationIntegrationId[];
   runAllSeedersCandidate?: boolean;
+  /** Explicit, reviewed opt-in into the auto-enable policy — see ./automation-toggle. */
+  autoEnableCandidate?: boolean;
 };
 
 type WorkflowTemplatePayload = {
@@ -130,13 +133,22 @@ function parseWorkflowSource(source: WorkflowTemplateSource): SeedWorkflow | nul
   if (!match?.[1]) throw new Error(`Workflow template ${config.name} has no JSON definition`);
   const payload = JSON.parse(match[1]) as WorkflowTemplatePayload;
 
+  const requires = config.requires ?? [];
+  const requiredParams = config.placeholders ?? [];
   return {
     name: config.name,
     description: config.description,
-    // Boot seeding inventories the automation, but activation is always an
-    // explicit operator action. The template's enabled flag still documents
-    // its recommended state for manual installs.
-    enabled: false,
+    // Boot seeding always inventories the automation. Whether it also arrives
+    // enabled is gated by the operator switch (SEED_AUTOMATIONS_ENABLED), the
+    // item being zero-config (no requires/placeholders), the template's own
+    // explicit autoEnableCandidate opt-in, and the template not explicitly
+    // recommending it stay off. See ./automation-toggle.
+    enabled: resolveSeededEnabled({
+      requires,
+      requiredParams,
+      autoEnableCandidate: config.autoEnableCandidate === true,
+      templateRecommendsEnabled: payload.enabled !== false,
+    }),
     definition: {
       nodes: payload.nodes,
       onNodeFailure: payload.onNodeFailure ?? "fail",
@@ -146,8 +158,8 @@ function parseWorkflowSource(source: WorkflowTemplateSource): SeedWorkflow | nul
     input: payload.input,
     triggerSchema: payload.triggerSchema,
     params: {},
-    requiredParams: config.placeholders ?? [],
-    requires: config.requires ?? [],
+    requiredParams,
+    requires,
   };
 }
 
