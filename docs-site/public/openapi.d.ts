@@ -6469,6 +6469,8 @@ export interface paths {
                         status: "open" | "snoozed" | "dismissed" | "done";
                         /** Format: date-time */
                         snoozeUntil?: string;
+                        /** Format: date-time */
+                        readAt?: string;
                     };
                 };
             };
@@ -21185,6 +21187,7 @@ export interface components {
             snoozeUntil?: string;
             dismissedAt?: string;
             doneAt?: string;
+            readAt?: string;
             createdAt: string;
             lastUpdatedAt: string;
         };

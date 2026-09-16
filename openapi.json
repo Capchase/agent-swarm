@@ -2039,6 +2039,9 @@
           "doneAt": {
             "type": "string"
           },
+          "readAt": {
+            "type": "string"
+          },
           "createdAt": {
             "type": "string"
           },
@@ -17764,6 +17767,10 @@
                     ]
                   },
                   "snoozeUntil": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "readAt": {
                     "type": "string",
                     "format": "date-time"
                   }
