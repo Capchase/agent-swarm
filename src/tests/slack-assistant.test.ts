@@ -6,11 +6,16 @@ import {
   createTaskExtended,
   getAgentWorkingOnThread,
   getLeadAgent,
+  getMostRecentTaskInThread,
   getTaskById,
   initDb,
 } from "../be/db";
+import { createAssistant } from "../slack/assistant";
 import { rewriteSlackMentions } from "../slack/enrich";
 import { buildEffectiveText } from "../slack/inbound-files";
+
+/** The single function Bolt's `Assistant` stores for the `message` event — not part of its public type. */
+type AssistantUserMessageHandler = (args: Record<string, unknown>) => Promise<void>;
 
 process.env.SLACK_RENDER_V2 = "false";
 
@@ -145,6 +150,55 @@ describe("assistant DM path self-mention rendering (Option 1 fix)", () => {
       cachedBotUserId ?? undefined,
     );
     expect(rendered).toBe(`<@${BOT_USER_ID}> (unknown user) what's the status?`);
+  });
+});
+
+describe("assistant DM path self-mention rendering — production ingestion path", () => {
+  // Drives `createAssistant()`'s real `userMessage` handler end-to-end (the
+  // production DM path), rather than calling `rewriteSlackMentions` in
+  // isolation. This is the regression test PR #108 review asked for: it must
+  // fail if the fix at src/slack/assistant.ts (the `cachedBotUserId ??
+  // undefined` argument to `rewriteSlackMentions`) is reverted.
+  const BOT_USER_ID = "U0PRODBOT99";
+  const OTHER_USER_ID = "U0PRODOTHR1";
+  const CHANNEL_ID = "D_PROD_DM_SELF_MENTION";
+  const THREAD_TS = "5551112223.000001";
+
+  test("resolves the bot's own mention and leaves another user's mention correct", async () => {
+    const assistant = createAssistant();
+    const userMessage = (assistant as unknown as { userMessage: AssistantUserMessageHandler[] })
+      .userMessage[0];
+
+    const client = {
+      auth: { test: async () => ({ user_id: BOT_USER_ID }) },
+      reactions: { add: async () => ({}) },
+      chat: { postMessage: async () => ({}) },
+      users: { info: async () => ({ user: undefined }) },
+    };
+
+    const message = {
+      channel: CHANNEL_ID,
+      ts: THREAD_TS,
+      thread_ts: THREAD_TS,
+      text: `<@${BOT_USER_ID}> can you loop in <@${OTHER_USER_ID}> on this?`,
+      user: "U_PROD_REQUESTER",
+    };
+
+    await userMessage({
+      message,
+      body: { event_id: "Ev_PROD_DM_SELF_MENTION_1" },
+      say: async () => {},
+      setStatus: async () => ({}),
+      setTitle: async () => ({}),
+      getThreadContext: async () => undefined,
+      client,
+    });
+
+    const task = await getMostRecentTaskInThread(CHANNEL_ID, THREAD_TS);
+    expect(task).toBeDefined();
+    expect(task!.task).toBe(
+      `<@${BOT_USER_ID}> (that's you) can you loop in <@${OTHER_USER_ID}> (unknown user) on this?`,
+    );
   });
 });
 
