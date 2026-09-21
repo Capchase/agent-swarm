@@ -29,6 +29,7 @@ process.env.SLACK_RENDER_V2 = "false";
 // ---------------------------------------------------------------------------
 
 let createAssistantFn: typeof import("../slack/assistant").createAssistant;
+let resetAssistantBotUserIdForTestingFn: typeof import("../slack/assistant").resetAssistantBotUserIdForTesting;
 let registerMessageHandlerFn: typeof import("../slack/handlers").registerMessageHandler;
 let resetSlackHandlerCachesForTestingFn: typeof import("../slack/handlers").resetSlackHandlerCachesForTesting;
 
@@ -98,7 +99,10 @@ beforeAll(async () => {
 
   installSpyImplementations();
 
-  ({ createAssistant: createAssistantFn } = await import("../slack/assistant"));
+  ({
+    createAssistant: createAssistantFn,
+    resetAssistantBotUserIdForTesting: resetAssistantBotUserIdForTestingFn,
+  } = await import("../slack/assistant"));
   ({
     registerMessageHandler: registerMessageHandlerFn,
     resetSlackHandlerCachesForTesting: resetSlackHandlerCachesForTestingFn,
@@ -117,6 +121,7 @@ beforeEach(() => {
   resolveSlackUserIdSpy.mockClear();
   enrichSlackUserEmailSpy.mockClear();
   wasEventSeenSpy.mockClear();
+  resetAssistantBotUserIdForTestingFn();
   installSpyImplementations();
 });
 
@@ -132,7 +137,7 @@ afterAll(() => {
 // Shared constants
 // ---------------------------------------------------------------------------
 
-const BOT_USER_ID = "U_BOT_PROD_TEST";
+const BOT_USER_ID = "U0ASK3PCZ4P";
 const DEVIN_USER_ID = "U0831BS93V1"; // the other agent from the original regression
 let slackDeliverySequence = 0;
 
@@ -168,6 +173,54 @@ describe("assistant.ts — userMessage production-path co-mention guard", () => 
 
   beforeAll(() => {
     userMessageHandler = (createAssistantFn() as any).userMessage[0] as typeof userMessageHandler;
+  });
+
+  test("keeps the current unknown-user rendering when the bot ID cache is unavailable", async () => {
+    await userMessageHandler({
+      message: {
+        channel: "D_ASSISTANT_PROD_TEST",
+        ts: "1000000001.000000",
+        text: `<@${BOT_USER_ID}> help me`,
+        user: "U_HUMAN_ASST_001",
+      },
+      body: { event_id: "evt_prod_asst_missing_bot_id_001" },
+      say: mock(async () => {}),
+      setStatus: mock(async () => {}),
+      setTitle: mock(async () => {}),
+      getThreadContext: mock(async () => ({})),
+      client: {
+        ...mockClient,
+        auth: { test: async () => Promise.reject(new Error("Slack auth unavailable")) },
+      },
+    });
+
+    expect(createTaskWithSiblingAwarenessSpy).toHaveBeenCalledTimes(1);
+    expect(createTaskWithSiblingAwarenessSpy.mock.calls[0]?.[0]).toContain(
+      `<@${BOT_USER_ID}> (unknown user)`,
+    );
+  });
+
+  test("renders the bot's own DM mention as that's you", async () => {
+    await userMessageHandler({
+      message: {
+        channel: "D_ASSISTANT_PROD_TEST",
+        ts: "1000000001.000004",
+        text: `<@${BOT_USER_ID}> help me`,
+        user: "U_HUMAN_ASST_001",
+      },
+      body: { event_id: "evt_prod_asst_self_mention_001" },
+      say: mock(async () => {}),
+      setStatus: mock(async () => {}),
+      setTitle: mock(async () => {}),
+      getThreadContext: mock(async () => ({})),
+      client: mockClient,
+    });
+
+    expect(createTaskWithSiblingAwarenessSpy).toHaveBeenCalledTimes(1);
+    expect(createTaskWithSiblingAwarenessSpy.mock.calls[0]?.[0]).toContain(
+      `<@${BOT_USER_ID}> (that's you)`,
+    );
+    expect(createTaskWithSiblingAwarenessSpy.mock.calls[0]?.[0]).not.toContain("(unknown user)");
   });
 
   test("does NOT spawn a task when message @-mentions another agent but not our bot", async () => {

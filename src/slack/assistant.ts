@@ -25,6 +25,10 @@ const isAdditiveSlack = () => isEnvFlagEnabled("ADDITIVE_SLACK", false);
 // a different agent (e.g. Devin) rather than our bot.
 let cachedBotUserId: string | null = null;
 
+export function resetAssistantBotUserIdForTesting(): void {
+  cachedBotUserId = null;
+}
+
 export function createAssistant(): Assistant {
   return new Assistant({
     threadStarted: async ({ say, setSuggestedPrompts, saveThreadContext }) => {
@@ -147,6 +151,7 @@ export function createAssistant(): Assistant {
         // raw `messageText`, not this rendered copy.
         const renderedMessageText = await rewriteSlackMentions(
           buildEffectiveText(messageText, inbound.files, inbound.failed),
+          cachedBotUserId ?? undefined,
         );
 
         if (workingAgent && workingAgent.status !== "offline") {
