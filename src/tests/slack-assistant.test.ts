@@ -9,6 +9,8 @@ import {
   getTaskById,
   initDb,
 } from "../be/db";
+import { rewriteSlackMentions } from "../slack/enrich";
+import { buildEffectiveText } from "../slack/inbound-files";
 
 process.env.SLACK_RENDER_V2 = "false";
 
@@ -118,6 +120,31 @@ describe("assistant userMessage routing — follow-up (working agent exists)", (
     expect(fetched).toBeDefined();
     expect(fetched!.slackChannelId).toBe("D_FOLLOWUP");
     expect(fetched!.slackThreadTs).toBe("9999999999.000001");
+  });
+});
+
+describe("assistant DM path self-mention rendering (Option 1 fix)", () => {
+  const BOT_USER_ID = "U0ASK3PCZ4P";
+
+  // Mirrors the exact call assistant.ts makes on the DM / Assistant path:
+  // rewriteSlackMentions(buildEffectiveText(...), cachedBotUserId ?? undefined).
+  test("bot's own mention renders '(that's you)' when the bot ID is cached", async () => {
+    const cachedBotUserId: string | null = BOT_USER_ID;
+    const rendered = await rewriteSlackMentions(
+      buildEffectiveText(`<@${BOT_USER_ID}> what's the status?`),
+      cachedBotUserId ?? undefined,
+    );
+    expect(rendered).toBe(`<@${BOT_USER_ID}> (that's you) what's the status?`);
+    expect(rendered).not.toContain("(unknown user)");
+  });
+
+  test("falls back to today's behavior — no crash — when auth.test() has not cached a bot ID", async () => {
+    const cachedBotUserId: string | null = null;
+    const rendered = await rewriteSlackMentions(
+      buildEffectiveText(`<@${BOT_USER_ID}> what's the status?`),
+      cachedBotUserId ?? undefined,
+    );
+    expect(rendered).toBe(`<@${BOT_USER_ID}> (unknown user) what's the status?`);
   });
 });
 

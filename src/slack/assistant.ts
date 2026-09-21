@@ -147,6 +147,7 @@ export function createAssistant(): Assistant {
         // raw `messageText`, not this rendered copy.
         const renderedMessageText = await rewriteSlackMentions(
           buildEffectiveText(messageText, inbound.files, inbound.failed),
+          cachedBotUserId ?? undefined,
         );
 
         if (workingAgent && workingAgent.status !== "offline") {
