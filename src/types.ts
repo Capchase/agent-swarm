@@ -136,16 +136,22 @@ export const DEFAULT_MODEL_TIER_MAP: Record<ProviderName, Record<ModelTier, stri
     ultra: "gpt-5.6-sol",
   },
   pi: {
-    smol: "openrouter/deepseek/deepseek-v4-flash",
-    regular: "openrouter/deepseek/deepseek-v4-flash",
-    smart: "openrouter/deepseek/deepseek-v4-pro",
-    ultra: "openrouter/anthropic/claude-opus-4.8",
+    smol: "openrouter/deepseek/deepseek-v4.1-flash",
+    regular: "openrouter/deepseek/deepseek-v4.1-flash",
+    smart: "openrouter/deepseek/deepseek-v4-pro-0813",
+    ultra: "openrouter/anthropic/claude-opus-5.5",
   },
   opencode: {
-    smol: "openrouter/deepseek/deepseek-v4-flash",
-    regular: "openrouter/deepseek/deepseek-v4-flash",
-    smart: "openrouter/deepseek/deepseek-v4-pro",
-    ultra: "openrouter/anthropic/claude-opus-4.8",
+    smol: "openrouter/deepseek/deepseek-v4.1-flash",
+    regular: "openrouter/deepseek/deepseek-v4.1-flash",
+    smart: "openrouter/deepseek/deepseek-v4-pro-0813",
+    ultra: "openrouter/anthropic/claude-opus-5.5",
+  },
+  dsh: {
+    smol: "openrouter/deepseek/deepseek-v4.1-flash",
+    regular: "openrouter/deepseek/deepseek-v4.1-flash",
+    smart: "openrouter/deepseek/deepseek-v4-pro-0813",
+    ultra: "openrouter/anthropic/claude-opus-5.5",
   },
   devin: {
     smol: "devin",
@@ -367,6 +373,7 @@ export const ProviderNameSchema = z.enum([
   "claude-managed",
   "opencode",
   "acp",
+  "dsh",
 ]);
 export type ProviderName = z.infer<typeof ProviderNameSchema>;
 
@@ -455,6 +462,7 @@ export const PROVIDER_STEER_CAPABILITIES: Record<ProviderName, SteerMode[]> = {
   // single in-flight turn and the only interrupt is `session/cancel` (abort).
   // Advertise nothing rather than promise semantics we can't honor.
   acp: [],
+  dsh: [],
 };
 
 export type DevinProviderMeta = {
@@ -474,6 +482,7 @@ export type ProviderMetaMap = {
   "claude-managed": NoProviderMeta;
   opencode: NoProviderMeta;
   acp: NoProviderMeta;
+  dsh: NoProviderMeta;
 };
 
 export const FollowUpConfigSchema = z

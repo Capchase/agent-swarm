@@ -91,6 +91,10 @@ if [ "$HARNESS_PROVIDER" = "pi" ]; then
             fi
             ;;
     esac
+elif [ "$HARNESS_PROVIDER" = "dsh" ]; then
+    if [ -z "$DEEPSEEK_API_KEY" ] && [ -z "$OPENROUTER_API_KEY" ]; then
+        echo "Warning: dsh provider has no credentials yet (DEEPSEEK_API_KEY / OPENROUTER_API_KEY). Worker will park in credential-wait until creds appear in swarm_config."
+    fi
 elif [ "$HARNESS_PROVIDER" = "opencode" ]; then
     # opencode auth: OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or auth.json must exist
     OPENCODE_AUTH_FILE="${HOME}/.local/share/opencode/auth.json"
@@ -317,6 +321,13 @@ elif [ "$HARNESS_PROVIDER" = "opencode" ]; then
         exit 1
     fi
     echo "opencode CLI: $(command -v "$OPENCODE_BIN")"
+elif [ "$HARNESS_PROVIDER" = "dsh" ]; then
+    DSH_BIN="${DSH_BINARY:-dsh}"
+    if ! command -v "$DSH_BIN" >/dev/null 2>&1; then
+        echo "FATAL: dsh CLI not found: '$DSH_BIN'. Use worker-full or install @deepseek-ai/dsh@0.1.7-alpha.2 during image provisioning."
+        exit 1
+    fi
+    echo "dsh CLI: $(command -v "$DSH_BIN")"
 elif [ "$HARNESS_PROVIDER" != "pi" ]; then
     CLAUDE_BIN="${CLAUDE_BINARY:-claude}"
     # CLAUDE_BINARY may be a whitespace-separated command string. Only

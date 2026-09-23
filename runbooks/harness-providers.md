@@ -14,6 +14,47 @@ Operational rules for editing or adding harness providers (claude, codex, openco
 | Claude Managed | `claude-managed` | `ClaudeManagedAdapter` | Anthropic managed sandbox; SSE relay |
 | ACP | `acp` | `ACPAdapter` | Curated `opencode` preset or a custom [Agent Client Protocol](https://agentclientprotocol.com) command. Session knobs such as model use `session/set_config_option` when advertised, with target-specific startup fallbacks. No swarm-side *model-provider* credential — the target owns its own model auth. The target receives the worker's swarm API key as the swarm MCP bearer, so point custom targets only at binaries you trust |
 
+## DeepSeek Harness (`dsh`)
+
+Set `HARNESS_PROVIDER=dsh` and `OPENROUTER_API_KEY` in the worker environment or
+agent-scoped config. This runs DeepSeek's own harness with the same defaults as
+pi: smol/regular `openrouter/deepseek/deepseek-v4.1-flash`, smart
+`openrouter/deepseek/deepseek-v4-pro-0813`, ultra `openrouter/anthropic/claude-opus-5.5`.
+
+Routing follows the model prefix, even when both keys are available:
+`MODEL_OVERRIDE=openrouter/<model-id>` uses the bundled `llm-pi-ai` adapter with
+`OPENROUTER_API_KEY`, strips only `openrouter/`, and honors `OPENROUTER_BASE_URL`
+(default `https://openrouter.ai/api/v1`). The selected model is explicitly declared
+so newly released IDs do not depend on the bundled catalog. For direct DeepSeek,
+set `DEEPSEEK_API_KEY` and a bare `MODEL_OVERRIDE` such as `deepseek-v4-pro`;
+this retains the native `llm-deepseek` route. The native Flash ID is
+`deepseek-flash` (V4.1 Flash); OpenRouter uses `deepseek/deepseek-v4.1-flash`.
+There is no fallback across providers when the selected route's key is missing.
+
+The full worker image installs `@deepseek-ai/dsh@0.1.7-alpha.2` at build time
+in `worker-full-base`, alongside the optional tools in `/opt/global-deps-full`.
+The slim image does not include dsh: use `worker-full` or provision the pinned
+package in your custom image before starting a dsh worker. Both the entrypoint
+and adapter fail when the executable is absent; startup never downloads npm
+packages. `DSH_BINARY` selects a trusted preinstalled executable, otherwise the
+adapter finds `dsh` on PATH. Use the pinned alpha for its required stdin/JSON
+surface.
+
+The adapter launches `--profile headless --patch <temporary-file> --json -`,
+sends the task over stdin, sets the child working directory, and applies the
+model and system prompt through the profile patch. Patch files are private and
+removed after exit or cancellation. Credential readiness accepts either environment
+key; session startup requires the key matching the selected model. Readiness
+does not inspect dsh's managed credential store or verify inference.
+
+This minimal integration has local tools and final output, but no swarm MCP
+connection, live steering, native resume, or cost/context telemetry. The runner
+handles task completion from the returned output. Configure it as a worker;
+lead orchestration needs MCP. Developer-preview compatibility can change.
+
+Verified against the [upstream headless documentation](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.1.7-alpha.2/packages/bundle/headless/README.md)
+and the installed CLI's top-level and headless help.
+
 ## Claude transport selection
 
 `CLAUDE_TRANSPORT=cli|sdk` selects execution inside `ClaudeAdapter`. CLI remains the default.
