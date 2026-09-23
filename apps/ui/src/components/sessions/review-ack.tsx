@@ -19,12 +19,11 @@ import { useSearchParams } from "react-router-dom";
 import { useAgent } from "@/api/hooks/use-agents";
 import type { AgentTask } from "@/api/types";
 import { AgentAvatar } from "@/components/shared/agent-avatar";
+import { TERMINAL_STATUSES } from "@/lib/task-activity";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import { ChainOfThought } from "./chain-of-thought";
 import { TaskOutcome } from "./task-card";
 import { TaskDetailSheet } from "./task-detail-sheet";
-
-const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "superseded"]);
 
 export function ReviewAck({ reviews, className }: { reviews: AgentTask[]; className?: string }) {
   // Most recent review carries the "final" prose — that's the entry point.
