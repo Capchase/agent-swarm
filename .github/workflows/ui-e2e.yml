@@ -100,7 +100,7 @@ jobs:
 
   report:
     needs: test
-    if: needs.test.result != 'skipped'
+    if: always() && needs.test.result != 'skipped'
     runs-on: ubuntu-latest
     permissions:
       contents: read
