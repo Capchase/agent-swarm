@@ -391,6 +391,10 @@
             "type": "boolean",
             "default": false
           },
+          "deferredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
           "compactionCount": {
             "type": "integer",
             "minimum": 0
@@ -26692,6 +26696,14 @@
                     "parentTaskId": {
                       "type": "string"
                     },
+                    "requestedDelayMs": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0
+                    },
+                    "requestedRunAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
                     "timezone": {
                       "type": "string",
                       "default": "UTC"
@@ -27049,6 +27061,14 @@
                               "parentTaskId": {
                                 "type": "string"
                               },
+                              "requestedDelayMs": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0
+                              },
+                              "requestedRunAt": {
+                                "type": "string",
+                                "format": "date-time"
+                              },
                               "timezone": {
                                 "type": "string",
                                 "default": "UTC"
@@ -27232,6 +27252,14 @@
                               },
                               "parentTaskId": {
                                 "type": "string"
+                              },
+                              "requestedDelayMs": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0
+                              },
+                              "requestedRunAt": {
+                                "type": "string",
+                                "format": "date-time"
                               },
                               "timezone": {
                                 "type": "string",
@@ -27459,6 +27487,14 @@
                         },
                         "parentTaskId": {
                           "type": "string"
+                        },
+                        "requestedDelayMs": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0
+                        },
+                        "requestedRunAt": {
+                          "type": "string",
+                          "format": "date-time"
                         },
                         "timezone": {
                           "type": "string",
@@ -27701,6 +27737,14 @@
                     },
                     "parentTaskId": {
                       "type": "string"
+                    },
+                    "requestedDelayMs": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0
+                    },
+                    "requestedRunAt": {
+                      "type": "string",
+                      "format": "date-time"
                     },
                     "timezone": {
                       "type": "string",
@@ -28063,6 +28107,14 @@
                     },
                     "parentTaskId": {
                       "type": "string"
+                    },
+                    "requestedDelayMs": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0
+                    },
+                    "requestedRunAt": {
+                      "type": "string",
+                      "format": "date-time"
                     },
                     "timezone": {
                       "type": "string",
@@ -28446,6 +28498,14 @@
                     },
                     "parentTaskId": {
                       "type": "string"
+                    },
+                    "requestedDelayMs": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0
+                    },
+                    "requestedRunAt": {
+                      "type": "string",
+                      "format": "date-time"
                     },
                     "timezone": {
                       "type": "string",
@@ -40142,6 +40202,14 @@
                           },
                           "parentTaskId": {
                             "type": "string"
+                          },
+                          "requestedDelayMs": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0
+                          },
+                          "requestedRunAt": {
+                            "type": "string",
+                            "format": "date-time"
                           },
                           "timezone": {
                             "type": "string",
