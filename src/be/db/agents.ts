@@ -206,8 +206,79 @@ export async function getAgentById(id: string): Promise<Agent | null> {
   return row ? rowToAgent(row) : null;
 }
 
-export async function getAllAgents(opts?: { slim?: boolean }): Promise<Agent[]> {
-  const rows = await getDbClient().query<AgentRow>("SELECT * FROM agents ORDER BY name");
+/**
+ * Role stamped on the `ext:<name>` agent row an extension authenticates as
+ * (`src/extensions/identity.ts`). These rows are API identities, not workers:
+ * they are hidden from agent listings and can never be assigned, offered, or
+ * claim tasks. The rows themselves are kept so the extension can keep calling
+ * the API and re-enabling it finds the same identity.
+ */
+export const EXTENSION_AGENT_ROLE = "extension";
+
+/** SQL predicate that drops extension-identity rows from an `agents` scan. */
+export const NOT_EXTENSION_AGENT_SQL = `COALESCE(role, '') != '${EXTENSION_AGENT_ROLE}'`;
+
+export function isExtensionAgent(agent: Pick<Agent, "role"> | null | undefined): boolean {
+  return agent?.role === EXTENSION_AGENT_ROLE;
+}
+
+export function extensionAgentAssignmentError(agent: Pick<Agent, "id" | "name">): string {
+  return `Agent "${agent.name}" (${agent.id}) is an extension identity and cannot be assigned, offered, or scheduled tasks. Target a worker or lead agent instead.`;
+}
+
+/**
+ * Thrown when an ordinary registration or profile update tries to grant the
+ * reserved extension role, or to strip it from an extension identity. Only
+ * `ensureExtensionAgent` may set it.
+ */
+export class ReservedAgentRoleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReservedAgentRoleError";
+  }
+}
+
+/**
+ * Returns the reason a role change is refused, or null when it is allowed.
+ * `allowExtensionRole` is passed only by the extension identity lifecycle.
+ */
+export function reservedRoleViolation(
+  currentRole: string | null | undefined,
+  nextRole: string | undefined,
+  opts?: { allowExtensionRole?: boolean },
+): string | null {
+  if (nextRole === undefined || nextRole === currentRole) return null;
+  if (currentRole === EXTENSION_AGENT_ROLE) {
+    return `Extension identities keep the "${EXTENSION_AGENT_ROLE}" role; it cannot be changed.`;
+  }
+  if (nextRole === EXTENSION_AGENT_ROLE && !opts?.allowExtensionRole) {
+    return `Role "${EXTENSION_AGENT_ROLE}" is reserved for extension identities.`;
+  }
+  return null;
+}
+
+/** Thrown by task creation when the assignee or offer target is an extension identity. */
+export class ExtensionAgentAssignmentError extends Error {
+  constructor(agent: Pick<Agent, "id" | "name">) {
+    super(extensionAgentAssignmentError(agent));
+    this.name = "ExtensionAgentAssignmentError";
+  }
+}
+
+/**
+ * Lists agents ordered by name. Extension identities are excluded unless
+ * `includeExtensions` is set; only the extension identity lifecycle and
+ * name-collision checks need them.
+ */
+export async function getAllAgents(opts?: {
+  slim?: boolean;
+  includeExtensions?: boolean;
+}): Promise<Agent[]> {
+  const rows = await getDbClient().query<AgentRow>(
+    opts?.includeExtensions
+      ? "SELECT * FROM agents ORDER BY name"
+      : `SELECT * FROM agents WHERE ${NOT_EXTENSION_AGENT_SQL} ORDER BY name`,
+  );
   return rows.map((row) => rowToAgent(row, opts?.slim ?? false));
 }
 
@@ -529,6 +600,8 @@ export function isAgentEligibleForTask(
   agent: Pick<Agent, "id" | "isLead" | "role" | "capabilities">,
   task: Pick<AgentTask, "routingAffinity" | "routingAffinityInvalid">,
 ): boolean {
+  // Extension identities are API principals, never task executors.
+  if (isExtensionAgent(agent)) return false;
   const affinity = task.routingAffinity;
   // A malformed persisted blob is a security boundary failure, not an
   // untagged task. Quarantine it from every assignment/claim path.

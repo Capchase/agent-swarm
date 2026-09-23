@@ -5,6 +5,7 @@ import {
   computeContentHash,
   createAgent,
   deleteSwarmConfigByKey,
+  EXTENSION_AGENT_ROLE,
   getAgentById,
   getAgentWithTasks,
   getAllAgents,
@@ -12,6 +13,7 @@ import {
   getDbClient,
   getResolvedConfig,
   getSwarmConfigs,
+  ReservedAgentRoleError,
   resetEmptyPollCount,
   setAgentHarnessProvider,
   updateAgentActivity,
@@ -339,7 +341,7 @@ const listAgents = route({
   pattern: ["api", "agents"],
   summary: "List all agents",
   description:
-    "Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`.",
+    "Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`. Extension identities (`ext:<name>`, role `extension`) are never listed; they are API principals, not workers.",
   tags: ["Agents"],
   query: z.object({
     include: z.enum(["tasks"]).optional(),
@@ -577,6 +579,12 @@ export async function handleAgentRegister(
   if (registerAgent.match(req.method, pathSegments)) {
     const parsed = await registerAgent.parse(req, res, pathSegments, new URLSearchParams());
     if (!parsed) return true;
+
+    // Extension identities are created only by the extension lifecycle.
+    if (parsed.body.role === EXTENSION_AGENT_ROLE) {
+      jsonError(res, `Role "${EXTENSION_AGENT_ROLE}" is reserved for extension identities.`, 400);
+      return true;
+    }
 
     const agentId = myAgentId || crypto.randomUUID();
     // Read once so one mode applies consistently even if a config reload
@@ -877,7 +885,7 @@ export async function handleAgentsRest(
         },
       );
     } catch (error) {
-      if (error instanceof HeartbeatExpiryError) {
+      if (error instanceof HeartbeatExpiryError || error instanceof ReservedAgentRoleError) {
         jsonError(res, error.message, 400);
         return true;
       }

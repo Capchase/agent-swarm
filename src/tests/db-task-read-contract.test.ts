@@ -94,8 +94,12 @@ type:UpsertAssetKeyMappingInput
 type:WorkflowFilters
 type:WorkflowRunListOptions
 type:WorkflowRunPage
+value:EXTENSION_AGENT_ROLE
+value:ExtensionAgentAssignmentError
 value:KvTypeCollisionError
 value:MAX_EMPTY_POLLS
+value:NOT_EXTENSION_AGENT_SQL
+value:ReservedAgentRoleError
 value:SKILL_FILE_LIMITS
 value:UNATTRIBUTED_USER_ID
 value:__resetSqliteVecExtensionPathCacheForTests
@@ -195,6 +199,7 @@ value:emitBuiltInIntegrationConnectedOnce
 value:emitMcpServerConnectedTelemetry
 value:ensureSlackDelegationActivation
 value:ensureSlackRenderV2Activation
+value:extensionAgentAssignmentError
 value:failPendingResumeIfUnclaimed
 value:failTask
 value:findCompletedTaskInThread
@@ -418,6 +423,7 @@ value:installMcpServer
 value:installSkill
 value:installSystemDefaultSkillsForAgent
 value:isAgentEligibleForTask
+value:isExtensionAgent
 value:isPendingSlackMessage
 value:isPoolAffinityEnforcementEnabled
 value:isSqliteVecAvailable
@@ -485,6 +491,7 @@ value:releaseStaleReviewingTasks
 value:releaseTask
 value:replaceTaskAttachment
 value:reserveSlackMessage
+value:reservedRoleViolation
 value:resetEmptyPollCount
 value:resetOrphanedInProgressTasksForAgent
 value:resetPromptTemplateToDefault
