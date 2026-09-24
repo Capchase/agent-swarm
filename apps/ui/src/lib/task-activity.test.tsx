@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { allTasksTerminal, TERMINAL_STATUSES, taskIsRunning } from "./task-activity";
+import {
+  allTasksTerminal,
+  SESSION_ACTIVE_POLL_MS,
+  SESSION_SETTLED_POLL_MS,
+  sessionRefetchInterval,
+  TERMINAL_STATUSES,
+  taskIsRunning,
+} from "./task-activity";
 
 describe("TERMINAL_STATUSES", () => {
   // ReviewAck (review-ack.tsx) and useSession's poll gate (use-sessions.ts)
@@ -44,5 +51,27 @@ describe("allTasksTerminal", () => {
     expect(
       allTasksTerminal([{ status: "completed" }, { status: "completed" }, { status: "failed" }]),
     ).toBe(true);
+  });
+});
+
+describe("sessionRefetchInterval", () => {
+  test("polls fast before the first response", () => {
+    expect(sessionRefetchInterval(undefined)).toBe(SESSION_ACTIVE_POLL_MS);
+  });
+
+  test("polls fast while any task in the chain is active", () => {
+    expect(
+      sessionRefetchInterval({ root: { status: "completed" }, chain: [{ status: "in_progress" }] }),
+    ).toBe(SESSION_ACTIVE_POLL_MS);
+  });
+
+  test("keeps polling at the settled cadence once every task is terminal, never stops", () => {
+    // Tasks can join a settled chain (defer wake-ups, the Lead follow-up), so this must not be `false`.
+    const interval = sessionRefetchInterval({
+      root: { status: "completed" },
+      chain: [{ status: "completed" }],
+    });
+    expect(interval).toBe(SESSION_SETTLED_POLL_MS);
+    expect(typeof interval).toBe("number");
   });
 });

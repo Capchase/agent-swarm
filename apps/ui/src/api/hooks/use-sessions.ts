@@ -13,13 +13,8 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { allTasksTerminal } from "@/lib/task-activity";
+import { sessionRefetchInterval } from "@/lib/task-activity";
 import { api } from "../client";
-
-/** Poll cadence while any task in the session's chain is still active. Matches
- *  `ChainOfThought`'s own interval so the outer status chrome and the inline
- *  activity feed stay visually in sync. */
-const SESSION_POLL_MS = 4000;
 
 export interface UseSessionsOptions {
   limit?: number;
@@ -53,16 +48,9 @@ export function useSession(rootTaskId: string | undefined) {
     queryKey: ["session", rootTaskId],
     queryFn: () => api.getSession(rootTaskId!),
     enabled: !!rootTaskId,
-    // Without this, the chain is fetched once on mount: a delegated worker's
-    // status pill freezes at whatever it was on load, and a system follow-up
-    // created after that (the Lead's answer once the worker completes) never
-    // shows up without a manual reload. Poll until every task is terminal,
-    // then stop — no perpetual polling on old, finished sessions.
-    refetchInterval: (query) => {
-      const data = query.state.data;
-      if (!data) return SESSION_POLL_MS;
-      return allTasksTerminal([data.root, ...data.chain]) ? false : SESSION_POLL_MS;
-    },
+    // Replaces the app-wide 10s default: 4s while any task is active so live
+    // progress keeps up, back to 10s once the chain settles (never stops).
+    refetchInterval: (query) => sessionRefetchInterval(query.state.data),
   });
 }
 

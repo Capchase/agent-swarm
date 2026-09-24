@@ -21,9 +21,9 @@ mock.module("./chain-of-thought", () => ({
     <div data-testid="chain-of-thought">{`live:${taskId}:${status}`}</div>
   ),
 }));
-mock.module("./task-card", () => ({
+mock.module("./task-outcome", () => ({
   TaskOutcome: ({ task }: { task: AgentTask }) => (
-    <div data-testid="task-outcome">{task.output ?? ""}</div>
+    <div data-testid="task-outcome">{task.output ?? task.failureReason ?? ""}</div>
   ),
 }));
 mock.module("./task-detail-sheet", () => ({
@@ -94,5 +94,41 @@ describe("ReviewAck", () => {
     expect(html).toContain("is reviewing");
     expect(html).toContain("live:review-b:in_progress");
     expect(html).not.toContain("first pass");
+  });
+
+  test("a failed follow-up says the review failed, not 'Reviewed by'", () => {
+    const html = render([review({ status: "failed", failureReason: "Lead crashed" })]);
+
+    expect(html).toContain("failed");
+    expect(html).not.toContain("Reviewed by");
+    expect(html).toContain("Lead crashed");
+  });
+
+  test("cancelled and superseded follow-ups get their own copy", () => {
+    expect(render([review({ status: "cancelled" })])).toContain("cancelled");
+    const superseded = render([review({ status: "superseded" })]);
+    expect(superseded).toContain("superseded");
+    expect(superseded).not.toContain("Reviewed by");
+  });
+
+  test("pending and paused follow-ups don't claim someone is reviewing", () => {
+    const pending = render([review({ status: "pending" })]);
+    expect(pending).toContain("queued");
+    expect(pending).not.toContain("is reviewing");
+    expect(pending).toContain("live:task-review-1:pending");
+
+    const paused = render([review({ status: "paused" })]);
+    expect(paused).toContain("paused");
+    expect(paused).not.toContain("is reviewing");
+  });
+
+  test("long outcomes clamp behind a Show more toggle; short ones don't", () => {
+    const long = render([review({ status: "completed", output: "x".repeat(500) })]);
+    expect(long).toContain("max-h-24");
+    expect(long).toContain("Show more");
+
+    const short = render([review({ status: "completed", output: "short answer" })]);
+    expect(short).not.toContain("max-h-24");
+    expect(short).not.toContain("Show more");
   });
 });

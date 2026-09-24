@@ -13,8 +13,8 @@
  * happening.
  */
 
-import { Check } from "lucide-react";
-import { useCallback } from "react";
+import { Ban, Check, SkipForward, X } from "lucide-react";
+import { type ReactNode, useCallback, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useAgent } from "@/api/hooks/use-agents";
 import type { AgentTask } from "@/api/types";
@@ -22,13 +22,26 @@ import { AgentAvatar } from "@/components/shared/agent-avatar";
 import { TERMINAL_STATUSES } from "@/lib/task-activity";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import { ChainOfThought } from "./chain-of-thought";
-import { TaskOutcome } from "./task-card";
 import { TaskDetailSheet } from "./task-detail-sheet";
+import { TaskOutcome } from "./task-outcome";
+
+/** Same "is long" heuristic as `TaskBrief` in `task-card.tsx`. */
+function isLongText(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.length > 240 || text.split("\n").length > 3;
+}
+
+function Name({ children }: { children: ReactNode }) {
+  return <span className="font-medium text-foreground/80">{children}</span>;
+}
 
 export function ReviewAck({ reviews, className }: { reviews: AgentTask[]; className?: string }) {
   // Most recent review carries the "final" prose — that's the entry point.
   const lastReview = reviews[reviews.length - 1];
-  const isActive = !TERMINAL_STATUSES.has(lastReview.status);
+  const status = lastReview.status;
+  const isActive = !TERMINAL_STATUSES.has(status);
+  const isRunning = status === "in_progress";
+  const [expanded, setExpanded] = useState(false);
   // Sheet open-state lives in the URL (`?task=<id>`) for shareable links —
   // mirrors TaskCard so a session URL pinning a review is reproducible.
   const [searchParams, setSearchParams] = useSearchParams();
@@ -51,6 +64,69 @@ export function ReviewAck({ reviews, className }: { reviews: AgentTask[]; classN
   const reviewerName =
     agent?.name ?? (lastReview.agentId ? `${lastReview.agentId.slice(0, 8)}…` : "agent");
   const finishedAt = lastReview.lastUpdatedAt ?? lastReview.createdAt;
+  const outcomeText = status === "completed" ? lastReview.output : lastReview.failureReason;
+  const clampable = !isActive && isLongText(outcomeText);
+  const suffix = (
+    <>
+      {reviews.length > 1 ? <span> · {reviews.length} reviews</span> : null}
+      <span className="text-muted-foreground/60"> · {formatRelativeTime(finishedAt)}</span>
+    </>
+  );
+  const iconClass = "h-3 w-3 shrink-0 inline -mt-0.5 mr-1";
+
+  let label: ReactNode;
+  if (status === "in_progress") {
+    label = (
+      <>
+        <Name>{reviewerName}</Name> is reviewing…
+      </>
+    );
+  } else if (status === "paused") {
+    label = (
+      <>
+        Review by <Name>{reviewerName}</Name> paused
+      </>
+    );
+  } else if (isActive) {
+    // pending / offered / unassigned / backlog / draft / reviewing: nobody is working on it yet.
+    label = lastReview.agentId ? (
+      <>
+        Review by <Name>{reviewerName}</Name> queued
+      </>
+    ) : (
+      "Review queued"
+    );
+  } else if (status === "failed") {
+    label = (
+      <>
+        <X className={cn(iconClass, "text-status-error-strong")} aria-hidden="true" />
+        Review by <Name>{reviewerName}</Name> failed{suffix}
+      </>
+    );
+  } else if (status === "cancelled") {
+    label = (
+      <>
+        <Ban className={iconClass} aria-hidden="true" />
+        Review by <Name>{reviewerName}</Name> cancelled{suffix}
+      </>
+    );
+  } else if (status === "superseded") {
+    label = (
+      <>
+        <SkipForward className={iconClass} aria-hidden="true" />
+        Review by <Name>{reviewerName}</Name> superseded{suffix}
+      </>
+    );
+  } else {
+    label = (
+      <>
+        <Check className={iconClass} aria-hidden="true" />
+        Reviewed by <Name>{reviewerName}</Name>
+        {suffix}
+      </>
+    );
+  }
+
   return (
     <div className={cn("flex flex-col gap-1 min-w-0", className)}>
       <button
@@ -67,31 +143,34 @@ export function ReviewAck({ reviews, className }: { reviews: AgentTask[]; classN
           agentId={lastReview.agentId}
           agentName={agent?.name}
           size="xs"
-          className={cn(isActive && "ring-2 ring-primary/40 animate-pulse")}
+          className={cn(isRunning && "ring-2 ring-primary/40 animate-pulse")}
         />
-        {isActive ? (
-          <span>
-            <span className="text-foreground/80 font-medium">{reviewerName}</span> is reviewing…
-          </span>
-        ) : (
-          <span>
-            <Check className="h-3 w-3 shrink-0 inline -mt-0.5 mr-1" aria-hidden="true" />
-            Reviewed by <span className="font-medium text-foreground/80">{reviewerName}</span>
-            {reviews.length > 1 ? <span> · {reviews.length} reviews</span> : null}
-            <span className="text-muted-foreground/60"> · {formatRelativeTime(finishedAt)}</span>
-          </span>
-        )}
+        <span>{label}</span>
       </button>
-      {/* While the review is still running, show its live progress line —
-          otherwise the hidden row reads as "nothing is happening" even
-          though this is exactly where the real answer is being composed.
-          Once it lands, render the outcome inline so the answer shows up
-          the moment the next poll picks it up — no click required. */}
+      {/* Live progress while the review is active, the outcome inline once it
+          lands. Long outcomes clamp so relays don't take over the timeline. */}
       <div className="pl-6 min-w-0">
         {isActive ? (
-          <ChainOfThought taskId={lastReview.id} status={lastReview.status} />
+          <ChainOfThought taskId={lastReview.id} status={status} />
         ) : (
-          <TaskOutcome task={lastReview} />
+          <>
+            <div
+              data-slot="review-outcome"
+              className={cn(clampable && !expanded && "max-h-24 overflow-hidden")}
+            >
+              <TaskOutcome task={lastReview} />
+            </div>
+            {clampable ? (
+              <button
+                type="button"
+                onClick={() => setExpanded((v) => !v)}
+                className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground/70 hover:text-foreground transition-colors mt-1"
+                aria-expanded={expanded}
+              >
+                {expanded ? "Show less" : "Show more"}
+              </button>
+            ) : null}
+          </>
         )}
       </div>
       <TaskDetailSheet
