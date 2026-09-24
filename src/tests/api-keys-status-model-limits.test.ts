@@ -73,6 +73,31 @@ describe("computeModelLimits", () => {
     );
     expect(limits.map((l) => l.model).sort()).toEqual(["fable", "opus"]);
   });
+
+  test("a reported negative out-of-Date-range resetsAt never reaches computeModelLimits unsanitized (GET /api/keys/status stays 200)", () => {
+    const nowMs = Date.now();
+    const reported = {
+      seven_day_overage_included: {
+        status: "rejected",
+        resetsAt: -1e20,
+        lastSeenAt: new Date().toISOString(),
+      },
+    };
+    const stored = sanitizeReportedWindowResets(reported);
+    expect(() => computeModelLimits(stored, nowMs)).not.toThrow();
+    const limits = computeModelLimits(stored, nowMs);
+    expect(limits).toHaveLength(1);
+    expect(() => new Date(limits[0]!.resetsAtIso)).not.toThrow();
+  });
+
+  test("a reported positive out-of-Date-range resetsAt never reaches computeModelLimits unsanitized", () => {
+    const nowMs = Date.now();
+    const reported = {
+      seven_day_opus: { status: "rejected", resetsAt: 1e20, lastSeenAt: new Date().toISOString() },
+    };
+    const stored = sanitizeReportedWindowResets(reported);
+    expect(() => computeModelLimits(stored, nowMs)).not.toThrow();
+  });
 });
 
 describe("rateLimitWindowSchema — malformed resetsAt at the report boundary", () => {
@@ -146,5 +171,36 @@ describe("sanitizeReportedWindowResets", () => {
       },
     };
     expect(sanitizeReportedWindowResets(windows).seven_day_sonnet?.resetsAt).toBe(soonSec);
+  });
+
+  test("clamps a finite negative out-of-Date-range resetsAt so rendering it never throws", () => {
+    const windows = {
+      seven_day_overage_included: {
+        status: "rejected",
+        resetsAt: -1e20,
+        lastSeenAt: new Date().toISOString(),
+      },
+    };
+    const sanitized = sanitizeReportedWindowResets(windows);
+    const resetsAt = sanitized.seven_day_overage_included?.resetsAt;
+    expect(resetsAt).toBeDefined();
+    expect(() => new Date(resetsAt! * 1000).toISOString()).not.toThrow();
+    expect(resetsAt).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000));
+  });
+
+  test("clamps a representable but implausibly far-past resetsAt to now", () => {
+    const farPastSec = Math.floor(new Date("1000-01-01T00:00:00Z").getTime() / 1000);
+    const windows = {
+      seven_day_opus: {
+        status: "rejected",
+        resetsAt: farPastSec,
+        lastSeenAt: new Date().toISOString(),
+      },
+    };
+    const sanitized = sanitizeReportedWindowResets(windows);
+    expect(sanitized.seven_day_opus?.resetsAt).toBeGreaterThan(farPastSec);
+    expect(sanitized.seven_day_opus?.resetsAt).toBeGreaterThanOrEqual(
+      Math.floor(Date.now() / 1000),
+    );
   });
 });

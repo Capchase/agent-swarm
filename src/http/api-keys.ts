@@ -79,24 +79,29 @@ export const rateLimitWindowSchema = z.object({
 });
 
 /**
- * Clamps a reported window's `resetsAt` (seconds) to the same 7-day ceiling
- * used for the key-wide cooldown (`MAX_RATE_LIMIT_RESET_MS`). Guards two
- * failure modes: a finite-but-out-of-Date-range value (e.g. 1e20) that would
- * otherwise throw when rendered via `new Date(resetsAt * 1000).toISOString()`,
- * and a representable but implausibly far-future value that would otherwise
- * keep a key blocked indefinitely. NaN/Infinity are already rejected upstream
- * by the route's `.finite()` schema.
+ * Clamps a reported window's `resetsAt` (seconds) to `[now, now+7d]`, the
+ * same 7-day ceiling used for the key-wide cooldown (`MAX_RATE_LIMIT_RESET_MS`).
+ * Guards two failure modes at the report boundary, in either direction: a
+ * finite-but-out-of-Date-range value (e.g. 1e20 or -1e20) that would
+ * otherwise throw when rendered via `new Date(resetsAt * 1000).toISOString()`
+ * downstream in `computeModelLimits`, and a representable but implausible
+ * value (far-future, or negative/past — a freshly reported window can't
+ * reset in the past) that would otherwise read as bogus. NaN/Infinity are
+ * already rejected upstream by the route's `.finite()` schema. Applied
+ * before storage, so `computeModelLimits` never sees an out-of-range value
+ * from data reported through this endpoint.
  */
 export function sanitizeReportedWindowResets(
   windows: RateLimitWindowTelemetry,
 ): RateLimitWindowTelemetry {
+  const nowSec = Math.floor(Date.now() / 1000);
   const maxResetsAtSec = Math.floor((Date.now() + MAX_RATE_LIMIT_RESET_MS) / 1000);
   const sanitized: RateLimitWindowTelemetry = {};
   for (const [key, window] of Object.entries(windows)) {
     sanitized[key] =
       window.resetsAt === undefined
         ? window
-        : { ...window, resetsAt: Math.min(window.resetsAt, maxResetsAtSec) };
+        : { ...window, resetsAt: Math.min(Math.max(window.resetsAt, nowSec), maxResetsAtSec) };
   }
   return sanitized;
 }

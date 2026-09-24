@@ -1926,7 +1926,7 @@ export async function reportKeyRateLimitWindows(
   });
   if (!response.ok) {
     throw new Error(
-      `Failed to report rate-limit windows for key ...${keySuffix}: HTTP ${response.status}`,
+      `Failed to report rate-limit windows for key #${keyIndex}: HTTP ${response.status}`,
     );
   }
   if (logKeySuffix) {

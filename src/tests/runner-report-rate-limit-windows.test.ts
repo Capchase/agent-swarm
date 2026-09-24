@@ -45,6 +45,34 @@ describe("reportKeyRateLimitWindows — response-failure path", () => {
     ).rejects.toThrow(/HTTP 400/);
   });
 
+  test("failure-path error message never includes the key suffix", async () => {
+    mockFetch(500, false);
+    const keySuffix = "aaa11";
+
+    let thrown: unknown;
+    try {
+      await reportKeyRateLimitWindows(
+        "https://api.test",
+        "test-key",
+        "ANTHROPIC_API_KEY",
+        keySuffix,
+        0,
+        {
+          seven_day_opus: {
+            status: "rejected",
+            resetsAt: Math.floor(Date.now() / 1000) + 3600,
+            lastSeenAt: new Date().toISOString(),
+          },
+        },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).not.toContain(keySuffix);
+  });
+
   test("resolves without throwing on a 2xx response", async () => {
     mockFetch(200, true);
 
