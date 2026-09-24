@@ -46,7 +46,11 @@ import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
-import { type CredentialSelection, resolveCredentialPools } from "../utils/credentials.ts";
+import {
+  type CredentialSelection,
+  ModelWindowExhaustedError,
+  resolveCredentialPools,
+} from "../utils/credentials.ts";
 import {
   type RateLimitWindowTelemetry,
   resolveCodexCreditsExhaustedCooldownMs,
@@ -3517,19 +3521,39 @@ async function spawnProviderProcess(
   // fetchResolvedEnv's own resolveTaskModelSelection call) and can apply
   // both the harness × model matrix (e.g. exclude OPENAI_API_KEY for
   // OpenRouter models) and the model-scoped window filter.
-  const { env: freshEnv, credentialSelections } = await fetchResolvedEnv(
-    opts.apiUrl,
-    opts.apiKey,
-    opts.agentId,
-    process.env,
-    opts.model,
-    {
-      repoId: sessionRepo?.id,
-      provider: adapter.name as ProviderName,
-      modelTier: opts.modelTier,
-      localBlocks: opts.localBlocks,
-    },
-  );
+  let freshEnv: Record<string, string | undefined>;
+  let credentialSelections: CredentialSelection[];
+  try {
+    ({ env: freshEnv, credentialSelections } = await fetchResolvedEnv(
+      opts.apiUrl,
+      opts.apiKey,
+      opts.agentId,
+      process.env,
+      opts.model,
+      {
+        repoId: sessionRepo?.id,
+        provider: adapter.name as ProviderName,
+        modelTier: opts.modelTier,
+        localBlocks: opts.localBlocks,
+      },
+    ));
+  } catch (err) {
+    if (err instanceof ModelWindowExhaustedError && realTaskId) {
+      const modelLabel = err.model.charAt(0).toUpperCase() + err.model.slice(1);
+      const reason = `No ${err.keyType} key has ${modelLabel} capacity until ${err.earliestResetAt ?? "unknown"}. Re-dispatch with another model or modelTier.`;
+      console.warn(`[${opts.role}] ${reason}`);
+      await ensureTaskFinished(
+        { apiUrl: opts.apiUrl, apiKey: opts.apiKey, agentId: opts.agentId },
+        opts.role,
+        realTaskId,
+        1,
+        reason,
+        undefined,
+        opts.harnessProvider,
+      );
+    }
+    throw err;
+  }
 
   // Report which key was selected for this task (fire-and-forget)
   if (credentialSelections.length > 0 && realTaskId) {

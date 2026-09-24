@@ -115,6 +115,44 @@ export interface CredentialSelection {
   earliestModelResetAt?: string | null;
 }
 
+const MODEL_LABELS: Record<ModelFamily, string> = {
+  fable: "Fable",
+  opus: "Opus",
+  sonnet: "Sonnet",
+  haiku: "Haiku",
+};
+
+/**
+ * Thrown by `resolveCredentialPools` when every key for a pool is either
+ * key-wide rate-limited or blocked by the requested model's weekly window,
+ * and `MODEL_WINDOW_EXHAUSTED_POLICY` is `fail` (the default). The caller
+ * must not spawn the CLI on this error — see `spawnProviderProcess` in
+ * `src/commands/runner.ts`.
+ */
+export class ModelWindowExhaustedError extends Error {
+  readonly model: ModelFamily;
+  readonly window: string;
+  readonly earliestResetAt: string | null;
+  readonly keyType: string;
+
+  constructor(opts: {
+    model: ModelFamily;
+    window: string;
+    earliestResetAt: string | null;
+    keyType: string;
+  }) {
+    const modelLabel = MODEL_LABELS[opts.model];
+    super(
+      `No ${opts.keyType} key has ${modelLabel} capacity until ${opts.earliestResetAt ?? "unknown"}. Re-dispatch with another model or modelTier.`,
+    );
+    this.name = "ModelWindowExhaustedError";
+    this.model = opts.model;
+    this.window = opts.window;
+    this.earliestResetAt = opts.earliestResetAt;
+    this.keyType = opts.keyType;
+  }
+}
+
 function isJsonObject(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
@@ -353,12 +391,34 @@ export async function resolveCredentialPools(
     if (val) {
       const info = availableIndicesMap?.[envVar];
       let available = info?.availableIndices;
+      let modelBlockedCount = info?.modelBlockedIndices?.length ?? 0;
       if (available && window && opts?.localBlocks) {
+        const beforeCount = available.length;
         available = available.filter((i) => {
           const blockedUntilMs = opts.localBlocks?.get(`${envVar}:${i}:${window}`);
           return blockedUntilMs === undefined || blockedUntilMs <= nowMs;
         });
+        modelBlockedCount += beforeCount - available.length;
       }
+
+      // Every key is either key-wide rate-limited or blocked by this
+      // model's weekly window, and at least one is blocked specifically by
+      // the model (not just legacy key-wide rate limiting) — the picker
+      // can't make progress for this model on this pool. Default policy
+      // fails fast instead of looping the worker through the same
+      // exhausted key every few minutes.
+      if (window && modelFamily && available && available.length === 0 && modelBlockedCount > 0) {
+        const policy = (env.MODEL_WINDOW_EXHAUSTED_POLICY ?? "fail").trim().toLowerCase();
+        if (policy !== "fallback") {
+          throw new ModelWindowExhaustedError({
+            model: modelFamily,
+            window,
+            earliestResetAt: info?.earliestModelResetAt ?? null,
+            keyType: envVar,
+          });
+        }
+      }
+
       const result = selectCredential(val, available, envVar);
       env[envVar] = result.selected;
       const availInfo = available ? ` (${available.length} available of ${result.total})` : "";
