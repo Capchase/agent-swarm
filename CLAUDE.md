@@ -344,6 +344,29 @@ Frontend (`apps/ui/`, `apps/templates-ui/`) PRs additionally require screenshots
 
 </important>
 
+<important if="you are writing a pull request description or filing a GitHub issue on this repo">
+
+Most PRs here are written by agents, so the description must carry the intent a reviewer checks the diff against. Write for a human, in the style of the [`comms` skill](https://github.com/desplega-ai/ai-toolbox/blob/main/cc-plugin/base/skills/comms/SKILL.md) (Precise mode): short direct sentences, no filler. Each template section gives a length target. Synthesize to meet it, and go past it only when the reviewer needs the detail.
+
+PR descriptions MUST fill every required section of [.github/pull_request_template.md](./.github/pull_request_template.md). A `fix:` / `fix(scope):` title also requires Repro and Setup.
+
+- **Intent**: link the source (issue, Linear, Slack thread, swarm task) and keep the requester's words. Do not rewrite the ask to match what you built.
+- **Decisions & trade-offs**: up to 3 choices the request did not specify, each with its cost. Always list every migration, new config key, and breaking change.
+- **Urgency**: copy it from the request. If the request gives none, check "nice to have". Never pick it yourself. After the check passes, "asap" requests a review from tarasyarema and posts a comment. "this week" requests a review from desplega-bot, which starts a swarm review.
+
+`gh pr create --body` skips the template, so write the description to a file, check it, then pass the file:
+
+```bash
+bun scripts/check-pr-body.ts --title "<conventional title>" --body-file /tmp/pr-body.md
+gh pr create --title "<conventional title>" --body-file /tmp/pr-body.md
+```
+
+The **PR Body** workflow (`.github/workflows/pr-body.yml`) runs the same check on every PR event. To fix a failure, edit the PR title or description; no push is needed. Dependabot PRs, `release:` PRs, and PRs labeled `skip-pr-body-check` are exempt.
+
+Issues MUST use one of the forms in `.github/ISSUE_TEMPLATE/` (bug, feature request, question). `gh issue create` skips forms, so write each form field label as a `### <label>` heading, fill the required fields, and apply the form's label.
+
+</important>
+
 <important if="you are modifying memory system code (src/be/memory/, src/be/embedding.ts, src/tools/memory-*.ts, src/http/memory.ts, or src/tools/store-progress.ts memory sections)">
 
 Architecture, key files, and full test commands: see [runbooks/memory-system.md](./runbooks/memory-system.md). Always run all four memory test files after any change.
