@@ -1,5 +1,6 @@
 import { isSafeBundlePath } from "../../extensions/bundle-path";
 import { EXTENSION_TYPE_DEFINITIONS } from "../../extensions/contract-types.generated";
+import { referencedBundlePaths, skillDirs } from "../../extensions/manifest-format";
 import { checkImportAllowlist } from "../../scripts-runtime/import-allowlist";
 import { type ExtensionManifest, ExtensionManifestSchema } from "../../types";
 import {
@@ -38,12 +39,6 @@ export async function validateBundle(input: {
     return { ok: false, diagnostics: ['runtime "worker" is not supported in v1'] };
   }
 
-  for (const asset of ["skills", "workflows", "schedules"] as const) {
-    if ((manifest.assets[asset]?.length ?? 0) > 0) {
-      return { ok: false, diagnostics: [`assets.${asset} is not supported in v1`] };
-    }
-  }
-
   const hookPath = manifest.assets.hooks;
   if (!(hookPath in input.files)) {
     return {
@@ -51,12 +46,28 @@ export async function validateBundle(input: {
       diagnostics: [`assets.hooks "${hookPath}" does not name a file in files`],
     };
   }
-  const extraPaths = Object.keys(input.files).filter((path) => path !== hookPath);
+  const referenced = new Set(referencedBundlePaths(manifest));
+  const dirs = skillDirs(manifest);
+  const missing = [
+    ...[...referenced].filter((path) => !(path in input.files)),
+    ...dirs.map((dir) => `${dir}/SKILL.md`).filter((path) => !(path in input.files)),
+  ];
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      diagnostics: missing.map((path) => `Referenced file "${path}" is missing from files`),
+    };
+  }
+  const extraPaths = Object.keys(input.files).filter(
+    (path) =>
+      !referenced.has(path) &&
+      !dirs.some((dir) => path === `${dir}/SKILL.md` || path.startsWith(`${dir}/files/`)),
+  );
   if (extraPaths.length > 0) {
     return {
       ok: false,
       diagnostics: [
-        `Only the hooks asset is supported in v1. Unexpected files: ${extraPaths.join(", ")}`,
+        `Files not referenced by the manifest are not allowed: ${extraPaths.join(", ")}`,
       ],
     };
   }

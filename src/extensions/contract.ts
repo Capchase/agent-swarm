@@ -6,16 +6,43 @@ import type { ActiveSession, AgentTask, CreateTaskOptions } from "../types";
 
 export type Runtime = "api" | "worker";
 
+export interface ExtensionScriptAsset {
+  name: string;
+  file: string;
+  description: string;
+  intent?: string;
+}
+
+export interface ExtensionScheduleAsset {
+  name: string;
+  description?: string;
+  script: string;
+  cronExpression?: string;
+  intervalMs?: number;
+  timezone?: string;
+  args?: Record<string, unknown>;
+}
+
+export interface ExtensionWorkflowAsset {
+  file: string;
+}
+
+export interface ExtensionSkillAsset {
+  dir: string;
+}
+
 export interface ExtensionManifest {
+  $schema?: string;
   name: string;
   description: string;
   version: string;
   runtime: Runtime;
   assets: {
     hooks: string;
-    skills?: string[];
-    workflows?: string[];
-    schedules?: string[];
+    scripts?: readonly ExtensionScriptAsset[];
+    schedules?: readonly ExtensionScheduleAsset[];
+    workflows?: readonly ExtensionWorkflowAsset[];
+    skills?: readonly ExtensionSkillAsset[];
   };
   homepage?: string;
   author?: string;
