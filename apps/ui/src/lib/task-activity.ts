@@ -1,11 +1,16 @@
 import type { AgentTaskStatus } from "@/api/types";
 
-const TERMINAL_STATUSES: ReadonlySet<AgentTaskStatus> = new Set([
+export const TERMINAL_STATUSES: ReadonlySet<AgentTaskStatus> = new Set([
   "completed",
   "failed",
   "cancelled",
   "superseded",
 ]);
+
+/** `true` only when every task in the list has reached a terminal status. */
+export function allTasksTerminal(tasks: { status: AgentTaskStatus }[]): boolean {
+  return tasks.every((t) => TERMINAL_STATUSES.has(t.status));
+}
 
 /**
  * Tri-state liveness for a task, used by the session-log viewer footer.
