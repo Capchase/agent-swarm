@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import {
   isRateLimitMessage,
   MAX_RATE_LIMIT_RESET_MS,
@@ -21,6 +21,28 @@ const FIXTURE_REJECTED = {
   },
   uuid: "ff6e5299-429c-4fcb-ab34-0ce4e8fa6202",
   session_id: "69dbe5a1-1130-45eb-983f-58a7a13c9c3c",
+};
+
+// Verbatim fixture from task fe35598c-8973-4728-a691-6d039d983101, session_logs line 0,
+// 2026-09-24T02:05:41.040Z. The Fable weekly limit arrives as
+// rateLimitType: "seven_day_overage_included".
+const FIXTURE_FABLE_REJECTED = {
+  type: "rate_limit_event",
+  rate_limit_info: {
+    status: "rejected",
+    resetsAt: 1790467200, // seconds since epoch — 2026-09-27T00:00:00Z
+    rateLimitType: "seven_day_overage_included",
+    overageStatus: "rejected",
+    overageDisabledReason: "group_zero_credit_limit",
+    isUsingOverage: false,
+    unifiedWindows: {
+      five_hour: { utilization: 0.05, resetsAt: 1790217000 },
+      seven_day: { utilization: 0.77, resetsAt: 1790467200 },
+      seven_day_overage_included: { utilization: 1, resetsAt: 1790467200 },
+    },
+  },
+  uuid: "347bea29-f868-47b4-a070-5a9ba117989e",
+  session_id: "0a7b672e-3cd1-4fe6-a5fd-12dd8698f121",
 };
 
 describe("SessionErrorTracker — rate_limit_event processing", () => {
@@ -254,6 +276,46 @@ describe("SessionErrorTracker — rate_limit_event processing", () => {
   test("no rate_limit_event at all → getRateLimitResetAt returns undefined", () => {
     const tracker = new SessionErrorTracker();
     expect(tracker.getRateLimitResetAt()).toBeUndefined();
+  });
+});
+
+describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)", () => {
+  afterEach(() => {
+    setSystemTime();
+  });
+
+  test("Fable rejection sets getModelRateLimit and never sets getRateLimitResetAt", () => {
+    setSystemTime(new Date("2026-09-24T02:05:41.040Z"));
+    const tracker = new SessionErrorTracker();
+    tracker.processRateLimitEvent(FIXTURE_FABLE_REJECTED);
+
+    expect(tracker.getRateLimitResetAt()).toBeUndefined();
+    expect(tracker.getModelRateLimit()).toEqual({
+      window: "seven_day_overage_included",
+      model: "fable",
+      resetAt: "2026-09-27T00:00:00.000Z",
+    });
+  });
+
+  test("Fable rejection still records the 3-key unified window telemetry", () => {
+    setSystemTime(new Date("2026-09-24T02:05:41.040Z"));
+    const tracker = new SessionErrorTracker();
+    tracker.processRateLimitEvent(FIXTURE_FABLE_REJECTED);
+
+    const windows = tracker.getRateLimitWindows();
+    expect(windows).toBeDefined();
+    expect(Object.keys(windows!)).toHaveLength(3);
+    expect(windows!.five_hour?.utilization).toBe(0.05);
+    expect(windows!.seven_day?.utilization).toBe(0.77);
+    expect(windows!.seven_day_overage_included?.status).toBe("rejected");
+  });
+
+  test("a five_hour rejected fixture still sets getRateLimitResetAt (legacy key-wide path)", () => {
+    const tracker = new SessionErrorTracker();
+    tracker.processRateLimitEvent(FIXTURE_REJECTED);
+
+    expect(tracker.getRateLimitResetAt()).toBeDefined();
+    expect(tracker.getModelRateLimit()).toBeUndefined();
   });
 });
 

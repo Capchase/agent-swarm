@@ -1,3 +1,9 @@
+import {
+  isModelScopedWindow,
+  MODEL_SCOPED_WINDOWS,
+  type ModelFamily,
+} from "./model-rate-limit-windows";
+
 /**
  * Tracks error signals from Claude CLI stream-json output to produce
  * meaningful failure reasons instead of generic "exited with code N".
@@ -21,10 +27,16 @@ export interface RateLimitWindowInfo {
 
 export type RateLimitWindowTelemetry = Record<string, RateLimitWindowInfo>;
 
+/**
+ * Parses a rate_limit_event into one window entry per key of `unifiedWindows`
+ * (when present) plus the top-level entry, keyed by `rateLimitType`. The
+ * top-level entry is returned last so it overwrites any `unifiedWindows`
+ * entry that shares its key when the caller applies entries in order.
+ */
 export function parseRateLimitWindowTelemetry(
   json: Record<string, unknown>,
   lastSeenAt = new Date().toISOString(),
-): { rateLimitType: string; info: RateLimitWindowInfo } | null {
+): Array<{ rateLimitType: string; info: RateLimitWindowInfo }> | null {
   try {
     if (json.type !== "rate_limit_event") return null;
     const rawInfo = json.rate_limit_info;
@@ -34,25 +46,46 @@ export function parseRateLimitWindowTelemetry(
     if (typeof info.status !== "string" || info.status.length === 0) return null;
     if (typeof info.rateLimitType !== "string" || info.rateLimitType.length === 0) return null;
 
-    const window: RateLimitWindowInfo = {
+    const entries: Array<{ rateLimitType: string; info: RateLimitWindowInfo }> = [];
+
+    const unifiedWindows = info.unifiedWindows;
+    if (unifiedWindows && typeof unifiedWindows === "object") {
+      for (const [key, rawWindow] of Object.entries(unifiedWindows as Record<string, unknown>)) {
+        if (!rawWindow || typeof rawWindow !== "object") continue;
+        const rawWindowRecord = rawWindow as Record<string, unknown>;
+        const utilization = rawWindowRecord.utilization;
+        const resetsAt = rawWindowRecord.resetsAt;
+        if (typeof utilization !== "number" || !Number.isFinite(utilization)) continue;
+        if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt) || resetsAt <= 0) continue;
+
+        const status =
+          key === info.rateLimitType ? info.status : utilization >= 1 ? "rejected" : "allowed";
+        entries.push({
+          rateLimitType: key,
+          info: { status, utilization, resetsAt, lastSeenAt },
+        });
+      }
+    }
+
+    const topLevel: RateLimitWindowInfo = {
       status: info.status,
       lastSeenAt,
     };
-
     if (typeof info.utilization === "number" && Number.isFinite(info.utilization)) {
-      window.utilization = info.utilization;
+      topLevel.utilization = info.utilization;
     }
     if (typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt) && info.resetsAt > 0) {
-      window.resetsAt = info.resetsAt;
+      topLevel.resetsAt = info.resetsAt;
     }
     if (typeof info.isUsingOverage === "boolean") {
-      window.isUsingOverage = info.isUsingOverage;
+      topLevel.isUsingOverage = info.isUsingOverage;
     }
     if (typeof info.surpassedThreshold === "number" && Number.isFinite(info.surpassedThreshold)) {
-      window.surpassedThreshold = info.surpassedThreshold;
+      topLevel.surpassedThreshold = info.surpassedThreshold;
     }
+    entries.push({ rateLimitType: info.rateLimitType, info: topLevel });
 
-    return { rateLimitType: info.rateLimitType, info: window };
+    return entries;
   } catch {
     return null;
   }
@@ -131,8 +164,10 @@ function clampRateLimitResetMs(candidateMs: number): number {
 
 export class SessionErrorTracker {
   private errors: ErrorSignal[] = [];
-  /** Stashed reset time (ms) from the last rejected rate_limit_event in this session. */
+  /** Stashed reset time (ms) from the last rejected key-wide rate_limit_event in this session. */
   private rateLimitResetAtMs: number | undefined;
+  /** Stashed model-scoped rejection (Fable/Opus/Sonnet window) from the last such event. */
+  private modelRateLimit: { window: string; model: ModelFamily; resetAtMs: number } | undefined;
   private rateLimitWindows: RateLimitWindowTelemetry = {};
 
   /** Record an error from an assistant message with message.error field */
@@ -188,9 +223,11 @@ export class SessionErrorTracker {
       const info = json.rate_limit_info as Record<string, unknown> | undefined;
       if (!info) return;
 
-      const telemetry = parseRateLimitWindowTelemetry(json);
-      if (telemetry) {
-        this.rateLimitWindows[telemetry.rateLimitType] = telemetry.info;
+      const telemetryEntries = parseRateLimitWindowTelemetry(json);
+      if (telemetryEntries) {
+        for (const { rateLimitType, info: windowInfo } of telemetryEntries) {
+          this.rateLimitWindows[rateLimitType] = windowInfo;
+        }
       }
 
       if (info.status !== "rejected") return;
@@ -204,6 +241,16 @@ export class SessionErrorTracker {
       }
 
       const resetsAtMs = resetsAtSec * 1000;
+      const rateLimitType = info.rateLimitType;
+      if (typeof rateLimitType === "string" && isModelScopedWindow(rateLimitType)) {
+        this.modelRateLimit = {
+          window: rateLimitType,
+          model: MODEL_SCOPED_WINDOWS[rateLimitType]!,
+          resetAtMs: clampRateLimitResetMs(resetsAtMs),
+        };
+        return;
+      }
+
       this.rateLimitResetAtMs = clampRateLimitResetMs(resetsAtMs);
     } catch (err) {
       console.warn(`[rate_limit_event] Failed to process event: ${err}`);
@@ -242,6 +289,20 @@ export class SessionErrorTracker {
   getRateLimitWindows(): RateLimitWindowTelemetry | undefined {
     if (Object.keys(this.rateLimitWindows).length === 0) return undefined;
     return { ...this.rateLimitWindows };
+  }
+
+  /**
+   * Returns the stashed model-scoped rejection (Fable/Opus/Sonnet weekly
+   * window), or undefined if no such rejected rate_limit_event was seen in
+   * this session. A model-scoped rejection never sets rateLimitResetAtMs.
+   */
+  getModelRateLimit(): { window: string; model: ModelFamily; resetAt: string } | undefined {
+    if (!this.modelRateLimit) return undefined;
+    return {
+      window: this.modelRateLimit.window,
+      model: this.modelRateLimit.model,
+      resetAt: new Date(this.modelRateLimit.resetAtMs).toISOString(),
+    };
   }
 
   hasErrors(): boolean {
