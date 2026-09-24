@@ -36044,6 +36044,68 @@
                         {
                           "type": "object",
                           "properties": {
+                            "citations": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "index": {
+                                    "type": "integer",
+                                    "minimum": 1
+                                  },
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "task",
+                                      "memory",
+                                      "github",
+                                      "slack",
+                                      "agent-fs",
+                                      "page",
+                                      "script-run",
+                                      "url"
+                                    ]
+                                  },
+                                  "ref": {
+                                    "type": "string",
+                                    "maxLength": 2048
+                                  },
+                                  "label": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "quote": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "resolvedUrl": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "verified": {
+                                    "type": "string",
+                                    "enum": [
+                                      "true",
+                                      "false",
+                                      "unchecked"
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "index",
+                                  "kind",
+                                  "ref",
+                                  "resolvedUrl",
+                                  "verified"
+                                ]
+                              }
+                            },
                             "isLeadTask": {
                               "type": "boolean"
                             },
@@ -36059,6 +36121,7 @@
                             }
                           },
                           "required": [
+                            "citations",
                             "isLeadTask",
                             "supportedSteerModes"
                           ]
@@ -36075,6 +36138,68 @@
                           {
                             "type": "object",
                             "properties": {
+                              "citations": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "index": {
+                                      "type": "integer",
+                                      "minimum": 1
+                                    },
+                                    "kind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "task",
+                                        "memory",
+                                        "github",
+                                        "slack",
+                                        "agent-fs",
+                                        "page",
+                                        "script-run",
+                                        "url"
+                                      ]
+                                    },
+                                    "ref": {
+                                      "type": "string",
+                                      "maxLength": 2048
+                                    },
+                                    "label": {
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
+                                    "quote": {
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
+                                    "resolvedUrl": {
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
+                                    "verified": {
+                                      "type": "string",
+                                      "enum": [
+                                        "true",
+                                        "false",
+                                        "unchecked"
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "index",
+                                    "kind",
+                                    "ref",
+                                    "resolvedUrl",
+                                    "verified"
+                                  ]
+                                }
+                              },
                               "isLeadTask": {
                                 "type": "boolean"
                               },
@@ -36090,6 +36215,7 @@
                               }
                             },
                             "required": [
+                              "citations",
                               "isLeadTask",
                               "supportedSteerModes"
                             ]
@@ -42381,13 +42507,76 @@
                           "items": {
                             "$ref": "#/components/schemas/TaskAttachment"
                           }
+                        },
+                        "citations": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "index": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "kind": {
+                                "type": "string",
+                                "enum": [
+                                  "task",
+                                  "memory",
+                                  "github",
+                                  "slack",
+                                  "agent-fs",
+                                  "page",
+                                  "script-run",
+                                  "url"
+                                ]
+                              },
+                              "ref": {
+                                "type": "string",
+                                "maxLength": 2048
+                              },
+                              "label": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "quote": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "resolvedUrl": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "verified": {
+                                "type": "string",
+                                "enum": [
+                                  "true",
+                                  "false",
+                                  "unchecked"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "kind",
+                              "ref",
+                              "resolvedUrl",
+                              "verified"
+                            ]
+                          }
                         }
                       },
                       "required": [
                         "isLeadTask",
                         "supportedSteerModes",
                         "logs",
-                        "attachments"
+                        "attachments",
+                        "citations"
                       ]
                     }
                   ]
