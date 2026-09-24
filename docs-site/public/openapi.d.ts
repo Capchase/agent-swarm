@@ -5073,6 +5073,13 @@ export interface paths {
                                         lastSeenAt: string;
                                     };
                                 };
+                                modelLimits: {
+                                    model: string;
+                                    window: string;
+                                    resetsAt: number;
+                                    resetsAtIso: string;
+                                    active: boolean;
+                                }[];
                                 createdAt: string;
                                 updatedAt: string;
                             }[];

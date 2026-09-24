@@ -10,6 +10,7 @@ import {
   recordKeyUsage,
   setApiKeyName,
 } from "../be/db";
+import { activeModelBlocks, MODEL_SCOPED_WINDOWS } from "../utils/model-rate-limit-windows";
 import { route } from "./route-def";
 import { jsonError } from "./utils";
 
@@ -152,9 +153,58 @@ const ApiKeyStatusSchema = z.object({
   provider: z.string(),
   /** Latest provider-emitted rate-limit window snapshots, keyed by window type. */
   rateLimitWindows: z.record(z.string(), rateLimitWindowSchema),
+  /** Derived, readable view of any rejected model-scoped window (Fable/Opus/Sonnet) on this key. */
+  modelLimits: z.array(
+    z.object({
+      model: z.string(),
+      window: z.string(),
+      resetsAt: z.number(),
+      resetsAtIso: z.string(),
+      active: z.boolean(),
+    }),
+  ),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
+
+/**
+ * Derives the readable `modelLimits` view from a key's raw `rateLimitWindows`:
+ * every model-scoped window (Fable/Opus/Sonnet) with a rejected entry,
+ * `active` when its `resetsAt` is still in the future.
+ */
+export function computeModelLimits(
+  windows: Record<string, { status: string; resetsAt?: number }>,
+  nowMs: number,
+): Array<{
+  model: string;
+  window: string;
+  resetsAt: number;
+  resetsAtIso: string;
+  active: boolean;
+}> {
+  const active = activeModelBlocks(windows, nowMs);
+  const activeWindows = new Set(active.map((b) => b.window));
+  const limits = active.map((b) => ({
+    model: b.model,
+    window: b.window,
+    resetsAt: b.resetsAt,
+    resetsAtIso: new Date(b.resetsAt * 1000).toISOString(),
+    active: true,
+  }));
+  for (const window of Object.keys(MODEL_SCOPED_WINDOWS)) {
+    if (activeWindows.has(window)) continue;
+    const entry = windows[window];
+    if (!entry || entry.status !== "rejected" || typeof entry.resetsAt !== "number") continue;
+    limits.push({
+      model: MODEL_SCOPED_WINDOWS[window]!,
+      window,
+      resetsAt: entry.resetsAt,
+      resetsAtIso: new Date(entry.resetsAt * 1000).toISOString(),
+      active: false,
+    });
+  }
+  return limits;
+}
 
 const listStatuses = route({
   method: "get",
@@ -395,7 +445,12 @@ export async function handleApiKeys(
     const { keyType, scope, scopeId } = parsed.query;
     try {
       const statuses = await getKeyStatuses(keyType, scope, scopeId ?? null);
-      listStatuses.respond(res, 200, { success: true, keys: statuses });
+      const nowMs = Date.now();
+      const keys = statuses.map((status) => ({
+        ...status,
+        modelLimits: computeModelLimits(status.rateLimitWindows, nowMs),
+      }));
+      listStatuses.respond(res, 200, { success: true, keys });
     } catch (err) {
       jsonError(res, err instanceof Error ? err.message : "Failed to get key statuses", 500);
     }

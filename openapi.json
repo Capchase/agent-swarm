@@ -15207,6 +15207,36 @@
                               ]
                             }
                           },
+                          "modelLimits": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "window": {
+                                  "type": "string"
+                                },
+                                "resetsAt": {
+                                  "type": "number"
+                                },
+                                "resetsAtIso": {
+                                  "type": "string"
+                                },
+                                "active": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "model",
+                                "window",
+                                "resetsAt",
+                                "resetsAtIso",
+                                "active"
+                              ]
+                            }
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -15230,6 +15260,7 @@
                           "name",
                           "provider",
                           "rateLimitWindows",
+                          "modelLimits",
                           "createdAt",
                           "updatedAt"
                         ]
