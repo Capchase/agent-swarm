@@ -340,7 +340,7 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
     expect(tracker.getRateLimitResetAt()).toBeDefined();
   });
 
-  test("a model-scoped rejection followed by a key-wide rejection clears the stale model block", () => {
+  test("a model-scoped rejection followed by a key-wide rejection keeps both blocks", () => {
     const tracker = new SessionErrorTracker();
     const resetsAtSec = Math.floor(Date.now() / 1000) + 3600;
     tracker.processRateLimitEvent({
@@ -358,11 +358,11 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
       rate_limit_info: { status: "rejected", resetsAt: resetsAtSec, rateLimitType: "five_hour" },
     });
 
-    expect(tracker.getModelRateLimit()).toBeUndefined();
-    expect(tracker.getRateLimitResetAt()).toBeDefined();
+    expect(tracker.getModelRateLimit()?.window).toBe("seven_day_overage_included");
+    expect(tracker.getRateLimitResetAt()).toBe(new Date(resetsAtSec * 1000).toISOString());
   });
 
-  test("a key-wide rejection followed by a model-scoped rejection clears the stale key-wide block", () => {
+  test("a key-wide rejection followed by a model-scoped rejection keeps the key-wide block", () => {
     const tracker = new SessionErrorTracker();
     const resetsAtSec = Math.floor(Date.now() / 1000) + 3600;
     tracker.processRateLimitEvent({
@@ -380,8 +380,67 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
       },
     });
 
+    // Independent windows: the Fable rejection is no evidence that the
+    // five-hour window recovered, so both constraints stay effective.
+    expect(tracker.getRateLimitResetAt()).toBe(new Date(resetsAtSec * 1000).toISOString());
+    expect(tracker.getModelRateLimit()?.window).toBe("seven_day_overage_included");
+  });
+
+  test("two rejected key-wide windows → the later reset wins (the key waits for both)", () => {
+    const tracker = new SessionErrorTracker();
+    const fiveHourSec = Math.floor(Date.now() / 1000) + 3600;
+    const sevenDaySec = Math.floor(Date.now() / 1000) + 2 * 24 * 3600;
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: sevenDaySec, rateLimitType: "seven_day" },
+    });
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: fiveHourSec, rateLimitType: "five_hour" },
+    });
+
+    expect(tracker.getRateLimitResetAt()).toBe(new Date(sevenDaySec * 1000).toISOString());
+  });
+
+  test("a non-rejected event for the same window is its explicit recovery", () => {
+    const tracker = new SessionErrorTracker();
+    const resetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: resetsAtSec, rateLimitType: "five_hour" },
+    });
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: resetsAtSec,
+        rateLimitType: "seven_day_overage_included",
+      },
+    });
+
+    // Recovery of another window leaves the five-hour block in place.
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "allowed", resetsAt: resetsAtSec, rateLimitType: "seven_day" },
+    });
+    expect(tracker.getRateLimitResetAt()).toBeDefined();
+
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "allowed", resetsAt: resetsAtSec, rateLimitType: "five_hour" },
+    });
     expect(tracker.getRateLimitResetAt()).toBeUndefined();
     expect(tracker.getModelRateLimit()).toBeDefined();
+
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "allowed",
+        resetsAt: resetsAtSec,
+        rateLimitType: "seven_day_overage_included",
+      },
+    });
+    expect(tracker.getModelRateLimit()).toBeUndefined();
   });
 });
 

@@ -21,6 +21,12 @@ export type RateLimitOutcome =
       window: string;
       resetsAtSec: number;
       source: "event" | "text";
+      /**
+       * An independent key-wide rejection from the same session (structured
+       * event only), still to enforce. Windows are independent: a model
+       * rejection is never evidence that the key-wide window recovered.
+       */
+      keyRateLimitedUntil?: string;
     };
 
 interface ClassifiableResult {
@@ -52,6 +58,11 @@ export function classifyRateLimitOutcome(
   nowMs: number,
   codexCreditsExhaustedCooldownMs: number = CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS,
 ): RateLimitOutcome {
+  const keyRateLimitedUntil = result.rateLimitResetAt
+    ? new Date(clampMs(new Date(result.rateLimitResetAt).getTime(), nowMs)).toISOString()
+    : undefined;
+  const keyExtra = keyRateLimitedUntil ? { keyRateLimitedUntil } : {};
+
   if (result.modelRateLimit) {
     const resetsAtSec = Math.floor(new Date(result.modelRateLimit.resetAt).getTime() / 1000);
     return {
@@ -60,6 +71,7 @@ export function classifyRateLimitOutcome(
       window: result.modelRateLimit.window,
       resetsAtSec,
       source: "event",
+      ...keyExtra,
     };
   }
 
@@ -75,7 +87,7 @@ export function classifyRateLimitOutcome(
       const fallbackResetsAtSec = Math.floor((nowMs + 24 * 60 * 60 * 1000) / 1000);
       const maxResetsAtSec = Math.floor((nowMs + MAX_RATE_LIMIT_RESET_MS) / 1000);
       const resetsAtSec = Math.min(sevenDayResetsAtSec ?? fallbackResetsAtSec, maxResetsAtSec);
-      return { kind: "model", model: family, window, resetsAtSec, source: "text" };
+      return { kind: "model", model: family, window, resetsAtSec, source: "text", ...keyExtra };
     }
   }
 
@@ -84,10 +96,8 @@ export function classifyRateLimitOutcome(
     (failureReason != null && isRateLimitMessage(failureReason))
   ) {
     let rateLimitedUntil: string;
-    if (result.rateLimitResetAt) {
-      rateLimitedUntil = new Date(
-        clampMs(new Date(result.rateLimitResetAt).getTime(), nowMs),
-      ).toISOString();
+    if (keyRateLimitedUntil) {
+      rateLimitedUntil = keyRateLimitedUntil;
     } else if (failureReason != null) {
       const parsedResetTime = parseRateLimitResetTime(failureReason);
       if (parsedResetTime) {
@@ -106,4 +116,31 @@ export function classifyRateLimitOutcome(
   }
 
   return { kind: "none" };
+}
+
+/**
+ * Builds the one telemetry payload a finished session reports for its key:
+ * the session's window snapshots with the classified model rejection merged
+ * over its own window. A single payload keeps an older `allowed` snapshot
+ * from the same session (e.g. before a text-only "reached your Fable limit"
+ * failure) from overwriting the terminal rejection in a second report.
+ */
+export function buildFinalRateLimitWindows(
+  sessionWindows: RateLimitWindowTelemetry | undefined,
+  outcome: RateLimitOutcome,
+  nowIso: string,
+): RateLimitWindowTelemetry | undefined {
+  if (outcome.kind !== "model") return sessionWindows;
+  // Keep the session's own fields (utilization, overage) only when that
+  // snapshot is itself the rejection; an older `allowed` read is stale.
+  const sessionEntry = sessionWindows?.[outcome.window];
+  return {
+    ...sessionWindows,
+    [outcome.window]: {
+      ...(sessionEntry?.status === "rejected" ? sessionEntry : {}),
+      status: "rejected",
+      resetsAt: outcome.resetsAtSec,
+      lastSeenAt: nowIso,
+    },
+  };
 }

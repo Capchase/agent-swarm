@@ -369,6 +369,111 @@ describe("API key tracking DB queries", () => {
       expect(result.availableIndices).not.toContain(1);
       expect(result.modelBlockedIndices).not.toContain(1);
     });
+
+    test("concurrent Fable and Opus rejections for one key both survive", async () => {
+      // Own scope so rows from the tests above do not share keyIndex 0.
+      const scopeId = "race-concurrent";
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      const lastSeenAt = new Date().toISOString();
+      await Promise.all([
+        recordKeyRateLimitWindows(
+          KEY_TYPE,
+          "rac01",
+          0,
+          {
+            seven_day_overage_included: {
+              status: "rejected",
+              resetsAt: futureResetsAtSec,
+              lastSeenAt,
+            },
+          },
+          "agent",
+          scopeId,
+        ),
+        recordKeyRateLimitWindows(
+          KEY_TYPE,
+          "rac01",
+          0,
+          { seven_day_opus: { status: "rejected", resetsAt: futureResetsAtSec, lastSeenAt } },
+          "agent",
+          scopeId,
+        ),
+      ]);
+
+      const [key] = await getKeyStatuses(KEY_TYPE, "agent", scopeId);
+      expect(Object.keys(key?.rateLimitWindows ?? {}).sort()).toEqual([
+        "seven_day_opus",
+        "seven_day_overage_included",
+      ]);
+      const fable = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
+      expect(fable.availableIndices).toEqual([]);
+      const opus = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "opus");
+      expect(opus.availableIndices).toEqual([]);
+    });
+
+    test("an older allowed snapshot after a terminal rejection does not reopen the window", async () => {
+      const scopeId = "race-freshness";
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      const rejectedAt = new Date().toISOString();
+      const olderSnapshotAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      await recordKeyRateLimitWindows(
+        KEY_TYPE,
+        "rac02",
+        0,
+        {
+          seven_day_overage_included: {
+            status: "rejected",
+            resetsAt: futureResetsAtSec,
+            lastSeenAt: rejectedAt,
+          },
+        },
+        "agent",
+        scopeId,
+      );
+      // Another worker's session reports telemetry read before the rejection.
+      await recordKeyRateLimitWindows(
+        KEY_TYPE,
+        "rac02",
+        0,
+        {
+          seven_day_overage_included: {
+            status: "allowed",
+            utilization: 0.4,
+            resetsAt: futureResetsAtSec,
+            lastSeenAt: olderSnapshotAt,
+          },
+          five_hour: { status: "allowed", utilization: 0.1, lastSeenAt: olderSnapshotAt },
+        },
+        "agent",
+        scopeId,
+      );
+
+      const [key] = await getKeyStatuses(KEY_TYPE, "agent", scopeId);
+      expect(key?.rateLimitWindows.seven_day_overage_included?.status).toBe("rejected");
+      // The older payload's other windows still land.
+      expect(key?.rateLimitWindows.five_hour?.status).toBe("allowed");
+      const fable = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
+      expect(fable.availableIndices).toEqual([]);
+
+      // A snapshot observed after the rejection is an explicit recovery.
+      await recordKeyRateLimitWindows(
+        KEY_TYPE,
+        "rac02",
+        0,
+        {
+          seven_day_overage_included: {
+            status: "allowed",
+            utilization: 0.1,
+            resetsAt: futureResetsAtSec,
+            lastSeenAt: new Date(Date.now() + 1000).toISOString(),
+          },
+        },
+        "agent",
+        scopeId,
+      );
+      const recovered = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
+      expect(recovered.availableIndices).toEqual([0]);
+    });
   });
 });
 

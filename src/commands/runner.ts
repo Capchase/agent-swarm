@@ -95,7 +95,7 @@ import {
   reportLatestModel,
   sendCredStatusReport,
 } from "./provider-credentials.ts";
-import { classifyRateLimitOutcome } from "./rate-limit-outcome.ts";
+import { buildFinalRateLimitWindows, classifyRateLimitOutcome } from "./rate-limit-outcome.ts";
 import {
   type ResumeSessionCandidate,
   type ResumeSessionResolution,
@@ -790,6 +790,13 @@ export async function fetchResolvedEnv(
      * `resolveCredentialPools`.
      */
     localBlocks?: Map<string, number>;
+    /**
+     * Task admission only (`spawnProviderProcess`): fail fast with
+     * `ModelWindowExhaustedError` when the task's model has no capacity.
+     * Taskless calls (boot, credential recovery, reconciliation) leave it
+     * unset so an exhausted default model never blocks configuration loading.
+     */
+    enforceModelCapacity?: boolean;
   },
 ): Promise<ResolvedEnvResult> {
   const env: Record<string, string | undefined> = { ...baseEnv };
@@ -893,6 +900,7 @@ export async function fetchResolvedEnv(
     provider: resolvedProvider,
     model: effectiveModel,
     localBlocks: sessionContext?.localBlocks,
+    enforceModelCapacity: sessionContext?.enforceModelCapacity,
   });
 
   return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
@@ -3552,6 +3560,7 @@ async function spawnProviderProcess(
         provider: adapter.name as ProviderName,
         modelTier: opts.modelTier,
         localBlocks: opts.localBlocks,
+        enforceModelCapacity: true,
       },
     ));
   } catch (err) {
@@ -4509,8 +4518,12 @@ async function checkCompletedProcesses(
       // Sonnet weekly limits) before the legacy key-wide gate, so a
       // model-scoped rejection blocks only that model family on this key —
       // never the whole key — via report-rate-limit-windows instead of
-      // report-rate-limit. The post is awaited so it completes before the
-      // task finishes.
+      // report-rate-limit. A key-wide rejection seen in the same session is
+      // still reported alongside it (windows are independent). The session's
+      // window telemetry and the classified model rejection go out as ONE
+      // payload, so an older `allowed` snapshot never overwrites the terminal
+      // rejection. The post is awaited so it completes before the task
+      // finishes.
       if (credentialInfo) {
         const outcome = classifyRateLimitOutcome(
           result,
@@ -4518,56 +4531,55 @@ async function checkCompletedProcesses(
           Date.now(),
           state.codexCreditsExhaustedCooldownMs,
         );
-        if (outcome.kind === "key") {
-          console.log(`[credentials] Rate limit reset: ${outcome.rateLimitedUntil}`);
+        const keyRateLimitedUntil =
+          outcome.kind === "key"
+            ? outcome.rateLimitedUntil
+            : outcome.kind === "model"
+              ? outcome.keyRateLimitedUntil
+              : undefined;
+        if (keyRateLimitedUntil) {
+          console.log(`[credentials] Rate limit reset: ${keyRateLimitedUntil}`);
           reportKeyRateLimit(
             apiConfig.apiUrl,
             apiConfig.apiKey,
             credentialInfo.keyType,
             credentialInfo.keySuffix,
             credentialInfo.keyIndex,
-            outcome.rateLimitedUntil,
+            keyRateLimitedUntil,
           ).catch(() => {});
-        } else if (outcome.kind === "model") {
+        }
+        if (outcome.kind === "model") {
           const resetsAtIso = new Date(outcome.resetsAtSec * 1000).toISOString();
           const blockKey = `${credentialInfo.keyType}:${credentialInfo.keyIndex}:${outcome.window}`;
           state.modelWindowBlocks.set(blockKey, outcome.resetsAtSec * 1000);
           console.log(
             `[credential] ${outcome.model} weekly window exhausted (${outcome.window}) on key #${credentialInfo.keyIndex} until ${resetsAtIso}`,
           );
-          try {
-            await reportKeyRateLimitWindows(
-              apiConfig.apiUrl,
-              apiConfig.apiKey,
-              credentialInfo.keyType,
-              credentialInfo.keySuffix,
-              credentialInfo.keyIndex,
-              {
-                [outcome.window]: {
-                  status: "rejected",
-                  resetsAt: outcome.resetsAtSec,
-                  lastSeenAt: new Date().toISOString(),
-                },
-              },
-              false,
-            );
-          } catch (err) {
-            console.warn(
-              `[credential] Failed to report model window ${outcome.window}: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
         }
-      }
 
-      if (credentialInfo && result.rateLimitWindows) {
-        reportKeyRateLimitWindows(
-          apiConfig.apiUrl,
-          apiConfig.apiKey,
-          credentialInfo.keyType,
-          credentialInfo.keySuffix,
-          credentialInfo.keyIndex,
+        const finalWindows = buildFinalRateLimitWindows(
           result.rateLimitWindows,
-        ).catch(() => {});
+          outcome,
+          new Date().toISOString(),
+        );
+        if (finalWindows) {
+          const report = reportKeyRateLimitWindows(
+            apiConfig.apiUrl,
+            apiConfig.apiKey,
+            credentialInfo.keyType,
+            credentialInfo.keySuffix,
+            credentialInfo.keyIndex,
+            finalWindows,
+            outcome.kind !== "model",
+          ).catch((err) => {
+            console.warn(
+              `[credential] Failed to report rate-limit windows: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+          // A model rejection gates admission on other workers: land it before
+          // the task finishes. Plain telemetry stays fire-and-forget.
+          if (outcome.kind === "model") await report;
+        }
       }
       let bridgeDiagnostics: Awaited<ReturnType<typeof getBridgeFailureDiagnostics>> | undefined;
       if (result.exitCode !== 0 && harnessProvider === "claude" && workingDir) {

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { classifyRateLimitOutcome } from "../commands/rate-limit-outcome";
+import {
+  buildFinalRateLimitWindows,
+  classifyRateLimitOutcome,
+} from "../commands/rate-limit-outcome";
 
 describe("classifyRateLimitOutcome", () => {
   test("event source: modelRateLimit set gives kind 'model' with source 'event'", () => {
@@ -89,5 +92,134 @@ describe("classifyRateLimitOutcome", () => {
     if (outcome.kind === "key") {
       expect(new Date(outcome.rateLimitedUntil).getTime()).toBe(nowMs + cooldownMs);
     }
+  });
+});
+
+describe("classifyRateLimitOutcome — independent key-wide and model rejections", () => {
+  const nowMs = new Date("2026-09-24T02:05:41.040Z").getTime();
+  const inOneHourIso = new Date(nowMs + 60 * 60 * 1000).toISOString();
+
+  test("a model event with a key-wide rejection keeps the key-wide cooldown", () => {
+    const outcome = classifyRateLimitOutcome(
+      {
+        rateLimitResetAt: inOneHourIso,
+        modelRateLimit: {
+          window: "seven_day_overage_included",
+          model: "fable",
+          resetAt: inOneHourIso,
+        },
+      },
+      undefined,
+      nowMs,
+    );
+    expect(outcome).toEqual({
+      kind: "model",
+      model: "fable",
+      window: "seven_day_overage_included",
+      resetsAtSec: Math.floor((nowMs + 60 * 60 * 1000) / 1000),
+      source: "event",
+      keyRateLimitedUntil: inOneHourIso,
+    });
+  });
+
+  test("a text-only model rejection with a key-wide rejection keeps the key-wide cooldown", () => {
+    const outcome = classifyRateLimitOutcome(
+      { rateLimitResetAt: inOneHourIso },
+      "You've reached your Fable limit. Switch to another model to continue.",
+      nowMs,
+    );
+    expect(outcome.kind).toBe("model");
+    expect(outcome.kind === "model" ? outcome.keyRateLimitedUntil : undefined).toBe(inOneHourIso);
+  });
+
+  test("a model rejection alone carries no key-wide cooldown", () => {
+    const outcome = classifyRateLimitOutcome(
+      {
+        modelRateLimit: {
+          window: "seven_day_overage_included",
+          model: "fable",
+          resetAt: inOneHourIso,
+        },
+      },
+      undefined,
+      nowMs,
+    );
+    expect(outcome.kind === "model" ? outcome.keyRateLimitedUntil : "wrong kind").toBeUndefined();
+  });
+});
+
+describe("buildFinalRateLimitWindows", () => {
+  const nowMs = new Date("2026-09-24T02:05:41.040Z").getTime();
+  const nowIso = new Date(nowMs).toISOString();
+  const earlierIso = new Date(nowMs - 10 * 60 * 1000).toISOString();
+
+  test("an earlier allowed snapshot + a terminal text-only rejection gives ONE rejected entry", () => {
+    const sessionWindows = {
+      seven_day_overage_included: {
+        status: "allowed",
+        utilization: 0.4,
+        resetsAt: 1790467200,
+        lastSeenAt: earlierIso,
+      },
+      five_hour: {
+        status: "allowed",
+        utilization: 0.1,
+        resetsAt: 1790217000,
+        lastSeenAt: earlierIso,
+      },
+    };
+    const outcome = classifyRateLimitOutcome(
+      { rateLimitWindows: sessionWindows },
+      "You've reached your Fable limit. Switch to another model to continue.",
+      nowMs,
+    );
+    expect(outcome.kind).toBe("model");
+
+    const finalWindows = buildFinalRateLimitWindows(sessionWindows, outcome, nowIso);
+    expect(finalWindows?.seven_day_overage_included).toEqual({
+      status: "rejected",
+      resetsAt: outcome.kind === "model" ? outcome.resetsAtSec : -1,
+      lastSeenAt: nowIso,
+    });
+    // Unrelated session telemetry is still reported in the same payload.
+    expect(finalWindows?.five_hour).toEqual(sessionWindows.five_hour);
+  });
+
+  test("an event-source rejection keeps the session's own rejected fields", () => {
+    const sessionWindows = {
+      seven_day_overage_included: {
+        status: "rejected",
+        utilization: 1,
+        resetsAt: 1790467200,
+        lastSeenAt: earlierIso,
+      },
+    };
+    const finalWindows = buildFinalRateLimitWindows(
+      sessionWindows,
+      {
+        kind: "model",
+        model: "fable",
+        window: "seven_day_overage_included",
+        resetsAtSec: 1790467200,
+        source: "event",
+      },
+      nowIso,
+    );
+    expect(finalWindows?.seven_day_overage_included).toEqual({
+      status: "rejected",
+      utilization: 1,
+      resetsAt: 1790467200,
+      lastSeenAt: nowIso,
+    });
+  });
+
+  test("a non-model outcome reports the session telemetry unchanged", () => {
+    const sessionWindows = {
+      five_hour: { status: "allowed", utilization: 0.1, lastSeenAt: earlierIso },
+    };
+    expect(buildFinalRateLimitWindows(sessionWindows, { kind: "none" }, nowIso)).toBe(
+      sessionWindows,
+    );
+    expect(buildFinalRateLimitWindows(undefined, { kind: "none" }, nowIso)).toBeUndefined();
   });
 });

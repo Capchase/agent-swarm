@@ -11320,6 +11320,41 @@ export async function markKeyRateLimited(
   );
 }
 
+/**
+ * Merges reported window snapshots into the stored ones, one window type at a
+ * time. A reported entry replaces the stored entry unless the stored entry was
+ * observed strictly later (`lastSeenAt`), so an older `allowed` snapshot that
+ * arrives after a terminal rejection cannot reopen an exhausted window. An
+ * unparseable `lastSeenAt` on either side falls back to "reported wins".
+ */
+function mergeRateLimitWindowTelemetry(
+  stored: RateLimitWindowTelemetry,
+  reported: RateLimitWindowTelemetry,
+): RateLimitWindowTelemetry {
+  const merged: RateLimitWindowTelemetry = { ...stored };
+  for (const [type, entry] of Object.entries(reported)) {
+    const current = merged[type];
+    const currentSeenMs = current ? Date.parse(current.lastSeenAt) : Number.NaN;
+    const reportedSeenMs = Date.parse(entry.lastSeenAt);
+    if (
+      Number.isFinite(currentSeenMs) &&
+      Number.isFinite(reportedSeenMs) &&
+      currentSeenMs > reportedSeenMs
+    ) {
+      continue;
+    }
+    merged[type] = entry;
+  }
+  return merged;
+}
+
+/**
+ * Persists reported window snapshots for a key. Admission
+ * (`getAvailableKeyIndices`) reads these windows, so the read-merge-write
+ * runs in one `BEGIN IMMEDIATE` transaction: two concurrent reports for the
+ * same key (e.g. a Fable and an Opus rejection) both survive instead of the
+ * later write dropping the earlier one.
+ */
 export async function recordKeyRateLimitWindows(
   keyType: string,
   keySuffix: string,
@@ -11333,28 +11368,28 @@ export async function recordKeyRateLimitWindows(
   const now = new Date().toISOString();
   const effectiveScopeId = scopeId ?? "";
   const provider = deriveProviderFromKeyType(keyType);
-  const client = getDbClient();
-  const existing = await client.get<{ rateLimitWindows: string | null }>(
-    `SELECT rateLimitWindows FROM api_key_status
-       WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?`,
-    [keyType, keySuffix, scope, effectiveScopeId],
-  );
-  const serialized = JSON.stringify({
-    ...parseRateLimitWindowsJson(existing?.rateLimitWindows),
-    ...windows,
-  });
+  await getDbClient().transaction(async (tx) => {
+    const existing = await tx.get<{ rateLimitWindows: string | null }>(
+      `SELECT rateLimitWindows FROM api_key_status
+         WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?`,
+      [keyType, keySuffix, scope, effectiveScopeId],
+    );
+    const serialized = JSON.stringify(
+      mergeRateLimitWindowTelemetry(parseRateLimitWindowsJson(existing?.rateLimitWindows), windows),
+    );
 
-  await client.run(
-    `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, rateLimitWindows, provider, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(keyType, keySuffix, scope, scopeId)
-       DO UPDATE SET
-         rateLimitWindows = excluded.rateLimitWindows,
-         keyIndex = excluded.keyIndex,
-         provider = excluded.provider,
-         updatedAt = excluded.updatedAt`,
-    [keyType, keySuffix, keyIndex, scope, effectiveScopeId, serialized, provider, now],
-  );
+    await tx.run(
+      `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, rateLimitWindows, provider, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(keyType, keySuffix, scope, scopeId)
+         DO UPDATE SET
+           rateLimitWindows = excluded.rateLimitWindows,
+           keyIndex = excluded.keyIndex,
+           provider = excluded.provider,
+           updatedAt = excluded.updatedAt`,
+      [keyType, keySuffix, keyIndex, scope, effectiveScopeId, serialized, provider, now],
+    );
+  });
 }
 
 /**

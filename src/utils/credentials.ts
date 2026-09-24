@@ -123,11 +123,12 @@ const MODEL_LABELS: Record<ModelFamily, string> = {
 };
 
 /**
- * Thrown by `resolveCredentialPools` when every key for a pool is either
- * key-wide rate-limited or blocked by the requested model's weekly window,
- * and `MODEL_WINDOW_EXHAUSTED_POLICY` is `fail` (the default). The caller
- * must not spawn the CLI on this error — see `spawnProviderProcess` in
- * `src/commands/runner.ts`.
+ * Thrown by `resolveCredentialPools` at task admission (`enforceModelCapacity`)
+ * when every key for a pool is either key-wide rate-limited or blocked by the
+ * requested model's weekly window, and `MODEL_WINDOW_EXHAUSTED_POLICY` is
+ * `fail` (the default). The caller must not spawn the CLI on this error — see
+ * `spawnProviderProcess` in `src/commands/runner.ts`. Taskless configuration
+ * loads never throw it.
  */
 export class ModelWindowExhaustedError extends Error {
   readonly model: ModelFamily;
@@ -369,6 +370,15 @@ export async function resolveCredentialPools(
      * value is the reset time in ms.
      */
     localBlocks?: Map<string, number>;
+    /**
+     * Set only at task admission (`spawnProviderProcess`). When true, an
+     * exhausted model window fails fast with `ModelWindowExhaustedError`.
+     * Taskless configuration loads (worker boot, credential recovery,
+     * periodic reconciliation) leave it unset: they still pick a key, so an
+     * exhausted default model never blocks boot or config refresh, and the
+     * worker can still accept tasks for another model.
+     */
+    enforceModelCapacity?: boolean;
   },
 ): Promise<CredentialSelection[]> {
   const providerVars = opts?.provider
@@ -407,7 +417,14 @@ export async function resolveCredentialPools(
       // can't make progress for this model on this pool. Default policy
       // fails fast instead of looping the worker through the same
       // exhausted key every few minutes.
-      if (window && modelFamily && available && available.length === 0 && modelBlockedCount > 0) {
+      if (
+        opts?.enforceModelCapacity &&
+        window &&
+        modelFamily &&
+        available &&
+        available.length === 0 &&
+        modelBlockedCount > 0
+      ) {
         const policy = (env.MODEL_WINDOW_EXHAUSTED_POLICY ?? "fail").trim().toLowerCase();
         if (policy !== "fallback") {
           throw new ModelWindowExhaustedError({

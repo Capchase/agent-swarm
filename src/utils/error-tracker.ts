@@ -166,10 +166,18 @@ function clampRateLimitResetMs(candidateMs: number): number {
   return Math.min(Math.max(candidateMs, minMs), maxMs);
 }
 
+/** Key for the Codex usage-limit message in the key-wide rejection map (it carries no window type). */
+const CODEX_USAGE_LIMIT_KEY = "codex_usage_limit";
+
 export class SessionErrorTracker {
   private errors: ErrorSignal[] = [];
-  /** Stashed reset time (ms) from the last rejected key-wide rate_limit_event in this session. */
-  private rateLimitResetAtMs: number | undefined;
+  /**
+   * Stashed key-wide rejections (ms reset time), one per window type. Windows
+   * are independent: a rejection of another window (key-wide or model-scoped)
+   * is not evidence that this one recovered, so an entry leaves only on an
+   * explicit non-rejected event for the same window type.
+   */
+  private keyWideRejections = new Map<string, number>();
   /** Stashed model-scoped rejection (Fable/Opus/Sonnet window) from the last such event. */
   private modelRateLimit: { window: string; model: ModelFamily; resetAtMs: number } | undefined;
   private rateLimitWindows: RateLimitWindowTelemetry = {};
@@ -216,8 +224,11 @@ export class SessionErrorTracker {
 
   /**
    * Process a parsed rate_limit_event JSON object from the Claude CLI stream.
-   * Only stashes the reset time when status === "rejected"; ignores all others.
-   * Last call wins — if the CLI emits multiple events, the final rejected one is used.
+   * A rejected event stashes the reset time for its own window type; a later
+   * rejection of the same type replaces it. A non-rejected event for a window
+   * type is that window's explicit recovery and clears its stashed rejection.
+   * Key-wide and model-scoped rejections are independent and never clear each
+   * other.
    *
    * `resetsAt` is **seconds** since epoch (empirically verified; Linear description is wrong).
    * Conversion to ms happens here at this single well-named boundary.
@@ -234,7 +245,18 @@ export class SessionErrorTracker {
         }
       }
 
-      if (info.status !== "rejected") return;
+      const rateLimitType = typeof info.rateLimitType === "string" ? info.rateLimitType : undefined;
+      const isModelScoped = rateLimitType !== undefined && isModelScopedWindow(rateLimitType);
+
+      if (info.status !== "rejected") {
+        if (rateLimitType === undefined) return;
+        if (isModelScoped) {
+          if (this.modelRateLimit?.window === rateLimitType) this.modelRateLimit = undefined;
+        } else {
+          this.keyWideRejections.delete(rateLimitType);
+        }
+        return;
+      }
 
       const resetsAtSec = info.resetsAt;
       if (typeof resetsAtSec !== "number" || !Number.isFinite(resetsAtSec) || resetsAtSec <= 0) {
@@ -245,23 +267,16 @@ export class SessionErrorTracker {
       }
 
       const resetsAtMs = resetsAtSec * 1000;
-      const rateLimitType = info.rateLimitType;
-      if (typeof rateLimitType === "string" && isModelScopedWindow(rateLimitType)) {
-        // Latest rejected outcome wins outright: a model-scoped rejection
-        // clears any stale key-wide block so a key-wide event that arrives
-        // later isn't shadowed by an earlier model-scoped one (and vice
-        // versa below).
+      if (isModelScoped) {
         this.modelRateLimit = {
           window: rateLimitType,
           model: MODEL_SCOPED_WINDOWS[rateLimitType]!,
           resetAtMs: clampRateLimitResetMs(resetsAtMs),
         };
-        this.rateLimitResetAtMs = undefined;
         return;
       }
 
-      this.rateLimitResetAtMs = clampRateLimitResetMs(resetsAtMs);
-      this.modelRateLimit = undefined;
+      this.keyWideRejections.set(rateLimitType ?? "unknown", clampRateLimitResetMs(resetsAtMs));
     } catch (err) {
       console.warn(`[rate_limit_event] Failed to process event: ${err}`);
     }
@@ -284,16 +299,18 @@ export class SessionErrorTracker {
 
     const candidateMs = new Date(iso).getTime();
     if (!Number.isFinite(candidateMs)) return;
-    this.rateLimitResetAtMs = clampRateLimitResetMs(candidateMs);
+    this.keyWideRejections.set(CODEX_USAGE_LIMIT_KEY, clampRateLimitResetMs(candidateMs));
   }
 
   /**
-   * Returns the stashed rate limit reset time as an ISO string, or undefined
-   * if no rejected rate_limit_event was seen in this session.
+   * Returns the key-wide rate limit reset time as an ISO string, or undefined
+   * if no key-wide rejection is stashed for this session. With several
+   * rejected key-wide windows, the key stays blocked until the last of them
+   * resets, so the latest reset time wins.
    */
   getRateLimitResetAt(): string | undefined {
-    if (this.rateLimitResetAtMs === undefined) return undefined;
-    return new Date(this.rateLimitResetAtMs).toISOString();
+    if (this.keyWideRejections.size === 0) return undefined;
+    return new Date(Math.max(...this.keyWideRejections.values())).toISOString();
   }
 
   getRateLimitWindows(): RateLimitWindowTelemetry | undefined {
@@ -304,7 +321,8 @@ export class SessionErrorTracker {
   /**
    * Returns the stashed model-scoped rejection (Fable/Opus/Sonnet weekly
    * window), or undefined if no such rejected rate_limit_event was seen in
-   * this session. A model-scoped rejection never sets rateLimitResetAtMs.
+   * this session. A model-scoped rejection never sets the key-wide reset
+   * time, and never clears it either.
    */
   getModelRateLimit(): { window: string; model: ModelFamily; resetAt: string } | undefined {
     if (!this.modelRateLimit) return undefined;
