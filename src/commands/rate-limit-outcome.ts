@@ -1,0 +1,109 @@
+import {
+  CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS,
+  isCodexCreditsExhaustedMessage,
+  isRateLimitMessage,
+  MAX_RATE_LIMIT_RESET_MS,
+  parseRateLimitResetTime,
+  type RateLimitWindowTelemetry,
+} from "../utils/error-tracker";
+import {
+  type ModelFamily,
+  parseModelLimitMessage,
+  windowForModelFamily,
+} from "../utils/model-rate-limit-windows";
+
+export type RateLimitOutcome =
+  | { kind: "none" }
+  | { kind: "key"; rateLimitedUntil: string }
+  | {
+      kind: "model";
+      model: ModelFamily;
+      window: string;
+      resetsAtSec: number;
+      source: "event" | "text";
+    };
+
+interface ClassifiableResult {
+  rateLimitResetAt?: string;
+  rateLimitWindows?: RateLimitWindowTelemetry;
+  modelRateLimit?: { window: string; model: ModelFamily; resetAt: string };
+}
+
+function clampMs(candidateMs: number, nowMs: number): number {
+  const minMs = nowMs + 60_000;
+  const maxMs = nowMs + MAX_RATE_LIMIT_RESET_MS;
+  return Math.min(Math.max(candidateMs, minMs), maxMs);
+}
+
+/**
+ * Classifies a finished provider session's rate-limit signal into one of
+ * three outcomes: no rate limit, a key-wide rate limit (legacy path), or a
+ * model-scoped weekly-window rejection (Fable/Opus/Sonnet). Model outcomes
+ * are tested before key outcomes so a model-scoped event or message never
+ * falls into the legacy key-wide gate and marks the whole key.
+ *
+ * `codexCreditsExhaustedCooldownMs` defaults to the fixed constant so the
+ * function stays pure and testable with 3 args; the runner call site passes
+ * the live, config-driven cooldown to preserve today's behavior exactly.
+ */
+export function classifyRateLimitOutcome(
+  result: ClassifiableResult,
+  failureReason: string | undefined,
+  nowMs: number,
+  codexCreditsExhaustedCooldownMs: number = CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS,
+): RateLimitOutcome {
+  if (result.modelRateLimit) {
+    const resetsAtSec = Math.floor(new Date(result.modelRateLimit.resetAt).getTime() / 1000);
+    return {
+      kind: "model",
+      model: result.modelRateLimit.model,
+      window: result.modelRateLimit.window,
+      resetsAtSec,
+      source: "event",
+    };
+  }
+
+  if (failureReason != null) {
+    const family = parseModelLimitMessage(failureReason);
+    const window = family ? windowForModelFamily(family) : undefined;
+    if (family && window) {
+      const sevenDay = result.rateLimitWindows?.seven_day;
+      const sevenDayResetsAtSec =
+        sevenDay && typeof sevenDay.resetsAt === "number" && sevenDay.resetsAt * 1000 > nowMs
+          ? sevenDay.resetsAt
+          : undefined;
+      const fallbackResetsAtSec = Math.floor((nowMs + 24 * 60 * 60 * 1000) / 1000);
+      const maxResetsAtSec = Math.floor((nowMs + MAX_RATE_LIMIT_RESET_MS) / 1000);
+      const resetsAtSec = Math.min(sevenDayResetsAtSec ?? fallbackResetsAtSec, maxResetsAtSec);
+      return { kind: "model", model: family, window, resetsAtSec, source: "text" };
+    }
+  }
+
+  if (
+    result.rateLimitResetAt != null ||
+    (failureReason != null && isRateLimitMessage(failureReason))
+  ) {
+    let rateLimitedUntil: string;
+    if (result.rateLimitResetAt) {
+      rateLimitedUntil = new Date(
+        clampMs(new Date(result.rateLimitResetAt).getTime(), nowMs),
+      ).toISOString();
+    } else if (failureReason != null) {
+      const parsedResetTime = parseRateLimitResetTime(failureReason);
+      if (parsedResetTime) {
+        rateLimitedUntil = new Date(
+          clampMs(new Date(parsedResetTime).getTime(), nowMs),
+        ).toISOString();
+      } else if (isCodexCreditsExhaustedMessage(failureReason)) {
+        rateLimitedUntil = new Date(nowMs + codexCreditsExhaustedCooldownMs).toISOString();
+      } else {
+        rateLimitedUntil = new Date(nowMs + 5 * 60 * 1000).toISOString();
+      }
+    } else {
+      rateLimitedUntil = new Date(nowMs + 5 * 60 * 1000).toISOString();
+    }
+    return { kind: "key", rateLimitedUntil };
+  }
+
+  return { kind: "none" };
+}

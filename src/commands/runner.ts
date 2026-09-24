@@ -48,10 +48,6 @@ import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
 import { type CredentialSelection, resolveCredentialPools } from "../utils/credentials.ts";
 import {
-  isCodexCreditsExhaustedMessage,
-  isRateLimitMessage,
-  MAX_RATE_LIMIT_RESET_MS,
-  parseRateLimitResetTime,
   type RateLimitWindowTelemetry,
   resolveCodexCreditsExhaustedCooldownMs,
 } from "../utils/error-tracker.ts";
@@ -95,6 +91,7 @@ import {
   reportLatestModel,
   sendCredStatusReport,
 } from "./provider-credentials.ts";
+import { classifyRateLimitOutcome } from "./rate-limit-outcome.ts";
 import {
   type ResumeSessionCandidate,
   type ResumeSessionResolution,
@@ -1861,6 +1858,13 @@ async function reportKeyRateLimit(
   }
 }
 
+/**
+ * Reports rate-limit window telemetry for a key. Returns the underlying
+ * fetch promise (does not swallow errors) so a caller that needs the post to
+ * complete before the task finishes (a model-scoped block) can await it and
+ * decide how to handle a failure; a caller that wants the legacy
+ * fire-and-forget behavior appends `.catch(() => {})`.
+ */
 async function reportKeyRateLimitWindows(
   apiUrl: string,
   apiKey: string,
@@ -1870,24 +1874,20 @@ async function reportKeyRateLimitWindows(
   windows: RateLimitWindowTelemetry,
 ): Promise<void> {
   if (Object.keys(windows).length === 0) return;
-  try {
-    await fetch(`${apiUrl}/api/keys/report-rate-limit-windows`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        keyType,
-        keySuffix,
-        keyIndex,
-        windows,
-      }),
-    });
-    console.log(`[credentials] Reported rate-limit windows for key ...${keySuffix}`);
-  } catch {
-    // Non-blocking
-  }
+  await fetch(`${apiUrl}/api/keys/report-rate-limit-windows`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      keyType,
+      keySuffix,
+      keyIndex,
+      windows,
+    }),
+  });
+  console.log(`[credentials] Reported rate-limit windows for key ...${keySuffix}`);
 }
 
 /** Clear a stale rate-limit record after a successful task (fire-and-forget) */
@@ -2358,6 +2358,14 @@ interface RunnerState {
    * application site so a fresh value applies to the next credits-exhausted failure.
    */
   codexCreditsExhaustedCooldownMs: number;
+  /**
+   * In-process guard against re-drawing a key whose model-scoped window
+   * (Fable/Opus/Sonnet) was just reported as exhausted, before the server's
+   * `report-rate-limit-windows` write is visible to this worker's next
+   * `GET /api/keys/available` poll. Keyed by `${keyType}:${keyIndex}:${window}`,
+   * value is the reset time in ms. Read by `selectCredential` (T5).
+   */
+  modelWindowBlocks: Map<string, number>;
 }
 
 /** Buffer for session logs */
@@ -4423,60 +4431,57 @@ async function checkCompletedProcesses(
       // `[usage-limit]` (see codex-adapter.formatTerminalError); Claude
       // surfaces "rate limit" / "hit your limit" via SessionErrorTracker.
       //
-      // The gate must also fire on a bare structured rate_limit_event: a
-      // `status: "rejected"` event sets result.rateLimitResetAt but does NOT
-      // set hasErrors(), so failureReason can be empty even though the key is
-      // exhausted. Gating on rateLimitResetAt != null ensures the structured
-      // event alone still triggers the cooldown.
-      if (
-        credentialInfo &&
-        (result.rateLimitResetAt != null ||
-          (failureReason != null && isRateLimitMessage(failureReason)))
-      ) {
-        // Three-tier reset-time resolver (most to least precise):
-        // Tier 1: structured rate_limit_event from Claude CLI (resetsAt epoch sec)
-        // Tier 2: regex on the error message (e.g. "resets 3pm (UTC)")
-        // Tier 3: 5-min hard fallback — only when both structured and regex fail
-        // Tiers 1 & 2 are clamped to [now+60s, now+7d] (weekly limits reset ~2 days out).
-        const clampResetTime = (isoString: string): string => {
-          const nowMs = Date.now();
-          const minMs = nowMs + 60_000;
-          const maxMs = nowMs + MAX_RATE_LIMIT_RESET_MS;
-          const candidateMs = new Date(isoString).getTime();
-          return new Date(Math.min(Math.max(candidateMs, minMs), maxMs)).toISOString();
-        };
-
-        let rateLimitedUntil: string;
-        if (result.rateLimitResetAt) {
-          rateLimitedUntil = clampResetTime(result.rateLimitResetAt);
-          console.log(`[credentials] Rate limit reset from rate_limit_event: ${rateLimitedUntil}`);
-        } else if (failureReason != null) {
-          const parsedResetTime = parseRateLimitResetTime(failureReason);
-          if (parsedResetTime) {
-            rateLimitedUntil = clampResetTime(parsedResetTime);
-            console.log(
-              `[credentials] Parsed rate limit reset time from error: ${rateLimitedUntil}`,
+      // classifyRateLimitOutcome tests model-scoped windows (Fable/Opus/
+      // Sonnet weekly limits) before the legacy key-wide gate, so a
+      // model-scoped rejection blocks only that model family on this key —
+      // never the whole key — via report-rate-limit-windows instead of
+      // report-rate-limit. The post is awaited so it completes before the
+      // task finishes.
+      if (credentialInfo) {
+        const outcome = classifyRateLimitOutcome(
+          result,
+          failureReason,
+          Date.now(),
+          state.codexCreditsExhaustedCooldownMs,
+        );
+        if (outcome.kind === "key") {
+          console.log(`[credentials] Rate limit reset: ${outcome.rateLimitedUntil}`);
+          reportKeyRateLimit(
+            apiConfig.apiUrl,
+            apiConfig.apiKey,
+            credentialInfo.keyType,
+            credentialInfo.keySuffix,
+            credentialInfo.keyIndex,
+            outcome.rateLimitedUntil,
+          ).catch(() => {});
+        } else if (outcome.kind === "model") {
+          const resetsAtIso = new Date(outcome.resetsAtSec * 1000).toISOString();
+          const blockKey = `${credentialInfo.keyType}:${credentialInfo.keyIndex}:${outcome.window}`;
+          state.modelWindowBlocks.set(blockKey, outcome.resetsAtSec * 1000);
+          console.log(
+            `[credential] model window ${outcome.window} exhausted for ${outcome.model} on key #${credentialInfo.keyIndex} until ${resetsAtIso}`,
+          );
+          try {
+            await reportKeyRateLimitWindows(
+              apiConfig.apiUrl,
+              apiConfig.apiKey,
+              credentialInfo.keyType,
+              credentialInfo.keySuffix,
+              credentialInfo.keyIndex,
+              {
+                [outcome.window]: {
+                  status: "rejected",
+                  resetsAt: outcome.resetsAtSec,
+                  lastSeenAt: new Date().toISOString(),
+                },
+              },
             );
-          } else if (isCodexCreditsExhaustedMessage(failureReason)) {
-            const cooldownMs = state.codexCreditsExhaustedCooldownMs;
-            rateLimitedUntil = new Date(Date.now() + cooldownMs).toISOString();
-            console.log(
-              `[credentials] Codex credits exhausted — applying cooldown (${cooldownMs}ms): ${rateLimitedUntil}`,
+          } catch (err) {
+            console.warn(
+              `[credential] Failed to report model window ${outcome.window}: ${err instanceof Error ? err.message : String(err)}`,
             );
-          } else {
-            rateLimitedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
           }
-        } else {
-          rateLimitedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
         }
-        reportKeyRateLimit(
-          apiConfig.apiUrl,
-          apiConfig.apiKey,
-          credentialInfo.keyType,
-          credentialInfo.keySuffix,
-          credentialInfo.keyIndex,
-          rateLimitedUntil,
-        ).catch(() => {});
       }
 
       if (credentialInfo && result.rateLimitWindows) {
@@ -4981,6 +4986,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
     tasksProcessed: 0,
     harnessProvider: bootProvider,
     codexCreditsExhaustedCooldownMs: bootCooldownMs,
+    modelWindowBlocks: new Map(),
   };
 
   // Track tasks already signaled for cancellation to avoid repeated SIGTERM
