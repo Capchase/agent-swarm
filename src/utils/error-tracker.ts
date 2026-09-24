@@ -2,6 +2,7 @@ import {
   isModelScopedWindow,
   MODEL_SCOPED_WINDOWS,
   type ModelFamily,
+  parseModelLimitMessage,
 } from "./model-rate-limit-windows";
 
 /**
@@ -29,9 +30,11 @@ export type RateLimitWindowTelemetry = Record<string, RateLimitWindowInfo>;
 
 /**
  * Parses a rate_limit_event into one window entry per key of `unifiedWindows`
- * (when present) plus the top-level entry, keyed by `rateLimitType`. The
- * top-level entry is returned last so it overwrites any `unifiedWindows`
- * entry that shares its key when the caller applies entries in order.
+ * (when present) merged with the top-level entry when they share a key. The
+ * top-level fields win field-by-field (it's the freshest read for its own
+ * `rateLimitType`), but a unified field the top level does not carry — e.g.
+ * `utilization`, which the observed Fable event only carries on the unified
+ * entry — is kept rather than dropped.
  */
 export function parseRateLimitWindowTelemetry(
   json: Record<string, unknown>,
@@ -46,7 +49,7 @@ export function parseRateLimitWindowTelemetry(
     if (typeof info.status !== "string" || info.status.length === 0) return null;
     if (typeof info.rateLimitType !== "string" || info.rateLimitType.length === 0) return null;
 
-    const entries: Array<{ rateLimitType: string; info: RateLimitWindowInfo }> = [];
+    const byType = new Map<string, RateLimitWindowInfo>();
 
     const unifiedWindows = info.unifiedWindows;
     if (unifiedWindows && typeof unifiedWindows === "object") {
@@ -60,10 +63,7 @@ export function parseRateLimitWindowTelemetry(
 
         const status =
           key === info.rateLimitType ? info.status : utilization >= 1 ? "rejected" : "allowed";
-        entries.push({
-          rateLimitType: key,
-          info: { status, utilization, resetsAt, lastSeenAt },
-        });
+        byType.set(key, { status, utilization, resetsAt, lastSeenAt });
       }
     }
 
@@ -83,9 +83,13 @@ export function parseRateLimitWindowTelemetry(
     if (typeof info.surpassedThreshold === "number" && Number.isFinite(info.surpassedThreshold)) {
       topLevel.surpassedThreshold = info.surpassedThreshold;
     }
-    entries.push({ rateLimitType: info.rateLimitType, info: topLevel });
+    const existing = byType.get(info.rateLimitType);
+    byType.set(info.rateLimitType, existing ? { ...existing, ...topLevel } : topLevel);
 
-    return entries;
+    return Array.from(byType, ([rateLimitType, windowInfo]) => ({
+      rateLimitType,
+      info: windowInfo,
+    }));
   } catch {
     return null;
   }
@@ -243,15 +247,21 @@ export class SessionErrorTracker {
       const resetsAtMs = resetsAtSec * 1000;
       const rateLimitType = info.rateLimitType;
       if (typeof rateLimitType === "string" && isModelScopedWindow(rateLimitType)) {
+        // Latest rejected outcome wins outright: a model-scoped rejection
+        // clears any stale key-wide block so a key-wide event that arrives
+        // later isn't shadowed by an earlier model-scoped one (and vice
+        // versa below).
         this.modelRateLimit = {
           window: rateLimitType,
           model: MODEL_SCOPED_WINDOWS[rateLimitType]!,
           resetAtMs: clampRateLimitResetMs(resetsAtMs),
         };
+        this.rateLimitResetAtMs = undefined;
         return;
       }
 
       this.rateLimitResetAtMs = clampRateLimitResetMs(resetsAtMs);
+      this.modelRateLimit = undefined;
     } catch (err) {
       console.warn(`[rate_limit_event] Failed to process event: ${err}`);
     }
@@ -608,6 +618,14 @@ export function parseRateLimitResetTime(errorMessage: string): string | undefine
 
 /**
  * Parse stderr text for known error patterns and add them to the tracker.
+ *
+ * `reached your Fable limit` (and its Opus/Sonnet siblings) is intentionally
+ * NOT matched by {@link isRateLimitMessage} — that matcher is shared with the
+ * runner's key-wide cooldown gate, and this text must never mark the whole
+ * key. {@link parseModelLimitMessage} is the dedicated model-limit signal: it
+ * still records the line as an error (so `buildFailureReason` carries the raw
+ * text forward for `classifyRateLimitOutcome` to parse) without widening
+ * `isRateLimitMessage` to recognize it.
  */
 export function parseStderrForErrors(stderr: string, tracker: SessionErrorTracker): void {
   if (!stderr.trim()) return;
@@ -615,7 +633,7 @@ export function parseStderrForErrors(stderr: string, tracker: SessionErrorTracke
   const lower = stderr.toLowerCase();
   const firstLine = stderr.trim().split("\n")[0] ?? stderr.trim();
 
-  if (isRateLimitMessage(stderr)) {
+  if (parseModelLimitMessage(stderr) || isRateLimitMessage(stderr)) {
     tracker.addStderrError(firstLine);
   } else if (
     lower.includes("authentication") ||

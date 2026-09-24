@@ -384,7 +384,9 @@ export default function ApiKeysPage() {
         cellRenderer: (params: { value: ApiKeyStatusType; data: ApiKeyStatus | undefined }) => (
           <div className="flex flex-col gap-1 py-1">
             <KeyStatusBadge status={params.value} />
-            {params.data && <ModelLimitBadges modelLimits={params.data.modelLimits} />}
+            {params.data && params.value === "available" && (
+              <ModelLimitBadges modelLimits={params.data.modelLimits} />
+            )}
           </div>
         ),
       },

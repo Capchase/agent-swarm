@@ -59,7 +59,7 @@ export function windowForModelFamily(family: ModelFamily): string | undefined {
 }
 
 export function isModelScopedWindow(type: string): boolean {
-  return type in MODEL_SCOPED_WINDOWS;
+  return Object.hasOwn(MODEL_SCOPED_WINDOWS, type) && MODEL_SCOPED_WINDOWS[type] !== undefined;
 }
 
 /**

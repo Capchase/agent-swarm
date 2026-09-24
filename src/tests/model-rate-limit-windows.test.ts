@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   activeModelBlock,
   FABLE_WINDOW,
+  isModelScopedWindow,
   modelFamilyOf,
   OPUS_WINDOW,
   parseModelLimitMessage,
@@ -124,5 +125,26 @@ describe("activeModelBlock", () => {
 
   test("returns undefined when windows is undefined", () => {
     expect(activeModelBlock(undefined, "fable", Date.now())).toBeUndefined();
+  });
+});
+
+describe("isModelScopedWindow", () => {
+  test.each([FABLE_WINDOW, OPUS_WINDOW, SONNET_WINDOW])("%s is model-scoped", (type) => {
+    expect(isModelScopedWindow(type)).toBe(true);
+  });
+
+  test.each([
+    "five_hour",
+    "seven_day",
+    "overage",
+    "unknown_window",
+  ])("%s is not model-scoped", (type) => {
+    expect(isModelScopedWindow(type)).toBe(false);
+  });
+
+  test("prototype-chain properties are not model-scoped (own-property check, not `in`)", () => {
+    expect(isModelScopedWindow("toString")).toBe(false);
+    expect(isModelScopedWindow("constructor")).toBe(false);
+    expect(isModelScopedWindow("hasOwnProperty")).toBe(false);
   });
 });

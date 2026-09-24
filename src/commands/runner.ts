@@ -1891,17 +1891,27 @@ async function reportKeyRateLimit(
  * complete before the task finishes (a model-scoped block) can await it and
  * decide how to handle a failure; a caller that wants the legacy
  * fire-and-forget behavior appends `.catch(() => {})`.
+ *
+ * Throws on a non-2xx response so a failed persistence surfaces to the
+ * caller instead of logging success while only the in-process guard took
+ * effect — otherwise other workers redraw the same exhausted key at once.
+ *
+ * `logKeySuffix` defaults to true for the legacy full-telemetry call site;
+ * the model-scoped call site passes false since it already logs the model
+ * family and key index itself (see the `[credential] model window ...`
+ * log above the call).
  */
-async function reportKeyRateLimitWindows(
+export async function reportKeyRateLimitWindows(
   apiUrl: string,
   apiKey: string,
   keyType: string,
   keySuffix: string,
   keyIndex: number,
   windows: RateLimitWindowTelemetry,
+  logKeySuffix = true,
 ): Promise<void> {
   if (Object.keys(windows).length === 0) return;
-  await fetch(`${apiUrl}/api/keys/report-rate-limit-windows`, {
+  const response = await fetch(`${apiUrl}/api/keys/report-rate-limit-windows`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1914,7 +1924,14 @@ async function reportKeyRateLimitWindows(
       windows,
     }),
   });
-  console.log(`[credentials] Reported rate-limit windows for key ...${keySuffix}`);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to report rate-limit windows for key ...${keySuffix}: HTTP ${response.status}`,
+    );
+  }
+  if (logKeySuffix) {
+    console.log(`[credentials] Reported rate-limit windows for key ...${keySuffix}`);
+  }
 }
 
 /** Clear a stale rate-limit record after a successful task (fire-and-forget) */
@@ -4516,7 +4533,7 @@ async function checkCompletedProcesses(
           const blockKey = `${credentialInfo.keyType}:${credentialInfo.keyIndex}:${outcome.window}`;
           state.modelWindowBlocks.set(blockKey, outcome.resetsAtSec * 1000);
           console.log(
-            `[credential] model window ${outcome.window} exhausted for ${outcome.model} on key #${credentialInfo.keyIndex} until ${resetsAtIso}`,
+            `[credential] ${outcome.model} weekly window exhausted (${outcome.window}) on key #${credentialInfo.keyIndex} until ${resetsAtIso}`,
           );
           try {
             await reportKeyRateLimitWindows(
@@ -4532,6 +4549,7 @@ async function checkCompletedProcesses(
                   lastSeenAt: new Date().toISOString(),
                 },
               },
+              false,
             );
           } catch (err) {
             console.warn(

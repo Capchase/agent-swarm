@@ -10,6 +10,7 @@ import {
   recordKeyUsage,
   setApiKeyName,
 } from "../be/db";
+import { MAX_RATE_LIMIT_RESET_MS, type RateLimitWindowTelemetry } from "../utils/error-tracker";
 import { activeModelBlocks, MODEL_SCOPED_WINDOWS } from "../utils/model-rate-limit-windows";
 import { route } from "./route-def";
 import { jsonError } from "./utils";
@@ -66,14 +67,39 @@ const reportRateLimit = route({
   auth: { apiKey: true },
 });
 
-const rateLimitWindowSchema = z.object({
+export const rateLimitWindowSchema = z.object({
   status: z.string(),
   utilization: z.number().optional(),
-  resetsAt: z.number().optional(),
+  // .finite() rejects NaN/Infinity at the report boundary; sanitizeReportedWindowResets
+  // below still has to guard a finite-but-out-of-range or implausibly far-future value.
+  resetsAt: z.number().finite().optional(),
   isUsingOverage: z.boolean().optional(),
   surpassedThreshold: z.number().optional(),
   lastSeenAt: z.string().datetime(),
 });
+
+/**
+ * Clamps a reported window's `resetsAt` (seconds) to the same 7-day ceiling
+ * used for the key-wide cooldown (`MAX_RATE_LIMIT_RESET_MS`). Guards two
+ * failure modes: a finite-but-out-of-Date-range value (e.g. 1e20) that would
+ * otherwise throw when rendered via `new Date(resetsAt * 1000).toISOString()`,
+ * and a representable but implausibly far-future value that would otherwise
+ * keep a key blocked indefinitely. NaN/Infinity are already rejected upstream
+ * by the route's `.finite()` schema.
+ */
+export function sanitizeReportedWindowResets(
+  windows: RateLimitWindowTelemetry,
+): RateLimitWindowTelemetry {
+  const maxResetsAtSec = Math.floor((Date.now() + MAX_RATE_LIMIT_RESET_MS) / 1000);
+  const sanitized: RateLimitWindowTelemetry = {};
+  for (const [key, window] of Object.entries(windows)) {
+    sanitized[key] =
+      window.resetsAt === undefined
+        ? window
+        : { ...window, resetsAt: Math.min(window.resetsAt, maxResetsAtSec) };
+  }
+  return sanitized;
+}
 
 const reportRateLimitWindows = route({
   method: "post",
@@ -373,7 +399,7 @@ export async function handleApiKeys(
         keyType,
         keySuffix,
         keyIndex,
-        windows,
+        sanitizeReportedWindowResets(windows),
         scope,
         scopeId ?? null,
       );

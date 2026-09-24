@@ -7,6 +7,7 @@ import {
   SessionErrorTracker,
   trackErrorFromJson,
 } from "../utils/error-tracker";
+import { parseModelLimitMessage } from "../utils/model-rate-limit-windows";
 
 // Verbatim fixture from Linear CAI-1279 (session logs for task b7fbbdb9-4922-41d9-88ec-21febd6c4fec)
 const FIXTURE_REJECTED = {
@@ -308,6 +309,11 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
     expect(windows!.five_hour?.utilization).toBe(0.05);
     expect(windows!.seven_day?.utilization).toBe(0.77);
     expect(windows!.seven_day_overage_included?.status).toBe("rejected");
+    // The top-level entry (written for the same rateLimitType) has no
+    // utilization of its own — it must merge over the unified entry's
+    // utilization: 1 rather than overwrite it away.
+    expect(windows!.seven_day_overage_included?.utilization).toBe(1);
+    expect(windows!.seven_day_overage_included?.resetsAt).toBe(1790467200);
   });
 
   test("a five_hour rejected fixture still sets getRateLimitResetAt (legacy key-wide path)", () => {
@@ -316,6 +322,66 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
 
     expect(tracker.getRateLimitResetAt()).toBeDefined();
     expect(tracker.getModelRateLimit()).toBeUndefined();
+  });
+
+  test("rateLimitType 'toString' is not model-scoped (own-property check, not `in`) — falls back to key-wide", () => {
+    const tracker = new SessionErrorTracker();
+    const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: futureResetsAtSec,
+        rateLimitType: "toString",
+      },
+    });
+
+    expect(tracker.getModelRateLimit()).toBeUndefined();
+    expect(tracker.getRateLimitResetAt()).toBeDefined();
+  });
+
+  test("a model-scoped rejection followed by a key-wide rejection clears the stale model block", () => {
+    const tracker = new SessionErrorTracker();
+    const resetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: resetsAtSec,
+        rateLimitType: "seven_day_overage_included",
+      },
+    });
+    expect(tracker.getModelRateLimit()).toBeDefined();
+
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: resetsAtSec, rateLimitType: "five_hour" },
+    });
+
+    expect(tracker.getModelRateLimit()).toBeUndefined();
+    expect(tracker.getRateLimitResetAt()).toBeDefined();
+  });
+
+  test("a key-wide rejection followed by a model-scoped rejection clears the stale key-wide block", () => {
+    const tracker = new SessionErrorTracker();
+    const resetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: resetsAtSec, rateLimitType: "five_hour" },
+    });
+    expect(tracker.getRateLimitResetAt()).toBeDefined();
+
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: resetsAtSec,
+        rateLimitType: "seven_day_overage_included",
+      },
+    });
+
+    expect(tracker.getRateLimitResetAt()).toBeUndefined();
+    expect(tracker.getModelRateLimit()).toBeDefined();
   });
 });
 
@@ -450,5 +516,23 @@ describe("isRateLimitMessage — shared matcher (runner gate + stderr parser)", 
     const tracker = new SessionErrorTracker();
     parseStderrForErrors("HTTP 429 returned by upstream", tracker);
     expect(tracker.hasErrors()).toBe(true);
+  });
+
+  test("a stderr-only Fable limit message is captured, so failureReason carries the model-limit signal", () => {
+    const tracker = new SessionErrorTracker();
+    parseStderrForErrors(
+      "You've reached your Fable limit. Switch to another model to continue.",
+      tracker,
+    );
+
+    // Not classified as a generic rate-limit signal — must never widen the
+    // key-wide matcher for this text.
+    expect(isRateLimitMessage("You've reached your Fable limit. Switch to another model")).toBe(
+      false,
+    );
+    expect(tracker.hasErrors()).toBe(true);
+
+    const failureReason = tracker.buildFailureReason(1);
+    expect(parseModelLimitMessage(failureReason)).toBe("fable");
   });
 });
