@@ -133,6 +133,7 @@ import {
   checkIdentityFieldBudget,
   IdentityFieldBudgetError,
 } from "../utils/identity-field-budget";
+import { activeModelBlock, type ModelFamily } from "../utils/model-rate-limit-windows";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
 import { registerVolatileSecret, scrubSecrets } from "../utils/secret-scrubber";
 import { auditAssetKeys } from "./asset-key-audit";
@@ -11159,17 +11160,32 @@ function rowToApiKeyStatus(row: ApiKeyStatusRow): ApiKeyStatus {
   return { ...row, rateLimitWindows: parseRateLimitWindowsJson(row.rateLimitWindows) };
 }
 
+export interface AvailableKeyIndicesResult {
+  availableIndices: number[];
+  /** Indices excluded only by an active model-scoped window block (not key-wide). */
+  modelBlockedIndices: number[];
+  /** ISO of the earliest resetsAt among modelBlockedIndices, or null when none. */
+  earliestModelResetAt: string | null;
+}
+
 /**
  * Get available (non-rate-limited) key indices for a credential type.
  * Automatically clears expired rate limits before returning.
+ *
+ * When `modelFamily` has a weekly window (fable/opus/sonnet), a key whose
+ * `rateLimitWindows` carries an active rejected window for that family is
+ * excluded from `availableIndices` and reported in `modelBlockedIndices`
+ * instead — the key itself stays `available` for every other model.
  */
 export async function getAvailableKeyIndices(
   keyType: string,
   totalKeys: number,
   scope = "global",
   scopeId: string | null = null,
-): Promise<number[]> {
+  modelFamily?: ModelFamily,
+): Promise<AvailableKeyIndicesResult> {
   const now = new Date().toISOString();
+  const nowMs = Date.now();
   const client = getDbClient();
   const effectiveScopeId = scopeId ?? "";
 
@@ -11182,20 +11198,56 @@ export async function getAvailableKeyIndices(
     [now, keyType, scope, effectiveScopeId, now],
   );
 
-  // Get currently rate-limited key indices
-  const rateLimited = await client.query<{ keyIndex: number }>(
-    `SELECT keyIndex FROM api_key_status
-       WHERE keyType = ? AND scope = ? AND scopeId = ?
-         AND status = 'rate_limited'`,
+  const rows = await client.query<{
+    keyIndex: number;
+    status: string;
+    rateLimitWindows: string | null;
+  }>(
+    `SELECT keyIndex, status, rateLimitWindows FROM api_key_status
+       WHERE keyType = ? AND scope = ? AND scopeId = ?`,
     [keyType, scope, effectiveScopeId],
   );
 
-  const blockedIndices = new Set(rateLimited.map((r) => r.keyIndex));
-  const available: number[] = [];
-  for (let i = 0; i < totalKeys; i++) {
-    if (!blockedIndices.has(i)) available.push(i);
+  const blockedIndices = new Set(
+    rows.filter((r) => r.status === "rate_limited").map((r) => r.keyIndex),
+  );
+
+  const modelBlockedIndices: number[] = [];
+  let earliestModelResetsAtSec: number | undefined;
+  if (modelFamily) {
+    for (const row of rows) {
+      // A key already blocked key-wide doesn't need a separate model-block
+      // entry — it's excluded from availableIndices either way, and
+      // modelBlockedIndices means "excluded only by a model-scoped block".
+      if (blockedIndices.has(row.keyIndex)) continue;
+      const block = activeModelBlock(
+        parseRateLimitWindowsJson(row.rateLimitWindows),
+        modelFamily,
+        nowMs,
+      );
+      if (!block) continue;
+      modelBlockedIndices.push(row.keyIndex);
+      if (earliestModelResetsAtSec === undefined || block.resetsAt < earliestModelResetsAtSec) {
+        earliestModelResetsAtSec = block.resetsAt;
+      }
+    }
   }
-  return available;
+  const modelBlockedSet = new Set(modelBlockedIndices);
+
+  const availableIndices: number[] = [];
+  for (let i = 0; i < totalKeys; i++) {
+    if (blockedIndices.has(i) || modelBlockedSet.has(i)) continue;
+    availableIndices.push(i);
+  }
+
+  return {
+    availableIndices,
+    modelBlockedIndices,
+    earliestModelResetAt:
+      earliestModelResetsAtSec !== undefined
+        ? new Date(earliestModelResetsAtSec * 1000).toISOString()
+        : null,
+  };
 }
 
 /**

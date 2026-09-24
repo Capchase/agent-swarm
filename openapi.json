@@ -14979,6 +14979,20 @@
             "required": false,
             "name": "scopeId",
             "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "fable",
+                "opus",
+                "sonnet",
+                "haiku"
+              ]
+            },
+            "required": false,
+            "name": "model",
+            "in": "query"
           }
         ],
         "responses": {
@@ -15003,6 +15017,18 @@
                     },
                     "totalKeys": {
                       "type": "integer"
+                    },
+                    "modelBlockedIndices": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      }
+                    },
+                    "earliestModelResetAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [

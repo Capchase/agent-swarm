@@ -183,10 +183,10 @@ describe("API key tracking DB queries", () => {
   test("getAvailableKeyIndices excludes rate-limited keys", async () => {
     // Key 0 is rate-limited from above, add key 1 as available
     await recordKeyUsage("ANTHROPIC_API_KEY", "bbb22", 1, null);
-    const available = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
-    expect(available).toContain(1);
-    expect(available).toContain(2); // Never tracked, so available
-    expect(available).not.toContain(0); // Rate-limited
+    const { availableIndices } = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
+    expect(availableIndices).toContain(1);
+    expect(availableIndices).toContain(2); // Never tracked, so available
+    expect(availableIndices).not.toContain(0); // Rate-limited
   });
 
   test("getAvailableKeyIndices auto-clears expired rate limits", async () => {
@@ -195,8 +195,8 @@ describe("API key tracking DB queries", () => {
     await markKeyRateLimited("ANTHROPIC_API_KEY", "ccc33", 2, pastDate);
 
     // Should auto-clear and return as available
-    const available = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
-    expect(available).toContain(2);
+    const { availableIndices } = await getAvailableKeyIndices("ANTHROPIC_API_KEY", 3);
+    expect(availableIndices).toContain(2);
   });
 
   test("getKeyStatuses filters by keyType", async () => {
@@ -300,6 +300,74 @@ describe("API key tracking DB queries", () => {
         resetsAt: 1781270000,
         lastSeenAt: "2026-06-12T01:00:00.000Z",
       },
+    });
+  });
+
+  describe("getAvailableKeyIndices — model-scoped window filtering", () => {
+    const KEY_TYPE = "CLAUDE_CODE_OAUTH_TOKEN";
+
+    test("model=fable omits an index with an active Fable block and reports it in modelBlockedIndices", async () => {
+      await recordKeyUsage(KEY_TYPE, "fbl01", 0, null);
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      await recordKeyRateLimitWindows(KEY_TYPE, "fbl01", 0, {
+        seven_day_overage_included: {
+          status: "rejected",
+          resetsAt: futureResetsAtSec,
+          lastSeenAt: new Date().toISOString(),
+        },
+      });
+
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null, "fable");
+      expect(result.availableIndices).not.toContain(0);
+      expect(result.modelBlockedIndices).toEqual([0]);
+      expect(result.earliestModelResetAt).toBe(new Date(futureResetsAtSec * 1000).toISOString());
+    });
+
+    test("model=opus includes the same index (block is Fable-only)", async () => {
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null, "opus");
+      expect(result.availableIndices).toContain(0);
+      expect(result.modelBlockedIndices).toEqual([]);
+    });
+
+    test("no model param includes the index (legacy behavior, no filtering)", async () => {
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null);
+      expect(result.availableIndices).toContain(0);
+      expect(result.modelBlockedIndices).toEqual([]);
+      expect(result.earliestModelResetAt).toBeNull();
+    });
+
+    test("a row with resetsAt in the past is included for model=fable", async () => {
+      const pastResetsAtSec = Math.floor(Date.now() / 1000) - 3600;
+      await recordKeyRateLimitWindows(KEY_TYPE, "fbl01", 0, {
+        seven_day_overage_included: {
+          status: "rejected",
+          resetsAt: pastResetsAtSec,
+          lastSeenAt: new Date().toISOString(),
+        },
+      });
+
+      const result = await getAvailableKeyIndices(KEY_TYPE, 1, "global", null, "fable");
+      expect(result.availableIndices).toContain(0);
+      expect(result.modelBlockedIndices).toEqual([]);
+    });
+
+    test("a key-wide rate_limited status and an active model block coexist without double-listing", async () => {
+      await recordKeyUsage(KEY_TYPE, "fbl02", 1, null);
+      const until = new Date(Date.now() + 300_000).toISOString();
+      await markKeyRateLimited(KEY_TYPE, "fbl02", 1, until);
+      const futureResetsAtSec = Math.floor(Date.now() / 1000) + 3600;
+      await recordKeyRateLimitWindows(KEY_TYPE, "fbl02", 1, {
+        seven_day_overage_included: {
+          status: "rejected",
+          resetsAt: futureResetsAtSec,
+          lastSeenAt: new Date().toISOString(),
+        },
+      });
+
+      const result = await getAvailableKeyIndices(KEY_TYPE, 2, "global", null, "fable");
+      // Key-wide blocked: absent from availableIndices, and not double-reported in modelBlockedIndices.
+      expect(result.availableIndices).not.toContain(1);
+      expect(result.modelBlockedIndices).not.toContain(1);
     });
   });
 });

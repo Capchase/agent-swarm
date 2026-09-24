@@ -110,6 +110,8 @@ const getAvailable = route({
     totalKeys: z.coerce.number().int().min(1),
     scope: z.string().optional(),
     scopeId: z.string().optional(),
+    /** Model family the caller is about to run. Filters out keys with an active weekly window block for that family. */
+    model: z.enum(["fable", "opus", "sonnet", "haiku"]).optional(),
   }),
   responses: {
     200: {
@@ -118,6 +120,10 @@ const getAvailable = route({
         success: z.literal(true),
         availableIndices: z.array(z.number().int()),
         totalKeys: z.number().int(),
+        /** Indices excluded only by an active model-scoped window block. Present only when `model` was passed. */
+        modelBlockedIndices: z.array(z.number().int()).optional(),
+        /** ISO of the earliest reset among modelBlockedIndices. Present only when `model` was passed. */
+        earliestModelResetAt: z.string().nullable().optional(),
       }),
     },
     400: { description: "Validation error" },
@@ -340,10 +346,26 @@ export async function handleApiKeys(
     const parsed = await getAvailable.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, totalKeys, scope, scopeId } = parsed.query;
+    const { keyType, totalKeys, scope, scopeId, model } = parsed.query;
     try {
-      const indices = await getAvailableKeyIndices(keyType, totalKeys, scope, scopeId ?? null);
-      getAvailable.respond(res, 200, { success: true, availableIndices: indices, totalKeys });
+      const result = await getAvailableKeyIndices(
+        keyType,
+        totalKeys,
+        scope,
+        scopeId ?? null,
+        model,
+      );
+      getAvailable.respond(res, 200, {
+        success: true,
+        availableIndices: result.availableIndices,
+        totalKeys,
+        ...(model !== undefined
+          ? {
+              modelBlockedIndices: result.modelBlockedIndices,
+              earliestModelResetAt: result.earliestModelResetAt,
+            }
+          : {}),
+      });
     } catch (err) {
       jsonError(res, err instanceof Error ? err.message : "Failed to get available keys", 500);
     }
