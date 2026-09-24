@@ -117,7 +117,7 @@ describe("resolveCredentialPools", () => {
       ANTHROPIC_API_KEY: "example-key-aaa11,example-key-bbb22,example-key-ccc33",
     };
     const selections = await resolveCredentialPools(env, {
-      availableIndicesMap: { ANTHROPIC_API_KEY: [2] },
+      availableIndicesMap: { ANTHROPIC_API_KEY: { availableIndices: [2] } },
     });
     expect(selections.length).toBe(1);
     expect(selections[0]!.index).toBe(2);

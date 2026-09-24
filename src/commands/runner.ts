@@ -775,7 +775,18 @@ export async function fetchResolvedEnv(
   agentId: string,
   baseEnv: Record<string, string | undefined> = process.env,
   taskModel?: string,
-  sessionContext?: { repoId?: string; provider?: ProviderName },
+  sessionContext?: {
+    repoId?: string;
+    provider?: ProviderName;
+    modelTier?: string;
+    /**
+     * In-process guard (`RunnerState.modelWindowBlocks`) against re-drawing a
+     * key whose model-scoped window was just reported exhausted, before the
+     * server's write is visible to this worker's next poll. Forwarded to
+     * `resolveCredentialPools`.
+     */
+    localBlocks?: Map<string, number>;
+  },
 ): Promise<ResolvedEnvResult> {
   const env: Record<string, string | undefined> = { ...baseEnv };
   const repoId = sessionContext?.repoId;
@@ -848,11 +859,22 @@ export async function fetchResolvedEnv(
   const resolvedProvider = sessionContext?.provider ?? resolveHarnessProvider(env, baseEnv);
   if (sessionContext?.provider) env.HARNESS_PROVIDER = sessionContext.provider;
 
-  // Effective model: per-task model takes priority over the agent-level
-  // MODEL_OVERRIDE from swarm_config. Passed to resolveCredentialPools so
-  // the harness × model matrix can exclude incompatible credential vars
-  // (e.g. OPENAI_API_KEY when an OpenRouter model is selected on opencode).
-  const effectiveModel = taskModel || (env.MODEL_OVERRIDE as string | undefined) || "";
+  // Effective model: per-task model takes priority over modelTier, which
+  // takes priority over the agent-level MODEL_OVERRIDE from swarm_config.
+  // Resolved the same way spawnProviderProcess resolves the model it
+  // actually runs with (same inputs: model, modelTier, resolvedProvider,
+  // env) so the model used to pick a key never drifts from the model the
+  // CLI ends up using. Passed to resolveCredentialPools so both the
+  // harness × model matrix (exclude incompatible credential vars) and the
+  // model-scoped window filter (GET /api/keys/available?model=<family>)
+  // see the right model.
+  const modelSelection = resolveTaskModelSelection({
+    model: taskModel,
+    modelTier: sessionContext?.modelTier,
+    harnessProvider: resolvedProvider,
+    env,
+  });
+  const effectiveModel = modelSelection.model || (env.MODEL_OVERRIDE as string | undefined) || "";
 
   const credentialSelections = await resolveCredentialPools(env, {
     apiUrl,
@@ -866,6 +888,7 @@ export async function fetchResolvedEnv(
     // the worker's harness from the dashboard without restarting the container.
     provider: resolvedProvider,
     model: effectiveModel,
+    localBlocks: sessionContext?.localBlocks,
   });
 
   return { env, credentialSelections, resolvedProvider, scriptsOnlyConfigValue };
@@ -3473,6 +3496,8 @@ async function spawnProviderProcess(
     cwd?: string;
     vcsRepo?: string;
     contextKey?: string;
+    /** Forwarded to fetchResolvedEnv → resolveCredentialPools — see RunnerState.modelWindowBlocks. */
+    localBlocks?: Map<string, number>;
   },
   logDir: string,
   isYolo: boolean,
@@ -3487,15 +3512,23 @@ async function spawnProviderProcess(
     : null;
 
   // Resolve env first so we can use MODEL_OVERRIDE from config.
-  // Pass opts.model (per-task model) so the credential picker can apply
-  // the harness × model matrix (e.g. exclude OPENAI_API_KEY for OpenRouter models).
+  // Pass opts.model/opts.modelTier so the credential picker resolves the
+  // same effective model spawnProviderProcess resolves below (see
+  // fetchResolvedEnv's own resolveTaskModelSelection call) and can apply
+  // both the harness × model matrix (e.g. exclude OPENAI_API_KEY for
+  // OpenRouter models) and the model-scoped window filter.
   const { env: freshEnv, credentialSelections } = await fetchResolvedEnv(
     opts.apiUrl,
     opts.apiKey,
     opts.agentId,
     process.env,
     opts.model,
-    { repoId: sessionRepo?.id, provider: adapter.name as ProviderName },
+    {
+      repoId: sessionRepo?.id,
+      provider: adapter.name as ProviderName,
+      modelTier: opts.modelTier,
+      localBlocks: opts.localBlocks,
+    },
   );
 
   // Report which key was selected for this task (fire-and-forget)
@@ -5821,6 +5854,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               cwd: resumeCwd,
               vcsRepo: task.vcsRepo,
               contextKey: (task as { contextKey?: string }).contextKey,
+              localBlocks: state.modelWindowBlocks,
             },
             logDir,
             isYolo,
@@ -6381,6 +6415,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
               cwd: effectiveCwd,
               vcsRepo: taskVcsRepo,
               contextKey: taskContextKey,
+              localBlocks: state.modelWindowBlocks,
             },
             logDir,
             isYolo,

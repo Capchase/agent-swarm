@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { type ModelFamily, modelFamilyOf, windowForModelFamily } from "./model-rate-limit-windows";
 
 /** Env vars that may contain comma-separated credential pools */
 export const CREDENTIAL_POOL_VARS = [
@@ -108,6 +109,10 @@ export interface CredentialSelection {
   keyType: string;
   /** True when all indices for this keyType were rate-limited (best-effort pick) */
   isRateLimitFallback: boolean;
+  /** Indices excluded only by an active model-scoped window block for the requested model. */
+  modelBlockedIndices?: number[];
+  /** ISO of the earliest reset among modelBlockedIndices, or null/undefined when none. */
+  earliestModelResetAt?: string | null;
 }
 
 function isJsonObject(value: string): boolean {
@@ -232,29 +237,49 @@ export function validateOpencodeCredentials(
   );
 }
 
+/** Per-pool availability, including the model-scoped block breakdown when a model was requested. */
+export interface AvailabilityInfo {
+  availableIndices: number[];
+  modelBlockedIndices?: number[];
+  earliestModelResetAt?: string | null;
+}
+
 /**
  * Fetch available (non-rate-limited) key indices from the API for each credential pool.
- * Returns a map of envVar → available indices.
+ * Returns a map of envVar → availability info. When `modelFamily` has a weekly
+ * window (fable/opus/sonnet — haiku has none), the request also asks the
+ * server to exclude keys with an active block for that family.
  */
 async function fetchAvailableIndices(
   env: Record<string, string | undefined>,
   apiUrl: string,
   apiKey: string,
   poolVars: readonly string[] = CREDENTIAL_POOL_VARS,
-): Promise<Record<string, number[]>> {
-  const availableIndicesMap: Record<string, number[]> = {};
+  modelFamily?: ModelFamily,
+): Promise<Record<string, AvailabilityInfo>> {
+  const availableIndicesMap: Record<string, AvailabilityInfo> = {};
+  const window = modelFamily ? windowForModelFamily(modelFamily) : undefined;
+  const modelParam = window ? `&model=${encodeURIComponent(modelFamily as string)}` : "";
   for (const envVar of poolVars) {
     const val = env[envVar];
     if (val) {
       const totalKeys = val.includes(",") ? val.split(",").filter((s) => s.trim()).length : 1;
       try {
         const resp = await fetch(
-          `${apiUrl}/api/keys/available?keyType=${encodeURIComponent(envVar)}&totalKeys=${totalKeys}`,
+          `${apiUrl}/api/keys/available?keyType=${encodeURIComponent(envVar)}&totalKeys=${totalKeys}${modelParam}`,
           { headers: { Authorization: `Bearer ${apiKey}` } },
         );
         if (resp.ok) {
-          const data = (await resp.json()) as { availableIndices: number[] };
-          availableIndicesMap[envVar] = data.availableIndices;
+          const data = (await resp.json()) as {
+            availableIndices: number[];
+            modelBlockedIndices?: number[];
+            earliestModelResetAt?: string | null;
+          };
+          availableIndicesMap[envVar] = {
+            availableIndices: data.availableIndices,
+            modelBlockedIndices: data.modelBlockedIndices,
+            earliestModelResetAt: data.earliestModelResetAt,
+          };
           if (data.availableIndices.length < totalKeys) {
             console.log(
               `[credentials] ${envVar}: ${data.availableIndices.length}/${totalKeys} keys available (${totalKeys - data.availableIndices.length} rate-limited)`,
@@ -280,7 +305,7 @@ export async function resolveCredentialPools(
   opts?: {
     apiUrl?: string;
     apiKey?: string;
-    availableIndicesMap?: Record<string, number[]>;
+    availableIndicesMap?: Record<string, AvailabilityInfo>;
     /**
      * Optional `HARNESS_PROVIDER` value (claude, pi, codex). When provided,
      * only credential env vars relevant to that provider are pooled. This
@@ -293,33 +318,58 @@ export async function resolveCredentialPools(
      * Optional model string (e.g. "google/gemini-3-flash-preview", "gpt-4o").
      * Used together with `provider` to apply the harness × model matrix:
      * an OpenRouter-routed model (contains "/") on the opencode harness must
-     * not select OPENAI_API_KEY, while a direct OpenAI model may.
+     * not select OPENAI_API_KEY, while a direct OpenAI model may. Also used
+     * to derive the model family (fable/opus/sonnet/haiku) for the
+     * model-scoped window filter.
      */
     model?: string;
+    /**
+     * In-process guard (`RunnerState.modelWindowBlocks`) against re-drawing a
+     * key whose model-scoped window was just reported exhausted, before the
+     * server's write is visible to this worker's next `GET
+     * /api/keys/available` poll. Keyed by `${keyType}:${keyIndex}:${window}`,
+     * value is the reset time in ms.
+     */
+    localBlocks?: Map<string, number>;
   },
 ): Promise<CredentialSelection[]> {
   const providerVars = opts?.provider
     ? getModelAwareCredentialVars(opts.provider, opts.model)
     : CREDENTIAL_POOL_VARS;
 
+  const modelFamily = modelFamilyOf(opts?.model);
+  const window = modelFamily ? windowForModelFamily(modelFamily) : undefined;
+
   const availableIndicesMap =
     opts?.availableIndicesMap ??
     (opts?.apiUrl && opts?.apiKey
-      ? await fetchAvailableIndices(env, opts.apiUrl, opts.apiKey, providerVars)
+      ? await fetchAvailableIndices(env, opts.apiUrl, opts.apiKey, providerVars, modelFamily)
       : undefined);
 
+  const nowMs = Date.now();
   const selections: CredentialSelection[] = [];
   for (const envVar of providerVars) {
     const val = env[envVar];
     if (val) {
-      const available = availableIndicesMap?.[envVar];
+      const info = availableIndicesMap?.[envVar];
+      let available = info?.availableIndices;
+      if (available && window && opts?.localBlocks) {
+        available = available.filter((i) => {
+          const blockedUntilMs = opts.localBlocks?.get(`${envVar}:${i}:${window}`);
+          return blockedUntilMs === undefined || blockedUntilMs <= nowMs;
+        });
+      }
       const result = selectCredential(val, available, envVar);
       env[envVar] = result.selected;
       const availInfo = available ? ` (${available.length} available of ${result.total})` : "";
       console.log(
         `[credentials] Selected ${envVar} credential ${result.index + 1}/${result.total}${availInfo} [...${result.keySuffix}]`,
       );
-      selections.push({ ...result });
+      selections.push({
+        ...result,
+        modelBlockedIndices: info?.modelBlockedIndices,
+        earliestModelResetAt: info?.earliestModelResetAt,
+      });
     }
   }
   return selections;
