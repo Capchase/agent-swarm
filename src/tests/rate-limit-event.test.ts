@@ -295,7 +295,12 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
       window: "seven_day_overage_included",
       model: "fable",
       resetAt: "2026-09-27T00:00:00.000Z",
+      observedAt: "2026-09-24T02:05:41.040Z",
     });
+    // The telemetry entry for the same event carries the same observation time.
+    expect(tracker.getRateLimitWindows()?.seven_day_overage_included?.lastSeenAt).toBe(
+      "2026-09-24T02:05:41.040Z",
+    );
   });
 
   test("Fable rejection still records the 3-key unified window telemetry", () => {

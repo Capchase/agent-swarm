@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
+import { closeDb, getAvailableKeyIndices, initDb, recordKeyRateLimitWindows } from "../be/db";
 import {
   buildFinalRateLimitWindows,
   classifyRateLimitOutcome,
@@ -13,6 +15,7 @@ describe("classifyRateLimitOutcome", () => {
           window: "seven_day_overage_included",
           model: "fable",
           resetAt: "2026-09-27T00:00:00.000Z",
+          observedAt: "2026-09-24T01:55:41.040Z",
         },
       },
       undefined,
@@ -24,6 +27,7 @@ describe("classifyRateLimitOutcome", () => {
       window: "seven_day_overage_included",
       resetsAtSec: 1790467200,
       source: "event",
+      observedAt: "2026-09-24T01:55:41.040Z",
     });
   });
 
@@ -185,7 +189,7 @@ describe("buildFinalRateLimitWindows", () => {
     expect(finalWindows?.five_hour).toEqual(sessionWindows.five_hour);
   });
 
-  test("an event-source rejection keeps the session's own rejected fields", () => {
+  test("an event-source rejection keeps the session's own rejected fields and observation time", () => {
     const sessionWindows = {
       seven_day_overage_included: {
         status: "rejected",
@@ -209,8 +213,24 @@ describe("buildFinalRateLimitWindows", () => {
       status: "rejected",
       utilization: 1,
       resetsAt: 1790467200,
-      lastSeenAt: nowIso,
+      lastSeenAt: earlierIso,
     });
+  });
+
+  test("an event-source rejection uses the event's observedAt over the completion time", () => {
+    const finalWindows = buildFinalRateLimitWindows(
+      undefined,
+      {
+        kind: "model",
+        model: "fable",
+        window: "seven_day_overage_included",
+        resetsAtSec: 1790467200,
+        source: "event",
+        observedAt: earlierIso,
+      },
+      nowIso,
+    );
+    expect(finalWindows?.seven_day_overage_included?.lastSeenAt).toBe(earlierIso);
   });
 
   test("a non-model outcome reports the session telemetry unchanged", () => {
@@ -221,5 +241,85 @@ describe("buildFinalRateLimitWindows", () => {
       sessionWindows,
     );
     expect(buildFinalRateLimitWindows(undefined, { kind: "none" }, nowIso)).toBeUndefined();
+  });
+});
+
+describe("buildFinalRateLimitWindows — cross-worker recovery", () => {
+  const TEST_DB_PATH = "./test-rate-limit-outcome.sqlite";
+  const KEY_TYPE = "CLAUDE_CODE_OAUTH_TOKEN";
+
+  beforeAll(async () => {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      await unlink(`${TEST_DB_PATH}${suffix}`).catch(() => {});
+    }
+    initDb(TEST_DB_PATH);
+  });
+
+  afterAll(async () => {
+    closeDb();
+    for (const suffix of ["", "-wal", "-shm"]) {
+      await unlink(`${TEST_DB_PATH}${suffix}`).catch(() => {});
+    }
+  });
+
+  test("an older structured rejection reported late does not overwrite a newer recovery", async () => {
+    const nowMs = Date.now();
+    const t0 = new Date(nowMs - 10 * 60 * 1000).toISOString();
+    const t1 = new Date(nowMs - 5 * 60 * 1000).toISOString();
+    const t2 = new Date(nowMs).toISOString();
+    const resetsAtSec = Math.floor((nowMs + 60 * 60 * 1000) / 1000);
+    const scopeId = "cross-worker-recovery";
+
+    // Session A observes the Fable rejection at t0.
+    const sessionWindows = {
+      seven_day_overage_included: {
+        status: "rejected",
+        utilization: 1,
+        resetsAt: resetsAtSec,
+        lastSeenAt: t0,
+      },
+    };
+    const outcome = classifyRateLimitOutcome(
+      {
+        rateLimitWindows: sessionWindows,
+        modelRateLimit: {
+          window: "seven_day_overage_included",
+          model: "fable",
+          resetAt: new Date(resetsAtSec * 1000).toISOString(),
+          observedAt: t0,
+        },
+      },
+      undefined,
+      nowMs,
+    );
+
+    // Another worker reports the recovered window at t1.
+    await recordKeyRateLimitWindows(
+      KEY_TYPE,
+      "xwr01",
+      0,
+      {
+        seven_day_overage_included: {
+          status: "allowed",
+          utilization: 0.2,
+          resetsAt: resetsAtSec,
+          lastSeenAt: t1,
+        },
+      },
+      "agent",
+      scopeId,
+    );
+    expect(
+      (await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable")).availableIndices,
+    ).toEqual([0]);
+
+    // Session A finishes and reports at t2.
+    const finalWindows = buildFinalRateLimitWindows(sessionWindows, outcome, t2);
+    expect(finalWindows?.seven_day_overage_included?.lastSeenAt).toBe(t0);
+    await recordKeyRateLimitWindows(KEY_TYPE, "xwr01", 0, finalWindows!, "agent", scopeId);
+
+    expect(
+      (await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable")).availableIndices,
+    ).toEqual([0]);
   });
 });

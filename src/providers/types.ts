@@ -199,9 +199,10 @@ export interface ProviderResult {
    * A rejected model-scoped weekly window (`seven_day_opus`, `seven_day_sonnet`,
    * `seven_day_overage_included` — the Fable window) observed in this session.
    * Set instead of `rateLimitResetAt`: a model-scoped rejection blocks only that
-   * model family on this key, not the whole key.
+   * model family on this key, not the whole key. `observedAt` is when the
+   * rejection event arrived; it orders the report against other workers'.
    */
-  modelRateLimit?: { window: string; model: ModelFamily; resetAt: string };
+  modelRateLimit?: { window: string; model: ModelFamily; resetAt: string; observedAt?: string };
   /**
    * Reasoning/effort level the adapter actually applied (Phase 4). `null`
    * means `applyReasoningEffort()` returned `noop` (capability rejected the

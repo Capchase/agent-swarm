@@ -22,6 +22,11 @@ export type RateLimitOutcome =
       resetsAtSec: number;
       source: "event" | "text";
       /**
+       * When a structured rejection event was observed (event source only).
+       * A text-only rejection has no observation time of its own.
+       */
+      observedAt?: string;
+      /**
        * An independent key-wide rejection from the same session (structured
        * event only), still to enforce. Windows are independent: a model
        * rejection is never evidence that the key-wide window recovered.
@@ -32,7 +37,7 @@ export type RateLimitOutcome =
 interface ClassifiableResult {
   rateLimitResetAt?: string;
   rateLimitWindows?: RateLimitWindowTelemetry;
-  modelRateLimit?: { window: string; model: ModelFamily; resetAt: string };
+  modelRateLimit?: { window: string; model: ModelFamily; resetAt: string; observedAt?: string };
 }
 
 function clampMs(candidateMs: number, nowMs: number): number {
@@ -65,12 +70,14 @@ export function classifyRateLimitOutcome(
 
   if (result.modelRateLimit) {
     const resetsAtSec = Math.floor(new Date(result.modelRateLimit.resetAt).getTime() / 1000);
+    const { observedAt } = result.modelRateLimit;
     return {
       kind: "model",
       model: result.modelRateLimit.model,
       window: result.modelRateLimit.window,
       resetsAtSec,
       source: "event",
+      ...(observedAt ? { observedAt } : {}),
       ...keyExtra,
     };
   }
@@ -124,6 +131,11 @@ export function classifyRateLimitOutcome(
  * over its own window. A single payload keeps an older `allowed` snapshot
  * from the same session (e.g. before a text-only "reached your Fable limit"
  * failure) from overwriting the terminal rejection in a second report.
+ *
+ * `lastSeenAt` is the DB freshness key. A structured rejection keeps the time
+ * it was observed, so it never overwrites a later recovery that another worker
+ * reported in the meantime. Only a text-only rejection, which has no event of
+ * its own, is stamped with `nowIso`.
  */
 export function buildFinalRateLimitWindows(
   sessionWindows: RateLimitWindowTelemetry | undefined,
@@ -134,13 +146,17 @@ export function buildFinalRateLimitWindows(
   // Keep the session's own fields (utilization, overage) only when that
   // snapshot is itself the rejection; an older `allowed` read is stale.
   const sessionEntry = sessionWindows?.[outcome.window];
+  const sessionRejectedAt =
+    sessionEntry?.status === "rejected" ? sessionEntry.lastSeenAt : undefined;
+  const lastSeenAt =
+    outcome.source === "event" ? (outcome.observedAt ?? sessionRejectedAt ?? nowIso) : nowIso;
   return {
     ...sessionWindows,
     [outcome.window]: {
       ...(sessionEntry?.status === "rejected" ? sessionEntry : {}),
       status: "rejected",
       resetsAt: outcome.resetsAtSec,
-      lastSeenAt: nowIso,
+      lastSeenAt,
     },
   };
 }

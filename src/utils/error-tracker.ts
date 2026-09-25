@@ -178,8 +178,14 @@ export class SessionErrorTracker {
    * explicit non-rejected event for the same window type.
    */
   private keyWideRejections = new Map<string, number>();
-  /** Stashed model-scoped rejection (Fable/Opus/Sonnet window) from the last such event. */
-  private modelRateLimit: { window: string; model: ModelFamily; resetAtMs: number } | undefined;
+  /**
+   * Stashed model-scoped rejection (Fable/Opus/Sonnet window) from the last
+   * such event. `observedAt` is when the event arrived, so a later report
+   * never relabels an old rejection as fresh.
+   */
+  private modelRateLimit:
+    | { window: string; model: ModelFamily; resetAtMs: number; observedAt: string }
+    | undefined;
   private rateLimitWindows: RateLimitWindowTelemetry = {};
 
   /** Record an error from an assistant message with message.error field */
@@ -238,7 +244,8 @@ export class SessionErrorTracker {
       const info = json.rate_limit_info as Record<string, unknown> | undefined;
       if (!info) return;
 
-      const telemetryEntries = parseRateLimitWindowTelemetry(json);
+      const observedAt = new Date().toISOString();
+      const telemetryEntries = parseRateLimitWindowTelemetry(json, observedAt);
       if (telemetryEntries) {
         for (const { rateLimitType, info: windowInfo } of telemetryEntries) {
           this.rateLimitWindows[rateLimitType] = windowInfo;
@@ -272,6 +279,7 @@ export class SessionErrorTracker {
           window: rateLimitType,
           model: MODEL_SCOPED_WINDOWS[rateLimitType]!,
           resetAtMs: clampRateLimitResetMs(resetsAtMs),
+          observedAt,
         };
         return;
       }
@@ -324,12 +332,15 @@ export class SessionErrorTracker {
    * this session. A model-scoped rejection never sets the key-wide reset
    * time, and never clears it either.
    */
-  getModelRateLimit(): { window: string; model: ModelFamily; resetAt: string } | undefined {
+  getModelRateLimit():
+    | { window: string; model: ModelFamily; resetAt: string; observedAt: string }
+    | undefined {
     if (!this.modelRateLimit) return undefined;
     return {
       window: this.modelRateLimit.window,
       model: this.modelRateLimit.model,
       resetAt: new Date(this.modelRateLimit.resetAtMs).toISOString(),
+      observedAt: this.modelRateLimit.observedAt,
     };
   }
 
