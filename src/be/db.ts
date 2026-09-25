@@ -171,7 +171,7 @@ import {
 } from "./db/tasks/read";
 import { configureTaskWriteDependencies, failTask } from "./db/tasks/write";
 import { promotePendingSteeringForTask } from "./steering";
-import { isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
+import { isInternalConfigKey, isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
 import { emitTaskStarted } from "./task-lifecycle-events";
 
 export {
@@ -6335,7 +6335,7 @@ export async function getInjectableGlobalConfigs(): Promise<SwarmConfig[]> {
          AND UPPER(key) NOT IN ('API_KEY', 'SECRETS_ENCRYPTION_KEY', 'CORS_ALLOW_ANY_ORIGIN', 'EXTENSION_ALLOW_LEAD_ACTIVATION')
        ORDER BY key ASC`,
   );
-  return rows.map(rowToSwarmConfig);
+  return rows.filter((row) => !isInternalConfigKey(row.key)).map(rowToSwarmConfig);
 }
 
 /**
@@ -12808,6 +12808,21 @@ export async function getLiveAgentCounts(minutes: number = 5): Promise<{
     leads_alive: row?.leads_alive ?? 0,
     workers_alive: row?.workers_alive ?? 0,
   };
+}
+
+/**
+ * Leads and workers that can take work right now (status idle or busy). Used
+ * by the onboarding signals: the step 6 agents readout uses the same rule,
+ * while the `/status` heartbeat window (`lastActivityAt`) lags for idle agents.
+ */
+export async function getReadyAgentCounts(): Promise<{ leads: number; workers: number }> {
+  const row = await getDbClient().get<{ leads: number | null; workers: number | null }>(
+    `SELECT SUM(CASE WHEN isLead = 1 THEN 1 ELSE 0 END) AS leads,
+            SUM(CASE WHEN isLead = 0 THEN 1 ELSE 0 END) AS workers
+       FROM agents
+      WHERE status IN ('idle', 'busy') AND ${NOT_EXTENSION_AGENT_SQL}`,
+  );
+  return { leads: row?.leads ?? 0, workers: row?.workers ?? 0 };
 }
 
 /**
