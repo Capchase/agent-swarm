@@ -10,6 +10,7 @@ import {
   ensureSlackRenderV2Activation,
   getAgentById,
   getResolvableDeferralOutcomes,
+  getSlackMessageByChannelTs,
   getSlackOutcomeMessage,
   getSlackTasksInThread,
   getSlackTasksMissingTree,
@@ -1304,11 +1305,23 @@ export async function streamOutcomeCard(
     // A reservation noteOutcomeDeliveryFailure pre-created without ever
     // attempting a Slack call has nothing to reconcile against — treat it
     // like one this call just created, or it can bind to an unrelated older
-    // thread message that happens to share the same presentation text.
+    // thread message that happens to share the same presentation text. This
+    // in-memory marker is a fast path only: it resets on restart, so it
+    // cannot be the sole guard.
     const treatAsFresh = reservationWasCreated || outcomeReservedWithoutAttempt.delete(task.id);
-    const reconciled = treatAsFresh
+    let reconciled = treatAsFresh
       ? undefined
       : await findReservedSlackMessage(app.client, outcome, presentation);
+    if (reconciled?.ts) {
+      // The DB, not process memory, is the source of truth for ownership: a
+      // message matched by identical presentation text can belong to a
+      // different task's already-bound card (e.g. after a restart cleared
+      // the marker above). Binding onto it would collide on the
+      // (channel_id, ts) unique index on every retry and abandon this
+      // task's card for good, so only reconcile onto a ts nothing else owns.
+      const claimedBy = await getSlackMessageByChannelTs(outcome.channelId, reconciled.ts);
+      if (claimedBy && claimedBy.id !== outcome.id) reconciled = undefined;
+    }
     streamedFreshContent = !reconciled;
     let started = reconciled;
     if (!started) {
@@ -1434,7 +1447,10 @@ async function isAnsweredByDeferralCard(
  * and `streaming_state_conflict` all answer identically on the next tick.
  */
 const TRANSIENT_SLACK_ERROR_CODES = new Set([
+  // Slack documents both spellings for chat.stopStream: ratelimited elsewhere,
+  // rate_limited here. https://docs.slack.dev/reference/methods/chat.stopStream/#errors
   "ratelimited",
+  "rate_limited",
   "internal_error",
   "service_unavailable",
   "fatal_error",
