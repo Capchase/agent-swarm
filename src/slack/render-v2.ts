@@ -140,11 +140,53 @@ const OUTCOME_DELIVERY_MAX_ATTEMPTS = 5;
 const OUTCOME_DELIVERY_BASE_DELAY_MS = 30_000;
 const OUTCOME_DELIVERY_MAX_DELAY_MS = 30 * 60_000;
 const outcomeDeliveryNextAttemptAt = new Map<string, number>();
+// Task IDs whose outcome row was reserved by noteOutcomeDeliveryFailure
+// without ever attempting a Slack call (content/presentation build failed
+// before streamOutcomeCard's own reservation). Consumed — and cleared — the
+// next time streamOutcomeCard runs for that task. Resets on restart, same as
+// outcomeDeliveryNextAttemptAt; worst case that just reverts to today's
+// reconciliation behavior for the one row in flight.
+const outcomeReservedWithoutAttempt = new Set<string>();
 
 function outcomeDeliveryGate(taskId: string, card: SlackMessageRecord | null): boolean {
   if (card?.deliveryAbandonedAt) return false;
   if ((card?.deliveryAttempts ?? 0) >= OUTCOME_DELIVERY_MAX_ATTEMPTS) return false;
   return Date.now() >= (outcomeDeliveryNextAttemptAt.get(taskId) ?? 0);
+}
+
+/**
+ * Recovers a card stuck at max attempts without an abandon timestamp — the
+ * crash window between noteSlackOutcomeDeliveryFailure (which bumps
+ * delivery_attempts) and abandonSlackOutcomeDelivery (which sets
+ * delivery_abandoned_at). Without this, outcomeDeliveryGate's attempts check
+ * blocks the card forever and it never settles. abandonSlackOutcomeDelivery
+ * only returns non-null on the NULL -> set transition, so only the winner
+ * posts the give-up warning.
+ */
+async function reconcileStuckOutcomeDelivery(
+  task: AgentTask,
+  card: SlackMessageRecord | null,
+): Promise<void> {
+  if (!card || card.deliveryAbandonedAt) return;
+  if (card.deliveryAttempts < OUTCOME_DELIVERY_MAX_ATTEMPTS) return;
+  const lastError = card.deliveryLastError ?? "delivery attempts exhausted";
+  const abandoned = await abandonSlackOutcomeDelivery(task.id, lastError);
+  outcomeDeliveryNextAttemptAt.delete(task.id);
+  if (!abandoned) return;
+  console.error(
+    `[Slack] Recovered a stuck outcome delivery for task ${task.id} left at ` +
+      `${card.deliveryAttempts} attempt(s) without a give-up; surfacing failure and clearing the working indicator`,
+  );
+  await surfaceOutcomeDeliveryGiveUp(task, lastError, card.deliveryAttempts);
+}
+
+/** Reconciles a stuck card (see reconcileStuckOutcomeDelivery), then applies the gate. */
+async function checkOutcomeDeliveryGate(
+  task: AgentTask,
+  card: SlackMessageRecord | null,
+): Promise<boolean> {
+  await reconcileStuckOutcomeDelivery(task, card);
+  return outcomeDeliveryGate(task.id, card);
 }
 
 function noteOutcomeDeliverySuccess(taskId: string): void {
@@ -157,8 +199,16 @@ async function noteOutcomeDeliveryFailure(
   error: unknown,
 ): Promise<void> {
   const detail = describeSlackError(error);
-  const summary = slackErrorSummary(error);
-  if (!task.slackChannelId || !task.slackThreadTs) return;
+  // Scrubbed once here so every downstream sink — the two DB writes below and
+  // the Slack give-up warning — carries the same redacted text.
+  const summary = scrubSecrets(slackErrorSummary(error));
+  if (!task.slackChannelId || !task.slackThreadTs) {
+    // No channel/thread means delivery can never succeed. Still back off, or
+    // the gate (which only blocks on attempts/abandonment) lets this retry
+    // at tick cadence forever.
+    outcomeDeliveryNextAttemptAt.set(task.id, Date.now() + OUTCOME_DELIVERY_BASE_DELAY_MS);
+    return;
+  }
   // A failure before the reservation (content build, presentation) has no row
   // yet. Reserve one so the count and the give-up have a place to live.
   if (!(await getSlackOutcomeMessage(task.id))) {
@@ -169,6 +219,10 @@ async function noteOutcomeDeliveryFailure(
       kind: "outcome",
       taskId: task.id,
     });
+    // No Slack call was ever attempted for this reservation — the next
+    // streamOutcomeCard pass must not try to reconcile it against an
+    // unrelated older thread message by presentation text.
+    outcomeReservedWithoutAttempt.add(task.id);
   }
   const card = await noteSlackOutcomeDeliveryFailure(task.id, summary);
   const attempts = card?.deliveryAttempts ?? OUTCOME_DELIVERY_MAX_ATTEMPTS;
@@ -213,7 +267,10 @@ async function surfaceOutcomeDeliveryGiveUp(
       text: `⚠️ Couldn't deliver this task's reply after ${attempts} attempt(s) (${summary}). See task ${getTaskLink(task.id)} for the result.`,
     });
   } catch (postError) {
-    console.error(`[Slack] Give-up notice failed to post for task ${task.id}:`, postError);
+    console.error(
+      `[Slack] Give-up notice failed to post for task ${task.id}:`,
+      scrubSecrets(postError instanceof Error ? postError.message : String(postError)),
+    );
   }
   await clearAssistantStatus(app.client, task.slackChannelId, task.slackThreadTs);
 }
@@ -1244,7 +1301,12 @@ export async function streamOutcomeCard(
   let streamedFreshContent = false;
   let deliveredViaFallback = false;
   if (isPendingSlackMessage(outcome)) {
-    const reconciled = reservationWasCreated
+    // A reservation noteOutcomeDeliveryFailure pre-created without ever
+    // attempting a Slack call has nothing to reconcile against — treat it
+    // like one this call just created, or it can bind to an unrelated older
+    // thread message that happens to share the same presentation text.
+    const treatAsFresh = reservationWasCreated || outcomeReservedWithoutAttempt.delete(task.id);
+    const reconciled = treatAsFresh
       ? undefined
       : await findReservedSlackMessage(app.client, outcome, presentation);
     streamedFreshContent = !reconciled;
@@ -1614,7 +1676,7 @@ export async function processSlackRenderV2(): Promise<void> {
       if (!ownerAsk || ownerAsk.createdAt < delegationActivatedAt) continue;
       if (childCardsThisTick >= CHILD_CARDS_PER_TICK) continue;
       if (askId && (await childCardCountFor(askId)) >= CHILD_CARDS_PER_ASK) continue;
-      if (!outcomeDeliveryGate(task.id, card)) continue;
+      if (!(await checkOutcomeDeliveryGate(task, card))) continue;
       try {
         const outcome = await streamOutcomeCard(task, tree, { buildContent: childOutcomeContent });
         if (outcome) {
@@ -1642,7 +1704,7 @@ export async function processSlackRenderV2(): Promise<void> {
         task.createdAt >= delegationActivatedAt;
 
       if (!deferByClosure) {
-        if (!outcomeDeliveryGate(task.id, card)) continue;
+        if (!(await checkOutcomeDeliveryGate(task, card))) continue;
         try {
           const outcome = await streamOutcomeCard(task, tree);
           if (outcome) {
@@ -1677,7 +1739,7 @@ export async function processSlackRenderV2(): Promise<void> {
       if (childCardPending) continue;
       const state = closureState(task, closure, new Date(), settleSec, timeoutMin);
       if (state === "open") continue;
-      if (!outcomeDeliveryGate(task.id, card)) continue;
+      if (!(await checkOutcomeDeliveryGate(task, card))) continue;
       try {
         const outcome = await streamOutcomeCard(task, tree, {
           buildContent: (_t, slackReplySent) =>
@@ -1728,4 +1790,12 @@ export function _resetSlackRenderV2ForTests(): void {
   treeUpdateTails.clear();
   cachedTeamId = undefined;
   outcomeDeliveryNextAttemptAt.clear();
+  outcomeReservedWithoutAttempt.clear();
 }
+
+/**
+ * Exercises the real noteOutcomeDeliveryFailure — the natural triggers for
+ * its pre-reservation branch (a DB read throwing before streamOutcomeCard's
+ * own reservation) aren't practical to reproduce end-to-end in tests.
+ */
+export const _noteOutcomeDeliveryFailureForTests = noteOutcomeDeliveryFailure;

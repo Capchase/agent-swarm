@@ -37,6 +37,7 @@ import {
   insertTaskAttachment,
   isPendingSlackMessage,
   markTaskSlackReplySent,
+  noteSlackOutcomeDeliveryFailure,
   startTask,
   supersedeTask,
   upsertSwarmConfig,
@@ -45,6 +46,7 @@ import { upsertTaskCitations } from "../be/task-citations";
 import { createStandaloneScheduleTask } from "../scheduler/schedule-task";
 import { getTaskLink, MAX_SECTION_LENGTH } from "../slack/blocks";
 import {
+  _noteOutcomeDeliveryFailureForTests,
   _resetSlackRenderV2ForTests,
   callSlackWithRetry,
   childOutcomeContent,
@@ -2870,6 +2872,111 @@ describe("Outcome delivery give-up", () => {
     await processSlackRenderV2();
 
     expect(calls.filter((c) => c.method === "chat.update" && c.payload.ts === ts)).toHaveLength(1);
+  });
+
+  test("recovers a card crashed between the attempts ceiling and the abandon transition", async () => {
+    const { askId } = await orphanedOutcomeStream("C_GIVEUP_STUCK");
+    // Simulate a crash: delivery_attempts reached the ceiling via
+    // noteSlackOutcomeDeliveryFailure, but abandonSlackOutcomeDelivery never
+    // ran, leaving delivery_abandoned_at NULL. Without the fix,
+    // outcomeDeliveryGate's attempts check would block this card forever.
+    for (let i = 0; i < 4; i++) {
+      await noteSlackOutcomeDeliveryFailure(askId, "boom");
+    }
+    let card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAttempts).toBe(5);
+    expect(card?.deliveryAbandonedAt).toBeUndefined();
+
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    expect(card?.deliveryAttempts).toBe(5);
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(false);
+    const warnings = calls.filter(
+      (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+    );
+    expect(warnings).toHaveLength(1);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    expect(
+      calls.filter(
+        (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("scrubs a secret-shaped error from the persisted give-up and its Slack warning", async () => {
+    const { askId, ts } = await orphanedOutcomeStream("C_GIVEUP_SCRUB_PERSIST");
+    rejectedUpdateTs = ts;
+    rejectedUpdateCode = "msg_too_long";
+    rejectedUpdateMessages = ["token xoxb-1234567890-abcdefghij"];
+
+    await processSlackRenderV2();
+
+    const card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    expect(card?.deliveryLastError).not.toContain("xoxb-1234567890");
+    const warning = calls.find(
+      (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+    );
+    expect(warning).toBeDefined();
+    expect(String(warning?.payload.text)).not.toContain("xoxb-1234567890");
+  });
+
+  test("a reservation from the failure path is not reconciled against an identical older message", async () => {
+    const lead = await createAgent({ name: "Recon Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RECON");
+    const contextKey = slackContextKey({ channelId, threadTs });
+
+    // taskA posts first and settles normally; its outcome text will be
+    // identical to taskB's, since both complete with the same output.
+    const taskA = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey,
+    });
+    await startTask(taskA.id);
+    await ensureSlackThreadTree([taskA.id]);
+    await completeTask(taskA.id, "The answer.");
+    await processSlackRenderV2();
+    const cardA = await getSlackOutcomeMessage(taskA.id);
+    expect(cardA?.finalizedAt).toBeDefined();
+
+    const taskB0 = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey,
+    });
+    await startTask(taskB0.id);
+    await completeTask(taskB0.id, "The answer.");
+    const taskB = (await getTaskById(taskB0.id))!;
+
+    const tree = (await getSlackTreeMessageByThread(channelId, threadTs))!;
+    // Simulate a failure before streamOutcomeCard's own reservation (e.g. a
+    // DB read throwing while building content) — noteOutcomeDeliveryFailure
+    // eagerly reserves a row with no Slack call ever attempted.
+    await _noteOutcomeDeliveryFailureForTests(taskB, tree, new Error("content build blew up"));
+    const reservedB = await getSlackOutcomeMessage(taskB.id);
+    expect(reservedB?.ts.startsWith("pending:")).toBe(true);
+    expect(reservedB?.deliveryAttempts).toBe(1);
+
+    calls.length = 0;
+    const outcome = await streamOutcomeCard(taskB, tree);
+
+    // Without the fix, this reconciles by presentation text against taskA's
+    // identical, unrelated message instead of posting a fresh one.
+    expect(calls.some((c) => c.method === "conversations.replies")).toBe(false);
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(true);
+    expect(outcome?.finalizedAt).toBeDefined();
+    expect(outcome?.ts).not.toBe(cardA?.ts);
   });
 });
 
