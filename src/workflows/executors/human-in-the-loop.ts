@@ -370,10 +370,22 @@ export class HumanInTheLoopExecutor extends BaseExecutor<
           }
 
           const questions = Array.isArray(config.questions) ? config.questions : [];
-          const timeoutText = config.timeout
-            ? `\n⏱ _Timeout: ${formatTimeout(config.timeout.seconds)} — auto-rejects if not responded_`
-            : "";
-          const questionsText = buildSlackQuestionsSummary(questions, timeoutText);
+          const questionsText = buildSlackQuestionsSummary(questions);
+
+          // The deadline is a caption under the button, not part of the ask.
+          const timeoutCaption = config.timeout
+            ? [
+                {
+                  type: "context",
+                  elements: [
+                    {
+                      type: "mrkdwn",
+                      text: `⏱ Timeout: ${formatTimeout(config.timeout.seconds)} — auto-rejects if not responded`,
+                    },
+                  ],
+                },
+              ]
+            : [];
 
           const blocks = [
             {
@@ -401,6 +413,7 @@ export class HumanInTheLoopExecutor extends BaseExecutor<
                 },
               ],
             },
+            ...timeoutCaption,
           ];
 
           const result = await slackApp.client.chat.postMessage({
