@@ -39,7 +39,10 @@ test("desktop: Enter submits, Shift+Enter inserts a newline", async ({ page, see
 
   await composer.press("Enter");
   await expect.poll(() => calls).toEqual(["line one\nline two"]);
-  await expect(composer).toHaveValue("");
+  // A successful create navigates away to the new session — the strongest
+  // signal available that Enter actually submitted, since the draft doesn't
+  // persist to be re-checked on this page.
+  await expect(page).toHaveURL(/\/sessions\/e2e-composer-task$/);
 });
 
 test("mobile: Enter inserts a newline, blank lines survive, the send button submits", async ({
