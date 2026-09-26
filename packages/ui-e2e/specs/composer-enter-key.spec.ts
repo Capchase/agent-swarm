@@ -69,8 +69,16 @@ test("mobile: Enter inserts a newline, blank lines survive, the send button subm
   await expect.poll(() => calls).toEqual(["line one\n\nline two"]);
 });
 
-test("IME composition never submits the composer, on any device", async ({ page, seed }) => {
+test("IME composition never submits the composer, on any device", async ({
+  page,
+  seed,
+  isMobile,
+}) => {
   test.skip(!seed, "remote run without seed");
+  // Enter never submits on a coarse pointer regardless of composing state —
+  // the send button does. That path is exercised by the mobile test above;
+  // it can't distinguish a present guard from a missing one, so skip here.
+  test.skip(isMobile, "mobile Enter never submits — composing can't change that, see above");
 
   const calls = await interceptTaskCreate(page);
   await page.goto("/sessions");
@@ -84,6 +92,19 @@ test("IME composition never submits the composer, on any device", async ({ page,
     bubbles: true,
     cancelable: true,
   });
+  // A synchronous check here would pass whether or not the guard fired —
+  // the mocked create POST resolves a tick later. Give it a real window to
+  // land before asserting, so a missing guard actually fails this test.
+  await page.waitForTimeout(500);
   expect(calls).toEqual([]);
   await expect(composer).toHaveValue("こんにちは");
+
+  // Composition ends; the same Enter now submits.
+  await composer.dispatchEvent("keydown", {
+    key: "Enter",
+    isComposing: false,
+    bubbles: true,
+    cancelable: true,
+  });
+  await expect.poll(() => calls).toEqual(["こんにちは"]);
 });

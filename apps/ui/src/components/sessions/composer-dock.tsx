@@ -270,7 +270,6 @@ export function ComposerDock({
           onPaste={onPaste}
           placeholder={placeholder}
           disabled={disabled || isPending}
-          enterKeyHint={isCoarsePointerInput() ? "enter" : undefined}
           rows={1}
           className={cn(
             "field-sizing-content border-0 shadow-none bg-transparent",

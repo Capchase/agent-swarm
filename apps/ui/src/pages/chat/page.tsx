@@ -412,7 +412,6 @@ function MessageInput({
             e.preventDefault();
             handleSend();
           }}
-          enterKeyHint={isCoarsePointerInput() ? "enter" : undefined}
           className="min-h-[36px] max-h-24 resize-none text-sm"
           rows={1}
         />
