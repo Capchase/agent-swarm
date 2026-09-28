@@ -1,4 +1,4 @@
-import { Loader2, Send, Trash2 } from "lucide-react";
+import { Send, Trash2 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useState } from "react";
 import type { ApprovalRequest } from "@/api/types";
@@ -77,6 +77,7 @@ export function DiscardButton({
     <AlertDialog open={open} onOpenChange={setOpen}>
       <Button
         variant="outline"
+        status={discarding ? "loading" : "idle"}
         onClick={busy ? undefined : () => setOpen(true)}
         aria-disabled={busy ? true : undefined}
         className={cn(
@@ -84,7 +85,7 @@ export function DiscardButton({
           "aria-disabled:cursor-not-allowed aria-disabled:opacity-50 aria-disabled:active:scale-100",
         )}
       >
-        {discarding ? <Loader2 className="animate-spin" /> : <Trash2 />}
+        <Trash2 />
         Discard
       </Button>
       <AlertDialogContent>
@@ -132,7 +133,7 @@ export function SubmitBar({
 }) {
   const blocked = progress.blockedReason;
   const pct = progress.total ? (progress.answered / progress.total) * 100 : 0;
-  const label = submitting ? "Submitting…" : progress.rejects ? "Submit · reject" : "Submit";
+  const label = progress.rejects ? "Submit · reject" : "Submit";
   return (
     <motion.div
       initial={{ y: "100%", opacity: 0 }}
@@ -184,8 +185,10 @@ export function SubmitBar({
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
-                onClick={blocked || submitting || discarding ? undefined : onSubmit}
-                aria-disabled={blocked || submitting || discarding ? true : undefined}
+                // The loading status ignores presses on its own.
+                status={submitting ? "loading" : "idle"}
+                onClick={blocked || discarding ? undefined : onSubmit}
+                aria-disabled={blocked || discarding ? true : undefined}
                 aria-keyshortcuts="Control+Enter Meta+Enter"
                 variant={progress.rejects ? "destructive" : "default"}
                 className={cn(
@@ -193,7 +196,7 @@ export function SubmitBar({
                   "aria-disabled:cursor-not-allowed aria-disabled:opacity-50 aria-disabled:active:scale-100",
                 )}
               >
-                {submitting ? <Loader2 className="animate-spin" /> : <Send />}
+                <Send />
                 {label}
                 <span className="ml-0.5 hidden gap-0.5 [@media(hover:hover)_and_(pointer:fine)]:inline-flex">
                   <KeyHint tone="inverted">{MOD}</KeyHint>

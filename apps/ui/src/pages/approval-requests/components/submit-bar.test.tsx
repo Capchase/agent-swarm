@@ -25,6 +25,8 @@ afterAll(async () => {
 // Factories use require, not `() => import()`: Bun hangs when a later test
 // file in the same run re-registers an alias with an async factory.
 mock.module("@/lib/utils", () => require("../../../lib/utils"));
+mock.module("@/components/kibo-ui/spinner", () => require("../../../components/kibo-ui/spinner"));
+mock.module("@/components/ui/spinner", () => require("../../../components/ui/spinner"));
 
 mock.module("@/components/ui/alert-dialog", () => require("../../../components/ui/alert-dialog"));
 mock.module("@/components/ui/button", () => require("../../../components/ui/button"));
@@ -56,8 +58,8 @@ function render(status: "pending" | "cancelled"): string {
 }
 
 function buttonWithText(root: ParentNode, text: string): HTMLButtonElement {
-  const button = Array.from(root.querySelectorAll("button")).find(
-    (b) => b.textContent?.trim() === text,
+  const button = Array.from(root.querySelectorAll("button")).find((b) =>
+    b.textContent?.includes(text),
   );
   if (!button) throw new Error(`No button with the text ${text}`);
   return button;

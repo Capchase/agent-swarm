@@ -18,6 +18,8 @@ mock.module("@/hooks/use-user-name", () => require("../../../hooks/use-user-name
 mock.module("@/hooks/use-copy-to-clipboard", () => require("../../../hooks/use-copy-to-clipboard"));
 mock.module("@/lib/approval-format", () => require("../../../lib/approval-format"));
 mock.module("@/lib/utils", () => require("../../../lib/utils"));
+mock.module("@/components/kibo-ui/spinner", () => require("../../../components/kibo-ui/spinner"));
+mock.module("@/components/ui/spinner", () => require("../../../components/ui/spinner"));
 
 mock.module("@/api/hooks/use-users", () => require("../../../api/hooks/use-users"));
 mock.module("@/components/ui/badge", () => require("../../../components/ui/badge"));
