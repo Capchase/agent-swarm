@@ -6,9 +6,13 @@ import {
   getTaskById,
   getWorkflowRun,
   listCancelledApprovalRequestsForRun,
+  resolveApprovalRequest,
 } from "../be/db";
 import { can, type RbacPrincipal } from "../rbac";
-import { postApprovalCancellationUpdates } from "./approval-notifications";
+import {
+  createApprovalFollowUpTask,
+  postApprovalCancellationUpdates,
+} from "./approval-notifications";
 import { cancelWorkflowRunRows } from "./resume";
 
 export type CancelApprovalRequestResult =
@@ -66,6 +70,13 @@ export async function cancelApprovalRequest(input: {
       resolvedBy: input.resolvedBy,
     });
     if (!result) continue;
+    if ("timedOut" in result) {
+      return {
+        ok: false,
+        status: 409,
+        message: `Approval request expired at ${result.timedOut.expiresAt}`,
+      };
+    }
     return {
       ok: true,
       request: result.request,
@@ -80,14 +91,34 @@ export async function cancelApprovalRequest(input: {
 /**
  * Cancel 1 pending request and its live workflow run in 1 transaction: both
  * commit, or neither does. The Slack thread updates run after COMMIT.
- * Returns null when the request was not pending.
+ * Returns null when the request was not pending. A pending request whose
+ * explicit expiresAt passed becomes timeout instead, in the same transaction.
  */
 export async function cancelApprovalRequestAndRun(
   id: string,
   data: { reason: string; resolvedBy: string | null; slackReason?: string },
-): Promise<{ request: ApprovalRequest; runCancelled: boolean } | null> {
+): Promise<
+  { request: ApprovalRequest; runCancelled: boolean } | { timedOut: ApprovalRequest } | null
+> {
   const client = getDbClient();
   return await client.transaction(async () => {
+    // An elapsed explicit deadline wins over the cancel. A workflow run then
+    // routes on its timeout port through getStuckApprovalRuns, as for a late answer.
+    const current = await getApprovalRequestById(id);
+    if (
+      current?.status === "pending" &&
+      current.expiresAt &&
+      new Date(current.expiresAt) < new Date()
+    ) {
+      const timedOut = await resolveApprovalRequest(id, {
+        status: "timeout",
+        resolutionReason: `Timed out: the cancellation arrived after the deadline ${current.expiresAt}`,
+      });
+      if (!timedOut) return null;
+      await createApprovalFollowUpTask(timedOut, "hitl.timeout");
+      return { timedOut };
+    }
+
     const request = await cancelApprovalRequestById(id, {
       reason: data.reason,
       resolvedBy: data.resolvedBy,

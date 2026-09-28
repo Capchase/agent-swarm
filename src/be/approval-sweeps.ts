@@ -52,7 +52,7 @@ export async function autoCancelStaleApprovalRequests(
         resolvedBy: null,
         slackReason: "auto-cancelled with no response",
       });
-      if (!result) continue;
+      if (!result || "timedOut" in result) continue;
       cancelled.push(result.request);
       if (result.runCancelled && result.request.workflowRunId) {
         runsCancelled.push(result.request.workflowRunId);

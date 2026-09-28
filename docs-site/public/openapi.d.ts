@@ -3684,7 +3684,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description Already resolved with approved, rejected, or timeout */
+                /** @description Already resolved with approved, rejected, or timeout, or its expiresAt passed */
                 409: {
                     headers: {
                         [name: string]: unknown;

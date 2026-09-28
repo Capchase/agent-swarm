@@ -86,8 +86,14 @@ export async function createApprovalFollowUpTask(
   if (request.workflowRunId || !request.sourceTaskId) return false;
   const sourceTask = await getTaskById(request.sourceTaskId);
   if (!sourceTask) return false;
-  // A finished task has no agent to act on the outcome. The first sweep after deploy would otherwise create one task per backlog row.
-  if ((TERMINAL_TASK_STATUSES as readonly string[]).includes(sourceTask.status)) return false;
+  // Timeouts only: the first sweep after deploy would otherwise create one task per finished backlog row.
+  // A human answer still gets a follow-up after the source task finishes, as before.
+  if (
+    templateEventType === "hitl.timeout" &&
+    (TERMINAL_TASK_STATUSES as readonly string[]).includes(sourceTask.status)
+  ) {
+    return false;
+  }
 
   const { text: taskText } =
     templateEventType === "hitl.follow_up"

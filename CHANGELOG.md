@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `POST /api/approval-requests/{id}/cancel`, the `cancel-approval-request` MCP tool, the `approval_cancel` scripts SDK method, and a Discard button on the dashboard cancel a pending approval request.
 
 ### Changed
-- An answer that arrives after an approval request's `expiresAt` gets 409 and the request becomes `timeout`.
+- An answer or a cancel that arrives after an approval request's `expiresAt` gets 409 and the request becomes `timeout`.
 - The `request-human-input` tool text and the workflow Slack card no longer say that a timeout auto-rejects; the request becomes `timeout`.
 
 ## [1.157.0] - 2026-09-28

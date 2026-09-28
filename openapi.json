@@ -13139,7 +13139,7 @@
             }
           },
           "409": {
-            "description": "Already resolved with approved, rejected, or timeout",
+            "description": "Already resolved with approved, rejected, or timeout, or its expiresAt passed",
             "content": {
               "application/json": {
                 "schema": {

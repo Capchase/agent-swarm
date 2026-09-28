@@ -1712,6 +1712,20 @@ describe("Approval Requests", () => {
       expect(tasks[0]!.task).toContain("Human responded to your approval request");
     });
 
+    test("a respond still creates the hitl.follow_up task after the source task completes", async () => {
+      const taskId = await sourceTask("completed");
+      const data = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(data);
+
+      const res = await post(`/api/approval-requests/${data.id}/respond`, approve);
+
+      expect(res.status).toBe(200);
+      expect(res.body.approvalRequest.status).toBe("approved");
+      const tasks = await followUps(taskId);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.task).toContain("Human responded to your approval request");
+    });
+
     test("a late answer gets 409 and the request becomes timeout", async () => {
       const taskId = await sourceTask();
       const data = makeApprovalData({ sourceTaskId: taskId });
@@ -1875,6 +1889,38 @@ describe("Approval Requests", () => {
       expect(run!.error).toBe("stop the run");
       expect((await getWorkflowRunStep(stepId))!.status).toBe("cancelled");
       expect((await getTaskById(task.id))!.status).toBe("cancelled");
+    });
+
+    test("cancel on an expired pending request returns 409 and times it out", async () => {
+      const taskId = await sourceTask();
+      const data = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(data);
+      await setTimes(data.id, { expiresAt: new Date(Date.now() - 60_000).toISOString() });
+
+      const res = await post(`/api/approval-requests/${data.id}/cancel`, {}, lead.id);
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("Approval request expired at");
+      const row = await getApprovalRequestById(data.id);
+      expect(row!.status).toBe("timeout");
+      expect(row!.resolutionReason).toStartWith(
+        "Timed out: the cancellation arrived after the deadline",
+      );
+      const tasks = await followUps(taskId);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.task).toContain("timed out with no answer");
+    });
+
+    test("cancel on an expired request of a waiting run leaves the run for its timeout branch", async () => {
+      const { runId, stepId, approvalId } = await makeRun("waiting");
+      await setTimes(approvalId, { expiresAt: new Date(Date.now() - 60_000).toISOString() });
+
+      const res = await post(`/api/approval-requests/${approvalId}/cancel`, {}, lead.id);
+
+      expect(res.status).toBe(409);
+      expect((await getApprovalRequestById(approvalId))!.status).toBe("timeout");
+      expect((await getWorkflowRun(runId))!.status).toBe("waiting");
+      expect((await getWorkflowRunStep(stepId))!.status).toBe("waiting");
     });
 
     test("cancel on a dead run leaves the run alone", async () => {

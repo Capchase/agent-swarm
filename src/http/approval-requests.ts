@@ -285,7 +285,9 @@ const cancelRoute = route({
     },
     403: { description: "Caller may not cancel this request" },
     404: { description: "Not found" },
-    409: { description: "Already resolved with approved, rejected, or timeout" },
+    409: {
+      description: "Already resolved with approved, rejected, or timeout, or its expiresAt passed",
+    },
   },
   auth: { apiKey: true },
   rbac: { permission: "approval.cancel.any" },

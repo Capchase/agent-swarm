@@ -7,6 +7,7 @@ import {
   createApprovalRequest,
   createTaskExtended,
   getApprovalRequestById,
+  getDbClient,
   initDb,
 } from "../be/db";
 import { registerCancelApprovalRequestTool } from "../tools/cancel-approval-request";
@@ -97,5 +98,18 @@ describe("cancel-approval-request tool", () => {
     const result = await callTool({ requestId }, ownerId);
     expect(result.isError).toBeFalsy();
     expect((await getApprovalRequestById(requestId))!.status).toBe("cancelled");
+  });
+
+  test("an expired pending request gets a tool error and becomes timeout", async () => {
+    const requestId = await makeRequest();
+    await getDbClient().run("UPDATE approval_requests SET expiresAt = ? WHERE id = ?", [
+      new Date(Date.now() - 60_000).toISOString(),
+      requestId,
+    ]);
+
+    const result = await callTool({ requestId }, leadId);
+
+    expect(result.isError).toBe(true);
+    expect((await getApprovalRequestById(requestId))!.status).toBe("timeout");
   });
 });
