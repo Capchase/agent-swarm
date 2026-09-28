@@ -384,6 +384,7 @@ value:getStepCountForNode
 value:getStuckApprovalRuns
 value:getStuckWaitRuns
 value:getStuckWorkflowRuns
+value:getSupersededTasksWithoutResume
 value:getSwarmConfigById
 value:getSwarmConfigLookupById
 value:getSwarmConfigs
@@ -599,6 +600,7 @@ value:getMostRecentTaskInThread
 value:getPendingSlackRelayTasks
 value:getRecentlyFinishedWorkerTasks
 value:getSlackTasksMissingTree
+value:getSupersededTasksWithoutResume
 value:getTaskById
 value:getTaskStats
 value:getTasksByAgentId
