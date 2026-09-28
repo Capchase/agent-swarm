@@ -3128,7 +3128,8 @@
               "opencode",
               "devin",
               "gemini",
-              "acp"
+              "acp",
+              "dsh"
             ]
           },
           "model": {
@@ -10507,6 +10508,85 @@
                   "required": [
                     "runtimeInstances",
                     "staleThresholdMinutes"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Agent not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/{id}/task-activity": {
+      "get": {
+        "summary": "Daily task counts for an agent",
+        "description": "Number of tasks created for the agent per UTC day over the last `days` days (default 365, max 730), oldest first. Days with no tasks are omitted. Backs the activity heatmap on the agent page.",
+        "tags": [
+          "Agents"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 730
+            },
+            "required": false,
+            "name": "days",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Daily task counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "days": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "date": {
+                            "type": "string"
+                          },
+                          "count": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "date",
+                          "count"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "days"
                   ]
                 }
               }
@@ -28386,7 +28466,8 @@
                 "opencode",
                 "devin",
                 "gemini",
-                "acp"
+                "acp",
+                "dsh"
               ]
             },
             "required": true,
@@ -28467,7 +28548,8 @@
                 "opencode",
                 "devin",
                 "gemini",
-                "acp"
+                "acp",
+                "dsh"
               ]
             },
             "required": true,
@@ -28581,7 +28663,8 @@
                 "opencode",
                 "devin",
                 "gemini",
-                "acp"
+                "acp",
+                "dsh"
               ]
             },
             "required": true,
@@ -28663,7 +28746,8 @@
                 "opencode",
                 "devin",
                 "gemini",
-                "acp"
+                "acp",
+                "dsh"
               ]
             },
             "required": true,
@@ -38467,7 +38551,8 @@
                       "opencode",
                       "devin",
                       "gemini",
-                      "acp"
+                      "acp",
+                      "dsh"
                     ]
                   },
                   "createdAt": {
@@ -49812,6 +49897,27 @@
                         },
                         "taskId": {
                           "type": "string"
+                        },
+                        "skipped": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "extension": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "name": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "name"
+                          ]
                         }
                       },
                       "required": [
@@ -49865,6 +49971,27 @@
                     },
                     "taskId": {
                       "type": "string"
+                    },
+                    "skipped": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "extension": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name"
+                      ]
                     }
                   },
                   "required": [

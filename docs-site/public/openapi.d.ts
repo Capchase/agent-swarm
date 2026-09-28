@@ -2708,6 +2708,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agents/{id}/task-activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Daily task counts for an agent
+         * @description Number of tasks created for the agent per UTC day over the last `days` days (default 365, max 730), oldest first. Days with no tasks are omitted. Backs the activity heatmap on the agent page.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    days?: number;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Daily task counts */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            days: {
+                                date: string;
+                                count: number;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Agent not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agents/{id}/profile": {
         parameters: {
             query?: never;
@@ -11915,7 +11972,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -11943,7 +12000,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -12006,7 +12063,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -12058,7 +12115,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                     effectiveFrom: string;
@@ -14402,7 +14459,7 @@ export interface paths {
                         }[];
                         isError?: boolean;
                         /** @enum {string} */
-                        provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp";
+                        provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh";
                         createdAt?: number;
                     };
                 };
@@ -20166,6 +20223,12 @@ export interface paths {
                         } | {
                             created: boolean;
                             taskId?: string;
+                            skipped?: boolean;
+                            reason?: string;
+                            extension?: {
+                                id: string;
+                                name: string;
+                            };
                         };
                     };
                 };
@@ -20223,6 +20286,12 @@ export interface paths {
                         "application/json": {
                             created: boolean;
                             taskId?: string;
+                            skipped?: boolean;
+                            reason?: string;
+                            extension?: {
+                                id: string;
+                                name: string;
+                            };
                         };
                     };
                 };
@@ -22422,7 +22491,7 @@ export interface components {
         };
         PricingRow: {
             /** @enum {string} */
-            provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp";
+            provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh";
             model: string;
             /** @enum {string} */
             tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";

@@ -5,6 +5,7 @@ import { CONFIG_PRESETS } from "../../configs/presets.ts";
 import { getCatalog, refreshCatalog, startCatalogRefresh } from "../cost/catalog.ts";
 import { getClaudeAliasMap, listOpenrouterModels } from "../cost/pricing.ts";
 import { getDb, initDb } from "../db/client.ts";
+import { listHarnessConfigs } from "../db/harness-configs.ts";
 import {
   createRun,
   getArtifact,
@@ -29,6 +30,7 @@ import {
   killRunStacks,
   reconcileOrphanedRuns,
 } from "../runner/index.ts";
+import { assertRunConfigsResolve, ensureRunConfigPins } from "../runner/run-configs.ts";
 import { type SessionLogRow, SwarmClient } from "../swarm/client.ts";
 import { cleanVersion } from "../swarm/version.ts";
 import {
@@ -43,6 +45,7 @@ import {
   type SandboxInfo,
 } from "../types.ts";
 import { type AnalyticsSourceRow, buildAnalytics } from "./analytics.ts";
+import { createConfig, initHarnessConfigs, patchConfig } from "./configs-routes.ts";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -394,8 +397,10 @@ export const ANALYTICS_SQL = `
                 json_extract(a.sandbox_json, '$.workerVersion'),
                 json_extract(a.sandbox_json, '$.workers[0].version')
               ) END AS worker_version,
-         r.name AS run_name, r.created_at AS run_created_at
+         r.name AS run_name, r.created_at AS run_created_at,
+         a.resolved_model, rc.resolved_model AS pinned_model
   FROM attempts a JOIN eval_runs r ON r.id = a.run_id
+  LEFT JOIN eval_run_configs rc ON rc.run_id = a.run_id AND rc.config_id = a.config_id
   ORDER BY r.created_at ASC, a.attempt_index ASC`;
 
 /** Defensive numeric read off a SQL/JSON value — null instead of NaN, always. */
@@ -515,6 +520,7 @@ export async function startServer(
 ) {
   await initDb();
   const db = getDb();
+  await initHarnessConfigs(db);
   const reconcile = opts.reconcileOrphanedRuns ?? reconcileOrphanedRuns;
   const forceCancel = opts.forceCancelInactiveRun ?? forceCancelInactiveRun;
   const reconciled = await reconcile(db, (msg) => console.log(`[orphan-reconcile] ${msg}`));
@@ -578,6 +584,11 @@ export async function startServer(
           for (const id of body.configIds) {
             if (!registry.configs.has(id)) return json({ error: `unknown config "${id}"` }, 400);
           }
+          try {
+            await assertRunConfigsResolve(registry, body.scenarioIds, body.configIds);
+          } catch (err) {
+            return json({ error: err instanceof Error ? err.message : String(err) }, 400);
+          }
           const runId = newRunId();
           await createRun(db, {
             id: runId,
@@ -588,6 +599,7 @@ export async function startServer(
             concurrency: Math.max(1, body.concurrency ?? 2),
             judgeModel: body.judgeModel || undefined,
           });
+          await ensureRunConfigPins(db, runId, registry, body.scenarioIds, body.configIds);
           startRunExecution(db, runId);
           return json({ runId }, 201);
         },
@@ -795,15 +807,36 @@ export async function startServer(
         }
         return json({ scenario: serializeScenario(scenario), recentAttempts });
       },
-      "/api/configs": async (req) => {
-        if (!(await isAuthorized(req))) return unauthorized();
-        const registry = loadRegistry();
-        return json(
-          [...registry.configs.values()].map((c) => ({
-            ...serializeConfig(c),
-            isDefault: DEFAULT_CONFIG_IDS.includes(c.id),
-          })),
-        );
+      /** Harness configs from the harness_configs table (code seeds + API-created rows). */
+      "/api/configs": {
+        GET: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const registry = loadRegistry();
+          const sources = new Map(
+            (await listHarnessConfigs(db)).map((r) => [r.config.id, r.source]),
+          );
+          return json(
+            [...registry.configs.values()].map((c) => ({
+              ...serializeConfig(c),
+              isDefault: DEFAULT_CONFIG_IDS.includes(c.id),
+              source: sources.get(c.id) ?? "seed",
+            })),
+          );
+        },
+        POST: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const result = await createConfig(db, await req.json().catch(() => null));
+          if (!result.ok) return json({ error: result.error }, result.status);
+          return json(serializeConfig(result.config), result.status);
+        },
+      },
+      "/api/configs/:id": {
+        PATCH: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const result = await patchConfig(db, req.params.id, await req.json().catch(() => null));
+          if (!result.ok) return json({ error: result.error }, result.status);
+          return json(serializeConfig(result.config), result.status);
+        },
       },
       /** Quick-run config presets (v7.7 item 1) — static catalog data, validated by registry.test.ts. */
       "/api/presets": async (req) => {
@@ -864,6 +897,8 @@ export async function startServer(
           costSource: (r.cost_source as string) ?? null,
           judgeCostUsd: r.judge_cost_usd === null ? null : Number(r.judge_cost_usd),
           durationMs: r.duration_ms === null ? null : Number(r.duration_ms),
+          resolvedModel: (r.resolved_model as string) ?? null,
+          pinnedModel: (r.pinned_model as string) ?? null,
           tokenModel: (r.token_model as string) ?? null,
           // v7 §6.1: token sums; numOrNull guards stored-JSON garbage (no NaN).
           tokenInput: numOrNull(r.token_input),
