@@ -1,5 +1,24 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { MotionGlobalConfig } from "motion/react";
+import { act, useLayoutEffect } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
+
+// A DOM for the click test; removed after this file so other files keep
+// their server-render environment.
+GlobalRegistrator.register();
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+// happy-dom rejects a cancelled Web Animation, which motion does on unmount.
+MotionGlobalConfig.skipAnimations = true;
+// Radix picks a no-op layout effect when it first loads with no document. An
+// earlier server-render test file in the same run leaves that no-op behind,
+// and the dialog portal then never mounts.
+mock.module("@radix-ui/react-use-layout-effect", () => ({ useLayoutEffect }));
+afterAll(async () => {
+  MotionGlobalConfig.skipAnimations = false;
+  await GlobalRegistrator.unregister();
+});
 
 // The test runner cannot resolve ui's `@/` alias, so each aliased module in
 // this component's graph maps to its real file.
@@ -36,7 +55,50 @@ function render(status: "pending" | "cancelled"): string {
   );
 }
 
+function buttonWithText(root: ParentNode, text: string): HTMLButtonElement {
+  const button = Array.from(root.querySelectorAll("button")).find(
+    (b) => b.textContent?.trim() === text,
+  );
+  if (!button) throw new Error(`No button with the text ${text}`);
+  return button;
+}
+
 describe("SubmitBar Discard", () => {
+  test("a click on Discard opens the confirmation; confirming calls onDiscard", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onDiscard = mock(() => {});
+    await act(async () => {
+      root.render(
+        <TooltipProvider>
+          <SubmitBar
+            request={{ status: "pending", workflowRunId: "run-1" }}
+            progress={progress as never}
+            submitting={false}
+            discarding={false}
+            error={null}
+            onSubmit={() => {}}
+            onDiscard={onDiscard}
+          />
+        </TooltipProvider>,
+      );
+    });
+
+    expect(document.body.textContent).not.toContain(DISCARD_DIALOG_TITLE);
+    await act(async () => buttonWithText(container, "Discard").click());
+    const dialog = document.querySelector('[role="alertdialog"]');
+    expect(dialog?.textContent).toContain(DISCARD_DIALOG_TITLE);
+    expect(dialog?.textContent).toContain("Discard cancels that run too.");
+    expect(onDiscard).not.toHaveBeenCalled();
+
+    await act(async () => buttonWithText(dialog!, "Discard").click());
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.unmount());
+    container.remove();
+  });
+
   test("a pending request offers Discard", () => {
     expect(render("pending")).toContain("Discard");
   });

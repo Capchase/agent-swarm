@@ -149,7 +149,8 @@ function ApprovalRequestView({ request }: { request: ApprovalRequest }) {
   };
 
   const handleSubmit = async () => {
-    if (!isPending || submitting) return;
+    // The ⌘/Ctrl+Enter shortcut reaches here too, so a discard in flight blocks it.
+    if (!isPending || submitting || cancelMutation.isPending) return;
     if (progress.blockedReason) {
       setAttempted(true);
       const firstBlocked = questions.findIndex((question) =>
