@@ -13529,41 +13529,95 @@ export async function incrKv(namespace: string, key: string, by: number): Promis
 }
 
 /**
+ * Smallest string greater than every string that starts with `prefix`, in
+ * code-point order (which is SQLite's BINARY order over UTF-8). `null` means
+ * no upper bound exists (the prefix is all U+10FFFF).
+ */
+export function kvPrefixUpperBound(prefix: string): string | null {
+  const codePoints = Array.from(prefix);
+  while (codePoints.length > 0) {
+    const last = codePoints.pop()!.codePointAt(0)!;
+    if (last < 0x10ffff) {
+      const next = last + 1 === 0xd800 ? 0xe000 : last + 1;
+      return codePoints.join("") + String.fromCodePoint(next);
+    }
+  }
+  return null;
+}
+
+/**
+ * Key-prefix predicate as a range on the (namespace, key) primary key.
+ * `key LIKE 'p%'` cannot use that index (LIKE is case-insensitive, the PK is
+ * BINARY), so it scanned every row of the namespace. A range seeks straight
+ * to the prefix and matches it exactly (case-sensitive).
+ */
+function kvPrefixCondition(prefix: string | undefined): { sql: string; params: string[] } {
+  if (prefix === undefined || prefix.length === 0) return { sql: "", params: [] };
+  const upper = kvPrefixUpperBound(prefix);
+  return upper === null
+    ? { sql: "AND key >= ?", params: [prefix] }
+    : { sql: "AND key >= ? AND key < ?", params: [prefix, upper] };
+}
+
+/** Top-level JSON field equality, evaluated in SQLite before rows reach JS. */
+export type KvJsonFieldEquals = { field: string; value: string | number | boolean };
+
+function kvJsonFieldConditions(filters: KvJsonFieldEquals[] | undefined): {
+  sql: string;
+  params: (string | number | boolean)[];
+} {
+  const parts: string[] = [];
+  const params: (string | number | boolean)[] = [];
+  for (const filter of filters ?? []) {
+    // JSON path quoting has no escape for these characters.
+    if (/["\\]/.test(filter.field)) {
+      throw new Error(`unsupported JSON field name: ${filter.field}`);
+    }
+    // Only safe integers compare exactly: SQLite parses a stored literal like
+    // 1000000000000000100 as an exact INTEGER (and fractions with its own
+    // float parser) while the bound JS number is a double, so SQL could drop
+    // a row that JS `===` matches. Other numbers are left to the caller.
+    if (typeof filter.value === "number" && !Number.isSafeInteger(filter.value)) continue;
+    // json_valid guards the corrupt rows decodeKvRow tolerates: json_extract
+    // would abort the whole query on one of them.
+    parts.push(
+      "AND (CASE WHEN value_type = 'json' AND json_valid(value) THEN json_extract(value, ?) END) = ?",
+    );
+    params.push(`$."${filter.field}"`, filter.value);
+  }
+  return { sql: parts.join(" "), params };
+}
+
+/**
  * List entries in a namespace, optionally filtered by prefix. Expired rows
  * are filtered out by the SELECT (no inline DELETE — listing should be a
  * stable cursor; sweeping happens on point-reads instead).
+ *
+ * `jsonFieldEquals` narrows the rows in SQL so non-matching values are never
+ * decoded. SQL equality is looser than JS `===` (JSON `true` equals `1`) and
+ * numbers that are not safe integers are not filtered at all, so callers that
+ * need exact semantics re-check the decoded values.
  *
  * `limit` is capped by the caller (HTTP enforces ≤1000); helper does no extra
  * bounds-check beyond what SQL accepts.
  */
 export async function listKv(
   namespace: string,
-  opts: { prefix?: string; limit: number; offset: number },
+  opts: { prefix?: string; limit: number; offset: number; jsonFieldEquals?: KvJsonFieldEquals[] },
 ): Promise<KvEntry[]> {
   const now = Date.now();
-  if (opts.prefix !== undefined && opts.prefix.length > 0) {
-    // LIKE-escape `\` `%` `_` so a user-supplied prefix can't run wildcards.
-    const escaped = opts.prefix.replace(/[\\%_]/g, "\\$&");
-    const rows = await getDbClient().query<KvRow>(
-      `SELECT namespace, key, value, value_type, expires_at, created_at, updated_at
-           FROM kv_entries
-          WHERE namespace = ?
-            AND (expires_at IS NULL OR expires_at > ?)
-            AND key LIKE ? ESCAPE '\\'
-          ORDER BY key
-          LIMIT ? OFFSET ?`,
-      [namespace, now, `${escaped}%`, opts.limit, opts.offset],
-    );
-    return rows.map(decodeKvRow);
-  }
+  const prefix = kvPrefixCondition(opts.prefix);
+  const json = kvJsonFieldConditions(opts.jsonFieldEquals);
   const rows = await getDbClient().query<KvRow>(
     `SELECT namespace, key, value, value_type, expires_at, created_at, updated_at
          FROM kv_entries
         WHERE namespace = ?
           AND (expires_at IS NULL OR expires_at > ?)
+          ${prefix.sql}
+          ${json.sql}
         ORDER BY key
         LIMIT ? OFFSET ?`,
-    [namespace, now, opts.limit, opts.offset],
+    [namespace, now, ...prefix.params, ...json.params, opts.limit, opts.offset],
   );
   return rows.map(decodeKvRow);
 }
@@ -13574,22 +13628,13 @@ export async function listKv(
  */
 export async function countKv(namespace: string, opts: { prefix?: string }): Promise<number> {
   const now = Date.now();
-  if (opts.prefix !== undefined && opts.prefix.length > 0) {
-    const escaped = opts.prefix.replace(/[\\%_]/g, "\\$&");
-    const row = await getDbClient().get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM kv_entries
-          WHERE namespace = ?
-            AND (expires_at IS NULL OR expires_at > ?)
-            AND key LIKE ? ESCAPE '\\'`,
-      [namespace, now, `${escaped}%`],
-    );
-    return row?.n ?? 0;
-  }
+  const prefix = kvPrefixCondition(opts.prefix);
   const row = await getDbClient().get<{ n: number }>(
     `SELECT COUNT(*) AS n FROM kv_entries
         WHERE namespace = ?
-          AND (expires_at IS NULL OR expires_at > ?)`,
-    [namespace, now],
+          AND (expires_at IS NULL OR expires_at > ?)
+          ${prefix.sql}`,
+    [namespace, now, ...prefix.params],
   );
   return row?.n ?? 0;
 }
