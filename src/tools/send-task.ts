@@ -443,6 +443,7 @@ export async function sendTaskHandler(
     options: requestedTaskOptions,
     origin: "mcp",
     requestInfo: ctx.kind === "owner" ? ctx.requestInfo : undefined,
+    allowCustomModel,
   });
   if (preCreate.kind === "blocked") {
     return toolErr(preCreate.reason, {

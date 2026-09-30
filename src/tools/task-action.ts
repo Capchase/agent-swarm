@@ -322,6 +322,7 @@ export async function taskActionHandler(
       },
       origin: "mcp",
       requestInfo: ctx.requestInfo,
+      allowCustomModel: input.allowCustomModel,
     });
     if (preCreate.kind === "blocked") {
       return taskActionResult({ success: false, message: preCreate.reason }, agentId);

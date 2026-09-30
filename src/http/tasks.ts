@@ -965,7 +965,7 @@ export async function handleTasks(
           }),
           effort: parsed.body.effort,
         },
-        { origin: "rest" },
+        { origin: "rest", allowCustomModel: parsed.body.allowCustomModel },
       );
 
       ensure({
