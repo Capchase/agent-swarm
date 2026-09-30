@@ -120,6 +120,14 @@ MCP tools return `isError` on the wire `CallToolResult` (see [runbooks/mcp-tool-
 
 **pi**: `mcpToolsToDefinitions` in `src/providers/pi-mono-adapter.ts` calls `mcpClient.callTool(...)` and gets the raw result back. pi-agent-core derives a tool call's error flag from whether the wrapped `execute()` **throws** — not from any field on a resolved return value. The adapter therefore checks `result.isError` and `throw`s (rather than returning) when it's true; without that, a failed script/tool call would resolve normally and pi-agent-core would report it to the model as a success.
 
+On success the pi wrapper also returns the server's `structuredContent` next to the text, and sets `outputSchema` from `tools/list`. pi never sends `structuredContent` to the model; codemode scripts receive it instead of text. pi does not validate `outputSchema`, so our loose `z.looseObject` schemas pass as plain JSON Schema.
+
+**pi installed MCP servers** go through pi's MCP extension, not our client: the adapter maps them with `toPiMcpServers` and the swarm hook registers them on `session_start`. The adapter must call `session.bindExtensions({})`, since the SDK never emits `session_start` by itself. Keep the replaced `loadConfig` so pi never reads `mcp.json` files, and keep escaping resolved values with `escapePiConfigValue`.
+
+**pi tool deferral** (`PI_TOOL_DEFERRAL`, default off): non-core swarm tools get `exposure: "deferred"` and the session adds pi's `tool_search`. The adapter's `traits` getter reads the same flag for `hasToolSearch`, so the prompt and the session agree. Keep both reads on `process.env`. Pilot procedure: the harness-providers guide, section "pi tool deferral".
+
+**pi codemode** (`PI_CODEMODE`, default off): adds `createCodemodeExtension({ mode: "on", models: false })`, wrapped by `createBoundedCodemodeExtension` (120 s per-script deadline, 32 nested calls, 4 concurrent), and `+codemode` on every pi session. Never switch to `mode: "only"`: lifecycle tools must stay directly callable.
+
 ## Live task steering
 
 `ProviderSession.deliverSteering?(delivery: SteerDelivery): Promise<SteerDeliveryResult>` is the optional live-input seam. `ProviderTraits.steerModes` advertises the modes an adapter can provide; an absent field means `[]`.

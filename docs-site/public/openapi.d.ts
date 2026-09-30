@@ -21220,6 +21220,14 @@ export interface paths {
                                 format: "token-equality";
                                 /** @description Header containing the shared token to compare */
                                 header: string;
+                            } | {
+                                /** @enum {string} */
+                                format: "standard-webhooks";
+                                /**
+                                 * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                                 * @default 300
+                                 */
+                                toleranceSeconds?: number;
                             };
                         } | {
                             /** @enum {string} */
@@ -21384,6 +21392,14 @@ export interface paths {
                                 format: "token-equality";
                                 /** @description Header containing the shared token to compare */
                                 header: string;
+                            } | {
+                                /** @enum {string} */
+                                format: "standard-webhooks";
+                                /**
+                                 * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                                 * @default 300
+                                 */
+                                toleranceSeconds?: number;
                             };
                         } | {
                             /** @enum {string} */
@@ -23530,6 +23546,14 @@ export interface components {
                     format: "token-equality";
                     /** @description Header containing the shared token to compare */
                     header: string;
+                } | {
+                    /** @enum {string} */
+                    format: "standard-webhooks";
+                    /**
+                     * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                     * @default 300
+                     */
+                    toleranceSeconds: number;
                 };
             } | {
                 /** @enum {string} */
@@ -23738,6 +23762,14 @@ export interface components {
                     format: "token-equality";
                     /** @description Header containing the shared token to compare */
                     header: string;
+                } | {
+                    /** @enum {string} */
+                    format: "standard-webhooks";
+                    /**
+                     * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                     * @default 300
+                     */
+                    toleranceSeconds: number;
                 };
             } | {
                 /** @enum {string} */
