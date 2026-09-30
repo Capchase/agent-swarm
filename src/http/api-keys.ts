@@ -90,8 +90,6 @@ const reportAuthFailure = route({
     taskId: z.string().uuid().optional(),
     scope: z.string().optional(),
     scopeId: z.string().optional(),
-    /** When the worker saw the failure; orders it against success resets. Defaults to now. */
-    observedAt: z.string().datetime().optional(),
   }),
   responses: {
     200: {
@@ -111,11 +109,6 @@ const reportAuthFailure = route({
     ungated: "worker credential telemetry, same posture as POST /api/keys/report-rate-limit",
   },
 });
-
-/** Normalize a worker timestamp to `toISOString()` form, so the DB compares stamps as text. */
-function toIsoStamp(value: string | undefined): string | undefined {
-  return value === undefined ? undefined : new Date(value).toISOString();
-}
 
 export const rateLimitWindowSchema = z.object({
   status: z.string(),
@@ -206,6 +199,11 @@ const getAvailable = route({
         modelBlockedIndices: z.array(z.number().int()).optional(),
         /** ISO of the earliest reset among modelBlockedIndices. Present only when `model` was passed. */
         earliestModelResetAt: z.string().nullable().optional(),
+        /**
+         * Server-side order of the newest auth failure on these keys. Pass it back as
+         * `authFence` on `clear-rate-limit`: failures recorded after it survive the clear.
+         */
+        authFailureFence: z.number().int(),
       }),
     },
     400: { description: "Validation error" },
@@ -385,12 +383,15 @@ const clearRateLimitRoute = route({
     keySuffix: z.string().min(1).max(10),
     scope: z.string().optional(),
     scopeId: z.string().optional(),
-    /** Proof of health (task success or re-login): also lifts an auth-failure bench. */
+    /** Proof of health (task success or re-login): with `authFence`, also lifts an auth-failure bench. */
     clearAuthBench: z.boolean().optional(),
     /** Slot re-login: with `clearAuthBench`, also retires other identities recorded at this index. */
     keyIndex: z.number().int().min(0).optional(),
-    /** When the worker saw the success. A success older than the last auth failure lifts nothing. */
-    observedAt: z.string().datetime().optional(),
+    /**
+     * `authFailureFence` from `GET /api/keys/available`, read before the task or the credential
+     * write. Required to lift an auth bench; a failure recorded after it is kept.
+     */
+    authFence: z.number().int().min(0).optional(),
   }),
   responses: {
     200: {
@@ -524,7 +525,7 @@ export async function handleApiKeys(
     const parsed = await reportAuthFailure.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, keySuffix, keyIndex, scope, scopeId, observedAt } = parsed.body;
+    const { keyType, keySuffix, keyIndex, scope, scopeId } = parsed.body;
     try {
       const result = await recordKeyAuthFailure(
         keyType,
@@ -532,7 +533,6 @@ export async function handleApiKeys(
         keyIndex,
         scope,
         scopeId ?? null,
-        toIsoStamp(observedAt),
       );
       if (result.benched) clearUsageCache();
       reportAuthFailure.respond(res, 200, { success: true, ...result });
@@ -590,6 +590,7 @@ export async function handleApiKeys(
         success: true,
         availableIndices: result.availableIndices,
         totalKeys,
+        authFailureFence: result.authFailureFence,
         ...(model !== undefined
           ? {
               modelBlockedIndices: result.modelBlockedIndices,
@@ -701,13 +702,12 @@ export async function handleApiKeys(
     const parsed = await clearRateLimitRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, keySuffix, scope, scopeId, clearAuthBench, keyIndex, observedAt } =
-      parsed.body;
+    const { keyType, keySuffix, scope, scopeId, clearAuthBench, keyIndex, authFence } = parsed.body;
     try {
       const cleared = await clearKeyRateLimit(keyType, keySuffix, scope, scopeId ?? null, {
         clearAuthBench: clearAuthBench === true,
         keyIndex,
-        observedAt: toIsoStamp(observedAt),
+        authFence,
       });
       clearRateLimitRoute.respond(res, 200, {
         success: true,

@@ -198,6 +198,7 @@ describe("runCodexLogin", () => {
       store,
       loadAllSlots: mock(async () => []),
       clearAuthBench: mock(async () => false),
+      readAuthFence: mock(async () => 0),
       log: () => {},
       error: () => {},
       exit: () => {},
@@ -231,6 +232,7 @@ describe("runCodexLogin", () => {
         { slot: 1, creds: { access: "", refresh: "", expires: 0, accountId: "" } },
       ]),
       clearAuthBench: mock(async () => false),
+      readAuthFence: mock(async () => 0),
       log: () => {},
       error: () => {},
       exit: () => {},
@@ -288,6 +290,7 @@ describe("runCodexLogin", () => {
       store,
       loadAllSlots: mock(async () => []),
       clearAuthBench: mock(async () => false),
+      readAuthFence: mock(async () => 0),
       log: () => {},
       error: () => {},
       exit: () => {},
@@ -332,11 +335,15 @@ describe("runCodexLogin", () => {
       calls.push("store");
     });
     const clearAuthBench = mock(
-      async (_apiUrl: string, _apiKey: string, keySuffix: string, slot: number) => {
-        calls.push(`clear:${keySuffix}@${slot}`);
+      async (_apiUrl: string, _apiKey: string, keySuffix: string, slot: number, fence: number) => {
+        calls.push(`clear:${keySuffix}@${slot} fence ${fence}`);
         return true;
       },
     );
+    const readAuthFence = mock(async () => {
+      calls.push("read-fence");
+      return 7;
+    });
 
     await runCodexLogin([], {
       resolveConfig: async () => ({
@@ -353,13 +360,50 @@ describe("runCodexLogin", () => {
       store,
       loadAllSlots: mock(async () => []),
       clearAuthBench,
+      readAuthFence,
       log: () => {},
       error: () => {},
       exit: () => {},
     });
 
     // at_test has no chatgpt_user_id claim, so the suffix falls back to accountId.
-    expect(calls).toEqual(["store", "clear:d3Ove@2"]);
+    // The fence is read BEFORE the credential write, so failures on the fresh login survive.
+    expect(calls).toEqual(["read-fence", "store", "clear:d3Ove@2 fence 7"]);
+  });
+
+  it("skips the unfenced clear when the fence cannot be read", async () => {
+    const error = mock(() => {});
+    const exit = mock(() => {});
+    const store = mock(async () => {});
+    const clearAuthBench = mock(async () => true);
+
+    await runCodexLogin([], {
+      resolveConfig: async () => ({
+        apiUrl: "http://localhost:3013",
+        apiKey: "example-test-key",
+        slot: 2,
+      }),
+      login: mock(async () => ({
+        access: "at_test",
+        refresh: "rt_test",
+        expires: Date.now() + 3600000,
+        accountId: "acc-test-d3Ove",
+      })),
+      store,
+      loadAllSlots: mock(async () => []),
+      clearAuthBench,
+      readAuthFence: mock(async () => {
+        throw new Error("keys/available returned 503");
+      }),
+      log: () => {},
+      error,
+      exit,
+    });
+
+    expect(store).toHaveBeenCalled();
+    expect(clearAuthBench).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("keys/available returned 503"));
+    expect(exit).not.toHaveBeenCalled();
   });
 
   it("keeps a successful login when lifting the bench fails", async () => {
@@ -383,6 +427,7 @@ describe("runCodexLogin", () => {
       clearAuthBench: mock(async () => {
         throw new Error("clear-rate-limit returned 500");
       }),
+      readAuthFence: mock(async () => 0),
       log: () => {},
       error,
       exit,

@@ -2,8 +2,9 @@
  * A success reset that times out on the worker can still finish on the API
  * later. These tests run the production reporting code against the real
  * api-keys handler and a real DB, delay the success handler, and check the
- * state AFTER the late handler finishes: it must not clear auth failures the
- * worker saw after that success.
+ * state AFTER the late handler finishes: it must not clear auth failures
+ * recorded after the fence the task read with its key draw, from this runner
+ * or any other.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
@@ -35,6 +36,11 @@ let pendingClears: Promise<void>[] = [];
 
 const status = async (keySuffix: string) =>
   (await getKeyStatuses("CODEX_OAUTH")).find((s) => s.keySuffix === keySuffix)!;
+/** The `authFailureFence` a runner reads with its key draw, before the task starts. */
+const drawFence = async () => {
+  const resp = await fetch(`${apiUrl}/api/keys/available?keyType=CODEX_OAUTH&totalKeys=1`);
+  return ((await resp.json()) as { authFailureFence: number }).authFailureFence;
+};
 
 beforeAll(async () => {
   process.env.DB_PATH = TEST_DB;
@@ -97,11 +103,12 @@ beforeEach(() => {
 describe("late success reset", () => {
   test("a timed-out success reset that finishes late keeps the later auth bench", async () => {
     const credential = { keyType: "CODEX_OAUTH", keySuffix: "late1", keyIndex: 0 };
+    const authFence = await drawFence();
     const report = (i: number, exitCode: number, failureReason?: string, timeoutMs?: number) =>
       reportKeyCompletionOutcome({
         apiUrl,
         apiKey: "test-key",
-        credential,
+        credential: { ...credential, authFence },
         taskId: `00000000-0000-4000-8000-00000000010${i}`,
         exitCode,
         failureReason,
@@ -128,8 +135,56 @@ describe("late success reset", () => {
     expect(await getKv("codex-auth-watch", "bench:late1")).not.toBeNull();
   });
 
+  test("two runners: A's late success cannot clear B's later failures, whatever A's clock says", async () => {
+    const credential = { keyType: "CODEX_OAUTH", keySuffix: "late3", keyIndex: 2 };
+    const report = (
+      runner: string,
+      authFence: number,
+      exitCode: number,
+      failureReason?: string,
+      timeoutMs?: number,
+    ) =>
+      reportKeyCompletionOutcome({
+        apiUrl,
+        apiKey: "test-key",
+        credential: { ...credential, authFence },
+        taskId: crypto.randomUUID(),
+        exitCode,
+        failureReason,
+        timeoutMs,
+      }).then(() => runner);
+
+    // Runner A draws the key first; its clock runs an hour ahead. Nothing it sends
+    // carries a clock value, so the skew cannot move its success after B's failures.
+    const fenceA = await drawFence();
+    const realNow = Date.now;
+    Date.now = () => realNow() + 3_600_000;
+    clearDelayMs = 400;
+    try {
+      await report("A", fenceA, 0, undefined, 100);
+    } finally {
+      Date.now = realNow;
+    }
+    // Runner B draws after A and fails twice on the same login.
+    const fenceB = await drawFence();
+    await report("B", fenceB, 1, authFailure);
+    await report("B", fenceB, 1, authFailure);
+
+    await Promise.all(pendingClears);
+    expect(handled).toEqual(["auth-failure", "auth-failure", "clear"]);
+    const row = await status("late3");
+    expect(row.consecutiveAuthFailures).toBe(2);
+    expect(row.status).toBe("rate_limited");
+    expect(await getKv("codex-auth-watch", "bench:late3")).not.toBeNull();
+  });
+
   test("checkCompletedProcesses lands each outcome before it handles the next completion", async () => {
-    const credentialInfo = { keyType: "CODEX_OAUTH", keySuffix: "late2", keyIndex: 1 };
+    const credentialInfo = {
+      keyType: "CODEX_OAUTH",
+      keySuffix: "late2",
+      keyIndex: 1,
+      authFence: await drawFence(),
+    };
     const running = (i: number, result: ProviderResult) =>
       ({
         taskId: `00000000-0000-4000-8000-00000000020${i}`,

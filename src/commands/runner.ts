@@ -1783,14 +1783,19 @@ export async function resolveCodexOAuthCredentialInfo(
       const slots = await loadAllCodexOAuthSlots(apiUrl, apiKey);
       if (slots.length > 0) {
         let availableIndices: number[] | undefined;
+        let authFailureFence: number | undefined;
         try {
           const resp = await fetch(
             `${apiUrl}/api/keys/available?keyType=CODEX_OAUTH&totalKeys=${slots.length}`,
             { headers: { Authorization: `Bearer ${apiKey}` } },
           );
           if (resp.ok) {
-            const data = (await resp.json()) as { availableIndices: number[] };
+            const data = (await resp.json()) as {
+              availableIndices: number[];
+              authFailureFence?: number;
+            };
             availableIndices = data.availableIndices;
+            authFailureFence = data.authFailureFence;
             if (availableIndices.length < slots.length) {
               console.log(
                 `[credentials] CODEX_OAUTH: ${availableIndices.length}/${slots.length} slots available (${slots.length - availableIndices.length} rate-limited)`,
@@ -1831,7 +1836,10 @@ export async function resolveCodexOAuthCredentialInfo(
             },
             last_refresh: new Date(slotEntry.creds.expires).toISOString(),
           };
-          const sel = authJsonToCredentialSelection(authJson, selectedSlot, slots.length);
+          const sel = {
+            ...authJsonToCredentialSelection(authJson, selectedSlot, slots.length),
+            authFailureFence,
+          };
           console.log(
             `[credentials] Selected CODEX_OAUTH slot ${selectedSlot + 1}/${slots.length} [...${sel.keySuffix}]`,
           );
@@ -1908,17 +1916,6 @@ async function reportKeyRateLimit(
 /** Upper bound on each awaited credential-outcome report, so a slow API never stalls completions. */
 const KEY_OUTCOME_REPORT_TIMEOUT_MS = 5000;
 
-let lastKeyOutcomeStampMs = 0;
-/**
- * Strictly increasing stamp for credential-outcome reports. The API compares
- * a success stamp with the last auth-failure stamp, so a success report that
- * times out and lands late cannot clear failures this worker saw after it.
- */
-function nextKeyOutcomeStamp(): string {
-  lastKeyOutcomeStampMs = Math.max(Date.now(), lastKeyOutcomeStampMs + 1);
-  return new Date(lastKeyOutcomeStampMs).toISOString();
-}
-
 /** Report a Codex pool auth failure; the API benches after 2 in a row. Awaited, never throws. */
 async function reportKeyAuthFailure(
   apiUrl: string,
@@ -1927,7 +1924,6 @@ async function reportKeyAuthFailure(
   keySuffix: string,
   keyIndex: number,
   taskId: string,
-  observedAt: string,
   timeoutMs = KEY_OUTCOME_REPORT_TIMEOUT_MS,
 ): Promise<void> {
   try {
@@ -1937,7 +1933,7 @@ async function reportKeyAuthFailure(
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ keyType, keySuffix, keyIndex, taskId, observedAt }),
+      body: JSON.stringify({ keyType, keySuffix, keyIndex, taskId }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -2012,7 +2008,7 @@ async function reportKeyClearRateLimit(
   apiKey: string,
   keyType: string,
   keySuffix: string,
-  observedAt: string,
+  authFence: number | undefined,
   timeoutMs = KEY_OUTCOME_REPORT_TIMEOUT_MS,
 ): Promise<void> {
   try {
@@ -2023,8 +2019,9 @@ async function reportKeyClearRateLimit(
         Authorization: `Bearer ${apiKey}`,
       },
       // A task that exited 0 proves the login works, so it may lift an auth bench.
-      // `observedAt` stops a late (timed-out) report from clearing later failures.
-      body: JSON.stringify({ keyType, keySuffix, clearAuthBench: true, observedAt }),
+      // `authFence` (read before the task started) stops a late (timed-out) report,
+      // from this or any other worker, from clearing failures recorded after it.
+      body: JSON.stringify({ keyType, keySuffix, clearAuthBench: true, authFence }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (resp.ok) {
@@ -2044,29 +2041,28 @@ async function reportKeyClearRateLimit(
  * Report a finished task's credential outcome: a success resets the auth-failure
  * count (and lifts an auth bench); a counted Codex auth failure adds to it.
  * Awaited by the caller before it processes the next completion, so the API sees
- * success and failure reports in completion order. Each report also carries an
- * increasing `observedAt` stamp: when a success report times out and its handler
- * finishes late, the API still skips it if a later auth failure is on record.
- * Bounded, never throws.
+ * success and failure reports in completion order. A success carries the
+ * `authFence` the task read before it started: when its report times out and
+ * lands late, the API keeps every auth failure recorded after that fence.
+ * Without a fence, a success clears only an ordinary rate limit. Bounded, never throws.
  */
 export async function reportKeyCompletionOutcome(opts: {
   apiUrl: string;
   apiKey: string;
-  credential: { keyType: string; keySuffix: string; keyIndex: number };
+  credential: { keyType: string; keySuffix: string; keyIndex: number; authFence?: number };
   taskId: string;
   exitCode: number;
   failureReason: string | undefined;
   timeoutMs?: number;
 }): Promise<void> {
   const { apiUrl, apiKey, credential, taskId, exitCode, failureReason, timeoutMs } = opts;
-  const observedAt = nextKeyOutcomeStamp();
   if (exitCode === 0) {
     await reportKeyClearRateLimit(
       apiUrl,
       apiKey,
       credential.keyType,
       credential.keySuffix,
-      observedAt,
+      credential.authFence,
       timeoutMs,
     );
     return;
@@ -2079,7 +2075,6 @@ export async function reportKeyCompletionOutcome(opts: {
       credential.keySuffix,
       credential.keyIndex,
       taskId,
-      observedAt,
       timeoutMs,
     );
   }
@@ -2473,6 +2468,8 @@ export interface RunningTask {
     keyType: string;
     keySuffix: string;
     keyIndex: number;
+    /** `authFailureFence` read before the task started (Codex pool only). */
+    authFence?: number;
   };
   /**
    * Harness provider this session was actually spawned/resumed on, snapshotted
@@ -4542,6 +4539,7 @@ async function spawnProviderProcess(
         keyType: primarySelection.keyType,
         keySuffix: primarySelection.keySuffix,
         keyIndex: primarySelection.index,
+        authFence: primarySelection.authFailureFence,
       }
     : undefined;
 

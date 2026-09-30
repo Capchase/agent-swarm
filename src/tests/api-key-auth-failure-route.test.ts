@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { closeDb, initDb } from "../be/db";
-import { clearCodexAuthBench } from "../commands/codex-login";
+import { clearCodexAuthBench, readCodexAuthFailureFence } from "../commands/codex-login";
 import { handleApiKeys } from "../http/api-keys";
 import { listenOnFreePort } from "./test-net";
 
@@ -74,8 +74,19 @@ describe("API key auth-failure routes", () => {
     expect(result).toMatchObject({ success: true, cleared: false });
   });
 
-  test("clear-rate-limit with clearAuthBench lifts the bench and resets the count", async () => {
+  test("clear-rate-limit with clearAuthBench but no authFence leaves the auth bench", async () => {
     const result = await post("/api/keys/clear-rate-limit", { ...key, clearAuthBench: true });
+    expect(result).toMatchObject({ success: true, cleared: false });
+  });
+
+  test("clear-rate-limit with clearAuthBench and a current authFence lifts the bench", async () => {
+    const { authFailureFence } = await get("/api/keys/available?keyType=CODEX_OAUTH&totalKeys=3");
+    expect(typeof authFailureFence).toBe("number");
+    const result = await post("/api/keys/clear-rate-limit", {
+      ...key,
+      clearAuthBench: true,
+      authFence: authFailureFence,
+    });
     expect(result).toMatchObject({ success: true, cleared: true });
 
     const status = await get("/api/keys/status?keyType=CODEX_OAUTH");
@@ -92,13 +103,32 @@ describe("API key auth-failure routes", () => {
     const benched = await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 4 });
     expect(benched).toMatchObject({ benched: true });
 
-    expect(await clearCodexAuthBench(baseUrl, "test-key", "relog")).toBe(true);
+    const fence = await readCodexAuthFailureFence(baseUrl, "test-key");
+    expect(await clearCodexAuthBench(baseUrl, "test-key", "relog", 4, fence)).toBe(true);
 
     const status = await get("/api/keys/status?keyType=CODEX_OAUTH");
     const row = (status.keys as Array<Record<string, unknown>>).find(
       (k) => k.keySuffix === "relog",
     );
     expect(row).toMatchObject({ status: "available", consecutiveAuthFailures: 0 });
+  });
+
+  test("a late codex-login clear keeps failures on the fresh login", async () => {
+    const relog = { keyType: "CODEX_OAUTH", keySuffix: "relo2" };
+    await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 5 });
+    await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 5 });
+    // codex-login reads the fence, then stores the fresh credentials.
+    const fence = await readCodexAuthFailureFence(baseUrl, "test-key");
+    // Two tasks fail on the fresh login before the clear lands.
+    await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 5 });
+    await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 5 });
+    expect(await clearCodexAuthBench(baseUrl, "test-key", "relo2", 5, fence)).toBe(false);
+
+    const status = await get("/api/keys/status?keyType=CODEX_OAUTH");
+    const row = (status.keys as Array<Record<string, unknown>>).find(
+      (k) => k.keySuffix === "relo2",
+    );
+    expect(row).toMatchObject({ status: "rate_limited", consecutiveAuthFailures: 4 });
   });
 
   test("rejects an invalid body", async () => {

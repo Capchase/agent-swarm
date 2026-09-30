@@ -11375,6 +11375,7 @@ export interface AvailableKeyIndicesResult {
   modelBlockedIndices: number[];
   /** ISO of the earliest resetsAt among modelBlockedIndices, or null when none. */
   earliestModelResetAt: string | null;
+  authFailureFence: number; // highest `authFailureSeq` among these rows
 }
 
 /**
@@ -11411,8 +11412,9 @@ export async function getAvailableKeyIndices(
     keyIndex: number;
     status: string;
     rateLimitWindows: string | null;
+    authFailureSeq: number;
   }>(
-    `SELECT keyIndex, status, rateLimitWindows FROM api_key_status
+    `SELECT keyIndex, status, rateLimitWindows, authFailureSeq FROM api_key_status
        WHERE keyType = ? AND scope = ? AND scopeId = ?`,
     [keyType, scope, effectiveScopeId],
   );
@@ -11456,6 +11458,7 @@ export async function getAvailableKeyIndices(
       earliestModelResetsAtSec !== undefined
         ? new Date(earliestModelResetsAtSec * 1000).toISOString()
         : null,
+    authFailureFence: Math.max(0, ...rows.map((r) => r.authFailureSeq)),
   };
 }
 
@@ -11576,40 +11579,36 @@ export interface KeyAuthFailureResult {
   rateLimitedUntil: string | null;
 }
 
-/** Count an auth failure; at the threshold, bench the key (extend only) and write its KV marker. */
+/** Count an auth failure, ordered by `authFailureSeq`; at the threshold, bench (extend only). */
 export async function recordKeyAuthFailure(
   keyType: string,
   keySuffix: string,
   keyIndex: number,
   scope = "global",
   scopeId: string | null = null,
-  observedAt?: string,
 ): Promise<KeyAuthFailureResult> {
   const effectiveScopeId = scopeId ?? "";
   const provider = deriveProviderFromKeyType(keyType);
   return await getDbClient().transaction(async (tx) => {
-    const nowMs = Date.now();
-    const now = new Date(nowMs).toISOString();
+    const now = new Date().toISOString();
     const source = "report-auth-failure";
     const row = await tx.get<{ consecutiveAuthFailures: number; rateLimitedUntil: string | null }>(
-      `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, status, consecutiveAuthFailures, lastAuthFailureAt, provider, updatedAt)
-         VALUES (?, ?, ?, ?, ?, 'available', 1, ?, ?, ?)
+      `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, status, consecutiveAuthFailures, lastAuthFailureAt, authFailureSeq, provider, updatedAt)
+         VALUES (?, ?, ?, ?, ?, 'available', 1, ?, (SELECT COALESCE(MAX(authFailureSeq), 0) + 1 FROM api_key_status), ?, ?)
          ON CONFLICT(keyType, keySuffix, scope, scopeId)
          DO UPDATE SET
            consecutiveAuthFailures = consecutiveAuthFailures + 1,
-           lastAuthFailureAt = MAX(COALESCE(lastAuthFailureAt, ''), excluded.lastAuthFailureAt),
-           keyIndex = excluded.keyIndex,
-           updatedAt = excluded.updatedAt
+           lastAuthFailureAt = excluded.lastAuthFailureAt, authFailureSeq = excluded.authFailureSeq,
+           keyIndex = excluded.keyIndex, updatedAt = excluded.updatedAt
          RETURNING consecutiveAuthFailures, rateLimitedUntil`,
-      [keyType, keySuffix, keyIndex, scope, effectiveScopeId, observedAt ?? now, provider, now],
+      [keyType, keySuffix, keyIndex, scope, effectiveScopeId, now, provider, now],
     );
     if (!row) throw new Error("Failed to record auth failure");
     const { consecutiveAuthFailures } = row;
     if (consecutiveAuthFailures < CODEX_AUTH_FAILURE_BENCH_THRESHOLD) {
       return { consecutiveAuthFailures, benched: false, rateLimitedUntil: row.rateLimitedUntil };
     }
-
-    let benchedUntil = new Date(nowMs + CODEX_AUTH_FAILURE_BENCH_MS).toISOString();
+    let benchedUntil = new Date(Date.parse(now) + CODEX_AUTH_FAILURE_BENCH_MS).toISOString();
     if (row.rateLimitedUntil && Date.parse(row.rateLimitedUntil) > Date.parse(benchedUntil)) {
       benchedUntil = row.rateLimitedUntil;
     }
@@ -11772,39 +11771,39 @@ export async function setApiKeyName(
 }
 
 /**
- * Clear a stale rate-limit record after a successful use proves the key is healthy.
- * An auth bench clears only with `clearAuthBench` (task success or re-login); that also resets
- * the auth-failure count and deletes the Codex bench marker. `keyIndex` (slot re-login) also
- * retires the slot's other logins. `observedAt` skips a success older than the last auth failure.
+ * Clear a stale rate-limit record after a successful use proves the key is healthy. With
+ * `clearAuthBench` + `authFence` (the `authFailureFence` read before the task or credential write),
+ * also lift an auth bench, reset the count and delete the Codex bench marker, but never for a
+ * failure recorded after the fence. `keyIndex` (slot re-login) also retires the slot's other logins.
  */
 export async function clearKeyRateLimit(
   keyType: string,
   keySuffix: string,
   scope = "global",
   scopeId: string | null = null,
-  opts: { clearAuthBench?: boolean; keyIndex?: number; observedAt?: string } = {},
+  opts: { clearAuthBench?: boolean; keyIndex?: number; authFence?: number } = {},
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const effectiveScopeId = scopeId ?? "";
-  const { clearAuthBench = false, keyIndex = -1, observedAt = null } = opts;
+  const { keyIndex = -1, authFence = null } = opts;
+  const clearAuthBench = opts.clearAuthBench === true && authFence !== null;
   const key = [keyType, keySuffix, scope, effectiveScopeId];
   return await getDbClient().transaction(async (tx) => {
     const result = await tx.run(
       `UPDATE api_key_status
          SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
          WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?
-           AND status = 'rate_limited' AND ((? AND COALESCE(lastAuthFailureAt < ?, 1)) OR consecutiveAuthFailures < ?)`,
-      [now, ...key, clearAuthBench ? 1 : 0, observedAt, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
+           AND status = 'rate_limited' AND ((? AND authFailureSeq <= ?) OR consecutiveAuthFailures < ?)`,
+      [now, ...key, clearAuthBench ? 1 : 0, authFence, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
     );
     const cleared = result.changes > 0;
     if (!clearAuthBench) return cleared;
     const lifted = await tx.query<{ keySuffix: string }>(
       `UPDATE api_key_status SET consecutiveAuthFailures = 0, updatedAt = ?1,
            status = CASE WHEN keySuffix = ?2 THEN status ELSE 'available' END, rateLimitedUntil = CASE WHEN keySuffix = ?2 THEN rateLimitedUntil END
-         WHERE keyType = ?3 AND scope = ?4 AND scopeId = ?5
-           AND (keySuffix = ?2 OR keyIndex = ?6) AND (consecutiveAuthFailures > 0 OR status = 'rate_limited')
-           AND COALESCE(lastAuthFailureAt < ?7, 1) RETURNING keySuffix`,
-      [now, keySuffix, keyType, scope, effectiveScopeId, keyIndex, observedAt],
+         WHERE keyType = ?3 AND scope = ?4 AND scopeId = ?5 AND (consecutiveAuthFailures > 0 OR status = 'rate_limited')
+           AND ((keySuffix = ?2 AND authFailureSeq <= ?7) OR (keySuffix != ?2 AND keyIndex = ?6)) RETURNING keySuffix`,
+      [now, keySuffix, keyType, scope, effectiveScopeId, keyIndex, authFence],
     );
     const retired = lifted.filter((row) => row.keySuffix !== keySuffix);
     if (keyType === "CODEX_OAUTH") {
