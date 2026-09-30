@@ -11545,6 +11545,7 @@ export async function setApiKeyPlan(
 
 /**
  * Mark a key as rate-limited with a retry-after timestamp.
+ * An ordinary rate limit never shortens an active auth-failure bench.
  */
 export async function markKeyRateLimited(
   keyType: string,
@@ -11563,12 +11564,28 @@ export async function markKeyRateLimited(
        ON CONFLICT(keyType, keySuffix, scope, scopeId)
        DO UPDATE SET
          status = 'rate_limited',
-         rateLimitedUntil = excluded.rateLimitedUntil,
+         rateLimitedUntil = CASE
+           WHEN status = 'rate_limited' AND consecutiveAuthFailures >= ?
+             AND rateLimitedUntil > excluded.rateLimitedUntil
+           THEN rateLimitedUntil
+           ELSE excluded.rateLimitedUntil
+         END,
          lastRateLimitAt = excluded.lastRateLimitAt,
          rateLimitCount = rateLimitCount + 1,
          keyIndex = excluded.keyIndex,
          updatedAt = excluded.updatedAt`,
-    [keyType, keySuffix, keyIndex, scope, effectiveScopeId, rateLimitedUntil, now, provider, now],
+    [
+      keyType,
+      keySuffix,
+      keyIndex,
+      scope,
+      effectiveScopeId,
+      rateLimitedUntil,
+      now,
+      provider,
+      now,
+      CODEX_AUTH_FAILURE_BENCH_THRESHOLD,
+    ],
   );
 }
 

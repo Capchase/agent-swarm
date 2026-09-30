@@ -334,6 +334,28 @@ describe("API key tracking DB queries", () => {
     expect((await codexStatus("cdx04")).status).toBe("available");
   });
 
+  test("an ordinary rate limit and its expiry do not undo an auth bench", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx05", 4);
+    const benched = await recordKeyAuthFailure("CODEX_OAUTH", "cdx05", 4);
+    expect(benched.benched).toBe(true);
+
+    const expired = new Date(Date.now() - 1_000).toISOString();
+    await markKeyRateLimited("CODEX_OAUTH", "cdx05", 4, expired);
+
+    const row = await codexStatus("cdx05");
+    expect(row.status).toBe("rate_limited");
+    expect(row.rateLimitedUntil).toBe(benched.rateLimitedUntil);
+    const { availableIndices } = await getAvailableKeyIndices("CODEX_OAUTH", 5);
+    expect(availableIndices).not.toContain(4);
+    expect((await codexStatus("cdx05")).status).toBe("rate_limited");
+  });
+
+  test("an ordinary rate limit longer than the auth bench still applies", async () => {
+    const farUntil = new Date(Date.now() + 500 * DAY_MS).toISOString();
+    await markKeyRateLimited("CODEX_OAUTH", "cdx05", 4, farUntil);
+    expect((await codexStatus("cdx05")).rateLimitedUntil).toBe(farUntil);
+  });
+
   test("recordKeyRateLimitWindows persists latest provider windows", async () => {
     await recordKeyRateLimitWindows("ANTHROPIC_API_KEY", "aaa11", 0, {
       seven_day: {
