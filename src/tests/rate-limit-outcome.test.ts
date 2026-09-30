@@ -323,3 +323,64 @@ describe("buildFinalRateLimitWindows — cross-worker recovery", () => {
     ).toEqual([0]);
   });
 });
+
+describe("classifyRateLimitOutcome — seat mismatch", () => {
+  const nowMs = Date.parse("2026-09-30T12:00:00.000Z");
+  const creditsRequired = {
+    observedAt: "2026-09-30T11:59:00.000Z",
+    overageDisabledReason: "member_zero_credit_limit",
+  };
+  const observedText = "Fable 5.1 requires usage credits. Switch to another model to continue.";
+
+  test("the observed failure text is a seat outcome from text", () => {
+    expect(classifyRateLimitOutcome({}, observedText, nowMs)).toEqual({
+      kind: "seat",
+      model: "fable",
+      source: "text",
+    });
+  });
+
+  test("a credits_required event with the task model family is a seat outcome from event", () => {
+    expect(
+      classifyRateLimitOutcome({ creditsRequired }, undefined, nowMs, undefined, "fable"),
+    ).toEqual({ kind: "seat", model: "fable", source: "event" });
+  });
+
+  test("a credits_required event with no task model family and no text is not a seat outcome", () => {
+    expect(classifyRateLimitOutcome({ creditsRequired }, undefined, nowMs).kind).not.toBe("seat");
+  });
+
+  test("a seat outcome wins over modelRateLimit and rateLimitResetAt and carries no key reset", () => {
+    const outcome = classifyRateLimitOutcome(
+      {
+        creditsRequired,
+        rateLimitResetAt: "2026-10-01T00:00:00.000Z",
+        modelRateLimit: {
+          window: "seven_day_overage_included",
+          model: "fable",
+          resetAt: "2026-10-02T00:00:00.000Z",
+        },
+      },
+      observedText,
+      nowMs,
+      undefined,
+      "fable",
+    );
+    expect(outcome).toEqual({ kind: "seat", model: "fable", source: "text" });
+    expect(outcome).not.toHaveProperty("keyRateLimitedUntil");
+    expect(outcome).not.toHaveProperty("rateLimitedUntil");
+  });
+
+  test("buildFinalRateLimitWindows returns the session windows unchanged for a seat outcome", () => {
+    const windows = {
+      five_hour: { status: "allowed", utilization: 0.24, lastSeenAt: "2026-09-30T11:00:00.000Z" },
+    };
+    expect(
+      buildFinalRateLimitWindows(
+        windows,
+        { kind: "seat", model: "fable", source: "event" },
+        "2026-09-30T12:00:00.000Z",
+      ),
+    ).toBe(windows);
+  });
+});

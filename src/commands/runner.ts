@@ -59,6 +59,7 @@ import {
 } from "../utils/error-tracker.ts";
 import { probeHarnessCliVersion, reportHarnessModelOutcome } from "../utils/harness-cli-version.ts";
 import { resolveHarnessProvider } from "../utils/harness-provider.ts";
+import { type ModelFamily, modelFamilyOf } from "../utils/model-rate-limit-windows.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { terminateRegisteredProcessGroups } from "../utils/process-group.ts";
 import { refreshRuntimeModelCatalog } from "../utils/runtime-model-catalog.ts";
@@ -1898,6 +1899,33 @@ async function reportKeyRateLimit(
     );
   } catch {
     // Non-blocking
+  }
+}
+
+/**
+ * Reports a seat mismatch (`credits_required`) for a key: its subscription
+ * seat cannot run `model`. Returns the underlying fetch promise without a
+ * catch, the same as `reportKeyRateLimitWindows`, so the caller can await it
+ * before the task finishes. Never marks the key rate-limited.
+ */
+export async function reportKeySeatMismatch(
+  apiUrl: string,
+  apiKey: string,
+  keyType: string,
+  keySuffix: string,
+  keyIndex: number,
+  model: ModelFamily,
+): Promise<void> {
+  const response = await fetch(`${apiUrl}/api/keys/report-seat-mismatch`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ keyType, keySuffix, keyIndex, model }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to report seat mismatch for key #${keyIndex}: HTTP ${response.status}`);
   }
 }
 
@@ -4595,7 +4623,29 @@ async function checkCompletedProcesses(
           failureReason,
           Date.now(),
           state.codexCreditsExhaustedCooldownMs,
+          modelFamilyOf(model),
         );
+        // A seat mismatch is not a rate limit: the key stays available for
+        // every model its seat can run. `keyRateLimitedUntil` below is
+        // undefined for a seat outcome, so reportKeyRateLimit is not reached.
+        if (outcome.kind === "seat") {
+          const modelLabel = outcome.model.charAt(0).toUpperCase() + outcome.model.slice(1);
+          console.log(
+            `[credential] seat mismatch: key #${credentialInfo.keyIndex} (...${credentialInfo.keySuffix}) cannot run ${modelLabel}`,
+          );
+          await reportKeySeatMismatch(
+            apiConfig.apiUrl,
+            apiConfig.apiKey,
+            credentialInfo.keyType,
+            credentialInfo.keySuffix,
+            credentialInfo.keyIndex,
+            outcome.model,
+          ).catch((err) => {
+            console.warn(
+              `[credential] Failed to report seat mismatch: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
         const keyRateLimitedUntil =
           outcome.kind === "key"
             ? outcome.rateLimitedUntil
