@@ -6,6 +6,7 @@ import {
   getKeyCostSummary,
   getKeyStatuses,
   markKeyRateLimited,
+  recordKeyAuthFailure,
   recordKeyRateLimitWindows,
   recordKeyUsage,
   setApiKeyName,
@@ -74,6 +75,39 @@ const reportRateLimit = route({
     401: { description: "Unauthorized" },
   },
   auth: { apiKey: true },
+});
+
+const reportAuthFailure = route({
+  method: "post",
+  path: "/api/keys/report-auth-failure",
+  pattern: ["api", "keys", "report-auth-failure"],
+  summary: "Record an auth failure for a pooled key; bench it after 2 in a row",
+  tags: ["API Keys"],
+  body: z.object({
+    keyType: z.string(),
+    keySuffix: z.string().min(1).max(10),
+    keyIndex: z.number().int().min(0),
+    taskId: z.string().uuid().optional(),
+    scope: z.string().optional(),
+    scopeId: z.string().optional(),
+  }),
+  responses: {
+    200: {
+      description: "Failure recorded",
+      schema: z.object({
+        success: z.literal(true),
+        consecutiveAuthFailures: z.number().int(),
+        benched: z.boolean(),
+        rateLimitedUntil: z.string().nullable(),
+      }),
+    },
+    400: { description: "Validation error" },
+    401: { description: "Unauthorized" },
+  },
+  auth: { apiKey: true },
+  rbac: {
+    ungated: "worker credential telemetry, same posture as POST /api/keys/report-rate-limit",
+  },
 });
 
 export const rateLimitWindowSchema = z.object({
@@ -196,6 +230,9 @@ const ApiKeyStatusSchema = z.object({
   /** Subscription plan id (see `GET /api/keys/plans`), when known. */
   plan: z.string().nullable(),
   planSource: z.enum(["manual", "detected", "estimated"]).nullable(),
+  /** Auth failures in a row since the last success or clear. */
+  consecutiveAuthFailures: z.number().int(),
+  lastAuthFailureAt: z.string().nullable(),
   /** Derived, readable view of any rejected model-scoped window (Fable/Opus/Sonnet) on this key. */
   modelLimits: z.array(
     z.object({
@@ -341,6 +378,8 @@ const clearRateLimitRoute = route({
     keySuffix: z.string().min(1).max(10),
     scope: z.string().optional(),
     scopeId: z.string().optional(),
+    /** Proof of health (task success or re-login): also lifts an auth-failure bench. */
+    clearAuthBench: z.boolean().optional(),
   }),
   responses: {
     200: {
@@ -465,6 +504,28 @@ export async function handleApiKeys(
       });
     } catch (err) {
       jsonError(res, err instanceof Error ? err.message : "Failed to mark rate limit", 500);
+    }
+    return true;
+  }
+
+  // POST /api/keys/report-auth-failure
+  if (reportAuthFailure.match(req.method, pathSegments)) {
+    const parsed = await reportAuthFailure.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { keyType, keySuffix, keyIndex, scope, scopeId } = parsed.body;
+    try {
+      const result = await recordKeyAuthFailure(
+        keyType,
+        keySuffix,
+        keyIndex,
+        scope,
+        scopeId ?? null,
+      );
+      if (result.benched) clearUsageCache();
+      reportAuthFailure.respond(res, 200, { success: true, ...result });
+    } catch (err) {
+      jsonError(res, err instanceof Error ? err.message : "Failed to record auth failure", 500);
     }
     return true;
   }
@@ -628,9 +689,11 @@ export async function handleApiKeys(
     const parsed = await clearRateLimitRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, keySuffix, scope, scopeId } = parsed.body;
+    const { keyType, keySuffix, scope, scopeId, clearAuthBench } = parsed.body;
     try {
-      const cleared = await clearKeyRateLimit(keyType, keySuffix, scope, scopeId ?? null);
+      const cleared = await clearKeyRateLimit(keyType, keySuffix, scope, scopeId ?? null, {
+        clearAuthBench: clearAuthBench === true,
+      });
       clearRateLimitRoute.respond(res, 200, {
         success: true,
         cleared,
