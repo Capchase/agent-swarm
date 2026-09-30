@@ -337,6 +337,26 @@ describe("claim-time harness guard", () => {
     expect(claudeTrigger?.taskId).toBe(task.id);
     expect(claudeTrigger?.task.resolvedModel).toBe("claude-opus-5-5");
   });
+
+  test("Codex claims compatible pool work queued behind more incompatible tasks than the poll limit", async () => {
+    const codex = await createAgent({
+      name: "w-pool-codex-deep",
+      isLead: false,
+      status: "idle",
+      maxTasks: 1,
+      harnessProvider: "codex",
+    });
+    // Six higher-priority Anthropic tasks: more than the poll's five-candidate limit.
+    for (let i = 0; i < 6; i++) {
+      await createTaskExtended(`opus ${i}`, { model: "claude-opus-5-5", priority: 90 });
+    }
+    const compatible = await createTaskExtended("sol", { model: "gpt-5.6-sol", priority: 10 });
+
+    const trigger = await callPoll(codex.id, header({}));
+
+    expect(trigger?.type).toBe("task_assigned");
+    expect(trigger?.taskId).toBe(compatible.id);
+  });
 });
 
 describe("task list summaries", () => {

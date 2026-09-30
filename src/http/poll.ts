@@ -541,12 +541,10 @@ export async function handlePoll(
             // worker (runbooks/model-tiers.md § Harness compatibility). Filter before the
             // budget gate so an incompatible first candidate never drives a refusal.
             const harness = agent.harnessProvider ?? agent.provider ?? null;
-            const unassignedIds: string[] = [];
-            for (const candidateId of await getUnassignedTaskIdsForAgent(myAgentId, 5)) {
-              if (await poolTaskRunsOnHarness(await getTaskById(candidateId), harness)) {
-                unassignedIds.push(candidateId);
-              }
-            }
+            // The filter runs inside the paginated scan, so incompatible rows never use up the limit.
+            const unassignedIds = await getUnassignedTaskIdsForAgent(myAgentId, 5, (task) =>
+              poolTaskRunsOnHarness(task, harness),
+            );
             // Budget admission gate (Phase 3). Pool path is workers-only —
             // per-agent budgets matter most here, but we still check global.
             // Only run the gate when there's at least one candidate task; an
