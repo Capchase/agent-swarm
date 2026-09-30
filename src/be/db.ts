@@ -11543,10 +11543,7 @@ export async function setApiKeyPlan(
   return result.changes > 0;
 }
 
-/**
- * Mark a key as rate-limited with a retry-after timestamp.
- * An ordinary rate limit never shortens an active auth-failure bench.
- */
+/** Mark a key as rate-limited until a retry-after timestamp; never shortens an auth-failure bench. */
 export async function markKeyRateLimited(
   keyType: string,
   keySuffix: string,
@@ -11564,28 +11561,12 @@ export async function markKeyRateLimited(
        ON CONFLICT(keyType, keySuffix, scope, scopeId)
        DO UPDATE SET
          status = 'rate_limited',
-         rateLimitedUntil = CASE
-           WHEN status = 'rate_limited' AND consecutiveAuthFailures >= ?
-             AND rateLimitedUntil > excluded.rateLimitedUntil
-           THEN rateLimitedUntil
-           ELSE excluded.rateLimitedUntil
-         END,
+         rateLimitedUntil = CASE WHEN status = 'rate_limited' AND consecutiveAuthFailures >= ${CODEX_AUTH_FAILURE_BENCH_THRESHOLD} THEN MAX(COALESCE(rateLimitedUntil, ''), excluded.rateLimitedUntil) ELSE excluded.rateLimitedUntil END,
          lastRateLimitAt = excluded.lastRateLimitAt,
          rateLimitCount = rateLimitCount + 1,
          keyIndex = excluded.keyIndex,
          updatedAt = excluded.updatedAt`,
-    [
-      keyType,
-      keySuffix,
-      keyIndex,
-      scope,
-      effectiveScopeId,
-      rateLimitedUntil,
-      now,
-      provider,
-      now,
-      CODEX_AUTH_FAILURE_BENCH_THRESHOLD,
-    ],
+    [keyType, keySuffix, keyIndex, scope, effectiveScopeId, rateLimitedUntil, now, provider, now],
   );
 }
 
@@ -11793,9 +11774,8 @@ export async function setApiKeyName(
 /**
  * Clear a stale rate-limit record after a successful use proves the key is healthy.
  * An auth bench clears only with `clearAuthBench` (proof of health: task success or re-login),
- * which also resets the auth-failure count and deletes the Codex bench marker.
- * With `clearAuthBench` and `keyIndex` (a slot re-login), it also retires every other
- * identity recorded at that index: the slot now holds this key, so their blocks are stale.
+ * which also resets the auth-failure count and deletes the Codex bench marker. With a
+ * `keyIndex` (slot re-login), it also retires the other logins recorded at that slot.
  */
 export async function clearKeyRateLimit(
   keyType: string,
@@ -11817,37 +11797,22 @@ export async function clearKeyRateLimit(
       [now, ...key, clearAuthBench ? 1 : 0, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
     );
     const cleared = result.changes > 0;
-    if (clearAuthBench) {
-      await tx.run(
-        `UPDATE api_key_status
-           SET consecutiveAuthFailures = 0, updatedAt = ?
-           WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?
-             AND consecutiveAuthFailures > 0`,
-        [now, ...key],
-      );
-      if (cleared && keyType === "CODEX_OAUTH") {
-        await deleteKv(CODEX_AUTH_WATCH_NAMESPACE, codexAuthBenchMarkerKey(keySuffix));
+    if (!clearAuthBench) return cleared;
+    const lifted = await tx.query<{ keySuffix: string }>(
+      `UPDATE api_key_status SET consecutiveAuthFailures = 0, updatedAt = ?,
+           status = CASE WHEN keySuffix = ? THEN status ELSE 'available' END, rateLimitedUntil = CASE WHEN keySuffix = ? THEN rateLimitedUntil END
+         WHERE keyType = ? AND scope = ? AND scopeId = ?
+           AND (keySuffix = ? OR keyIndex = ?) AND (consecutiveAuthFailures > 0 OR status = 'rate_limited')
+         RETURNING keySuffix`,
+      [now, keySuffix, keySuffix, keyType, scope, effectiveScopeId, keySuffix, opts.keyIndex ?? -1],
+    );
+    const retired = lifted.filter((row) => row.keySuffix !== keySuffix);
+    if (keyType === "CODEX_OAUTH") {
+      for (const suffix of [...(cleared ? [keySuffix] : []), ...retired.map((r) => r.keySuffix)]) {
+        await deleteKv(CODEX_AUTH_WATCH_NAMESPACE, codexAuthBenchMarkerKey(suffix));
       }
     }
-    let retired = 0;
-    if (clearAuthBench && opts.keyIndex !== undefined) {
-      const previous = await tx.query<{ keySuffix: string }>(
-        `UPDATE api_key_status
-           SET status = 'available', rateLimitedUntil = NULL, consecutiveAuthFailures = 0,
-               updatedAt = ?
-           WHERE keyType = ? AND keySuffix != ? AND scope = ? AND scopeId = ? AND keyIndex = ?
-             AND (status = 'rate_limited' OR consecutiveAuthFailures > 0)
-           RETURNING keySuffix`,
-        [now, ...key, opts.keyIndex],
-      );
-      retired = previous.length;
-      if (keyType === "CODEX_OAUTH") {
-        for (const row of previous) {
-          await deleteKv(CODEX_AUTH_WATCH_NAMESPACE, codexAuthBenchMarkerKey(row.keySuffix));
-        }
-      }
-    }
-    return cleared || retired > 0;
+    return cleared || retired.length > 0;
   });
 }
 
