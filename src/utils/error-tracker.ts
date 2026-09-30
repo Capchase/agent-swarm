@@ -96,6 +96,51 @@ export function parseRateLimitWindowTelemetry(
 }
 
 /**
+ * `rate_limit_info` fields that describe the seat's billing state (the
+ * `credits_required` payload). `scrubSecrets` does not match them, so they
+ * are dropped structurally before a log egress.
+ */
+const SEAT_PAYLOAD_FIELDS = [
+  "overageDisabledReason",
+  "canUserPurchaseCredits",
+  "hasChargeableSavedPaymentMethod",
+] as const;
+
+/**
+ * Returns a `rate_limit_event` message without the seat billing fields of
+ * its `rate_limit_info`. Any other message is returned unchanged. Error
+ * tracking reads the original message; only log egress uses the result.
+ */
+export function redactRateLimitEvent<T>(message: T): T {
+  if (!message || typeof message !== "object") return message;
+  const json = message as Record<string, unknown>;
+  if (json.type !== "rate_limit_event") return message;
+  const info = json.rate_limit_info;
+  if (!info || typeof info !== "object") return message;
+  if (!SEAT_PAYLOAD_FIELDS.some((field) => field in info)) return message;
+  const redactedInfo = { ...(info as Record<string, unknown>) };
+  for (const field of SEAT_PAYLOAD_FIELDS) delete redactedInfo[field];
+  return { ...json, rate_limit_info: redactedInfo } as T;
+}
+
+/**
+ * Line form of `redactRateLimitEvent` for the CLI's stream-json output. A
+ * line that is not a `rate_limit_event` with seat billing fields is returned
+ * byte for byte.
+ */
+export function redactRateLimitEventLine(line: string): string {
+  if (!line.includes('"rate_limit_event"')) return line;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return line;
+  }
+  const redacted = redactRateLimitEvent(parsed);
+  return redacted === parsed ? line : JSON.stringify(redacted);
+}
+
+/**
  * Maximum cooldown horizon for a rate-limit reset. A weekly OAuth limit resets
  * up to ~7 days out, so the cap must be at least that or a weekly-limited key
  * gets re-clamped to a short cooldown and re-handed to a worker every few hours
