@@ -392,14 +392,11 @@ export async function resolveCodexAuthMode(
  * Build the `failureReason` for a pool-slot OAuth revalidation failure
  * (see `resolveCodexAuthMode` above).
  *
- * Wording matters: when the failure is a rejected refresh whose body
- * indicates the credential is dead (invalid_grant, reused, revoked), the
- * upstream error body is embedded verbatim so the EXISTING
- * `codex-auth-expiry-watch` script's `DEAD_TOKEN_LIKE` patterns (which match
- * on substrings like "refresh token was already used" / "log out and sign in
- * again") still catch it with zero script changes. A lock-wait timeout is
- * transient/retryable — its wording is deliberately distinct so the watch
- * does NOT bench a slot over a temporary contention blip.
+ * Wording matters: every variant carries `[auth-error]`, so the runner's
+ * `isCodexAuthFailureReason` counts it toward the auth-failure bench (2 in a
+ * row). A lock-wait timeout is transient/retryable — its wording ("waiting
+ * for the refresh lock") is excluded as transient, so a temporary contention
+ * blip does NOT count toward a bench.
  */
 function buildPoolRevalidationFailureReason(err: unknown, slot: number): string {
   if (err instanceof CodexOAuthRefreshError) {
