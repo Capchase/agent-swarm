@@ -9,8 +9,10 @@ import {
   closeDb,
   getAvailableKeyIndices,
   getKeyStatuses,
+  getKv,
   initDb,
   markKeyRateLimited,
+  recordKeyAuthFailure,
   recordKeyRateLimitWindows,
   recordKeyUsage,
 } from "../be/db";
@@ -240,6 +242,96 @@ describe("API key tracking DB queries", () => {
     await recordKeyUsage("OPENAI_API_KEY", "oai02", 1, null);
     const cleared = await clearKeyRateLimit("OPENAI_API_KEY", "oai02");
     expect(cleared).toBe(false);
+  });
+
+  const codexStatus = async (keySuffix: string) =>
+    (await getKeyStatuses("CODEX_OAUTH")).find((s) => s.keySuffix === keySuffix)!;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  test("recordKeyAuthFailure: 1 failure counts but does not bench", async () => {
+    const result = await recordKeyAuthFailure("CODEX_OAUTH", "cdx01", 0);
+    expect(result).toEqual({ consecutiveAuthFailures: 1, benched: false, rateLimitedUntil: null });
+
+    const row = await codexStatus("cdx01");
+    expect(row.consecutiveAuthFailures).toBe(1);
+    expect(row.lastAuthFailureAt).not.toBeNull();
+    expect(row.status).toBe("available");
+    const { availableIndices } = await getAvailableKeyIndices("CODEX_OAUTH", 3);
+    expect(availableIndices).toContain(0);
+  });
+
+  test("recordKeyAuthFailure: 2 failures in a row bench for 365 days", async () => {
+    const result = await recordKeyAuthFailure("CODEX_OAUTH", "cdx01", 0);
+    expect(result.consecutiveAuthFailures).toBe(2);
+    expect(result.benched).toBe(true);
+
+    const row = await codexStatus("cdx01");
+    expect(row.status).toBe("rate_limited");
+    expect(row.rateLimitedUntil).toBe(result.rateLimitedUntil);
+    expect(Math.abs(Date.parse(row.rateLimitedUntil!) - (Date.now() + 365 * DAY_MS))).toBeLessThan(
+      60_000,
+    );
+    expect(row.lastRateLimitAt).not.toBeNull();
+
+    const marker = await getKv("codex-auth-watch", "bench:cdx01");
+    expect(marker).not.toBeNull();
+    expect(marker!.value).toMatchObject({
+      keyIndex: 0,
+      keyType: "CODEX_OAUTH",
+      benchedUntil: row.rateLimitedUntil,
+      source: "report-auth-failure",
+    });
+
+    const { availableIndices } = await getAvailableKeyIndices("CODEX_OAUTH", 3);
+    expect(availableIndices).not.toContain(0);
+  });
+
+  test("recordKeyAuthFailure only extends an existing longer bench", async () => {
+    const farUntil = new Date(Date.now() + 400 * DAY_MS).toISOString();
+    await markKeyRateLimited("CODEX_OAUTH", "cdx02", 1, farUntil);
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx02", 1);
+    const result = await recordKeyAuthFailure("CODEX_OAUTH", "cdx02", 1);
+    expect(result.benched).toBe(true);
+    expect(result.rateLimitedUntil).toBe(farUntil);
+    expect((await codexStatus("cdx02")).rateLimitedUntil).toBe(farUntil);
+  });
+
+  test("a success between auth failures resets the run", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx03", 2);
+    await clearKeyRateLimit("CODEX_OAUTH", "cdx03", "global", null, { clearAuthBench: true });
+    const result = await recordKeyAuthFailure("CODEX_OAUTH", "cdx03", 2);
+    expect(result.benched).toBe(false);
+
+    const row = await codexStatus("cdx03");
+    expect(row.status).toBe("available");
+    expect(row.consecutiveAuthFailures).toBe(1);
+  });
+
+  test("clearKeyRateLimit without clearAuthBench cannot lift an auth bench", async () => {
+    const cleared = await clearKeyRateLimit("CODEX_OAUTH", "cdx01");
+    expect(cleared).toBe(false);
+    expect((await codexStatus("cdx01")).status).toBe("rate_limited");
+  });
+
+  test("clearKeyRateLimit with clearAuthBench lifts an auth bench", async () => {
+    const cleared = await clearKeyRateLimit("CODEX_OAUTH", "cdx01", "global", null, {
+      clearAuthBench: true,
+    });
+    expect(cleared).toBe(true);
+
+    const row = await codexStatus("cdx01");
+    expect(row.status).toBe("available");
+    expect(row.rateLimitedUntil).toBeNull();
+    expect(row.consecutiveAuthFailures).toBe(0);
+    expect(await getKv("codex-auth-watch", "bench:cdx01")).toBeNull();
+  });
+
+  test("clearKeyRateLimit without clearAuthBench still clears a plain rate limit", async () => {
+    const until = new Date(Date.now() + 300_000).toISOString();
+    await markKeyRateLimited("CODEX_OAUTH", "cdx04", 3, until);
+    const cleared = await clearKeyRateLimit("CODEX_OAUTH", "cdx04");
+    expect(cleared).toBe(true);
+    expect((await codexStatus("cdx04")).status).toBe("available");
   });
 
   test("recordKeyRateLimitWindows persists latest provider windows", async () => {
