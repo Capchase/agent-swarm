@@ -11403,8 +11403,7 @@ export async function getAvailableKeyIndices(
     `UPDATE api_key_status
      SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
      WHERE keyType = ? AND scope = ? AND scopeId = ?
-       AND status = 'rate_limited' AND rateLimitedUntil IS NOT NULL AND rateLimitedUntil <= ?
-       AND consecutiveAuthFailures < ?`,
+       AND status = 'rate_limited' AND rateLimitedUntil <= ? AND consecutiveAuthFailures < ?`,
     [now, keyType, scope, effectiveScopeId, now, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
   );
 
