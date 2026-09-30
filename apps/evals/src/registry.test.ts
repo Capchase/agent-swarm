@@ -269,12 +269,13 @@ describe("CONFIG_PRESETS (v7.7 item 1 — frozen contract)", () => {
     expect(nightly?.configIds).toEqual(["claude-opus-5.5", "codex-6-luna"]);
     expect(weekly?.configIds).toEqual([
       "claude-opus-5.5",
+      "codex-6.1-sol",
       "codex-6-luna",
       "codex-6-astra",
       "pi-deepseek-v4.1-flash",
     ]);
     expect(nightly?.runDefaults).toEqual({ attemptsPerCell: 3, maxMeteredUsd: 2 });
-    expect(weekly?.runDefaults).toEqual({ attemptsPerCell: 5, maxMeteredUsd: 12 });
+    expect(weekly?.runDefaults).toEqual({ attemptsPerCell: 5, maxMeteredUsd: 37 });
     for (const preset of CONFIG_PRESETS) {
       const plan = preset.runDefaults;
       if (!plan) continue;
@@ -287,7 +288,7 @@ describe("CONFIG_PRESETS (v7.7 item 1 — frozen contract)", () => {
     expect(presetRunDefaults(["nightly-canary"])).toEqual({ attemptsPerCell: 3, maxMeteredUsd: 2 });
     expect(presetRunDefaults(["budget", "weekly-matrix"])).toEqual({
       attemptsPerCell: 5,
-      maxMeteredUsd: 12,
+      maxMeteredUsd: 37,
     });
     expect(presetRunDefaults(["nightly-canary", "weekly-matrix"])).toEqual({
       attemptsPerCell: 3,
@@ -650,6 +651,64 @@ describe("validateScenario dependsOn (round 10 — relaxed range + cycle chain e
       'task 0 ("A"): dependsOn entry 9 must reference an existing task index [0, 2]',
     );
     expect(errors).toContain('dependency cycle: 0 ("A") → 1 ("B") → 0 ("A")');
+  });
+});
+
+describe("validateScenario — member profiles, workerExec, humanInput (Phase 8)", () => {
+  test("a declared profile, per-worker seeding and a canned human are valid together", () => {
+    expect(
+      validateScenario(
+        scenario({
+          workers: [
+            { name: "a", profile: { role: "ops", capabilities: ["on-call"] } },
+            { name: "b" },
+          ],
+          seed: { workerExec: [{ worker: 1, commands: ["true"] }] },
+          humanInput: { reply: "EU only" },
+          awaitSpawnedTasks: true,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a profile must say something, within the API's limits", () => {
+    expect(validateScenario(scenario({ workers: [{ profile: {} }] }))).toEqual([
+      "workers[0].profile must set role, description or capabilities",
+    ]);
+    expect(
+      validateScenario(
+        scenario({ workers: [{ profile: { role: "x".repeat(101), capabilities: [" "] } }] }),
+      ),
+    ).toEqual([
+      "workers[0].profile.role must be 1..100 chars",
+      "workers[0].profile.capabilities entries must be non-empty strings",
+    ]);
+  });
+
+  test("workerExec targets a booted worker and runs something", () => {
+    expect(
+      validateScenario(
+        scenario({
+          workers: 2,
+          seed: {
+            workerExec: [
+              { worker: 2, commands: ["true"] },
+              { worker: 0, commands: [] },
+            ],
+          },
+        }),
+      ),
+    ).toEqual([
+      "seed.workerExec[0].worker 2 out of range [0, 1]",
+      "seed.workerExec[1].commands is empty",
+    ]);
+  });
+
+  test("humanInput needs a reply and awaitSpawnedTasks (the answer is a follow-up task)", () => {
+    expect(validateScenario(scenario({ humanInput: { reply: " " } }))).toEqual([
+      "humanInput.reply must be non-empty",
+      "humanInput requires awaitSpawnedTasks",
+    ]);
   });
 });
 

@@ -171,6 +171,13 @@ export interface ScenarioSeed {
     /** Optional human label for logs/artifacts ("delete-input", "poison-result"). */
     label?: string;
   }[];
+  /**
+   * Per-worker seeding: shell `commands` run in `workers[entry.worker]`'s sandbox
+   * after `exec`, before `workerFailures`. Unlike `exec` (worker 0 only) this
+   * gives each teammate its own files, e.g. a reviewer's spec the coder never
+   * sees. Strict like `exec`: a non-zero exit fails the attempt as infra.
+   */
+  workerExec?: { worker: number; commands: string[] }[];
 }
 
 export interface LlmJudgeSpec {
@@ -335,6 +342,49 @@ export interface WorkerSpec {
   model?: string;
   /** Reserved runtime keys (AGENT_ID, API_KEY, HARNESS_PROVIDER, …) are rejected. */
   env?: Record<string, string>;
+  /**
+   * Declared profile, written by the runner through `PUT /api/agents/{id}/profile`
+   * after the stack boots and before any task exists. It is what a lead reads in
+   * `get-swarm` when it routes work (capability-routing). A failed write fails
+   * the attempt as infra, never as a model failure.
+   */
+  profile?: WorkerProfile;
+}
+
+export interface WorkerProfile {
+  role?: string;
+  description?: string;
+  capabilities?: string[];
+}
+
+/**
+ * Canned human for scenarios that expect `request-human-input` (human-in-loop).
+ * While tasks run, the runner answers every pending approval request of the
+ * attempt with this reply (see src/runner/human-input.ts for the per-question
+ * mapping), then keeps waiting until the follow-up work settles.
+ */
+export interface HumanInputSpec {
+  reply: string;
+  /**
+   * Scenario-owned answer for a structured question (select, boolean), so the
+   * canned human never contradicts its own reply (e.g. picks "include" on an
+   * email question because the reply says "do not include"). Return undefined,
+   * or a value the respond route would reject, to fall back to the generic
+   * mapping; the artifact marks every fallback.
+   */
+  answer?: (question: HumanQuestion) => unknown;
+}
+
+/** One `request-human-input` question (root src/tools/request-human-input.ts QuestionSchema). */
+export interface HumanQuestion {
+  id: string;
+  type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+  label: string;
+  required?: boolean;
+  description?: string;
+  options?: { value: string; label: string; description?: string }[];
+  minSelections?: number;
+  maxSelections?: number;
 }
 
 export interface Scenario {
@@ -401,6 +451,11 @@ export interface Scenario {
    * rejects a pairing that drifts. See src/baseline.ts for the comparison.
    */
   baselineOf?: string;
+  /**
+   * Answer `request-human-input` with a canned reply (human-in-loop). Requires
+   * `awaitSpawnedTasks`: the answer arrives as a `hitl-follow-up` task.
+   */
+  humanInput?: HumanInputSpec;
 }
 
 /** Worker count for either `Scenario.workers` shape (v7 §9). */
@@ -681,6 +736,12 @@ export interface SandboxWorkerInfo {
   configId?: string | null;
   provider?: HarnessProvider | null;
   model?: string | null;
+  /**
+   * How the credential this member booted with bills: "subscription" (claude
+   * OAuth token, codex ChatGPT auth.json) or "metered" (an API key). Null/absent
+   * on rows written before it was recorded.
+   */
+  billing?: "subscription" | "metered" | null;
 }
 
 /**

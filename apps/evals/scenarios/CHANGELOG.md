@@ -25,6 +25,10 @@ content hash of each version is pinned in `scenario-hashes.ts`;
   module moves both hashes: bump both, append both hashes, one changelog line
   each.
 
+- **Held-out scenarios** (`HELD_OUT_SCENARIO_IDS` in `suite.ts`) are in the
+  suite, run and scored, but `publish` never writes them into a snapshot.
+  Changing the held-out set changes what a snapshot covers: treat it as MAJOR.
+
 `1.0` is the suite Phase 10 publishes; until then it stays open and Phases 7-8
 add scenarios to it without a MAJOR bump. Nothing published depends on it yet.
 
@@ -42,6 +46,11 @@ add scenarios to it without a MAJOR bump. Nothing published depends on it yet.
 | fanout-research-solo | 1 | Single-agent baseline of fanout-research (Phase 7, plan Q6). |
 | worker-recovery | 1 | Lead + 2 workers, clerk-2's ledger poisoned at seed time (Phase 7). |
 | worker-recovery-solo | 1 | Single-agent baseline of worker-recovery (Phase 7, plan Q6). |
+| implement-review | 1 | Lead + coder + reviewer; reviewer alone holds the spec exposing a planted bug (Phase 8). |
+| implement-review-solo | 1 | Single-agent baseline of implement-review (Phase 8, plan Q6). |
+| capability-routing | 1 | Lead + 3 workers with declared profiles; each input on one worker only (Phase 8). |
+| human-in-loop | 1 | Ambiguous export, canned reply to request-human-input (Phase 8). |
+| human-in-loop-solo | 1 | Single-agent baseline of human-in-loop (Phase 8, plan Q6). |
 
 Versions 1 above are the state of `main` when versioning was introduced
 (Phase 3); earlier fixes (Phases 1-2) predate it and are not versioned.

@@ -186,6 +186,56 @@ export const SCENARIO_CARDS: Readonly<Record<string, ScenarioCard>> = {
     tags: { topology: "single-agent", flow: "sequential", kind: "capability" },
     changelog: [{ version: 1, note: "Baseline of worker-recovery (Phase 7, plan Q6)." }],
   },
+  "implement-review": {
+    summary:
+      "Does a code review between two workers catch a bug the coder had no reason to look for, and does the lead wait for approval before shipping?",
+    agentDoes:
+      "A small TypeScript cart repo has a failing coupon bug (the task) and a planted free-shipping boundary bug that no visible test covers. The coder fixes the coupon. Only the reviewer holds the spec and its acceptance tests. The lead relays the diff to the reviewer and the findings back to the coder, and may only say SHIPPED after an APPROVE.",
+    scoredBy:
+      "The grader's own copy of the visible tests must pass on the coder's code. Tests (weight 3): the grader runs the visible and planted test groups itself and checks the seeded test file is unmodified. Review (weight 3), from the task tree: the reviewer requested changes naming the shipping boundary, the coder was re-tasked after that, and a later review approved. Process (weight 2): every SHIPPED came after the first APPROVE. Efficiency (weight 1): cost and time against the budget. No judge. Pass at 0.75.",
+    tags: { topology: "swarm", flow: "sequential", kind: "capability" },
+    changelog: [{ version: 1, note: "Added in Phase 8 with a single-agent baseline." }],
+  },
+  "implement-review-solo": {
+    summary:
+      "What does one agent score on the implement-and-review brief? The baseline that shows what the swarm adds.",
+    agentDoes:
+      "The same cart repo and bugs as implement-review, with one worker and no lead. The worker holds the repo and the review material together, under the same timeout.",
+    scoredBy:
+      "The visible-tests gate, then the swarm scenario's outcome dimensions only: tests (weight 3) and efficiency (weight 1). There are no review or process dimensions, because there is no reviewer or lead. Pass at 0.75.",
+    tags: { topology: "single-agent", flow: "sequential", kind: "capability" },
+    changelog: [{ version: 1, note: "Baseline of implement-review (Phase 8, plan Q6)." }],
+  },
+  "capability-routing": {
+    summary:
+      "Does a lead read its teammates' declared roles and capabilities and send each job to the one worker who can do it?",
+    agentDoes:
+      "Three workers with neutral names declare different profiles (ops, data, localization), and each holds the only copy of one input: an on-call rota, an orders dataset, or a Spanish glossary. The lead gets three jobs listed in an order that matches no worker order, routes each one, and writes the answers to one file.",
+    scoredBy:
+      "The answers file must exist. Routing (weight 5), from the task tree: per job, full credit when the lead's first task for it went to the right worker, half when the job was also sent elsewhere or again, zero otherwise. Correctness (weight 3): six facts checked against the answer key; the glossary uses non-default translations, so guessing misses them. Efficiency (weight 1): cost and time against the budget. No judge and no solo baseline. Pass at 0.75.",
+    tags: { topology: "swarm", flow: "parallel", kind: "capability" },
+    changelog: [{ version: 1, note: "Added in Phase 8. No single-agent baseline." }],
+  },
+  "human-in-loop": {
+    summary:
+      "Given an ambiguous request, does the swarm ask the requester before guessing, ask the right question, and then use the answer?",
+    agentDoes:
+      "The lead gets a vague ask: prepare the customer export for a partner review. The analyst holds a 12-row customer list with emails across three regions. Nothing says which customers, which fields may leave, or which format. The requester is reachable through request-human-input, and a canned human replies: EU customers only, JSON with id, name and plan, no emails.",
+    scoredBy:
+      "The export file must exist. Clarification (weight 3), from the task tree: a request to the human exists, the follow-up task completed, and work went to the analyst after the answer. Question quality (weight 2): a judge asks whether the question targeted the real ambiguity. Correctness (weight 3): exactly the EU customers, each with name and plan; any email zeroes it. Efficiency (weight 1): cost and time against the budget. Pass at 0.75.",
+    tags: { topology: "swarm", flow: "sequential", kind: "capability" },
+    changelog: [{ version: 1, note: "Added in Phase 8 with a single-agent baseline." }],
+  },
+  "human-in-loop-solo": {
+    summary:
+      "What does one agent score on the ambiguous export brief? The baseline that shows what the swarm adds.",
+    agentDoes:
+      "The same customer export brief, data and canned human as human-in-loop, with the analyst alone and no lead.",
+    scoredBy:
+      "The export-file gate, then the swarm scenario's outcome dimensions only: question quality (weight 2, judge), correctness (weight 3) and efficiency (weight 1). There is no clarification dimension, which grades the lead-to-analyst paper trail. Pass at 0.75.",
+    tags: { topology: "single-agent", flow: "sequential", kind: "capability" },
+    changelog: [{ version: 1, note: "Baseline of human-in-loop (Phase 8, plan Q6)." }],
+  },
 };
 
 /** The card for a scenario id, or null for one that was never registered (historical runs). */
