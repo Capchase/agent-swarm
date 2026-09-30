@@ -46,6 +46,7 @@ import {
 } from "../types.ts";
 import { getApiKey } from "../utils/api-key.ts";
 import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
+import { isCodexAuthFailureReason } from "../utils/codex-auth-failure.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
 import {
@@ -1901,6 +1902,42 @@ async function reportKeyRateLimit(
   }
 }
 
+/** Report a Codex pool auth failure; the API benches after 2 in a row. Awaited, never throws. */
+async function reportKeyAuthFailure(
+  apiUrl: string,
+  apiKey: string,
+  keyType: string,
+  keySuffix: string,
+  keyIndex: number,
+  taskId: string,
+): Promise<void> {
+  try {
+    const resp = await fetch(`${apiUrl}/api/keys/report-auth-failure`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ keyType, keySuffix, keyIndex, taskId }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = (await resp.json()) as {
+      consecutiveAuthFailures: number;
+      benched: boolean;
+      rateLimitedUntil: string | null;
+    };
+    console.log(
+      `[credentials] Auth failure on ...${keySuffix}: ${data.consecutiveAuthFailures} in a row${
+        data.benched ? `; benched until ${data.rateLimitedUntil}` : ""
+      }`,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(scrubSecrets(`[credentials] Failed to report auth failure: ${message}`));
+  }
+}
+
 /**
  * Reports rate-limit window telemetry for a key. Returns the underlying
  * fetch promise (does not swallow errors) so a caller that needs the post to
@@ -1964,7 +2001,8 @@ async function reportKeyClearRateLimit(
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ keyType, keySuffix }),
+      // A task that exited 0 proves the login works, so it may lift an auth bench.
+      body: JSON.stringify({ keyType, keySuffix, clearAuthBench: true }),
     });
     if (resp.ok) {
       const data = (await resp.json()) as { cleared?: boolean };
@@ -4620,6 +4658,23 @@ async function checkCompletedProcesses(
           state.modelWindowBlocks.set(blockKey, outcome.resetsAtSec * 1000);
           console.log(
             `[credential] ${outcome.model} weekly window exhausted (${outcome.window}) on key #${credentialInfo.keyIndex} until ${resetsAtIso}`,
+          );
+        }
+
+        if (
+          result.exitCode !== 0 &&
+          credentialInfo.keyType === "CODEX_OAUTH" &&
+          isCodexAuthFailureReason(failureReason)
+        ) {
+          // Land the count (and a bench at 2) before this task finishes, so the
+          // next draw on any worker already skips a dead login.
+          await reportKeyAuthFailure(
+            apiConfig.apiUrl,
+            apiConfig.apiKey,
+            credentialInfo.keyType,
+            credentialInfo.keySuffix,
+            credentialInfo.keyIndex,
+            taskId,
           );
         }
 
