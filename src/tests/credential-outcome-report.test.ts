@@ -142,3 +142,30 @@ describe("reportCredentialOutcomeThenFinish — credits_required seat mismatch",
     });
   }
 });
+
+describe("reportCredentialOutcomeThenFinish — seat mismatch after a key-wide rejection", () => {
+  test("the earlier key-wide rejection is still reported next to the seat report", async () => {
+    const taskId = "22222222-2222-4222-8222-222222222222";
+    const rateLimitResetAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    await completeTask(
+      taskId,
+      {
+        exitCode: 1,
+        isError: true,
+        sessionId: "session-3",
+        failureReason: "Claude process exited with code 1",
+        rateLimitResetAt,
+        creditsRequired: {
+          observedAt: new Date().toISOString(),
+          overageDisabledReason: "member_zero_credit_limit",
+        },
+      },
+      "claude-fable-5-1",
+    );
+
+    expect(requests.filter((r) => r.path === "/api/keys/report-seat-mismatch")).toHaveLength(1);
+    const keyReports = requests.filter((r) => r.path === "/api/keys/report-rate-limit");
+    expect(keyReports).toHaveLength(1);
+    expect(keyReports[0]?.body).toMatchObject({ keyIndex: 3, rateLimitedUntil: rateLimitResetAt });
+  });
+});

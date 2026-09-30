@@ -18,11 +18,18 @@ export type RateLimitOutcome =
   | { kind: "key"; rateLimitedUntil: string }
   /**
    * The key's seat cannot run the model (`credits_required`). Not a rate
-   * limit: it never marks the key, and it carries no key-wide reset — the
-   * CLI stops at the first rejected request, so the same session cannot also
-   * prove a key-wide limit.
+   * limit: the seat rejection never marks the key by itself.
    */
-  | { kind: "seat"; model: ModelFamily; source: "event" | "text" }
+  | {
+      kind: "seat";
+      model: ModelFamily;
+      source: "event" | "text";
+      /**
+       * An independent key-wide rejection observed earlier in the same
+       * session, still to enforce. The seat outcome never erases it.
+       */
+      keyRateLimitedUntil?: string;
+    }
   | {
       kind: "model";
       model: ModelFamily;
@@ -78,18 +85,18 @@ export function classifyRateLimitOutcome(
   codexCreditsExhaustedCooldownMs: number = CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS,
   taskModelFamily?: ModelFamily,
 ): RateLimitOutcome {
-  if (failureReason != null) {
-    const seatFamily = parseCreditsRequiredMessage(failureReason);
-    if (seatFamily) return { kind: "seat", model: seatFamily, source: "text" };
-  }
-  if (result.creditsRequired && taskModelFamily) {
-    return { kind: "seat", model: taskModelFamily, source: "event" };
-  }
-
   const keyRateLimitedUntil = result.rateLimitResetAt
     ? new Date(clampMs(new Date(result.rateLimitResetAt).getTime(), nowMs)).toISOString()
     : undefined;
   const keyExtra = keyRateLimitedUntil ? { keyRateLimitedUntil } : {};
+
+  if (failureReason != null) {
+    const seatFamily = parseCreditsRequiredMessage(failureReason);
+    if (seatFamily) return { kind: "seat", model: seatFamily, source: "text", ...keyExtra };
+  }
+  if (result.creditsRequired && taskModelFamily) {
+    return { kind: "seat", model: taskModelFamily, source: "event", ...keyExtra };
+  }
 
   if (result.modelRateLimit) {
     const resetsAtSec = Math.floor(new Date(result.modelRateLimit.resetAt).getTime() / 1000);

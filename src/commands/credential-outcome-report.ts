@@ -131,15 +131,16 @@ export async function reportCredentialOutcomeThenFinish(
       modelFamilyOf(model),
     );
     // A seat mismatch is not a rate limit: the key stays available for
-    // every model its seat can run. `keyRateLimitedUntil` below is
-    // undefined for a seat outcome, so reportKeyRateLimit is not reached.
+    // every model its seat can run. A seat outcome carries
+    // `keyRateLimitedUntil` only for an independent key-wide rejection seen
+    // earlier in the same session, which is still reported below.
     if (outcome.kind === "seat") {
       await reportSeatMismatchOutcome(apiUrl, apiKey, credentialInfo, outcome.model);
     }
     const keyRateLimitedUntil =
       outcome.kind === "key"
         ? outcome.rateLimitedUntil
-        : outcome.kind === "model"
+        : outcome.kind === "model" || outcome.kind === "seat"
           ? outcome.keyRateLimitedUntil
           : undefined;
     if (keyRateLimitedUntil) {

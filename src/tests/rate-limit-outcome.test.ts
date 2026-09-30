@@ -5,6 +5,7 @@ import {
   buildFinalRateLimitWindows,
   classifyRateLimitOutcome,
 } from "../commands/rate-limit-outcome";
+import { SessionErrorTracker } from "../utils/error-tracker";
 
 describe("classifyRateLimitOutcome", () => {
   test("event source: modelRateLimit set gives kind 'model' with source 'event'", () => {
@@ -350,23 +351,49 @@ describe("classifyRateLimitOutcome — seat mismatch", () => {
     expect(classifyRateLimitOutcome({ creditsRequired }, undefined, nowMs).kind).not.toBe("seat");
   });
 
-  test("a seat outcome wins over modelRateLimit and rateLimitResetAt and carries no key reset", () => {
-    const outcome = classifyRateLimitOutcome(
-      {
-        creditsRequired,
-        rateLimitResetAt: "2026-10-01T00:00:00.000Z",
-        modelRateLimit: {
-          window: "seven_day_overage_included",
-          model: "fable",
-          resetAt: "2026-10-02T00:00:00.000Z",
-        },
+  test("a seat outcome keeps an earlier key-wide rejection from the real tracker", () => {
+    const tracker = new SessionErrorTracker();
+    const fiveHourResetsAtSec = Math.floor(nowMs / 1000) + 2 * 60 * 60;
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: fiveHourResetsAtSec,
+        rateLimitType: "five_hour",
       },
-      observedText,
+    });
+    tracker.processRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: 1790812800,
+        overageDisabledReason: "member_zero_credit_limit",
+        isUsingOverage: false,
+        errorCode: "credits_required",
+      },
+    });
+    const rateLimitResetAt = tracker.getRateLimitResetAt();
+    const creditsRequired = tracker.getCreditsRequired();
+    expect(rateLimitResetAt).toBeDefined();
+    expect(creditsRequired).toBeDefined();
+
+    const outcome = classifyRateLimitOutcome(
+      { rateLimitResetAt, creditsRequired },
+      undefined,
       nowMs,
       undefined,
       "fable",
     );
-    expect(outcome).toEqual({ kind: "seat", model: "fable", source: "text" });
+    expect(outcome).toEqual({
+      kind: "seat",
+      model: "fable",
+      source: "event",
+      keyRateLimitedUntil: new Date(fiveHourResetsAtSec * 1000).toISOString(),
+    });
+  });
+
+  test("a seat outcome with no key-wide rejection carries no key reset", () => {
+    const outcome = classifyRateLimitOutcome({ creditsRequired }, observedText, nowMs);
     expect(outcome).not.toHaveProperty("keyRateLimitedUntil");
     expect(outcome).not.toHaveProperty("rateLimitedUntil");
   });
