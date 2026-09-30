@@ -39037,6 +39037,9 @@
                     "type": "string",
                     "minLength": 1
                   },
+                  "allowCustomModel": {
+                    "type": "boolean"
+                  },
                   "parentTaskId": {
                     "type": "string",
                     "format": "uuid"
@@ -46066,7 +46069,8 @@
                     "type": "string"
                   },
                   "model": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Concrete model override for this task, interpreted by the assignee's harness/provider. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected."
                   },
                   "modelTier": {
                     "type": "string",

@@ -65,6 +65,7 @@ import { refreshRuntimeModelCatalog } from "../utils/runtime-model-catalog.ts";
 import { resolveScriptsOnlyMode } from "../utils/scripts-only-mode.ts";
 import { scrubSecrets } from "../utils/secret-scrubber.ts";
 import { refreshSkillsIfChanged } from "../utils/skills-refresh.ts";
+import { guardSpawnModel } from "../utils/spawn-model-guard.ts";
 import { isSteeringEnabled } from "../utils/steering-enabled.ts";
 import { interpolate } from "../utils/template.ts";
 import { detectVcsProvider } from "../vcs/index.ts";
@@ -3670,7 +3671,30 @@ async function spawnProviderProcess(
     );
   }
   const taskModel = opts.resolvedModel || taskModelSelection.model || "";
-  const model = taskModel || configModel || "";
+  // Never start a CLI with a model from another harness family (runbooks/model-tiers.md).
+  const spawnModel = guardSpawnModel({
+    taskModel,
+    configModel,
+    harness: opts.harnessProvider,
+    role: opts.role,
+  });
+  if (spawnModel.kind === "mismatch") {
+    console.warn(`[${opts.role}] ${spawnModel.reason}`);
+    if (realTaskId) {
+      await ensureTaskFinished(
+        { apiUrl: opts.apiUrl, apiKey: opts.apiKey, agentId: opts.agentId },
+        opts.role,
+        realTaskId,
+        1,
+        spawnModel.reason,
+        undefined,
+        opts.harnessProvider,
+      );
+    }
+    throw new Error(spawnModel.reason);
+  }
+  if (spawnModel.warning) console.warn(spawnModel.warning);
+  const model = spawnModel.model;
 
   // Resolve Codex OAuth pool slot BEFORE building ProviderSessionConfig so we
   // can pass codexSlot through and the adapter writes token refreshes back to
