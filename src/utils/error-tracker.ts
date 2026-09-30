@@ -186,6 +186,14 @@ export class SessionErrorTracker {
   private modelRateLimit:
     | { window: string; model: ModelFamily; resetAtMs: number; observedAt: string }
     | undefined;
+  /**
+   * Stashed `credits_required` rejection: the key's seat cannot run the
+   * session's model (e.g. "Fable 5.1 requires usage credits"). A seat fact,
+   * not a rate limit, so it never lands in `keyWideRejections`.
+   */
+  private creditsRequired:
+    | { observedAt: string; resetsAtMs?: number; overageDisabledReason?: string }
+    | undefined;
   private rateLimitWindows: RateLimitWindowTelemetry = {};
 
   /** Record an error from an assistant message with message.error field */
@@ -265,6 +273,21 @@ export class SessionErrorTracker {
         return;
       }
 
+      // Checked before the resetsAt validation: the observed event carries a
+      // resetsAt, but this branch must not depend on it.
+      if (info.errorCode === "credits_required") {
+        this.creditsRequired = {
+          observedAt,
+          resetsAtMs:
+            typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt)
+              ? info.resetsAt * 1000
+              : undefined,
+          overageDisabledReason:
+            typeof info.overageDisabledReason === "string" ? info.overageDisabledReason : undefined,
+        };
+        return;
+      }
+
       const resetsAtSec = info.resetsAt;
       if (typeof resetsAtSec !== "number" || !Number.isFinite(resetsAtSec) || resetsAtSec <= 0) {
         console.warn(
@@ -341,6 +364,18 @@ export class SessionErrorTracker {
       model: this.modelRateLimit.model,
       resetAt: new Date(this.modelRateLimit.resetAtMs).toISOString(),
       observedAt: this.modelRateLimit.observedAt,
+    };
+  }
+
+  /**
+   * Returns the stashed `credits_required` rejection, or undefined if none was
+   * seen in this session. It never sets the key-wide reset time.
+   */
+  getCreditsRequired(): { observedAt: string; overageDisabledReason?: string } | undefined {
+    if (!this.creditsRequired) return undefined;
+    return {
+      observedAt: this.creditsRequired.observedAt,
+      overageDisabledReason: this.creditsRequired.overageDisabledReason,
     };
   }
 

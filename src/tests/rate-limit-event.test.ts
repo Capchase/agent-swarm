@@ -449,6 +449,42 @@ describe("SessionErrorTracker — model-scoped rejection (Fable weekly window)",
   });
 });
 
+// Verbatim fixture from task 91175100-349d-4284-a0c1-c41d17ddf8fa, session_logs line 4,
+// 2026-09-30. Fable on a Claude Team standard seat: rejected, no rateLimitType,
+// errorCode "credits_required".
+const FIXTURE_CREDITS_REQUIRED = {
+  type: "rate_limit_event",
+  rate_limit_info: {
+    status: "rejected",
+    resetsAt: 1790812800,
+    overageDisabledReason: "member_zero_credit_limit",
+    isUsingOverage: false,
+    errorCode: "credits_required",
+    canUserPurchaseCredits: false,
+    hasChargeableSavedPaymentMethod: true,
+  },
+  uuid: "bff51e54-9777-458a-aceb-b50aaa4255b5",
+  session_id: "9d326326-0c59-4b00-b819-b9b7dd3bf99f",
+};
+
+describe("SessionErrorTracker — credits_required rejection", () => {
+  test("credits_required is a seat mismatch, never a key-wide or model-scoped limit", () => {
+    const tracker = new SessionErrorTracker();
+    tracker.processRateLimitEvent(FIXTURE_CREDITS_REQUIRED);
+    expect(tracker.getRateLimitResetAt()).toBeUndefined();
+    expect(tracker.getModelRateLimit()).toBeUndefined();
+    expect(tracker.getCreditsRequired()?.overageDisabledReason).toBe("member_zero_credit_limit");
+  });
+
+  test("a rejected event with no rateLimitType and no errorCode stays key-wide", () => {
+    const tracker = new SessionErrorTracker();
+    const { errorCode: _errorCode, ...info } = FIXTURE_CREDITS_REQUIRED.rate_limit_info;
+    tracker.processRateLimitEvent({ ...FIXTURE_CREDITS_REQUIRED, rate_limit_info: info });
+    expect(tracker.getRateLimitResetAt()).toBeDefined();
+    expect(tracker.getCreditsRequired()).toBeUndefined();
+  });
+});
+
 describe("trackErrorFromJson — rate_limit_event routing", () => {
   test("routes rate_limit_event to processRateLimitEvent, stashes reset time", () => {
     const tracker = new SessionErrorTracker();
