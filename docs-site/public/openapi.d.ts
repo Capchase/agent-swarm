@@ -17506,6 +17506,7 @@ export interface paths {
                         };
                         contextKey?: string;
                         requestedByUserId?: string;
+                        /** @description Concrete model override for this task, interpreted by the assignee's harness/provider. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. */
                         model?: string;
                         /** @enum {string} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra";
@@ -26416,6 +26417,7 @@ export interface operations {
                     dir?: string;
                     vcsRepo?: string;
                     model?: string;
+                    allowCustomModel?: boolean;
                     /** Format: uuid */
                     parentTaskId?: string;
                     requestedByUserId?: string;
