@@ -8,6 +8,7 @@ import {
   clearKeyRateLimit,
   closeDb,
   getAvailableKeyIndices,
+  getDbClient,
   getKeyStatuses,
   getKv,
   initDb,
@@ -348,6 +349,24 @@ describe("API key tracking DB queries", () => {
     const { availableIndices } = await getAvailableKeyIndices("CODEX_OAUTH", 5);
     expect(availableIndices).not.toContain(4);
     expect((await codexStatus("cdx05")).status).toBe("rate_limited");
+  });
+
+  test("an expired stored auth bench does not auto-clear", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx06", 1);
+    expect((await recordKeyAuthFailure("CODEX_OAUTH", "cdx06", 1)).benched).toBe(true);
+    const past = new Date(Date.now() - 60_000).toISOString();
+    await getDbClient().run(
+      `UPDATE api_key_status SET rateLimitedUntil = ? WHERE keyType = 'CODEX_OAUTH' AND keySuffix = 'cdx06'`,
+      [past],
+    );
+
+    const { availableIndices } = await getAvailableKeyIndices("CODEX_OAUTH", 5);
+    expect(availableIndices).not.toContain(1);
+    const row = await codexStatus("cdx06");
+    expect(row.status).toBe("rate_limited");
+    expect(row.rateLimitedUntil).toBe(past);
+    expect(row.consecutiveAuthFailures).toBe(2);
+    expect(await getKv("codex-auth-watch", "bench:cdx06")).not.toBeNull();
   });
 
   test("a slot re-login with a different account retires the previous login's bench", async () => {

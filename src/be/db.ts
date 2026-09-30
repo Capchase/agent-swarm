@@ -11398,13 +11398,14 @@ export async function getAvailableKeyIndices(
   const client = getDbClient();
   const effectiveScopeId = scopeId ?? "";
 
-  // Auto-clear expired rate limits
+  // Auto-clear expired rate limits. Never an auth bench: only `clearAuthBench` lifts it.
   await client.run(
     `UPDATE api_key_status
      SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
      WHERE keyType = ? AND scope = ? AND scopeId = ?
-       AND status = 'rate_limited' AND rateLimitedUntil IS NOT NULL AND rateLimitedUntil <= ?`,
-    [now, keyType, scope, effectiveScopeId, now],
+       AND status = 'rate_limited' AND rateLimitedUntil IS NOT NULL AND rateLimitedUntil <= ?
+       AND consecutiveAuthFailures < ?`,
+    [now, keyType, scope, effectiveScopeId, now, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
   );
 
   const rows = await client.query<{
