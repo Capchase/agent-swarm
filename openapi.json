@@ -15685,6 +15685,10 @@
                   },
                   "scopeId": {
                     "type": "string"
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
                   }
                 },
                 "required": [
@@ -16517,6 +16521,10 @@
                   "keyIndex": {
                     "type": "integer",
                     "minimum": 0
+                  },
+                  "observedAt": {
+                    "type": "string",
+                    "format": "date-time"
                   }
                 },
                 "required": [

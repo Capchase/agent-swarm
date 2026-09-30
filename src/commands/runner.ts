@@ -1908,6 +1908,17 @@ async function reportKeyRateLimit(
 /** Upper bound on each awaited credential-outcome report, so a slow API never stalls completions. */
 const KEY_OUTCOME_REPORT_TIMEOUT_MS = 5000;
 
+let lastKeyOutcomeStampMs = 0;
+/**
+ * Strictly increasing stamp for credential-outcome reports. The API compares
+ * a success stamp with the last auth-failure stamp, so a success report that
+ * times out and lands late cannot clear failures this worker saw after it.
+ */
+function nextKeyOutcomeStamp(): string {
+  lastKeyOutcomeStampMs = Math.max(Date.now(), lastKeyOutcomeStampMs + 1);
+  return new Date(lastKeyOutcomeStampMs).toISOString();
+}
+
 /** Report a Codex pool auth failure; the API benches after 2 in a row. Awaited, never throws. */
 async function reportKeyAuthFailure(
   apiUrl: string,
@@ -1916,6 +1927,7 @@ async function reportKeyAuthFailure(
   keySuffix: string,
   keyIndex: number,
   taskId: string,
+  observedAt: string,
   timeoutMs = KEY_OUTCOME_REPORT_TIMEOUT_MS,
 ): Promise<void> {
   try {
@@ -1925,7 +1937,7 @@ async function reportKeyAuthFailure(
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ keyType, keySuffix, keyIndex, taskId }),
+      body: JSON.stringify({ keyType, keySuffix, keyIndex, taskId, observedAt }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -2000,6 +2012,7 @@ async function reportKeyClearRateLimit(
   apiKey: string,
   keyType: string,
   keySuffix: string,
+  observedAt: string,
   timeoutMs = KEY_OUTCOME_REPORT_TIMEOUT_MS,
 ): Promise<void> {
   try {
@@ -2010,7 +2023,8 @@ async function reportKeyClearRateLimit(
         Authorization: `Bearer ${apiKey}`,
       },
       // A task that exited 0 proves the login works, so it may lift an auth bench.
-      body: JSON.stringify({ keyType, keySuffix, clearAuthBench: true }),
+      // `observedAt` stops a late (timed-out) report from clearing later failures.
+      body: JSON.stringify({ keyType, keySuffix, clearAuthBench: true, observedAt }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (resp.ok) {
@@ -2030,7 +2044,10 @@ async function reportKeyClearRateLimit(
  * Report a finished task's credential outcome: a success resets the auth-failure
  * count (and lifts an auth bench); a counted Codex auth failure adds to it.
  * Awaited by the caller before it processes the next completion, so the API sees
- * success and failure reports in completion order. Bounded, never throws.
+ * success and failure reports in completion order. Each report also carries an
+ * increasing `observedAt` stamp: when a success report times out and its handler
+ * finishes late, the API still skips it if a later auth failure is on record.
+ * Bounded, never throws.
  */
 export async function reportKeyCompletionOutcome(opts: {
   apiUrl: string;
@@ -2042,12 +2059,14 @@ export async function reportKeyCompletionOutcome(opts: {
   timeoutMs?: number;
 }): Promise<void> {
   const { apiUrl, apiKey, credential, taskId, exitCode, failureReason, timeoutMs } = opts;
+  const observedAt = nextKeyOutcomeStamp();
   if (exitCode === 0) {
     await reportKeyClearRateLimit(
       apiUrl,
       apiKey,
       credential.keyType,
       credential.keySuffix,
+      observedAt,
       timeoutMs,
     );
     return;
@@ -2060,6 +2079,7 @@ export async function reportKeyCompletionOutcome(opts: {
       credential.keySuffix,
       credential.keyIndex,
       taskId,
+      observedAt,
       timeoutMs,
     );
   }
@@ -2434,7 +2454,7 @@ export interface RunnerOptions {
 }
 
 /** Running task state for parallel execution */
-interface RunningTask {
+export interface RunningTask {
   taskId: string;
   session: ProviderSession;
   logFile: string;
@@ -2484,7 +2504,7 @@ interface RunningTask {
 }
 
 /** Runner state for tracking concurrent tasks */
-interface RunnerState {
+export interface RunnerState {
   activeTasks: Map<string, RunningTask>;
   maxConcurrent: number;
   startedAt: number;
@@ -4561,8 +4581,8 @@ async function spawnProviderProcess(
   return runningTask;
 }
 
-/** Check for completed processes and remove them from active tasks */
-async function checkCompletedProcesses(
+/** Check for completed processes and remove them from active tasks. Exported for tests. */
+export async function checkCompletedProcesses(
   state: RunnerState,
   role: string,
   apiConfig?: ApiConfig,

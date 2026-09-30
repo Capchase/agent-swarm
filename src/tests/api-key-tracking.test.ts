@@ -369,6 +369,49 @@ describe("API key tracking DB queries", () => {
     expect(await getKv("codex-auth-watch", "bench:cdx06")).not.toBeNull();
   });
 
+  const base = Date.now() - 60_000;
+  const t = (ms: number) => new Date(base + ms).toISOString();
+
+  test("a success observed before the last auth failure does not lift the bench", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx07", 2, "global", null, t(100));
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx07", 2, "global", null, t(200));
+    // A late, stale success report (observed at t(0)) lands after both failures.
+    const cleared = await clearKeyRateLimit("CODEX_OAUTH", "cdx07", "global", null, {
+      clearAuthBench: true,
+      observedAt: t(0),
+    });
+    expect(cleared).toBe(false);
+    let row = await codexStatus("cdx07");
+    expect(row.status).toBe("rate_limited");
+    expect(row.consecutiveAuthFailures).toBe(2);
+    expect(row.lastAuthFailureAt).toBe(t(200));
+    expect(await getKv("codex-auth-watch", "bench:cdx07")).not.toBeNull();
+
+    // A success observed after the last failure still lifts it.
+    await clearKeyRateLimit("CODEX_OAUTH", "cdx07", "global", null, {
+      clearAuthBench: true,
+      observedAt: t(300),
+    });
+    row = await codexStatus("cdx07");
+    expect(row.status).toBe("available");
+    expect(row.consecutiveAuthFailures).toBe(0);
+  });
+
+  test("a stale success does not reset a count below the threshold", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx08", 3, "global", null, t(100));
+    await clearKeyRateLimit("CODEX_OAUTH", "cdx08", "global", null, {
+      clearAuthBench: true,
+      observedAt: t(0),
+    });
+    expect((await codexStatus("cdx08")).consecutiveAuthFailures).toBe(1);
+  });
+
+  test("an out-of-order auth failure never moves lastAuthFailureAt back", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx09", 4, "global", null, t(200));
+    await recordKeyAuthFailure("CODEX_OAUTH", "cdx09", 4, "global", null, t(100));
+    expect((await codexStatus("cdx09")).lastAuthFailureAt).toBe(t(200));
+  });
+
   test("a slot re-login with a different account retires the previous login's bench", async () => {
     await recordKeyAuthFailure("CODEX_OAUTH", "old01", 0);
     await recordKeyAuthFailure("CODEX_OAUTH", "old01", 0);

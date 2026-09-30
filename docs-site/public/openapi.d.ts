@@ -5235,6 +5235,8 @@ export interface paths {
                         taskId?: string;
                         scope?: string;
                         scopeId?: string;
+                        /** Format: date-time */
+                        observedAt?: string;
                     };
                 };
             };
@@ -5682,6 +5684,8 @@ export interface paths {
                         scopeId?: string;
                         clearAuthBench?: boolean;
                         keyIndex?: number;
+                        /** Format: date-time */
+                        observedAt?: string;
                     };
                 };
             };

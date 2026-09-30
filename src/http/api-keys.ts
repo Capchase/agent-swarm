@@ -90,6 +90,8 @@ const reportAuthFailure = route({
     taskId: z.string().uuid().optional(),
     scope: z.string().optional(),
     scopeId: z.string().optional(),
+    /** When the worker saw the failure; orders it against success resets. Defaults to now. */
+    observedAt: z.string().datetime().optional(),
   }),
   responses: {
     200: {
@@ -109,6 +111,11 @@ const reportAuthFailure = route({
     ungated: "worker credential telemetry, same posture as POST /api/keys/report-rate-limit",
   },
 });
+
+/** Normalize a worker timestamp to `toISOString()` form, so the DB compares stamps as text. */
+function toIsoStamp(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : new Date(value).toISOString();
+}
 
 export const rateLimitWindowSchema = z.object({
   status: z.string(),
@@ -382,6 +389,8 @@ const clearRateLimitRoute = route({
     clearAuthBench: z.boolean().optional(),
     /** Slot re-login: with `clearAuthBench`, also retires other identities recorded at this index. */
     keyIndex: z.number().int().min(0).optional(),
+    /** When the worker saw the success. A success older than the last auth failure lifts nothing. */
+    observedAt: z.string().datetime().optional(),
   }),
   responses: {
     200: {
@@ -515,7 +524,7 @@ export async function handleApiKeys(
     const parsed = await reportAuthFailure.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, keySuffix, keyIndex, scope, scopeId } = parsed.body;
+    const { keyType, keySuffix, keyIndex, scope, scopeId, observedAt } = parsed.body;
     try {
       const result = await recordKeyAuthFailure(
         keyType,
@@ -523,6 +532,7 @@ export async function handleApiKeys(
         keyIndex,
         scope,
         scopeId ?? null,
+        toIsoStamp(observedAt),
       );
       if (result.benched) clearUsageCache();
       reportAuthFailure.respond(res, 200, { success: true, ...result });
@@ -691,11 +701,13 @@ export async function handleApiKeys(
     const parsed = await clearRateLimitRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, keySuffix, scope, scopeId, clearAuthBench, keyIndex } = parsed.body;
+    const { keyType, keySuffix, scope, scopeId, clearAuthBench, keyIndex, observedAt } =
+      parsed.body;
     try {
       const cleared = await clearKeyRateLimit(keyType, keySuffix, scope, scopeId ?? null, {
         clearAuthBench: clearAuthBench === true,
         keyIndex,
+        observedAt: toIsoStamp(observedAt),
       });
       clearRateLimitRoute.respond(res, 200, {
         success: true,
