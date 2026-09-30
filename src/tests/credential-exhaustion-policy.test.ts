@@ -231,6 +231,41 @@ describe("resolveCredentialPools — model window exhaustion policy", () => {
       expect(selections[0]!.isRateLimitFallback).toBe(true);
     });
 
+    test("MODEL_WINDOW_EXHAUSTED_POLICY=fallback: a mixed pool picks the Fable-capable key", async () => {
+      fableBlocks = { modelBlockedIndices: [1], seatBlockedIndices: [0] };
+      const env: Record<string, string | undefined> = {
+        CLAUDE_CODE_OAUTH_TOKEN: "tok-a,tok-b",
+        MODEL_WINDOW_EXHAUSTED_POLICY: "fallback",
+      };
+      const selections = await resolveCredentialPools(env, { ...fableTask, apiUrl });
+      expect(selections).toHaveLength(1);
+      expect(selections[0]!.index).toBe(1);
+      expect(selections[0]!.isRateLimitFallback).toBe(true);
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("tok-b");
+    });
+
+    test("MODEL_WINDOW_EXHAUSTED_POLICY=fallback: every key without a seat block stays reachable", async () => {
+      fableBlocks = { modelBlockedIndices: [1, 2], seatBlockedIndices: [0] };
+      const picked = new Set<number>();
+      for (let run = 0; run < 50; run++) {
+        const env: Record<string, string | undefined> = {
+          CLAUDE_CODE_OAUTH_TOKEN: "tok-a,tok-b,tok-c",
+          MODEL_WINDOW_EXHAUSTED_POLICY: "fallback",
+        };
+        const selections = await resolveCredentialPools(env, { ...fableTask, apiUrl });
+        picked.add(selections[0]!.index);
+      }
+      expect([...picked].sort()).toEqual([1, 2]);
+    });
+
+    test("default policy: a key-wide rate limit next to a seat block picks the other key", async () => {
+      fableBlocks = { modelBlockedIndices: [], seatBlockedIndices: [0] };
+      const env: Record<string, string | undefined> = { CLAUDE_CODE_OAUTH_TOKEN: "tok-a,tok-b" };
+      const selections = await resolveCredentialPools(env, { ...fableTask, apiUrl });
+      expect(selections[0]!.index).toBe(1);
+      expect(selections[0]!.isRateLimitFallback).toBe(true);
+    });
+
     test("a taskless configuration load never throws on seat blocks", async () => {
       fableBlocks = { modelBlockedIndices: [], seatBlockedIndices: [0, 1] };
       const env: Record<string, string | undefined> = { CLAUDE_CODE_OAUTH_TOKEN: "tok-a,tok-b" };

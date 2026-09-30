@@ -191,6 +191,15 @@ function isJsonObject(value: string): boolean {
  * Falls back to random selection from all credentials if no available indices match.
  * A JSON object value (the CODEX_OAUTH blob) is always one credential.
  */
+function splitCredentialPool(value: string): string[] {
+  return isJsonObject(value)
+    ? [value.trim()]
+    : value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
 export function selectCredential(
   value: string,
   availableIndices?: number[],
@@ -201,12 +210,7 @@ export function selectCredential(
   // handed out fragments such as `"accountId":"..."}` as the selected credential
   // and stamped `965"}` as the key suffix on task records. Codex pools live in
   // config-store slots (codex_oauth_<n>), resolved by the runner instead.
-  const credentials = isJsonObject(value)
-    ? [value.trim()]
-    : value
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
+  const credentials = splitCredentialPool(value);
   if (credentials.length <= 1) {
     const selected = value.trim();
     const isRateLimitFallback = availableIndices !== undefined && availableIndices.length === 0;
@@ -437,7 +441,9 @@ export async function resolveCredentialPools(
         modelBlockedCount += beforeCount - available.length;
       }
 
-      const seatBlockedCount = info?.seatBlockedIndices?.length ?? 0;
+      const seatBlockedIndices = info?.seatBlockedIndices ?? [];
+      const seatBlockedCount = seatBlockedIndices.length;
+      let seatFallbackIndices: number[] | undefined;
 
       // Every key is key-wide rate-limited, blocked by this model's weekly
       // window, or on a seat that cannot run the model, and at least one is
@@ -445,13 +451,19 @@ export async function resolveCredentialPools(
       // limiting) — the picker can't make progress for this model on this
       // pool. Default policy fails fast instead of looping the worker
       // through the same exhausted key every few minutes. A seat block is a
-      // plan fact with no window and no reset, so it ignores the policy: a
-      // random pick from seat-blocked keys is a guaranteed failure.
+      // plan fact with no window and no reset, so the fallback pick excludes
+      // seat-blocked keys: a pick from them is a guaranteed failure. It fails
+      // only when every key is seat-blocked.
       if (opts?.enforceModelCapacity && modelFamily && available && available.length === 0) {
         const policy = (env.MODEL_WINDOW_EXHAUSTED_POLICY ?? "fail").trim().toLowerCase();
         const windowExhausted =
           window !== undefined && modelBlockedCount > 0 && policy !== "fallback";
-        if (seatBlockedCount > 0 || windowExhausted) {
+        if (seatBlockedCount > 0) {
+          seatFallbackIndices = splitCredentialPool(val)
+            .map((_, i) => i)
+            .filter((i) => !seatBlockedIndices.includes(i));
+        }
+        if (windowExhausted || seatFallbackIndices?.length === 0) {
           throw new ModelWindowExhaustedError({
             model: modelFamily,
             window: window ?? "",
@@ -463,7 +475,9 @@ export async function resolveCredentialPools(
         }
       }
 
-      const result = selectCredential(val, available, envVar);
+      const result = seatFallbackIndices
+        ? { ...selectCredential(val, seatFallbackIndices, envVar), isRateLimitFallback: true }
+        : selectCredential(val, available, envVar);
       env[envVar] = result.selected;
       const availInfo = available ? ` (${available.length} available of ${result.total})` : "";
       console.log(
