@@ -3607,8 +3607,7 @@ async function spawnProviderProcess(
     ));
   } catch (err) {
     if (err instanceof ModelWindowExhaustedError && realTaskId) {
-      const modelLabel = err.model.charAt(0).toUpperCase() + err.model.slice(1);
-      const reason = `No ${err.keyType} key has ${modelLabel} capacity until ${err.earliestResetAt ?? "unknown"}. Re-dispatch with another model or modelTier.`;
+      const reason = err.message;
       console.warn(`[${opts.role}] ${reason}`);
       await ensureTaskFinished(
         { apiUrl: opts.apiUrl, apiKey: opts.apiKey, agentId: opts.agentId },
