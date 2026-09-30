@@ -352,6 +352,8 @@ describe("classifyRateLimitOutcome — seat mismatch", () => {
   });
 
   test("a seat outcome keeps an earlier key-wide rejection from the real tracker", () => {
+    // The tracker reads the real clock and clamps past resets, so use a real "now" here.
+    const nowMs = Date.now();
     const tracker = new SessionErrorTracker();
     const fiveHourResetsAtSec = Math.floor(nowMs / 1000) + 2 * 60 * 60;
     tracker.processRateLimitEvent({
