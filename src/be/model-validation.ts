@@ -93,6 +93,20 @@ export async function harnessModelErrorFor(
 }
 
 /**
+ * Pool claim filter: false when an unassigned task pins a `model` that `harness` cannot
+ * run, so an incompatible worker skips it and a compatible one takes it. `isAgentEligibleForTask`
+ * stays sync and catalog-free; this runs next to it.
+ */
+export async function poolTaskRunsOnHarness(
+  task: { model?: string | null } | null | undefined,
+  harness: string | null | undefined,
+): Promise<boolean> {
+  const model = task?.model?.trim();
+  if (!model) return true;
+  return (await harnessModelErrorFor(model, harness)) === null;
+}
+
+/**
  * The error message for an unknown explicit model, or null when it is fine.
  * An empty catalog (nothing to judge against) passes.
  */

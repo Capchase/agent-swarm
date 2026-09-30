@@ -4,7 +4,7 @@
  */
 import { harnessModelMismatch, isAlias, parseAlias } from "@desplega/model-catalog";
 import { MODEL_TIERS, type ModelTier, type ProviderName, ProviderNameSchema } from "../types";
-import { runtimeCatalogSection } from "../utils/runtime-model-catalog";
+import { runtimeHarnessSections } from "../utils/runtime-model-catalog";
 
 /** `MODEL_TIER_<PROVIDER>_<TIER>`; provider dashes become underscores. */
 export function tierConfigKey(provider: ProviderName, tier: ModelTier): string {
@@ -39,11 +39,7 @@ export function validateTierConfigValue(key: string, value: unknown): string | n
   if (isAlias(trimmed) && !parseAlias(trimmed)) return message;
   const provider = tierConfigKeyProvider(key);
   // Sync catalog view: the API process mirrors every catalog reload into it.
-  const sections = {
-    anthropic: { models: runtimeCatalogSection("anthropic") },
-    openai: { models: runtimeCatalogSection("openai") },
-  };
-  if (provider && harnessModelMismatch(trimmed, provider, sections)) {
+  if (provider && harnessModelMismatch(trimmed, provider, runtimeHarnessSections())) {
     return `Invalid ${key}: model "${trimmed}" does not run on the ${provider} harness.`;
   }
   return null;

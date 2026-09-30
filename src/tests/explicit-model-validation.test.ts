@@ -13,6 +13,7 @@ import {
   getSwarmConfigs,
   initDb,
 } from "../be/db";
+import { reloadModelsCatalog } from "../be/model-catalog-store";
 import { validateTierConfigValue } from "../be/model-tier-keys";
 import {
   explicitModelError,
@@ -50,6 +51,8 @@ let codexId = "";
 beforeAll(async () => {
   await removeDbFiles(TEST_DB_PATH);
   initDb(TEST_DB_PATH);
+  // Drop any catalog projection an earlier file cached in this process.
+  await reloadModelsCatalog();
   leadId = (await createAgent({ name: "validation-lead", isLead: true, status: "idle" })).id;
   workerId = (
     await createAgent({
