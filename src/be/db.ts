@@ -11673,9 +11673,10 @@ export async function recordKeyRateLimitWindows(
  * Records a `credits_required` rejection: the key's seat cannot run `model`.
  * Sets `lastSeatMismatchAt` / `lastSeatMismatchModel` on every scope row of
  * the key. A Claude key whose plan the operator did not pick gets
- * `claude_team_standard` / `detected`, the only plan that excludes Fable. A
- * `manual` plan is never changed; a contradiction is logged instead. The key
- * `status` is not touched.
+ * `claude_team_standard` / `detected`, the only plan that excludes Fable,
+ * but only when that plan excludes `model`: an Opus or Sonnet rejection is
+ * no evidence of a standard seat. A `manual` plan is never changed; a
+ * contradiction is logged instead. The key `status` is not touched.
  */
 export async function recordKeySeatMismatch(
   keyType: string,
@@ -11706,7 +11707,10 @@ export async function recordKeySeatMismatch(
     );
 
     let planChanged = false;
-    if (keyType === "CLAUDE_CODE_OAUTH_TOKEN") {
+    if (
+      keyType === "CLAUDE_CODE_OAUTH_TOKEN" &&
+      !planAllowsModelFamily("claude_team_standard", model)
+    ) {
       const result = await tx.run(
         `UPDATE api_key_status SET plan = 'claude_team_standard', planSource = 'detected'
            WHERE keyType = ? AND keySuffix = ? AND COALESCE(planSource, '') != 'manual'`,
