@@ -445,6 +445,21 @@ describe("harness compatibility at every create entry point", () => {
     expect(accepted.status).toBe(201);
   });
 
+  test("POST /api/tasks: an uncatalogued id in the harness's own namespace follows allowCustomModel", async () => {
+    const base = { task: "qualified custom", agentId: codexId, routingReason: "human_pinned" };
+    const custom = { ...base, model: "openai/private-deployment-1" };
+    const withFlag = await api("POST", "/api/tasks", { ...custom, allowCustomModel: true });
+    expect(withFlag.status).toBe(201);
+    const withoutFlag = await api("POST", "/api/tasks", custom);
+    expect(withoutFlag.status).toBe(400);
+    expect(String(withoutFlag.body.error)).toContain("allowCustomModel");
+    for (const model of ["anthropic/private-deployment-1", "openai/gpt-4o"]) {
+      const refused = await api("POST", "/api/tasks", { ...base, model, allowCustomModel: true });
+      expect(refused.status).toBe(400);
+      expect(String(refused.body.error)).toContain("does not run on the codex harness");
+    }
+  });
+
   test("send-task: the parent auto-route target is judged", async () => {
     const parent = await createTaskExtended("codex parent", { agentId: codexId, source: "mcp" });
     const refused = await sendTaskHandler(ownerCtx({ agentId: workerId }), {

@@ -198,22 +198,22 @@ export function harnessModelMismatch(
     return parsed.kind === section ? null : fail();
   }
 
+  let bare = id;
   const slash = id.indexOf("/");
   if (slash > 0) {
-    const prefix = id.slice(0, slash);
-    const rest = id.slice(slash + 1);
-    if (prefix !== section) return fail();
-    const facts = Object.hasOwn(own, rest) ? own[rest] : undefined;
-    return isHarnessCatalogModel(harness, rest, facts) ? null : fail();
+    if (id.slice(0, slash) !== section) return fail();
+    // The harness's own namespace: judge the rest like a bare id, so an
+    // uncatalogued id defers to the caller's custom-model check.
+    bare = id.slice(slash + 1);
   }
 
-  if (section === "anthropic" && Object.hasOwn(buildClaudeShortnameMap(own), id)) return null;
-  if (Object.hasOwn(own, id)) {
-    return isHarnessCatalogModel(harness, id, own[id]) ? null : fail();
+  if (section === "anthropic" && Object.hasOwn(buildClaudeShortnameMap(own), bare)) return null;
+  if (Object.hasOwn(own, bare)) {
+    return isHarnessCatalogModel(harness, bare, own[bare]) ? null : fail();
   }
   for (const [name, other] of Object.entries(sections)) {
     if (name === section) continue;
-    if (other?.models && Object.hasOwn(other.models, id)) return fail();
+    if (other?.models && Object.hasOwn(other.models, bare)) return fail();
   }
   return null;
 }

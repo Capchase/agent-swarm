@@ -115,7 +115,7 @@ A concrete `model` or `latest:` alias must also run on the harness that will run
 | `pi`, `opencode` | none pinned | any catalog model, bare or provider-qualified | any |
 | `dsh`, `devin`, `acp` | free-form | any string | any |
 
-A provider-qualified id on a pinned harness must name the harness section: `anthropic/claude-opus-5-5` runs on `claude`, `openrouter/anthropic/claude-opus-5.5` does not. An id the catalog does not know in any section passes this check (the catalog membership check above decides it). A bare shortname such as `opus` on `codex` therefore passes; legacy shortnames become `modelTier` before any create-time check anyway, and `modelTier` is never rejected.
+A provider-qualified id on a pinned harness must name the harness section: `anthropic/claude-opus-5-5` runs on `claude`, `openrouter/anthropic/claude-opus-5.5` does not. An id the catalog does not know in any section passes this check (the catalog membership check above decides it). This includes an uncatalogued id in the harness's own namespace: `openai/private-deployment-1` on `codex` passes with `allowCustomModel` and fails without it. A known id that the harness does not run (`openai/gpt-4o` on `codex`) fails even with the flag. A bare shortname such as `opus` on `codex` therefore passes; legacy shortnames become `modelTier` before any create-time check anyway, and `modelTier` is never rejected.
 
 Where the rule applies:
 

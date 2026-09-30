@@ -73,6 +73,20 @@ describe("harnessModelMismatch", () => {
     expect(harnessModelMismatch("anthropic/claude-opus-5-5", "claude-managed", catalog)).toBeNull();
   });
 
+  test("an uncatalogued id in the harness's own namespace passes; foreign and known-unsupported ids fail", () => {
+    expect(harnessModelMismatch("openai/private-deployment-1", "codex", catalog)).toBeNull();
+    expect(harnessModelMismatch("anthropic/claude-private-1", "claude", catalog)).toBeNull();
+    expect(harnessModelMismatch("openai/gpt-5-nano", "codex", catalog)).toContain(
+      "does not run on the codex harness",
+    );
+    expect(harnessModelMismatch("openai/claude-opus-5-5", "codex", catalog)).toContain(
+      "does not run on the codex harness",
+    );
+    expect(harnessModelMismatch("anthropic/private-deployment-1", "codex", catalog)).toContain(
+      "does not run on the codex harness",
+    );
+  });
+
   test("gpt-5-nano on codex fails (own section, excluded SKU)", () => {
     expect(harnessModelMismatch("gpt-5-nano", "codex", catalog)).toContain(
       "does not run on the codex harness",
