@@ -16929,6 +16929,7 @@ export interface paths {
                             };
                             steeringEnabled: boolean;
                             multiRuntimeEnabled: boolean;
+                            devMode: boolean;
                         };
                     };
                 };
