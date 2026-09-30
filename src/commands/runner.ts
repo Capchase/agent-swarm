@@ -59,7 +59,7 @@ import {
 } from "../utils/error-tracker.ts";
 import { probeHarnessCliVersion, reportHarnessModelOutcome } from "../utils/harness-cli-version.ts";
 import { resolveHarnessProvider } from "../utils/harness-provider.ts";
-import { type ModelFamily, modelFamilyOf } from "../utils/model-rate-limit-windows.ts";
+import { modelFamilyOf } from "../utils/model-rate-limit-windows.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { terminateRegisteredProcessGroups } from "../utils/process-group.ts";
 import { refreshRuntimeModelCatalog } from "../utils/runtime-model-catalog.ts";
@@ -106,6 +106,7 @@ import {
   type ResumeSessionResolution,
   resolveResumeSession,
 } from "./resume-session.ts";
+import { reportSeatMismatchOutcome } from "./seat-mismatch-report.ts";
 // Side-effect import: registers runner trigger/resumption templates
 import "./templates.ts";
 
@@ -1899,33 +1900,6 @@ async function reportKeyRateLimit(
     );
   } catch {
     // Non-blocking
-  }
-}
-
-/**
- * Reports a seat mismatch (`credits_required`) for a key: its subscription
- * seat cannot run `model`. Returns the underlying fetch promise without a
- * catch, the same as `reportKeyRateLimitWindows`, so the caller can await it
- * before the task finishes. Never marks the key rate-limited.
- */
-export async function reportKeySeatMismatch(
-  apiUrl: string,
-  apiKey: string,
-  keyType: string,
-  keySuffix: string,
-  keyIndex: number,
-  model: ModelFamily,
-): Promise<void> {
-  const response = await fetch(`${apiUrl}/api/keys/report-seat-mismatch`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ keyType, keySuffix, keyIndex, model }),
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to report seat mismatch for key #${keyIndex}: HTTP ${response.status}`);
   }
 }
 
@@ -4502,11 +4476,8 @@ async function spawnProviderProcess(
   return runningTask;
 }
 
-/**
- * Check for completed processes and remove them from active tasks. Exported
- * for the completion-path regression tests.
- */
-export async function checkCompletedProcesses(
+/** Check for completed processes and remove them from active tasks */
+async function checkCompletedProcesses(
   state: RunnerState,
   role: string,
   apiConfig?: ApiConfig,
@@ -4632,22 +4603,12 @@ export async function checkCompletedProcesses(
         // every model its seat can run. `keyRateLimitedUntil` below is
         // undefined for a seat outcome, so reportKeyRateLimit is not reached.
         if (outcome.kind === "seat") {
-          const modelLabel = outcome.model.charAt(0).toUpperCase() + outcome.model.slice(1);
-          console.log(
-            `[credential] seat mismatch: key #${credentialInfo.keyIndex} (...${credentialInfo.keySuffix}) cannot run ${modelLabel}`,
-          );
-          await reportKeySeatMismatch(
+          await reportSeatMismatchOutcome(
             apiConfig.apiUrl,
             apiConfig.apiKey,
-            credentialInfo.keyType,
-            credentialInfo.keySuffix,
-            credentialInfo.keyIndex,
+            credentialInfo,
             outcome.model,
-          ).catch((err) => {
-            console.warn(
-              `[credential] Failed to report seat mismatch: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
+          );
         }
         const keyRateLimitedUntil =
           outcome.kind === "key"
