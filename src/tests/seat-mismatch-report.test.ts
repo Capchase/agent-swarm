@@ -2,9 +2,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { reportSeatMismatchOutcome } from "../commands/seat-mismatch-report";
 
 /**
- * Completion-path regression for a `credits_required` seat mismatch: the
- * report sends the credential and model family, resolves only after the API
- * responds (the completion loop awaits it before `/finish`), and never throws.
+ * Report helper for a `credits_required` seat mismatch: the report sends the
+ * credential and model family, resolves only after the API responds, and
+ * never throws. The completion ordering is covered by
+ * `credential-outcome-report.test.ts`.
  */
 
 interface RecordedRequest {
