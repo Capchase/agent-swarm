@@ -1905,6 +1905,9 @@ async function reportKeyRateLimit(
   }
 }
 
+/** Upper bound on each awaited credential-outcome report, so a slow API never stalls completions. */
+const KEY_OUTCOME_REPORT_TIMEOUT_MS = 5000;
+
 /** Report a Codex pool auth failure; the API benches after 2 in a row. Awaited, never throws. */
 async function reportKeyAuthFailure(
   apiUrl: string,
@@ -1913,6 +1916,7 @@ async function reportKeyAuthFailure(
   keySuffix: string,
   keyIndex: number,
   taskId: string,
+  timeoutMs = KEY_OUTCOME_REPORT_TIMEOUT_MS,
 ): Promise<void> {
   try {
     const resp = await fetch(`${apiUrl}/api/keys/report-auth-failure`, {
@@ -1922,7 +1926,7 @@ async function reportKeyAuthFailure(
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ keyType, keySuffix, keyIndex, taskId }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = (await resp.json()) as {
@@ -1990,12 +1994,13 @@ export async function reportKeyRateLimitWindows(
   }
 }
 
-/** Clear a stale rate-limit record after a successful task (fire-and-forget) */
+/** Clear a stale rate-limit record after a successful task. Bounded, never throws. */
 async function reportKeyClearRateLimit(
   apiUrl: string,
   apiKey: string,
   keyType: string,
   keySuffix: string,
+  timeoutMs = KEY_OUTCOME_REPORT_TIMEOUT_MS,
 ): Promise<void> {
   try {
     const resp = await fetch(`${apiUrl}/api/keys/clear-rate-limit`, {
@@ -2006,6 +2011,7 @@ async function reportKeyClearRateLimit(
       },
       // A task that exited 0 proves the login works, so it may lift an auth bench.
       body: JSON.stringify({ keyType, keySuffix, clearAuthBench: true }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (resp.ok) {
       const data = (await resp.json()) as { cleared?: boolean };
@@ -2017,6 +2023,45 @@ async function reportKeyClearRateLimit(
     }
   } catch {
     // Non-blocking
+  }
+}
+
+/**
+ * Report a finished task's credential outcome: a success resets the auth-failure
+ * count (and lifts an auth bench); a counted Codex auth failure adds to it.
+ * Awaited by the caller before it processes the next completion, so the API sees
+ * success and failure reports in completion order. Bounded, never throws.
+ */
+export async function reportKeyCompletionOutcome(opts: {
+  apiUrl: string;
+  apiKey: string;
+  credential: { keyType: string; keySuffix: string; keyIndex: number };
+  taskId: string;
+  exitCode: number;
+  failureReason: string | undefined;
+  timeoutMs?: number;
+}): Promise<void> {
+  const { apiUrl, apiKey, credential, taskId, exitCode, failureReason, timeoutMs } = opts;
+  if (exitCode === 0) {
+    await reportKeyClearRateLimit(
+      apiUrl,
+      apiKey,
+      credential.keyType,
+      credential.keySuffix,
+      timeoutMs,
+    );
+    return;
+  }
+  if (credential.keyType === "CODEX_OAUTH" && isCodexAuthFailureReason(failureReason)) {
+    await reportKeyAuthFailure(
+      apiUrl,
+      apiKey,
+      credential.keyType,
+      credential.keySuffix,
+      credential.keyIndex,
+      taskId,
+      timeoutMs,
+    );
   }
 }
 
@@ -4664,22 +4709,17 @@ async function checkCompletedProcesses(
           );
         }
 
-        if (
-          result.exitCode !== 0 &&
-          credentialInfo.keyType === "CODEX_OAUTH" &&
-          isCodexAuthFailureReason(failureReason)
-        ) {
-          // Land the count (and a bench at 2) before this task finishes, so the
-          // next draw on any worker already skips a dead login.
-          await reportKeyAuthFailure(
-            apiConfig.apiUrl,
-            apiConfig.apiKey,
-            credentialInfo.keyType,
-            credentialInfo.keySuffix,
-            credentialInfo.keyIndex,
-            taskId,
-          );
-        }
+        // Land the success reset or the auth-failure count (and a bench at 2)
+        // before this task finishes and before the next completion, so the API
+        // sees them in order and the next draw already skips a dead login.
+        await reportKeyCompletionOutcome({
+          apiUrl: apiConfig.apiUrl,
+          apiKey: apiConfig.apiKey,
+          credential: credentialInfo,
+          taskId,
+          exitCode: result.exitCode,
+          failureReason,
+        });
 
         const finalWindows = buildFinalRateLimitWindows(
           result.rateLimitWindows,
@@ -4761,15 +4801,6 @@ async function checkCompletedProcesses(
         });
       }
       state.tasksProcessed += 1;
-
-      if (result.exitCode === 0 && credentialInfo) {
-        reportKeyClearRateLimit(
-          apiConfig.apiUrl,
-          apiConfig.apiKey,
-          credentialInfo.keyType,
-          credentialInfo.keySuffix,
-        ).catch(() => {});
-      }
 
       ensure({
         id: "worker_process_finished",

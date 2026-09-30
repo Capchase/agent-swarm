@@ -316,7 +316,7 @@ A pool login that fails auth on every task (for example `workspace routing disco
 - `no credentials found in config store` (slot removed mid-draw)
 - `not a confirmed auth rejection` (revalidation threw a refresh-lock HTTP, network, or persistence error)
 
-**How the bench works.** For each counted failure on a `CODEX_OAUTH` slot, the runner calls `POST /api/keys/report-auth-failure` and waits for the reply. The API counts auth failures in a row per key. At **2 in a row**, it marks the key `rate_limited` for **365 days** and writes the `codex-auth-watch` / `bench:<keySuffix>` KV marker. The slot then drops out of `GET /api/keys/available`. One transient failure followed by a success does not bench: a success resets the count to 0.
+**How the bench works.** For each counted failure on a `CODEX_OAUTH` slot, the runner calls `POST /api/keys/report-auth-failure` and waits for the reply. The API counts auth failures in a row per key. At **2 in a row**, it marks the key `rate_limited` for **365 days** and writes the `codex-auth-watch` / `bench:<keySuffix>` KV marker. The slot then drops out of `GET /api/keys/available`. One transient failure followed by a success does not bench: a success resets the count to 0. The runner also waits for the success reset (bounded to 5 seconds) before it processes the next completion, so the API sees success and failure reports in completion order.
 
 **How a benched slot returns.** Only proof of health lifts an auth bench:
 
