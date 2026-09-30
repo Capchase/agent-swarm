@@ -11448,10 +11448,9 @@ export async function getAvailableKeyIndices(
   }
   const modelBlockedSet = new Set(modelBlockedIndices);
 
-  // A seat block is a plan fact, so it is reported even when the key is also
-  // key-wide or model-window blocked. Otherwise the temporary block hides the
-  // seat from admission, and the fallback pick can select a key that cannot
-  // run the model.
+  // A seat block is a plan fact: report it even when the key is also key-wide
+  // or model-window blocked, or the temporary block hides it from admission
+  // and the fallback pick can select a key that cannot run the model.
   const seatBlockedIndices: number[] = [];
   if (modelFamily) {
     for (const row of rows) {
