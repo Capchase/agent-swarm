@@ -5,7 +5,12 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { closeDb, createAgent, getDbClient, getSwarmConfigs, initDb } from "../be/db";
-import { explicitModelError, isKnownCatalogModel } from "../be/model-validation";
+import { validateTierConfigValue } from "../be/model-tier-keys";
+import {
+  explicitModelError,
+  explicitModelErrorForAgent,
+  isKnownCatalogModel,
+} from "../be/model-validation";
 import { handleAgentsRest } from "../http/agents";
 import { handleSchedules } from "../http/schedules";
 import { handleTasks } from "../http/tasks";
@@ -28,6 +33,7 @@ let baseUrl = "";
 let leadId = "";
 let workerId = "";
 let acpId = "";
+let codexId = "";
 
 beforeAll(async () => {
   await removeDbFiles(TEST_DB_PATH);
@@ -47,6 +53,14 @@ beforeAll(async () => {
       isLead: false,
       status: "idle",
       harnessProvider: "acp",
+    })
+  ).id;
+  codexId = (
+    await createAgent({
+      name: "validation-codex",
+      isLead: false,
+      status: "idle",
+      harnessProvider: "codex",
     })
   ).id;
 
@@ -163,6 +177,70 @@ describe("explicitModelError", () => {
     expect(
       await explicitModelError({ model: "vendor-private-1", harnessProvider: "claude" }),
     ).toContain("Unknown model");
+  });
+
+  test("an Anthropic model on codex fails even with allowCustomModel", async () => {
+    for (const allowCustomModel of [false, true]) {
+      const error = await explicitModelError({
+        model: "claude-opus-5-5",
+        harnessProvider: "codex",
+        allowCustomModel,
+      });
+      expect(error).toContain("does not run on the codex harness");
+      expect(error).toContain("gpt-");
+    }
+  });
+
+  test("an OpenAI model on claude fails", async () => {
+    expect(await explicitModelError({ model: "gpt-5.6-sol", harnessProvider: "claude" })).toContain(
+      "does not run on the claude harness",
+    );
+  });
+
+  test("the directed message names the agent", async () => {
+    const error = await explicitModelErrorForAgent({ model: "claude-opus-5-5", agentId: codexId });
+    expect(error).toContain(`of agent "validation-codex" (${codexId})`);
+  });
+
+  test("pool existence: passes with a Claude agent registered, fails with only Codex agents", async () => {
+    expect(await explicitModelErrorForAgent({ model: "claude-opus-5-5" })).toBeNull();
+    const db = getDbClient();
+    const saved = await db.query<{ id: string; harness_provider: string | null }>(
+      "SELECT id, harness_provider FROM agents",
+    );
+    try {
+      await db.run("UPDATE agents SET harness_provider = 'codex'");
+      const error = await explicitModelErrorForAgent({ model: "claude-opus-5-5" });
+      expect(error).toContain(
+        'Model "claude-opus-5-5" does not run on any registered agent harness (codex)',
+      );
+      expect(await explicitModelErrorForAgent({ model: "gpt-5.6-sol" })).toBeNull();
+      expect(await explicitModelErrorForAgent({ model: "latest:anthropic/opus" })).toBeNull();
+    } finally {
+      for (const row of saved) {
+        await db.run("UPDATE agents SET harness_provider = ? WHERE id = ?", [
+          row.harness_provider,
+          row.id,
+        ]);
+      }
+    }
+  });
+});
+
+describe("MODEL_TIER_<PROVIDER>_<TIER> values", () => {
+  test("a model from another harness family is rejected on write", () => {
+    expect(validateTierConfigValue("MODEL_TIER_CODEX_SMART", "claude-opus-5-5")).toBe(
+      'Invalid MODEL_TIER_CODEX_SMART: model "claude-opus-5-5" does not run on the codex harness.',
+    );
+    expect(validateTierConfigValue("MODEL_TIER_CLAUDE_MANAGED_SMART", "gpt-5.6-sol")).toContain(
+      "does not run on the claude-managed harness",
+    );
+  });
+
+  test("own-harness values, shortnames and unpinned providers pass", () => {
+    expect(validateTierConfigValue("MODEL_TIER_CODEX_SMART", "gpt-5.6-sol")).toBeNull();
+    expect(validateTierConfigValue("MODEL_TIER_CLAUDE_SMART", "opus")).toBeNull();
+    expect(validateTierConfigValue("MODEL_TIER_PI_SMART", "claude-opus-5-5")).toBeNull();
   });
 });
 
