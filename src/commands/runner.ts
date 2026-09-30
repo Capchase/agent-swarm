@@ -4502,8 +4502,11 @@ async function spawnProviderProcess(
   return runningTask;
 }
 
-/** Check for completed processes and remove them from active tasks */
-async function checkCompletedProcesses(
+/**
+ * Check for completed processes and remove them from active tasks. Exported
+ * for the completion-path regression tests.
+ */
+export async function checkCompletedProcesses(
   state: RunnerState,
   role: string,
   apiConfig?: ApiConfig,
