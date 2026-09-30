@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
-import { closeDb, createAgent, initDb } from "../be/db";
+import { closeDb, createAgent, getDbClient, initDb, recordKeyUsage, setApiKeyPlan } from "../be/db";
 import { handleAgentsRest } from "../http/agents";
+import { handleApiKeys } from "../http/api-keys";
 import { getPathSegments, parseQueryParams } from "../http/utils";
 import { listenOnFreePort } from "./test-net";
 
@@ -28,7 +29,9 @@ function createTestServer(): Server {
     const pathSegments = getPathSegments(url);
     const queryParams = parseQueryParams(url);
 
-    const handled = await handleAgentsRest(req, res, pathSegments, queryParams, undefined);
+    const handled =
+      (await handleAgentsRest(req, res, pathSegments, queryParams, undefined)) ||
+      (await handleApiKeys(req, res, pathSegments, queryParams));
     if (!handled) {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not found" }));
@@ -314,5 +317,77 @@ describe("Phase 4 — credential-status HTTP endpoints", () => {
     };
     expect(afterSnapshot.credStatus.acp).toMatchObject({ target: "opencode" });
     expect(afterSnapshot.credStatus.acp?.configOptions).toHaveLength(1);
+  });
+
+  describe("POST /api/keys/report-seat-mismatch", () => {
+    const keyType = "CLAUDE_CODE_OAUTH_TOKEN";
+
+    async function reportSeatMismatch(keySuffix: string, keyIndex: number) {
+      const resp = await fetch(`${baseUrl}/api/keys/report-seat-mismatch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keyType, keySuffix, keyIndex, model: "fable" }),
+      });
+      expect(resp.status).toBe(200);
+    }
+
+    async function keyStatus(keySuffix: string) {
+      const resp = await fetch(`${baseUrl}/api/keys/status?keyType=${keyType}`);
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as {
+        keys: Array<{
+          keySuffix: string;
+          status: string;
+          plan: string | null;
+          planSource: string | null;
+          lastSeatMismatchAt: string | null;
+          lastSeatMismatchModel: string | null;
+        }>;
+      };
+      return body.keys.find((k) => k.keySuffix === keySuffix);
+    }
+
+    test("an estimated plan becomes claude_team_standard / detected", async () => {
+      await recordKeyUsage(keyType, "EST01", 0, null);
+      await getDbClient().run(
+        "UPDATE api_key_status SET plan = 'claude_max_5x', planSource = 'estimated' WHERE keySuffix = ?",
+        ["EST01"],
+      );
+      await reportSeatMismatch("EST01", 0);
+      const key = await keyStatus("EST01");
+      expect(key?.plan).toBe("claude_team_standard");
+      expect(key?.planSource).toBe("detected");
+      expect(key?.lastSeatMismatchAt).not.toBeNull();
+      expect(key?.lastSeatMismatchModel).toBe("fable");
+      expect(key?.status).toBe("available");
+    });
+
+    test("a manual plan is never changed", async () => {
+      await recordKeyUsage(keyType, "MAN01", 1, null);
+      await setApiKeyPlan(keyType, "MAN01", "claude_team_premium");
+      await reportSeatMismatch("MAN01", 1);
+      const key = await keyStatus("MAN01");
+      expect(key?.plan).toBe("claude_team_premium");
+      expect(key?.planSource).toBe("manual");
+      expect(key?.lastSeatMismatchAt).not.toBeNull();
+      expect(key?.lastSeatMismatchModel).toBe("fable");
+      expect(key?.status).toBe("available");
+    });
+
+    test("a key with no row gets a row with the detected plan", async () => {
+      await reportSeatMismatch("NEW01", 2);
+      const key = await keyStatus("NEW01");
+      expect(key?.plan).toBe("claude_team_standard");
+      expect(key?.planSource).toBe("detected");
+      expect(key?.lastSeatMismatchModel).toBe("fable");
+      expect(key?.status).toBe("available");
+    });
+
+    test("GET /api/keys/status returns the seat mismatch columns", async () => {
+      await recordKeyUsage(keyType, "NONE1", 3, null);
+      const key = await keyStatus("NONE1");
+      expect(key).toHaveProperty("lastSeatMismatchAt", null);
+      expect(key).toHaveProperty("lastSeatMismatchModel", null);
+    });
   });
 });

@@ -7,6 +7,7 @@ import {
   getKeyStatuses,
   markKeyRateLimited,
   recordKeyRateLimitWindows,
+  recordKeySeatMismatch,
   recordKeyUsage,
   setApiKeyName,
   setApiKeyPlan,
@@ -140,6 +141,32 @@ const reportRateLimitWindows = route({
   auth: { apiKey: true },
 });
 
+const reportSeatMismatch = route({
+  method: "post",
+  path: "/api/keys/report-seat-mismatch",
+  pattern: ["api", "keys", "report-seat-mismatch"],
+  summary: "Record that an API key's subscription seat cannot run a model family",
+  tags: ["API Keys"],
+  body: z.object({
+    keyType: z.string(),
+    keySuffix: z.string().min(1).max(10),
+    keyIndex: z.number().int().min(0),
+    /** Model family the CLI rejected with `errorCode: "credits_required"`. */
+    model: z.enum(["fable", "opus", "sonnet", "haiku"]),
+    scope: z.string().optional(),
+    scopeId: z.string().optional(),
+  }),
+  responses: {
+    200: { description: "Seat mismatch recorded", schema: successMessageSchema },
+    400: { description: "Validation error" },
+    401: { description: "Unauthorized" },
+  },
+  auth: { apiKey: true },
+  rbac: {
+    ungated: "worker credential telemetry, same posture as POST /api/keys/report-rate-limit",
+  },
+});
+
 const getAvailable = route({
   method: "get",
   path: "/api/keys/available",
@@ -196,6 +223,10 @@ const ApiKeyStatusSchema = z.object({
   /** Subscription plan id (see `GET /api/keys/plans`), when known. */
   plan: z.string().nullable(),
   planSource: z.enum(["manual", "detected", "estimated"]).nullable(),
+  /** When the CLI last rejected a model with `credits_required` on this key. */
+  lastSeatMismatchAt: z.string().nullable(),
+  /** Model family of that rejection (`fable`, `opus`, ...). */
+  lastSeatMismatchModel: z.string().nullable(),
   /** Derived, readable view of any rejected model-scoped window (Fable/Opus/Sonnet) on this key. */
   modelLimits: z.array(
     z.object({
@@ -495,6 +526,32 @@ export async function handleApiKeys(
         err instanceof Error ? err.message : "Failed to record rate-limit windows",
         500,
       );
+    }
+    return true;
+  }
+
+  // POST /api/keys/report-seat-mismatch
+  if (reportSeatMismatch.match(req.method, pathSegments)) {
+    const parsed = await reportSeatMismatch.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const { keyType, keySuffix, keyIndex, model, scope, scopeId } = parsed.body;
+    try {
+      const { planChanged } = await recordKeySeatMismatch(
+        keyType,
+        keySuffix,
+        keyIndex,
+        model,
+        scope,
+        scopeId ?? null,
+      );
+      if (planChanged) clearUsageCache();
+      reportSeatMismatch.respond(res, 200, {
+        success: true,
+        message: `Seat mismatch recorded for ...${keySuffix} (${model})`,
+      });
+    } catch (err) {
+      jsonError(res, err instanceof Error ? err.message : "Failed to record seat mismatch", 500);
     }
     return true;
   }

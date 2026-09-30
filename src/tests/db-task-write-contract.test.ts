@@ -499,6 +499,7 @@ value:reassociateSessionLogs
 value:recordBudgetRefusalNotification
 value:recordInlineScriptRun
 value:recordKeyRateLimitWindows
+value:recordKeySeatMismatch
 value:recordKeyUsage
 value:recordSlackMessage
 value:recordTaskPullRequestAttachments
