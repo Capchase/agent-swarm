@@ -5235,8 +5235,6 @@ export interface paths {
                         taskId?: string;
                         scope?: string;
                         scopeId?: string;
-                        /** Format: date-time */
-                        observedAt?: string;
                     };
                 };
             };
@@ -5397,6 +5395,7 @@ export interface paths {
                             totalKeys: number;
                             modelBlockedIndices?: number[];
                             earliestModelResetAt?: string | null;
+                            authFailureFence: number;
                         };
                     };
                 };
@@ -5684,8 +5683,7 @@ export interface paths {
                         scopeId?: string;
                         clearAuthBench?: boolean;
                         keyIndex?: number;
-                        /** Format: date-time */
-                        observedAt?: string;
+                        authFence?: number;
                     };
                 };
             };
