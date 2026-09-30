@@ -12,6 +12,7 @@
 import { exec } from "node:child_process";
 import { emitKeypressEvents } from "node:readline";
 
+import { deriveCodexKeySuffix } from "../providers/codex-oauth/auth-json.js";
 import { loginCodexOAuth } from "../providers/codex-oauth/flow.js";
 import {
   loadAllCodexOAuthSlots,
@@ -35,10 +36,31 @@ type RunCodexLoginDeps = {
   login?: typeof loginCodexOAuth;
   store?: typeof storeCodexOAuth;
   loadAllSlots?: typeof loadAllCodexOAuthSlots;
+  clearAuthBench?: typeof clearCodexAuthBench;
   log?: (message: string) => void;
   error?: (message: string) => void;
   exit?: (code: number) => void;
 };
+
+/**
+ * Lift an auth-failure bench on the re-logged key. A fresh login is proof of
+ * health, so it passes `clearAuthBench: true` (the API also deletes the
+ * `codex-auth-watch` bench marker). Returns `true` when a bench was lifted.
+ */
+export async function clearCodexAuthBench(
+  apiUrl: string,
+  apiKey: string,
+  keySuffix: string,
+): Promise<boolean> {
+  const resp = await fetch(`${apiUrl}/api/keys/clear-rate-limit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ keyType: "CODEX_OAUTH", keySuffix, clearAuthBench: true }),
+  });
+  if (!resp.ok) throw new Error(`clear-rate-limit returned ${resp.status}`);
+  const data = (await resp.json()) as { cleared?: boolean };
+  return data.cleared === true;
+}
 
 type ParsedCodexLoginArgs = {
   apiUrl?: string;
@@ -207,6 +229,7 @@ export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}
   const login = deps.login ?? loginCodexOAuth;
   const store = deps.store ?? storeCodexOAuth;
   const loadAllSlots = deps.loadAllSlots ?? loadAllCodexOAuthSlots;
+  const clearAuthBench = deps.clearAuthBench ?? clearCodexAuthBench;
   const log = deps.log ?? console.log;
   const error = deps.error ?? console.error;
   const exit = deps.exit ?? ((code: number) => process.exit(code));
@@ -287,6 +310,18 @@ export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}
     log("\nStoring credentials in swarm API config store...");
     await store(apiUrl, apiKey, creds, slot);
     log(`Credentials stored successfully in slot ${slot}!`);
+
+    // A re-login returns an auth-benched slot to the pool right away.
+    // Non-fatal: the credentials are stored, and a task success also lifts it.
+    const keySuffix = deriveCodexKeySuffix(creds.access, creds.accountId);
+    try {
+      if (await clearAuthBench(apiUrl, apiKey, keySuffix)) {
+        log(`Lifted the auth-failure bench on key ...${keySuffix}.`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      error(`Warning: could not lift the auth-failure bench on key ...${keySuffix}: ${message}`);
+    }
 
     log("\nDeployed Codex workers will automatically restore these credentials at boot.");
   } catch (err) {

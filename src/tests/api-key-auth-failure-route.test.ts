@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { closeDb, initDb } from "../be/db";
+import { clearCodexAuthBench } from "../commands/codex-login";
 import { handleApiKeys } from "../http/api-keys";
 import { listenOnFreePort } from "./test-net";
 
@@ -83,6 +84,21 @@ describe("API key auth-failure routes", () => {
     );
     expect(row).toMatchObject({ status: "available", consecutiveAuthFailures: 0 });
     expect(row!.lastAuthFailureAt).not.toBeNull();
+  });
+
+  test("a codex-login re-login lifts the auth bench", async () => {
+    const relog = { keyType: "CODEX_OAUTH", keySuffix: "relog" };
+    await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 4 });
+    const benched = await post("/api/keys/report-auth-failure", { ...relog, keyIndex: 4 });
+    expect(benched).toMatchObject({ benched: true });
+
+    expect(await clearCodexAuthBench(baseUrl, "test-key", "relog")).toBe(true);
+
+    const status = await get("/api/keys/status?keyType=CODEX_OAUTH");
+    const row = (status.keys as Array<Record<string, unknown>>).find(
+      (k) => k.keySuffix === "relog",
+    );
+    expect(row).toMatchObject({ status: "available", consecutiveAuthFailures: 0 });
   });
 
   test("rejects an invalid body", async () => {
