@@ -11387,7 +11387,8 @@ export interface AvailableKeyIndicesResult {
  * excluded from `availableIndices` and reported in `modelBlockedIndices`
  * instead — the key itself stays `available` for every other model. A key
  * whose `plan` cannot run the family (`planAllowsModelFamily`) is excluded
- * and reported in `seatBlockedIndices`; a seat block has no reset time.
+ * and reported in `seatBlockedIndices`, also when it is key-wide or
+ * model-window blocked; a seat block has no reset time.
  */
 export async function getAvailableKeyIndices(
   keyType: string,
@@ -11447,10 +11448,13 @@ export async function getAvailableKeyIndices(
   }
   const modelBlockedSet = new Set(modelBlockedIndices);
 
+  // A seat block is a plan fact, so it is reported even when the key is also
+  // key-wide or model-window blocked. Otherwise the temporary block hides the
+  // seat from admission, and the fallback pick can select a key that cannot
+  // run the model.
   const seatBlockedIndices: number[] = [];
   if (modelFamily) {
     for (const row of rows) {
-      if (blockedIndices.has(row.keyIndex) || modelBlockedSet.has(row.keyIndex)) continue;
       if (!planAllowsModelFamily(row.plan, modelFamily)) seatBlockedIndices.push(row.keyIndex);
     }
   }

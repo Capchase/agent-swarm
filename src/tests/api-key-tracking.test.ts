@@ -16,7 +16,11 @@ import {
   setApiKeyPlan,
 } from "../be/db";
 import type { CredentialSelection } from "../utils/credentials";
-import { resolveCredentialPools, selectCredential } from "../utils/credentials";
+import {
+  ModelWindowExhaustedError,
+  resolveCredentialPools,
+  selectCredential,
+} from "../utils/credentials";
 
 // ─── Credential Selection Unit Tests ────────────────────────────────────────
 
@@ -508,7 +512,7 @@ describe("API key tracking DB queries", () => {
         expect(result.seatBlockedIndices).not.toContain(1);
       });
 
-      test("a rate-limited standard-seat key is in neither blocked list", async () => {
+      test("a rate-limited standard-seat key stays seat-blocked", async () => {
         const otherScopeId = "seat-filter-rl";
         await recordKeyUsage(KEY_TYPE, "seat2", 0, null, scope, otherScopeId);
         await setApiKeyPlan(KEY_TYPE, "seat2", "claude_team_standard");
@@ -522,8 +526,58 @@ describe("API key tracking DB queries", () => {
         );
         const result = await getAvailableKeyIndices(KEY_TYPE, 1, scope, otherScopeId, "fable");
         expect(result.availableIndices).toEqual([]);
-        expect(result.seatBlockedIndices).toEqual([]);
+        expect(result.seatBlockedIndices).toEqual([0]);
         expect(result.modelBlockedIndices).toEqual([]);
+
+        // Admission must not fall back to the key-wide-blocked seat.
+        await expect(
+          resolveCredentialPools(
+            { CLAUDE_CODE_OAUTH_TOKEN: "tok-seat2" },
+            {
+              provider: "claude",
+              model: "claude-fable-5-1",
+              availableIndicesMap: { CLAUDE_CODE_OAUTH_TOKEN: result },
+              enforceModelCapacity: true,
+            },
+          ),
+        ).rejects.toBeInstanceOf(ModelWindowExhaustedError);
+      });
+
+      test("a Fable-window-blocked standard-seat key stays seat-blocked", async () => {
+        const otherScopeId = "seat-filter-window";
+        await recordKeyUsage(KEY_TYPE, "seat3", 0, null, scope, otherScopeId);
+        await setApiKeyPlan(KEY_TYPE, "seat3", "claude_team_standard");
+        await recordKeyRateLimitWindows(
+          KEY_TYPE,
+          "seat3",
+          0,
+          {
+            seven_day_overage_included: {
+              status: "rejected",
+              resetsAt: Math.floor(Date.now() / 1000) + 3600,
+              lastSeenAt: new Date().toISOString(),
+            },
+          },
+          scope,
+          otherScopeId,
+        );
+        const result = await getAvailableKeyIndices(KEY_TYPE, 1, scope, otherScopeId, "fable");
+        expect(result.availableIndices).toEqual([]);
+        expect(result.modelBlockedIndices).toEqual([0]);
+        expect(result.seatBlockedIndices).toEqual([0]);
+
+        // The window-block fallback policy never applies to a seat block.
+        await expect(
+          resolveCredentialPools(
+            { CLAUDE_CODE_OAUTH_TOKEN: "tok-seat3", MODEL_WINDOW_EXHAUSTED_POLICY: "fallback" },
+            {
+              provider: "claude",
+              model: "claude-fable-5-1",
+              availableIndicesMap: { CLAUDE_CODE_OAUTH_TOKEN: result },
+              enforceModelCapacity: true,
+            },
+          ),
+        ).rejects.toBeInstanceOf(ModelWindowExhaustedError);
       });
 
       test("earliestModelResetAt stays null when only seat blocks exist", async () => {
