@@ -392,13 +392,15 @@ export async function resolveCodexAuthMode(
  * Build the `failureReason` for a pool-slot OAuth revalidation failure
  * (see `resolveCodexAuthMode` above).
  *
- * Wording matters: every variant carries `[auth-error]`, so the runner's
- * `isCodexAuthFailureReason` counts it toward the auth-failure bench (2 in a
- * row). A lock-wait timeout is transient/retryable — its wording ("waiting
- * for the refresh lock") is excluded as transient, so a temporary contention
- * blip does NOT count toward a bench.
+ * Wording matters: every variant carries `[auth-error]`, but the runner's
+ * `isCodexAuthFailureReason` counts only a confirmed refresh rejection toward
+ * the auth-failure bench (2 in a row). A lock-wait timeout ("waiting for the
+ * refresh lock") and any other thrown error (refresh-lock HTTP or network
+ * failure, config-store persistence failure: "not a confirmed auth
+ * rejection") are excluded as transient, so an outage does NOT bench a
+ * healthy login.
  */
-function buildPoolRevalidationFailureReason(err: unknown, slot: number): string {
+export function buildPoolRevalidationFailureReason(err: unknown, slot: number): string {
   if (err instanceof CodexOAuthRefreshError) {
     if (err.reason === "lock_timeout") {
       return `[auth-error] Codex pool slot ${slot} [...${err.keySuffix}] revalidation failed: timed out waiting for the refresh lock — transient, will retry on next task.`;
@@ -406,7 +408,7 @@ function buildPoolRevalidationFailureReason(err: unknown, slot: number): string 
     return `[auth-error] Codex pool slot ${slot} [...${err.keySuffix}] revalidation failed: refresh rejected (${err.status ?? "unknown status"} ${err.body ?? ""}) — credential likely revoked; re-run codex-login for this slot.`;
   }
   const message = err instanceof Error ? err.message : String(err);
-  return `[auth-error] Codex pool slot ${slot} revalidation failed: ${message}`;
+  return `[auth-error] Codex pool slot ${slot} revalidation failed (not a confirmed auth rejection, transient): ${message}`;
 }
 
 /**

@@ -22,6 +22,9 @@ const TRANSIENT_AUTH_ERROR_MARKERS = [
   "refresh rejected (unknown status",
   "out of credits",
   "no credentials found in config store",
+  // Revalidation threw something other than a refresh rejection (lock HTTP,
+  // network, or persistence failure). See buildPoolRevalidationFailureReason.
+  "not a confirmed auth rejection",
 ];
 
 export function isCodexAuthFailureReason(failureReason: string | undefined | null): boolean {
