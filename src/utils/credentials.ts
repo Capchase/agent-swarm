@@ -117,6 +117,8 @@ export interface CredentialSelection {
   seatBlockedIndices?: number[];
   /** Subscription plan id detected on the credential (`SUBSCRIPTION_PLANS`), reported with its usage. */
   plan?: string | null;
+  /** `authFailureFence` from `GET /api/keys/available`, read before the task (Codex pool only). */
+  authFailureFence?: number;
 }
 
 const MODEL_LABELS: Record<ModelFamily, string> = {
