@@ -11374,6 +11374,8 @@ export interface AvailableKeyIndicesResult {
   modelBlockedIndices: number[];
   /** ISO of the earliest resetsAt among modelBlockedIndices, or null when none. */
   earliestModelResetAt: string | null;
+  /** Indices excluded because the key's subscription plan cannot run the model family. */
+  seatBlockedIndices: number[];
 }
 
 /**
@@ -11383,7 +11385,9 @@ export interface AvailableKeyIndicesResult {
  * When `modelFamily` has a weekly window (fable/opus/sonnet), a key whose
  * `rateLimitWindows` carries an active rejected window for that family is
  * excluded from `availableIndices` and reported in `modelBlockedIndices`
- * instead — the key itself stays `available` for every other model.
+ * instead — the key itself stays `available` for every other model. A key
+ * whose `plan` cannot run the family (`planAllowsModelFamily`) is excluded
+ * and reported in `seatBlockedIndices`; a seat block has no reset time.
  */
 export async function getAvailableKeyIndices(
   keyType: string,
@@ -11410,8 +11414,9 @@ export async function getAvailableKeyIndices(
     keyIndex: number;
     status: string;
     rateLimitWindows: string | null;
+    plan: string | null;
   }>(
-    `SELECT keyIndex, status, rateLimitWindows FROM api_key_status
+    `SELECT keyIndex, status, rateLimitWindows, plan FROM api_key_status
        WHERE keyType = ? AND scope = ? AND scopeId = ?`,
     [keyType, scope, effectiveScopeId],
   );
@@ -11442,15 +11447,25 @@ export async function getAvailableKeyIndices(
   }
   const modelBlockedSet = new Set(modelBlockedIndices);
 
+  const seatBlockedIndices: number[] = [];
+  if (modelFamily) {
+    for (const row of rows) {
+      if (blockedIndices.has(row.keyIndex) || modelBlockedSet.has(row.keyIndex)) continue;
+      if (!planAllowsModelFamily(row.plan, modelFamily)) seatBlockedIndices.push(row.keyIndex);
+    }
+  }
+  const seatBlockedSet = new Set(seatBlockedIndices);
+
   const availableIndices: number[] = [];
   for (let i = 0; i < totalKeys; i++) {
-    if (blockedIndices.has(i) || modelBlockedSet.has(i)) continue;
+    if (blockedIndices.has(i) || modelBlockedSet.has(i) || seatBlockedSet.has(i)) continue;
     availableIndices.push(i);
   }
 
   return {
     availableIndices,
     modelBlockedIndices,
+    seatBlockedIndices,
     earliestModelResetAt:
       earliestModelResetsAtSec !== undefined
         ? new Date(earliestModelResetsAtSec * 1000).toISOString()

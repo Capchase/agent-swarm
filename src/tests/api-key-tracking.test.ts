@@ -13,6 +13,7 @@ import {
   markKeyRateLimited,
   recordKeyRateLimitWindows,
   recordKeyUsage,
+  setApiKeyPlan,
 } from "../be/db";
 import type { CredentialSelection } from "../utils/credentials";
 import { resolveCredentialPools, selectCredential } from "../utils/credentials";
@@ -473,6 +474,63 @@ describe("API key tracking DB queries", () => {
       );
       const recovered = await getAvailableKeyIndices(KEY_TYPE, 1, "agent", scopeId, "fable");
       expect(recovered.availableIndices).toEqual([0]);
+    });
+
+    describe("seat filtering", () => {
+      // Own scope so the rows above do not leak into these counts.
+      const scope = "agent";
+      const scopeId = "seat-filter";
+
+      beforeAll(async () => {
+        await recordKeyUsage(KEY_TYPE, "seat0", 0, null, scope, scopeId);
+        await setApiKeyPlan(KEY_TYPE, "seat0", "claude_team_standard");
+        await recordKeyUsage(KEY_TYPE, "seat1", 1, null, scope, scopeId);
+      });
+
+      test("a claude_team_standard key is seat-blocked for fable", async () => {
+        const result = await getAvailableKeyIndices(KEY_TYPE, 2, scope, scopeId, "fable");
+        expect(result.availableIndices).toEqual([1]);
+        expect(result.seatBlockedIndices).toEqual([0]);
+      });
+
+      test("the same key is available for opus and for no model", async () => {
+        const opus = await getAvailableKeyIndices(KEY_TYPE, 2, scope, scopeId, "opus");
+        expect(opus.availableIndices).toEqual([0, 1]);
+        expect(opus.seatBlockedIndices).toEqual([]);
+        const none = await getAvailableKeyIndices(KEY_TYPE, 2, scope, scopeId);
+        expect(none.availableIndices).toEqual([0, 1]);
+        expect(none.seatBlockedIndices).toEqual([]);
+      });
+
+      test("a key with no plan is available for fable", async () => {
+        const result = await getAvailableKeyIndices(KEY_TYPE, 2, scope, scopeId, "fable");
+        expect(result.availableIndices).toContain(1);
+        expect(result.seatBlockedIndices).not.toContain(1);
+      });
+
+      test("a rate-limited standard-seat key is in neither blocked list", async () => {
+        const otherScopeId = "seat-filter-rl";
+        await recordKeyUsage(KEY_TYPE, "seat2", 0, null, scope, otherScopeId);
+        await setApiKeyPlan(KEY_TYPE, "seat2", "claude_team_standard");
+        await markKeyRateLimited(
+          KEY_TYPE,
+          "seat2",
+          0,
+          new Date(Date.now() + 3600_000).toISOString(),
+          scope,
+          otherScopeId,
+        );
+        const result = await getAvailableKeyIndices(KEY_TYPE, 1, scope, otherScopeId, "fable");
+        expect(result.availableIndices).toEqual([]);
+        expect(result.seatBlockedIndices).toEqual([]);
+        expect(result.modelBlockedIndices).toEqual([]);
+      });
+
+      test("earliestModelResetAt stays null when only seat blocks exist", async () => {
+        const result = await getAvailableKeyIndices(KEY_TYPE, 2, scope, scopeId, "fable");
+        expect(result.seatBlockedIndices).toEqual([0]);
+        expect(result.earliestModelResetAt).toBeNull();
+      });
     });
   });
 });

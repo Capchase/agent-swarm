@@ -5393,6 +5393,7 @@ export interface paths {
                             totalKeys: number;
                             modelBlockedIndices?: number[];
                             earliestModelResetAt?: string | null;
+                            seatBlockedIndices?: number[];
                         };
                     };
                 };

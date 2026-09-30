@@ -192,6 +192,8 @@ const getAvailable = route({
         modelBlockedIndices: z.array(z.number().int()).optional(),
         /** ISO of the earliest reset among modelBlockedIndices. Present only when `model` was passed. */
         earliestModelResetAt: z.string().nullable().optional(),
+        /** Indices excluded because the key's subscription plan cannot run the model. Present only when model was passed. */
+        seatBlockedIndices: z.array(z.number().int()).optional(),
       }),
     },
     400: { description: "Validation error" },
@@ -578,6 +580,7 @@ export async function handleApiKeys(
           ? {
               modelBlockedIndices: result.modelBlockedIndices,
               earliestModelResetAt: result.earliestModelResetAt,
+              seatBlockedIndices: result.seatBlockedIndices,
             }
           : {}),
       });
