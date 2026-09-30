@@ -5681,6 +5681,7 @@ export interface paths {
                         scope?: string;
                         scopeId?: string;
                         clearAuthBench?: boolean;
+                        keyIndex?: number;
                     };
                 };
             };

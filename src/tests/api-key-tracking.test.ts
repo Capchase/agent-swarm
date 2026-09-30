@@ -350,6 +350,34 @@ describe("API key tracking DB queries", () => {
     expect((await codexStatus("cdx05")).status).toBe("rate_limited");
   });
 
+  test("a slot re-login with a different account retires the previous login's bench", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "old01", 0);
+    await recordKeyAuthFailure("CODEX_OAUTH", "old01", 0);
+    expect(await getKv("codex-auth-watch", "bench:old01")).not.toBeNull();
+
+    const cleared = await clearKeyRateLimit("CODEX_OAUTH", "new01", "global", null, {
+      clearAuthBench: true,
+      keyIndex: 0,
+    });
+    expect(cleared).toBe(true);
+    await recordKeyUsage("CODEX_OAUTH", "new01", 0, null);
+
+    const old = await codexStatus("old01");
+    expect(old.status).toBe("available");
+    expect(old.rateLimitedUntil).toBeNull();
+    expect(old.consecutiveAuthFailures).toBe(0);
+    expect(await getKv("codex-auth-watch", "bench:old01")).toBeNull();
+    const { availableIndices } = await getAvailableKeyIndices("CODEX_OAUTH", 5);
+    expect(availableIndices).toContain(0);
+  });
+
+  test("a clear without keyIndex leaves other logins at the same index alone", async () => {
+    await recordKeyAuthFailure("CODEX_OAUTH", "old02", 3);
+    await recordKeyAuthFailure("CODEX_OAUTH", "old02", 3);
+    await clearKeyRateLimit("CODEX_OAUTH", "new02", "global", null, { clearAuthBench: true });
+    expect((await codexStatus("old02")).status).toBe("rate_limited");
+  });
+
   test("an ordinary rate limit longer than the auth bench still applies", async () => {
     const farUntil = new Date(Date.now() + 500 * DAY_MS).toISOString();
     await markKeyRateLimited("CODEX_OAUTH", "cdx05", 4, farUntil);

@@ -321,9 +321,9 @@ A pool login that fails auth on every task (for example `workspace routing disco
 **How a benched slot returns.** Only proof of health lifts an auth bench:
 
 1. A real task success on the slot. The runner calls `POST /api/keys/clear-rate-limit` with `clearAuthBench: true`. (The full-pool fallback can still draw a benched slot when no slot is available.)
-2. A re-login. `codex-login` stores the new credentials, then calls `POST /api/keys/clear-rate-limit` with `clearAuthBench: true` for the slot's key. The slot returns to the pool at once. The `codex-auth-expiry-watch` script is a backstop: it sees a newer `codex_oauth_<N>` write and clears the bench within about 1 hour.
+2. A re-login. `codex-login` stores the new credentials, then calls `POST /api/keys/clear-rate-limit` with `clearAuthBench: true` and `keyIndex: <N>` for the slot's key. The slot returns to the pool at once. When the new login is a different account, the API also retires the previous login's bench at that slot. The `codex-auth-expiry-watch` script is a backstop: it sees a newer `codex_oauth_<N>` write and clears the bench within about 1 hour.
 
-`POST /api/keys/clear-rate-limit` without `clearAuthBench: true` does not clear a key whose count is 2 or more. So a usage sweep or another caller cannot undo an auth bench by mistake.
+`POST /api/keys/clear-rate-limit` without `clearAuthBench: true` does not clear a key whose count is 2 or more. So a usage sweep or another caller cannot undo an auth bench by mistake. An ordinary rate-limit report on a benched key never shortens the bench.
 
 To re-login a slot, the slot owner runs this with their own ChatGPT account:
 

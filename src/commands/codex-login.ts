@@ -45,17 +45,24 @@ type RunCodexLoginDeps = {
 /**
  * Lift an auth-failure bench on the re-logged key. A fresh login is proof of
  * health, so it passes `clearAuthBench: true` (the API also deletes the
- * `codex-auth-watch` bench marker). Returns `true` when a bench was lifted.
+ * `codex-auth-watch` bench marker). It also passes the slot, so the API retires
+ * a different login that the slot held before. Returns `true` when a bench was lifted.
  */
 export async function clearCodexAuthBench(
   apiUrl: string,
   apiKey: string,
   keySuffix: string,
+  slot: number,
 ): Promise<boolean> {
   const resp = await fetch(`${apiUrl}/api/keys/clear-rate-limit`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ keyType: "CODEX_OAUTH", keySuffix, clearAuthBench: true }),
+    body: JSON.stringify({
+      keyType: "CODEX_OAUTH",
+      keySuffix,
+      clearAuthBench: true,
+      keyIndex: slot,
+    }),
   });
   if (!resp.ok) throw new Error(`clear-rate-limit returned ${resp.status}`);
   const data = (await resp.json()) as { cleared?: boolean };
@@ -315,7 +322,7 @@ export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}
     // Non-fatal: the credentials are stored, and a task success also lifts it.
     const keySuffix = deriveCodexKeySuffix(creds.access, creds.accountId);
     try {
-      if (await clearAuthBench(apiUrl, apiKey, keySuffix)) {
+      if (await clearAuthBench(apiUrl, apiKey, keySuffix, slot)) {
         log(`Lifted the auth-failure bench on key ...${keySuffix}.`);
       }
     } catch (err) {

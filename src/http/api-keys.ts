@@ -380,6 +380,8 @@ const clearRateLimitRoute = route({
     scopeId: z.string().optional(),
     /** Proof of health (task success or re-login): also lifts an auth-failure bench. */
     clearAuthBench: z.boolean().optional(),
+    /** Slot re-login: with `clearAuthBench`, also retires other identities recorded at this index. */
+    keyIndex: z.number().int().min(0).optional(),
   }),
   responses: {
     200: {
@@ -689,10 +691,11 @@ export async function handleApiKeys(
     const parsed = await clearRateLimitRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { keyType, keySuffix, scope, scopeId, clearAuthBench } = parsed.body;
+    const { keyType, keySuffix, scope, scopeId, clearAuthBench, keyIndex } = parsed.body;
     try {
       const cleared = await clearKeyRateLimit(keyType, keySuffix, scope, scopeId ?? null, {
         clearAuthBench: clearAuthBench === true,
+        keyIndex,
       });
       clearRateLimitRoute.respond(res, 200, {
         success: true,

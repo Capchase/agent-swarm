@@ -11794,13 +11794,15 @@ export async function setApiKeyName(
  * Clear a stale rate-limit record after a successful use proves the key is healthy.
  * An auth bench clears only with `clearAuthBench` (proof of health: task success or re-login),
  * which also resets the auth-failure count and deletes the Codex bench marker.
+ * With `clearAuthBench` and `keyIndex` (a slot re-login), it also retires every other
+ * identity recorded at that index: the slot now holds this key, so their blocks are stale.
  */
 export async function clearKeyRateLimit(
   keyType: string,
   keySuffix: string,
   scope = "global",
   scopeId: string | null = null,
-  opts: { clearAuthBench?: boolean } = {},
+  opts: { clearAuthBench?: boolean; keyIndex?: number } = {},
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const effectiveScopeId = scopeId ?? "";
@@ -11827,7 +11829,25 @@ export async function clearKeyRateLimit(
         await deleteKv(CODEX_AUTH_WATCH_NAMESPACE, codexAuthBenchMarkerKey(keySuffix));
       }
     }
-    return cleared;
+    let retired = 0;
+    if (clearAuthBench && opts.keyIndex !== undefined) {
+      const previous = await tx.query<{ keySuffix: string }>(
+        `UPDATE api_key_status
+           SET status = 'available', rateLimitedUntil = NULL, consecutiveAuthFailures = 0,
+               updatedAt = ?
+           WHERE keyType = ? AND keySuffix != ? AND scope = ? AND scopeId = ? AND keyIndex = ?
+             AND (status = 'rate_limited' OR consecutiveAuthFailures > 0)
+           RETURNING keySuffix`,
+        [now, ...key, opts.keyIndex],
+      );
+      retired = previous.length;
+      if (keyType === "CODEX_OAUTH") {
+        for (const row of previous) {
+          await deleteKv(CODEX_AUTH_WATCH_NAMESPACE, codexAuthBenchMarkerKey(row.keySuffix));
+        }
+      }
+    }
+    return cleared || retired > 0;
   });
 }
 

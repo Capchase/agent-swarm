@@ -331,10 +331,12 @@ describe("runCodexLogin", () => {
     const store = mock(async () => {
       calls.push("store");
     });
-    const clearAuthBench = mock(async (_apiUrl: string, _apiKey: string, keySuffix: string) => {
-      calls.push(`clear:${keySuffix}`);
-      return true;
-    });
+    const clearAuthBench = mock(
+      async (_apiUrl: string, _apiKey: string, keySuffix: string, slot: number) => {
+        calls.push(`clear:${keySuffix}@${slot}`);
+        return true;
+      },
+    );
 
     await runCodexLogin([], {
       resolveConfig: async () => ({
@@ -357,7 +359,7 @@ describe("runCodexLogin", () => {
     });
 
     // at_test has no chatgpt_user_id claim, so the suffix falls back to accountId.
-    expect(calls).toEqual(["store", "clear:d3Ove"]);
+    expect(calls).toEqual(["store", "clear:d3Ove@2"]);
   });
 
   it("keeps a successful login when lifting the bench fails", async () => {
