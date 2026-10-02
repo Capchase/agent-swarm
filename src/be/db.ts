@@ -10,6 +10,12 @@ import {
 import { realtimeBus } from "../realtime/bus";
 import { slackChannelFromContextKey } from "../tasks/slack-routing";
 import { _resolveIntegrationType, emitIntegrationConnected, telemetry } from "../telemetry";
+import { scheduleOrgDomainRecompute } from "../telemetry-identity";
+import {
+  emitTaskTelemetry,
+  type TaskTelemetryEvent,
+  type TaskTelemetryInput,
+} from "../telemetry-trigger";
 import type {
   ActiveSession,
   Agent,
@@ -331,7 +337,6 @@ configureTaskReadDependencies({
   previewText: (text, maxChars) => previewText(text, maxChars),
 });
 
-type TaskTelemetryProps = Parameters<typeof telemetry.taskEvent>[1];
 type TaskTelemetryContext = {
   provider?: ProviderName;
   harnessVariant?: string;
@@ -347,23 +352,27 @@ function assetKeyPrefixPattern(input: string): string {
   return literalPrefixPattern(normalizeAssetKey(input));
 }
 
-function emitTaskLifecycleTelemetryAfterCommit(
-  event: string,
-  props: TaskTelemetryProps,
+function emitTaskLifecycleTelemetryAfterCommit<S extends TaskTelemetryEvent>(
+  event: S,
+  props: TaskTelemetryInput<S>,
   verify?: (task: AgentTask | null) => boolean,
+  actorUserId?: string | null,
 ): void {
   // afterCommit (not queueMicrotask): under an async client transaction,
   // microtasks drain before COMMIT, so the verify read could observe
   // uncommitted state. afterCommit runs strictly post-COMMIT/ROLLBACK.
   getDbClient().afterCommit(() => {
+    // `trigger_surface` is resolved (one read up the parent chain) and
+    // `source` renamed to `task_source` inside emitTaskTelemetry, so every
+    // lifecycle event of a task reports the same root surface.
     if (!verify) {
-      telemetry.taskEvent(event, props);
+      void emitTaskTelemetry(event, props, actorUserId);
       return;
     }
-    getTaskById(props.taskId)
+    getTaskById((props as { taskId: string }).taskId)
       .then((task) => {
         if (!verify(task)) return;
-        telemetry.taskEvent(event, props);
+        return emitTaskTelemetry(event, props, actorUserId);
       })
       .catch((err) =>
         console.error(
@@ -2896,6 +2905,8 @@ export async function createTaskExtended(
       priority: row.priority,
     },
     (task) => task !== null,
+    // The human who asked (a pseudonymous user_ref), null for system tasks.
+    row.requestedByUserId,
   );
 
   getDbClient().afterCommit(() => {
@@ -7352,12 +7363,17 @@ export async function createWorkflow(
   if (!row) throw new Error("Failed to create workflow");
   const workflow = rowToWorkflow(row);
   // afterCommit: a caller's transaction that rolls back must not report the workflow.
+  const requestUserId = getCurrentRequestUserId();
   getDbClient().afterCommit(() =>
-    telemetry.workflow("created", {
-      workflowId: workflow.id,
-      nodeCount: workflow.definition.nodes.length,
-      ...(source ? { source } : {}),
-    }),
+    telemetry.workflow(
+      "created",
+      {
+        workflowId: workflow.id,
+        nodeCount: workflow.definition.nodes.length,
+        ...(source ? { via: source } : {}),
+      },
+      { userId: requestUserId ?? null },
+    ),
   );
   return workflow;
 }
@@ -7578,11 +7594,13 @@ async function deleteWorkflowRows(id: string, source?: "api" | "mcp"): Promise<b
   const deleted = result.changes > 0;
   if (deleted) {
     // afterCommit: a caller's transaction that rolls back must not report the delete.
+    const requestUserId = getCurrentRequestUserId();
     getDbClient().afterCommit(() =>
-      telemetry.workflow("deleted", {
-        workflowId: id,
-        ...(source ? { source } : {}),
-      }),
+      telemetry.workflow(
+        "deleted",
+        { workflowId: id, ...(source ? { via: source } : {}) },
+        { userId: requestUserId ?? null },
+      ),
     );
   }
   return deleted;
@@ -7669,6 +7687,7 @@ export async function getWorkflowRun(id: string): Promise<WorkflowRun | null> {
 
 function emitWorkflowTerminalTelemetry(run: WorkflowRun): void {
   if (run.status !== "completed" && run.status !== "failed") return;
+  const status = run.status;
 
   // afterCommit (not queueMicrotask): under an async client transaction,
   // microtasks drain before COMMIT, so the verify read below could observe
@@ -7678,9 +7697,9 @@ function emitWorkflowTerminalTelemetry(run: WorkflowRun): void {
   // crashing the process as an unhandled rejection.
   getDbClient().afterCommit(async () => {
     const latest = await getWorkflowRun(run.id);
-    if (!latest || latest.status !== run.status) return;
+    if (!latest || latest.status !== status) return;
     const steps = await getWorkflowRunStepsByRunId(run.id);
-    telemetry.workflow(run.status, {
+    telemetry.workflow(status, {
       workflowId: run.workflowId,
       durationMs: run.startedAt ? Date.now() - new Date(run.startedAt).getTime() : undefined,
       stepsCompleted: steps.filter((step) => step.status === "completed").length,
@@ -12046,6 +12065,8 @@ export async function createUser(data: {
     ],
   );
   if (!row) throw new Error("Failed to create user");
+  // The org's email domain may come from this user (debounced, post-commit).
+  getDbClient().afterCommit(scheduleOrgDomainRecompute);
   return rowToUser(row);
 }
 
@@ -12118,6 +12139,7 @@ export async function updateUser(
     `UPDATE users SET ${sets.join(", ")} WHERE id = ? RETURNING *`,
     params,
   );
+  if (row) getDbClient().afterCommit(scheduleOrgDomainRecompute);
   return row ? rowToUser(row) : null;
 }
 
@@ -12227,6 +12249,7 @@ export async function deleteUser(id: string, replacementUserId?: string): Promis
     await reclassifyTaskHumanFree(reclassifySeedIds);
 
     const result = await tx.run("DELETE FROM users WHERE id = ?", [id]);
+    if (result.changes > 0) getDbClient().afterCommit(scheduleOrgDomainRecompute);
     return result.changes > 0;
   });
 }
