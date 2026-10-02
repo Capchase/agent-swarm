@@ -598,6 +598,8 @@ describe("script connections", () => {
       markMigrationApplied(database, "190_memory_rating_model.sql");
       // 191 indexes context_versions, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "191_context_versions_previous_index.sql");
+      // 192 rebuilds user_favorites, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "192_favorites_agent_fs_path.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

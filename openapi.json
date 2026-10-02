@@ -171,7 +171,8 @@
               "schedule",
               "workflow",
               "linear",
-              "jira"
+              "jira",
+              "comb"
             ],
             "default": "mcp"
           },
@@ -2067,7 +2068,8 @@
             "enum": [
               "page",
               "workflow",
-              "schedule"
+              "schedule",
+              "agent-fs-path"
             ]
           },
           "itemId": {
@@ -15138,6 +15140,353 @@
         }
       }
     },
+    "/api/comb/review-batches": {
+      "post": {
+        "summary": "Send agent-fs comments to the swarm as one lead task",
+        "description": "Comb's 'Send to swarm'. The server reads each comment again from agent-fs with its bootstrap key, skips replies, resolved comments, and comments already sent, and creates ONE task for the lead. Each sent comment gets a `[comb:sent task=<id>]` reply from the swarm service account. A comment is sent at most once. When an earlier send lost its reply, the batch posts that reply again (`repaired`). Answers 404 while COMB_ENABLED is off.",
+        "tags": [
+          "Comb"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "orgId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "driveId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "commentIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "minItems": 1,
+                    "maxItems": 50
+                  },
+                  "scopePath": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  }
+                },
+                "required": [
+                  "orgId",
+                  "driveId",
+                  "commentIds",
+                  "scopePath"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "No new task: the batch only posted missing 'sent' replies again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "taskId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sent": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "skipped": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "enum": [
+                              "not-found",
+                              "reply",
+                              "resolved",
+                              "already-sent"
+                            ]
+                          },
+                          "taskId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "reason"
+                        ]
+                      }
+                    },
+                    "repaired": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "taskId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "taskId"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "taskId",
+                    "sent",
+                    "skipped",
+                    "repaired"
+                  ]
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Task created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "taskId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sent": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "skipped": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "enum": [
+                              "not-found",
+                              "reply",
+                              "resolved",
+                              "already-sent"
+                            ]
+                          },
+                          "taskId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "reason"
+                        ]
+                      }
+                    },
+                    "repaired": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "taskId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "taskId"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "taskId",
+                    "sent",
+                    "skipped",
+                    "repaired"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body, or not the swarm drive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller cannot create tasks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Comb is not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Nothing to send (every comment was skipped)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "skipped": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "enum": [
+                              "not-found",
+                              "reply",
+                              "resolved",
+                              "already-sent"
+                            ]
+                          },
+                          "taskId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "reason"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "skipped"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Task creation blocked by an extension",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "agent-fs could not read a comment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "agent-fs or the swarm drive is not set up, or an operator disabled a Comb review template",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "skipped": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "enum": [
+                              "not-found",
+                              "reply",
+                              "resolved",
+                              "already-sent"
+                            ]
+                          },
+                          "taskId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "reason"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "skipped"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/tasks/{id}/context": {
       "post": {
         "summary": "Record a context usage snapshot for a task",
@@ -18552,7 +18901,8 @@
               "enum": [
                 "page",
                 "workflow",
-                "schedule"
+                "schedule",
+                "agent-fs-path"
               ]
             },
             "required": false,
@@ -18630,7 +18980,8 @@
                     "enum": [
                       "page",
                       "workflow",
-                      "schedule"
+                      "schedule",
+                      "agent-fs-path"
                     ]
                   },
                   "itemId": {
@@ -18666,7 +19017,8 @@
                       "enum": [
                         "page",
                         "workflow",
-                        "schedule"
+                        "schedule",
+                        "agent-fs-path"
                       ]
                     },
                     "itemId": {
@@ -25137,7 +25489,7 @@
     "/status": {
       "get": {
         "summary": "Identity + setup readiness + live activity for the swarm dashboard",
-        "description": "Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; setup milestones each emit `unverified | configured | verified`; automations report `running | needs_setup` from the same runtime preflight used at dispatch; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set; telemetry reports the effective ANONYMIZED_TELEMETRY opt-out state.",
+        "description": "Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; setup milestones each emit `unverified | configured | verified`; automations report `running | needs_setup` from the same runtime preflight used at dispatch; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set, plus the Comb settings (COMB_ENABLED, the browser-facing agent-fs URL, the shared org and drive ids, and the agent-fs user id of the swarm service account); telemetry reports the effective ANONYMIZED_TELEMETRY opt-out state.",
         "tags": [
           "Status"
         ],
@@ -25338,13 +25690,57 @@
                         "capabilities": {
                           "type": "object",
                           "additionalProperties": {}
+                        },
+                        "comb": {
+                          "type": "object",
+                          "properties": {
+                            "enabled": {
+                              "type": "boolean"
+                            },
+                            "api_url": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "live_url": {
+                              "type": "string"
+                            },
+                            "org_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "drive_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "service_user_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "enabled",
+                            "api_url",
+                            "live_url",
+                            "org_id",
+                            "drive_id",
+                            "service_user_id"
+                          ]
                         }
                       },
                       "required": [
                         "configured",
                         "base_url",
                         "provider_id",
-                        "capabilities"
+                        "capabilities",
+                        "comb"
                       ]
                     },
                     "automations": {
@@ -30547,6 +30943,63 @@
                   "required": [
                     "error"
                   ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/realtime/ticket": {
+      "post": {
+        "summary": "Issue a one-shot dashboard realtime ticket",
+        "tags": [
+          "Rooms"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One-shot realtime ticket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "expiresAt": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "ticket",
+                    "expiresAt"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Comb presence is not allowed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Comb is not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -40810,7 +41263,8 @@
                                       "schedule",
                                       "workflow",
                                       "linear",
-                                      "jira"
+                                      "jira",
+                                      "comb"
                                     ],
                                     "default": "mcp"
                                   },
@@ -46146,7 +46600,8 @@
                                   "schedule",
                                   "workflow",
                                   "linear",
-                                  "jira"
+                                  "jira",
+                                  "comb"
                                 ],
                                 "default": "mcp"
                               },
@@ -46456,7 +46911,8 @@
                       "schedule",
                       "workflow",
                       "linear",
-                      "jira"
+                      "jira",
+                      "comb"
                     ]
                   },
                   "outputSchema": {

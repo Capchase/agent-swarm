@@ -364,6 +364,7 @@ export const AgentTaskSourceSchema = z.enum([
   "workflow",
   "linear",
   "jira",
+  "comb",
 ]);
 export type AgentTaskSource = z.infer<typeof AgentTaskSourceSchema>;
 
@@ -1045,7 +1046,7 @@ export type InboxItemState = z.infer<typeof InboxItemStateSchema>;
 // User Favorites (principal-scoped stars for app navigation)
 // ============================================================================
 
-export const FavoriteItemTypeSchema = z.enum(["page", "workflow", "schedule"]);
+export const FavoriteItemTypeSchema = z.enum(["page", "workflow", "schedule", "agent-fs-path"]);
 export type FavoriteItemType = z.infer<typeof FavoriteItemTypeSchema>;
 
 export const UserFavoriteSchema = z
