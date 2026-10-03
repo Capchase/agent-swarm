@@ -352,6 +352,28 @@ const COMMAND_HELP: Record<
       `  ${binName} claude-managed-setup --api-url https://swarm.example.com`,
     ].join("\n"),
   },
+  attach: {
+    usage: [
+      `${binName} attach <agent-name> [--task <task-id>] [--prompt <text>] [--json] [--poll-ms <n>]`,
+      `${binName} attach setup [--api-url <url>] [--token <aswt_...>] [--yes]`,
+    ].join("\n  "),
+    description:
+      "Control one swarm agent from this terminal: watch its session live, queue messages, cancel, or start a follow-up task. Uses the REST API with a personal aswt_ token.",
+    options: [
+      "  setup                         Validate and store the API URL and user token in ~/.config/agent-swarm/cli.json",
+      "  <agent-name>                  Attach to the agent's running task, or start a new one",
+      "  --task <task-id>              Attach to this task, or continue from it",
+      "  --prompt <text>               First message when no task runs",
+      "  --json                        One JSON object per line, commands from stdin",
+      "  --poll-ms <n>                 Log poll interval (default 3000)",
+      "  Interactive commands: /steer <text>, /cancel, /new <text>, /status, /help, /quit",
+    ].join("\n"),
+    examples: [
+      `  ${binName} attach setup --api-url https://swarm.example.com --token aswt_xxx`,
+      `  ${binName} attach Picateclas`,
+      `  ${binName} attach Picateclas --task <task-id>`,
+    ].join("\n"),
+  },
   e2b: {
     usage: `${binName} e2b <subcommand> [options]`,
     description:
@@ -423,6 +445,7 @@ function printHelp(command?: string) {
   const commands = [
     ["onboard", "Set up a new swarm from scratch (Docker Compose)"],
     ["connect", "Connect this project to an existing swarm"],
+    ["attach", "Attach to an agent: live session, queue messages, cancel"],
     ["worker", "Run Claude in headless loop mode"],
     ["lead", "Run Claude as lead agent in headless loop"],
     ["api", "Start the API + MCP HTTP server"],
@@ -795,6 +818,10 @@ if (args.showHelp || args.command === "help" || args.command === undefined) {
   const { runClaudeManagedSetup } = await import("./commands/claude-managed-setup");
   const setupArgs = process.argv.slice(process.argv.indexOf("claude-managed-setup") + 1);
   await runClaudeManagedSetup(setupArgs);
+} else if (args.command === "attach") {
+  const { runAttachCommand } = await import("./commands/attach");
+  const attachArgs = process.argv.slice(process.argv.indexOf("attach") + 1);
+  await runAttachCommand(attachArgs);
 } else if (args.command === "e2b") {
   const { runE2BCommand } = await import("./commands/e2b");
   const e2bArgs = process.argv.slice(process.argv.indexOf("e2b") + 1);

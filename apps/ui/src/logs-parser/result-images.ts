@@ -30,9 +30,10 @@ function imageBlock(value: unknown): ResultImage | undefined {
   // OpenCode's tool state attachments are FileParts, with an inline data URL.
   if (block.type === "file" && typeof block.url === "string") {
     const match = /^data:(image\/[a-z+]+);base64,/.exec(block.url);
-    if (match && IMAGE_MIME.test(match[1]) && block.mime === match[1]) {
+    const mimeType = match?.[1];
+    if (match && mimeType && IMAGE_MIME.test(mimeType) && block.mime === mimeType) {
       const data = block.url.slice(match[0].length);
-      if (data) return { mimeType: match[1], data };
+      if (data) return { mimeType, data };
     }
   }
 }

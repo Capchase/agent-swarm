@@ -115,7 +115,7 @@ function parseCodexLoginArgs(args: string[]): ParsedCodexLoginArgs {
   return parsed;
 }
 
-async function promptTextInput(label: string, defaultValue: string): Promise<string> {
+export async function promptTextInput(label: string, defaultValue: string): Promise<string> {
   const { createInterface } = await import("node:readline");
   const rl = createInterface({
     input: process.stdin,
