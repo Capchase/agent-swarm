@@ -86,6 +86,7 @@ const OPERATOR_ONLY_VERBS: PermissionVerb[] = [];
 const LEAD_OR_OPERATOR_OR_USER_VERBS: PermissionVerb[] = [
   "mcp-server.stdio.write",
   "extension.write",
+  "task.requester.assign",
   "extension.activate",
   "extension.install.inline",
   "repo.merge-policy.write",
