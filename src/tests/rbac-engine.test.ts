@@ -88,6 +88,7 @@ const LEAD_OR_OPERATOR_OR_USER_VERBS: PermissionVerb[] = [
   "extension.write",
   "extension.activate",
   "extension.install.inline",
+  "repo.merge-policy.write",
 ];
 const OPERATOR_OR_USER_VERBS: PermissionVerb[] = ["comb.presence"];
 
