@@ -170,7 +170,11 @@ import {
   reservedRoleViolation,
   rowToAgent,
 } from "./db/agents";
-import { type ApprovalRequestListFilters, approvalRequestListClause } from "./db/approvals";
+import {
+  type ApprovalRequestListFilters,
+  type ApprovalVote,
+  approvalRequestListClause,
+} from "./db/approvals";
 import {
   computeContentHash,
   createContextVersion,
@@ -231,7 +235,13 @@ export {
   updateAgentStatusFromCapacity,
 } from "./db/agents";
 export { recordKeySeatMismatch } from "./db/api-keys";
-export { type ApprovalRequestSummary, listApprovalRequestSummaries } from "./db/approvals";
+export {
+  type ApprovalRequestSummary,
+  type ApprovalVote,
+  getPendingApprovalVoteState,
+  listApprovalRequestSummaries,
+  recordApprovalVotes,
+} from "./db/approvals";
 export {
   computeContentHash,
   createContextVersion,
@@ -9460,6 +9470,7 @@ export interface ApprovalRequest {
   approvers: unknown;
   status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
   responses: unknown | null;
+  approvals: ApprovalVote[] | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
   resolutionReason: string | null;
@@ -9481,6 +9492,7 @@ interface ApprovalRequestRow {
   approvers: string;
   status: string;
   responses: string | null;
+  approvals: string | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
   resolutionReason: string | null;
@@ -9504,6 +9516,7 @@ function rowToApprovalRequest(row: ApprovalRequestRow): ApprovalRequest {
     approvers: JSON.parse(row.approvers),
     status: row.status as ApprovalRequest["status"],
     responses: row.responses ? JSON.parse(row.responses) : null,
+    approvals: row.approvals ? JSON.parse(row.approvals) : null,
     resolvedBy: row.resolvedBy,
     resolvedAt: normalizeDate(row.resolvedAt),
     resolutionReason: row.resolutionReason,
@@ -9593,6 +9606,7 @@ export async function resolveApprovalRequest(
   data: {
     status: "approved" | "rejected" | "timeout";
     responses?: unknown;
+    approvals?: ApprovalVote[];
     resolvedBy?: string;
     resolutionReason?: string;
   },
@@ -9619,14 +9633,15 @@ export async function resolveApprovalRequest(
     : "";
   const row = await getDbClient().get<ApprovalRequestRow>(
     `UPDATE approval_requests
-       SET status = ?, responses = ?, resolvedBy = ?, resolutionReason = ?, resolvedAt = ?,
-           updatedAt = ?
+       SET status = ?, responses = ?, approvals = COALESCE(?, approvals), resolvedBy = ?,
+           resolutionReason = ?, resolvedAt = ?, updatedAt = ?
        WHERE id = ? AND status = 'pending'
          ${actionableWorkflowClause}
        RETURNING *`,
     [
       data.status,
       data.responses ? JSON.stringify(data.responses) : null,
+      data.approvals ? JSON.stringify(data.approvals) : null,
       data.resolvedBy ?? null,
       data.resolutionReason ?? null,
       now,

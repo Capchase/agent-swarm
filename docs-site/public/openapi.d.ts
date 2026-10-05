@@ -3208,6 +3208,26 @@ export interface paths {
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
                                 resolutionReason: string | null;
@@ -3230,6 +3250,14 @@ export interface paths {
                                 sourceTaskId: string | null;
                                 /** @enum {string} */
                                 status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
                                 timeoutSeconds: number | null;
@@ -3342,6 +3370,26 @@ export interface paths {
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
                                 resolutionReason: string | null;
@@ -3439,6 +3487,26 @@ export interface paths {
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
                                 resolutionReason: string | null;
@@ -3485,7 +3553,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Submit a response to an approval request */
+        /**
+         * Submit a response to an approval request
+         * @description Only a person may answer: a user token, a page session signed for a user, or the shared key with no agent identity (recorded as `operator`). The responder is taken from the credential. When the request lists `approvers.users` or `approvers.roles`, a user must match one of them. A rejection resolves the request at once; approvals resolve it when the `any`, `all` or `{ min: N }` policy is met, and until then it stays pending with the answer recorded in `approvals`.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -3501,12 +3572,13 @@ export interface paths {
                         responses: {
                             [key: string]: unknown;
                         };
+                        /** @description Unverified display name. Stored as `claimedRespondedBy` on the answer; never used as the responder. */
                         respondedBy?: string;
                     };
                 };
             };
             responses: {
-                /** @description Response recorded */
+                /** @description Response recorded. `status` stays `pending` while the policy needs more approvals. */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -3549,6 +3621,26 @@ export interface paths {
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
                                 resolutionReason: string | null;
@@ -3576,6 +3668,15 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
+                /** @description Caller is an agent, or is not one of the request's approvers */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 /** @description Not found */
                 404: {
                     headers: {
@@ -3585,7 +3686,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description Already resolved */
+                /** @description Already resolved, or this responder already answered */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -3672,6 +3773,26 @@ export interface paths {
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
                                 resolutionReason: string | null;

@@ -65,6 +65,7 @@ type:ApiKeyStatus
 type:AppVersion
 type:ApprovalRequest
 type:ApprovalRequestSummary
+type:ApprovalVote
 type:AssetSummaryFilters
 type:AttributionByPersonRow
 type:AvailableKeyIndicesResult
@@ -349,6 +350,7 @@ value:getPageBySlug
 value:getPageVersion
 value:getPageVersions
 value:getPausedTasksForAgent
+value:getPendingApprovalVoteState
 value:getPendingEventWaitNames
 value:getPendingSlackRelayTasks
 value:getPendingSteeringForAgent
@@ -522,6 +524,7 @@ value:postMessage
 value:promoteAbandonedDraftTasks
 value:promoteDraftTask
 value:reassociateSessionLogs
+value:recordApprovalVotes
 value:recordBudgetRefusalNotification
 value:recordInlineScriptRun
 value:recordKeyAuthFailure
