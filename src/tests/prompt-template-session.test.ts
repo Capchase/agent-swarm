@@ -37,6 +37,7 @@ const SYSTEM_TEMPLATES = [
   "system.agent.steering.delivery",
   "system.agent.tool_preload",
   "system.agent.tool_discovery.search",
+  "system.agent.tool_discovery.amp",
   "system.agent.tool_discovery.direct",
   "system.agent.tools_skills",
   "system.agent.worker",
@@ -115,11 +116,11 @@ describe("Session templates: registration", () => {
     expect(sessionSystemEventTypes("session")).toEqual([...SESSION_TEMPLATES].sort());
   });
 
-  test("registers 29 system and session templates in total", () => {
+  test("registers 30 system and session templates in total", () => {
     const all = getAllTemplateDefinitions();
     const sessionSystem = all.filter((d) => d.category === "system" || d.category === "session");
-    // 24 system blocks + 5 session composites.
-    expect(sessionSystem.length).toBe(29);
+    // 25 system blocks + 5 session composites.
+    expect(sessionSystem.length).toBe(30);
   });
 
   test("drops the v1 blocks that prompt v2 deleted", () => {

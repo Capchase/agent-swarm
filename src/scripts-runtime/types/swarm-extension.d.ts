@@ -91,6 +91,7 @@ declare module "swarm-extension" {
             | "opencode"
             | "acp"
             | "dsh"
+            | "amp"
             | "cursor"
             | undefined;
           leadOnly?: boolean | undefined;
@@ -218,6 +219,7 @@ declare module "swarm-extension" {
       | "opencode"
       | "acp"
       | "dsh"
+      | "amp"
       | "cursor"
       | undefined;
     providerMeta?: Record<string, unknown> | undefined;
@@ -238,6 +240,7 @@ declare module "swarm-extension" {
             | "opencode"
             | "acp"
             | "dsh"
+            | "amp"
             | "cursor"
             | undefined;
           leadOnly?: boolean | undefined;

@@ -50,6 +50,8 @@ const ADAPTERS: Record<string, Adapter> = {
   codex: normalizeCodex,
   opencode: normalizeOpencode,
   dsh: normalizeDsh,
+  // Amp's `--stream-json` is Claude Code-compatible: assistant, user, system and result events.
+  amp: normalizeAnthropic,
   cursor: normalizeCursor,
 };
 

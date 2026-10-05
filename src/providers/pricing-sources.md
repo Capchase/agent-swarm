@@ -56,6 +56,19 @@ rate by hand should also update this file.
   - DeepSeek direct-API models (models.dev `deepseek` section, bare ids) →
     rows under `provider='dsh'`. dsh's `deepseek-flash` id is not in that
     section and stays `unpriced`.
+  - Anthropic, OpenAI, Google and Fireworks models (models.dev `anthropic`,
+    `openai`, `google`, `fireworks-ai` sections, the vendor's own ids) → rows
+    under `provider='amp'`. Amp reports the model it routed a mode to
+    (`claude-opus-5-5`, `gpt-5-nano-2025-08-07`,
+    `accounts/fireworks/models/glm-5p3-flash`); the lookup strips a
+    `provider/` pin prefix and an OpenAI `-YYYY-MM-DD` snapshot date. A model
+    outside these sections stays `unpriced`. An `amp` row without a per-model
+    breakdown (the thread export failed) is `estimated`: its stream totals are
+    priced at the pin, else the model its mode is known to run
+    (`AMP_ESTIMATE_MODELS`), else the `medium` model, never recorded as $0.
+    When the adapter reports what Amp billed (`amp threads usage`, only when
+    every request was billed through Amp), that harness cost wins and the
+    rows above only fill the per-model breakdown.
   - OpenAI, Anthropic, Google and xAI models (bare vendor ids) → rows under
     `provider='cursor'`. Cursor bills the vendor's API rates and reports the
     vendor's own id. Cursor's own models are not in models.dev: see

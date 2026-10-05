@@ -1,6 +1,7 @@
 import type { ReactElement, SVGProps } from "react";
 import { isProviderName, type ProviderName } from "@/api/types";
 import { cn } from "@/lib/utils";
+import { AmpMark } from "./amp-mark";
 
 // Inline SVGs (paths from agent-swarm-internal/apps/web/public/harness-logos/).
 // We render them as inline <svg> rather than <img src=...>:
@@ -150,6 +151,7 @@ const ICON_BY_HARNESS: Record<ProviderName, (p: IconProps) => ReactElement> = {
   devin: DevinIcon,
   acp: AcpIcon,
   dsh: DshIcon,
+  amp: AmpMark,
   cursor: CursorIcon,
 };
 

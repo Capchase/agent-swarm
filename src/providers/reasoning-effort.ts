@@ -28,7 +28,7 @@ export { REASONING_EFFORT_LEVELS };
 export type ReasoningEffort = ReasoningEffortLevel;
 
 /** The local harnesses this feature covers (Devin / claude-managed / ACP are out of scope). */
-export type ReasoningHarness = "claude" | "codex" | "pi" | "opencode" | "dsh" | "cursor";
+export type ReasoningHarness = "claude" | "codex" | "pi" | "opencode" | "dsh" | "cursor" | "amp";
 
 export interface ReasoningCapability {
   supported: boolean;
@@ -53,6 +53,7 @@ export type ReasoningEffortApplication =
       options: Record<string, unknown>;
     }
   | { kind: "dsh-effort"; reasoningEffort: ReasoningEffort }
+  | { kind: "amp-effort"; reasoningEffort: ReasoningEffort }
   | { kind: "cursor-effort"; reasoningEffort: ReasoningEffort }
   | { kind: "noop" };
 
@@ -213,6 +214,10 @@ export function applyReasoningEffort(
       // dsh's own level names match the normalized enum; the adapter decides
       // the per-route transport (see `src/providers/dsh-adapter.ts`).
       return { kind: "dsh-effort", reasoningEffort: level };
+    case "amp":
+      // The adapter hands this to the per-task plugin agent (`off` -> `none`);
+      // see `src/providers/amp-adapter.ts`. Amp has no effort flag.
+      return { kind: "amp-effort", reasoningEffort: level };
     case "cursor":
       // Each Cursor model names its effort parameter and values itself
       // (`reasoning`, `reasoning_effort`, `effort`); the adapter maps the

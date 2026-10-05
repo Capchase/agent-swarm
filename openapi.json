@@ -447,6 +447,7 @@
               "opencode",
               "acp",
               "dsh",
+              "amp",
               "cursor"
             ]
           },
@@ -519,6 +520,7 @@
               "opencode",
               "acp",
               "dsh",
+              "amp",
               "cursor"
             ]
           },
@@ -667,6 +669,7 @@
               "opencode",
               "acp",
               "dsh",
+              "amp",
               "cursor",
               null
             ],
@@ -1000,6 +1003,7 @@
               "opencode",
               "acp",
               "dsh",
+              "amp",
               "cursor"
             ]
           },
@@ -1017,6 +1021,7 @@
               "opencode",
               "acp",
               "dsh",
+              "amp",
               "cursor",
               null
             ]
@@ -3164,6 +3169,7 @@
               "gemini",
               "acp",
               "dsh",
+              "amp",
               "cursor"
             ]
           },
@@ -3579,7 +3585,8 @@
             "enum": [
               "harness",
               "pricing-table",
-              "unpriced"
+              "unpriced",
+              "estimated"
             ],
             "default": "harness"
           },
@@ -9695,6 +9702,7 @@
                       "opencode",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   },
@@ -9709,6 +9717,7 @@
                       "opencode",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   },
@@ -9999,6 +10008,7 @@
                       "opencode",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   }
@@ -10216,6 +10226,7 @@
                       "opencode",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   },
@@ -11315,6 +11326,7 @@
                         "opencode",
                         "acp",
                         "dsh",
+                        "amp",
                         "cursor",
                         null
                       ]
@@ -11333,6 +11345,7 @@
                         "opencode",
                         "acp",
                         "dsh",
+                        "amp",
                         "cursor",
                         null
                       ]
@@ -11453,6 +11466,7 @@
                               "opencode",
                               "acp",
                               "dsh",
+                              "amp",
                               "cursor",
                               null
                             ]
@@ -11471,6 +11485,7 @@
                               "opencode",
                               "acp",
                               "dsh",
+                              "amp",
                               "cursor",
                               null
                             ]
@@ -24541,6 +24556,7 @@
                               "opencode",
                               "acp",
                               "dsh",
+                              "amp",
                               "cursor"
                             ]
                           },
@@ -26480,6 +26496,7 @@
                               "opencode",
                               "acp",
                               "dsh",
+                              "amp",
                               "cursor"
                             ]
                           },
@@ -26499,6 +26516,7 @@
                                     "opencode",
                                     "acp",
                                     "dsh",
+                                    "amp",
                                     "cursor"
                                   ]
                                 },
@@ -26827,6 +26845,7 @@
                       "opencode",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   }
@@ -27414,6 +27433,7 @@
                                   "opencode",
                                   "acp",
                                   "dsh",
+                                  "amp",
                                   "cursor"
                                 ]
                               },
@@ -28406,6 +28426,7 @@
                                   "opencode",
                                   "acp",
                                   "dsh",
+                                  "amp",
                                   "cursor"
                                 ]
                               },
@@ -31115,6 +31136,7 @@
                 "gemini",
                 "acp",
                 "dsh",
+                "amp",
                 "cursor"
               ]
             },
@@ -31198,6 +31220,7 @@
                 "gemini",
                 "acp",
                 "dsh",
+                "amp",
                 "cursor"
               ]
             },
@@ -31314,6 +31337,7 @@
                 "gemini",
                 "acp",
                 "dsh",
+                "amp",
                 "cursor"
               ]
             },
@@ -31398,6 +31422,7 @@
                 "gemini",
                 "acp",
                 "dsh",
+                "amp",
                 "cursor"
               ]
             },
@@ -41309,6 +41334,7 @@
                       "gemini",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   },
@@ -42263,6 +42289,7 @@
                                       "opencode",
                                       "acp",
                                       "dsh",
+                                      "amp",
                                       "cursor"
                                     ]
                                   },
@@ -47610,6 +47637,7 @@
                                   "opencode",
                                   "acp",
                                   "dsh",
+                                  "amp",
                                   "cursor"
                                 ]
                               },
@@ -48086,6 +48114,7 @@
                           "opencode",
                           "acp",
                           "dsh",
+                          "amp",
                           "cursor"
                         ]
                       },
@@ -49031,6 +49060,7 @@
                       "opencode",
                       "acp",
                       "dsh",
+                      "amp",
                       "cursor"
                     ]
                   }

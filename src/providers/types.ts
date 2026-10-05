@@ -55,7 +55,8 @@ export interface CostData {
     | "devin"
     | "acp"
     | "dsh"
-    | "cursor";
+    | "cursor"
+    | "amp";
 }
 
 import type { ProviderName, SteerMode } from "../types";
