@@ -52,12 +52,12 @@ import { computeBudgetBackoffMs } from "../utils/budget-backoff.ts";
 import { isCodexAuthFailureReason } from "../utils/codex-auth-failure.ts";
 import { getMcpBaseUrl } from "../utils/constants.ts";
 import { getContextWindowSize } from "../utils/context-window.ts";
-import { isEnvFlagEnabled } from "../utils/env-flag.ts";
 import {
   type CredentialSelection,
   ModelWindowExhaustedError,
   resolveCredentialPools,
 } from "../utils/credentials.ts";
+import { isEnvFlagEnabled } from "../utils/env-flag.ts";
 import { resolveCodexCreditsExhaustedCooldownMs } from "../utils/error-tracker.ts";
 import { probeHarnessCliVersion, reportHarnessModelOutcome } from "../utils/harness-cli-version.ts";
 import { resolveHarnessProvider } from "../utils/harness-provider.ts";
