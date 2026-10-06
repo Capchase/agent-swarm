@@ -9,6 +9,7 @@ import {
   rmdir,
   stat,
   unlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -319,8 +320,8 @@ const execFileAsync = promisify(execFile);
  *
  * Read-merge-write: sets `projects[dir].hasTrustDialogAccepted`, keeps every
  * other key, skips the write when nothing changes, and renames a temp file into
- * place (mode preserved). A malformed file is backed up, not clobbered. Claude
- * Code owns `~/.claude.json.lock`; this never touches it.
+ * place (mode preserved). A malformed file is backed up, not clobbered. The
+ * whole cycle runs under the `~/.claude.json.lock` mkdir lock Claude Code uses.
  *
  * Exported for unit testing.
  */
@@ -330,45 +331,128 @@ export async function preseedClaudeTrustDialog(
   homeDir: string = process.env.HOME ?? homedir(),
 ): Promise<void> {
   const claudeJsonPath = join(homeDir, ".claude.json");
-  await withClaudeJsonLock(claudeJsonPath, () => seedTrustLocked(claudeJsonPath, dirs));
+  // Mutual exclusion on a mkdir lock cannot be made airtight against stale
+  // takeover, so confirm the write landed and redo it if another writer's
+  // overwrite dropped our entries.
+  for (let attempt = 1; ; attempt++) {
+    await withClaudeJsonLock(claudeJsonPath, dirs.join(","), (assertOwned) =>
+      seedTrustLocked(claudeJsonPath, dirs, assertOwned),
+    );
+    if (await trustPersisted(claudeJsonPath, dirs)) return;
+    if (attempt >= CLAUDE_JSON_LOCK_ATTEMPTS) {
+      throw new Error(`trust entries for ${dirs.join(", ")} did not persist in ${claudeJsonPath}`);
+    }
+  }
 }
 
 // Same protocol as Claude Code's writer (proper-lockfile): `mkdir <file>.lock`
-// is the atomic acquire, and a lock whose mtime is older than 10s is stale.
+// is the atomic acquire, the owner refreshes the mtime while it works, and a
+// lock whose mtime is older than 10s is stale. Two additions keep stale recovery
+// from admitting two writers:
+//  - takeover renames the lock to a unique tombstone and re-checks the
+//    tombstone's mtime. If it is fresh, we grabbed a live successor's lock, so
+//    we put it back instead of deleting it.
+//  - the owner records the lock's inode and re-checks it right before the
+//    rename that commits the write. A lost lock throws and the whole
+//    read-merge-write retries under a fresh lock.
 const CLAUDE_JSON_LOCK_STALE_MS = 10_000;
+const CLAUDE_JSON_LOCK_RENEW_MS = 3_000;
 const CLAUDE_JSON_LOCK_TIMEOUT_MS = 15_000;
+const CLAUDE_JSON_LOCK_ATTEMPTS = 5;
 
-async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T>): Promise<T> {
+class ClaudeJsonLockLostError extends Error {}
+
+/** Test seams: pause a caller at a named point of the lock protocol. */
+export const claudeJsonLockTestHooks: {
+  beforeStaleTakeover?: (label: string) => Promise<void>;
+  insideLock?: (label: string) => Promise<void>;
+} = {};
+
+async function withClaudeJsonLock<T>(
+  claudeJsonPath: string,
+  label: string,
+  fn: (assertOwned: () => Promise<void>) => Promise<T>,
+): Promise<T> {
   const lockPath = `${claudeJsonPath}.lock`;
   const deadline = Date.now() + CLAUDE_JSON_LOCK_TIMEOUT_MS;
-  for (;;) {
+  for (let attempt = 1; ; attempt++) {
+    const ino = await acquireClaudeJsonLock(lockPath, label, deadline);
+    const renew = setInterval(() => {
+      const now = new Date();
+      utimes(lockPath, now, now).catch(() => {});
+    }, CLAUDE_JSON_LOCK_RENEW_MS);
+    renew.unref?.();
+    const assertOwned = async () => {
+      const current = await stat(lockPath).catch(() => null);
+      if (!current || current.ino !== ino) throw new ClaudeJsonLockLostError(lockPath);
+    };
     try {
-      await mkdir(lockPath);
-      break;
+      await claudeJsonLockTestHooks.insideLock?.(label);
+      return await fn(assertOwned);
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw err;
-      try {
-        const { mtimeMs } = await stat(lockPath);
-        if (Date.now() - mtimeMs > CLAUDE_JSON_LOCK_STALE_MS) {
-          await rmdir(lockPath).catch(() => {});
-          continue;
-        }
-      } catch {
-        continue; // lock vanished between mkdir and stat; retry
-      }
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${lockPath}`);
-      await new Promise((r) => setTimeout(r, 20 + Math.random() * 30));
+      if (err instanceof ClaudeJsonLockLostError && attempt < CLAUDE_JSON_LOCK_ATTEMPTS) continue;
+      throw err;
+    } finally {
+      clearInterval(renew);
+      // Only release a lock we still own; never delete a successor's.
+      const current = await stat(lockPath).catch(() => null);
+      if (current && current.ino === ino) await rmdir(lockPath).catch(() => {});
     }
-  }
-  try {
-    return await fn();
-  } finally {
-    await rmdir(lockPath).catch(() => {});
   }
 }
 
-async function seedTrustLocked(claudeJsonPath: string, dirs: string[]): Promise<void> {
+async function acquireClaudeJsonLock(
+  lockPath: string,
+  label: string,
+  deadline: number,
+): Promise<number> {
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      return (await stat(lockPath)).ino;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "ENOENT") throw err; // ENOENT: taken over under us
+    }
+    const seen = await stat(lockPath).catch(() => null);
+    if (!seen) continue; // lock vanished; retry the mkdir
+    if (Date.now() - seen.mtimeMs > CLAUDE_JSON_LOCK_STALE_MS) {
+      await claudeJsonLockTestHooks.beforeStaleTakeover?.(label);
+      const tomb = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+      try {
+        await rename(lockPath, tomb);
+        const moved = await stat(tomb);
+        if (Date.now() - moved.mtimeMs > CLAUDE_JSON_LOCK_STALE_MS) {
+          await rmdir(tomb).catch(() => {});
+        } else {
+          // Took a live successor's lock: put it back; its owner re-checks.
+          await rename(tomb, lockPath).catch(() => rmdir(tomb).catch(() => {}));
+        }
+      } catch {
+        // someone else took it over first
+      }
+      continue;
+    }
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${lockPath}`);
+    await new Promise((r) => setTimeout(r, 20 + Math.random() * 30));
+  }
+}
+
+async function trustPersisted(claudeJsonPath: string, dirs: string[]): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(await readFile(claudeJsonPath, "utf-8"));
+    const projects = (parsed?.projects ?? {}) as Record<string, Record<string, unknown>>;
+    return dirs.every((d) => projects[d]?.hasTrustDialogAccepted === true);
+  } catch {
+    return false;
+  }
+}
+
+async function seedTrustLocked(
+  claudeJsonPath: string,
+  dirs: string[],
+  assertOwned: () => Promise<void>,
+): Promise<void> {
   let data: Record<string, unknown> = {};
   let mode: number | undefined;
   try {
@@ -408,6 +492,7 @@ async function seedTrustLocked(claudeJsonPath: string, dirs: string[]): Promise<
   const tmp = `${claudeJsonPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
     await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: mode ?? 0o600, flag: "wx" });
+    await assertOwned();
     await rename(tmp, claudeJsonPath);
   } catch (err) {
     await unlink(tmp).catch(() => {});

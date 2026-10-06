@@ -32,6 +32,7 @@ import {
   readFile,
   realpath,
   rm,
+  rmdir,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -39,6 +40,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ClaudeAdapter,
+  claudeJsonLockTestHooks,
   parseClaudeBinary,
   parseClaudeBridgeEnabled,
   preseedClaudeTrustDialog,
@@ -489,7 +491,22 @@ describe("preseedClaudeTrustDialog", () => {
     expect(leftovers).toEqual([]);
   });
 
-  test("waits for a held lock and clears a stale one", async () => {
+  test("waits for a fresh held lock until it is released", async () => {
+    const lock = join(homeDir, ".claude.json.lock");
+    await mkdir(lock);
+    let done = false;
+    const seeding = preseedClaudeTrustDialog(["/after/held"], homeDir).then(() => {
+      done = true;
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(done).toBe(false);
+    await rmdir(lock);
+    await seeding;
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/after/held"].hasTrustDialogAccepted).toBe(true);
+  });
+
+  test("clears a stale lock", async () => {
     const lock = join(homeDir, ".claude.json.lock");
     await mkdir(lock);
     const old = new Date(Date.now() - 60_000);
@@ -497,6 +514,63 @@ describe("preseedClaudeTrustDialog", () => {
     await preseedClaudeTrustDialog(["/after/stale"], homeDir);
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/after/stale"].hasTrustDialogAccepted).toBe(true);
+  });
+
+  test("two waiters on a stale lock never both enter (stale-recovery race)", async () => {
+    const lock = join(homeDir, ".claude.json.lock");
+    await mkdir(lock);
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+
+    // Both waiters have seen the stale lock. A takes over and holds the new
+    // lock; only then does B resume its takeover against A's fresh lock.
+    let aHoldsLock!: () => void;
+    const aHolds = new Promise<void>((r) => {
+      aHoldsLock = r;
+    });
+    let bTookOver!: () => void;
+    const bDone = new Promise<void>((r) => {
+      bTookOver = r;
+    });
+    claudeJsonLockTestHooks.beforeStaleTakeover = async (label) => {
+      if (label === "/b") {
+        await aHolds;
+        setTimeout(bTookOver, 100); // let B's rename/restore finish
+      }
+    };
+    claudeJsonLockTestHooks.insideLock = async (label) => {
+      if (label === "/a") {
+        aHoldsLock();
+        await bDone; // A is mid-transaction while B attempts the takeover
+      }
+    };
+    try {
+      await Promise.all([
+        preseedClaudeTrustDialog(["/a"], homeDir),
+        preseedClaudeTrustDialog(["/b"], homeDir),
+      ]);
+    } finally {
+      claudeJsonLockTestHooks.beforeStaleTakeover = undefined;
+      claudeJsonLockTestHooks.insideLock = undefined;
+    }
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/a"].hasTrustDialogAccepted).toBe(true);
+    expect(data.projects["/b"].hasTrustDialogAccepted).toBe(true);
+    expect(await readdir(homeDir)).toEqual([".claude.json"]);
+  });
+
+  test("many waiters on a stale lock keep every entry", async () => {
+    for (let round = 0; round < 5; round++) {
+      const lock = join(homeDir, ".claude.json.lock");
+      await mkdir(lock);
+      const old = new Date(Date.now() - 60_000);
+      await utimes(lock, old, old);
+      const dirs = Array.from({ length: 6 }, (_, i) => `/round${round}/${i}`);
+      await Promise.all(dirs.map((d) => preseedClaudeTrustDialog([d], homeDir)));
+      const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+      for (const d of dirs) expect(data.projects[d].hasTrustDialogAccepted).toBe(true);
+    }
+    expect(await readdir(homeDir)).toEqual([".claude.json"]);
   });
 
   test("non-repo cwd: only its real path", async () => {
