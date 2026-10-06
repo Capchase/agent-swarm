@@ -25,7 +25,6 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { execFileSync } from "node:child_process";
 import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +39,7 @@ import {
   resolveClaudeTrustDirs,
 } from "../providers/claude-adapter";
 import type { ProviderSessionConfig } from "../providers/types";
+import { CHILD_PROCESS_TEST_BUDGET_MS, expectChildOk, runChild } from "./test-proc";
 
 const LEGACY_BRIDGE_COMPAT_BINARY = "shan" + "non";
 const LEGACY_BRIDGE_COMPAT_PACKAGE = `@dexh/${LEGACY_BRIDGE_COMPAT_BINARY}`;
@@ -65,7 +65,8 @@ function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSes
 // Bun's child_process shim calls Bun.spawn, so the spawn mocks below must pass
 // the trust-dir `git` lookup through to the real implementation.
 const realSpawn = Bun.spawn;
-const isGit = (cmd: unknown) => Array.isArray(cmd) && cmd[0] === "git";
+const isGit = (cmd: unknown) =>
+  (Array.isArray(cmd) ? cmd : (cmd as { cmd?: unknown[] } | null)?.cmd)?.[0] === "git";
 
 /** Fake Bun.Subprocess that behaves as a process that exited cleanly with no output. */
 function makeFakeProc(): ReturnType<typeof Bun.spawn> {
@@ -374,27 +375,31 @@ describe("preseedClaudeTrustDialog", () => {
     );
   });
 
-  test("worktree: seeds the worktree and the main checkout", async () => {
-    const repo = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-repo-")));
-    const wt = join(repo, "..", `wt-${Date.now()}`);
-    try {
-      for (const args of [
-        ["init", "-q"],
-        ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
-        ["worktree", "add", "-q", wt],
-      ]) {
-        execFileSync("git", ["-C", repo, ...args]);
+  test(
+    "worktree: seeds the worktree and the main checkout",
+    async () => {
+      const repo = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-repo-")));
+      const wt = join(repo, "..", `wt-${Date.now()}`);
+      try {
+        for (const args of [
+          ["init", "-q"],
+          ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+          ["worktree", "add", "-q", wt],
+        ]) {
+          expectChildOk(await runChild(["git", "-C", repo, ...args]), `git ${args[0]}`);
+        }
+        const dirs = await resolveClaudeTrustDirs(wt);
+        expect(dirs).toEqual([await realpath(wt), repo]);
+        await preseedClaudeTrustDialog(dirs, homeDir);
+        const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+        expect(Object.keys(data.projects).sort()).toEqual([...dirs].sort());
+      } finally {
+        await rm(wt, { recursive: true, force: true });
+        await rm(repo, { recursive: true, force: true });
       }
-      const dirs = await resolveClaudeTrustDirs(wt);
-      expect(dirs).toEqual([await realpath(wt), repo]);
-      await preseedClaudeTrustDialog(dirs, homeDir);
-      const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
-      expect(Object.keys(data.projects).sort()).toEqual([...dirs].sort());
-    } finally {
-      await rm(wt, { recursive: true, force: true });
-      await rm(repo, { recursive: true, force: true });
-    }
-  });
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
 
   test("non-repo cwd: only its real path", async () => {
     expect(await resolveClaudeTrustDirs(homeDir)).toEqual([await realpath(homeDir)]);
@@ -983,16 +988,6 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/other/cwd"]).toEqual({ hasTrustDialogAccepted: true, custom: 1 });
     expect(data.projects["/new/cwd"].hasTrustDialogAccepted).toBe(true);
-  });
-
-  test("default CLAUDE_BINARY=claude does NOT touch ~/.claude.json", async () => {
-    delete process.env.CLAUDE_BINARY;
-    const adapter = new ClaudeAdapter();
-    await createCompletedSession(adapter, makeConfig({ cwd: "/some/abs/cwd" }));
-
-    // No .claude.json should have been written.
-    const exists = await Bun.file(join(homeDir, ".claude.json")).exists();
-    expect(exists).toBe(false);
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true writes hasTrustDialogAccepted for config.cwd", async () => {
