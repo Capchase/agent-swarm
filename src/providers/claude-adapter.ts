@@ -1,6 +1,8 @@
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { copyFile, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { deriveDefaultRoute, routeCredentialStatus, routeUnsetEnv } from "@desplega/model-routing";
 import { type Span, trace } from "@opentelemetry/api";
 import {
@@ -10,6 +12,7 @@ import {
 import { isClaudeBridgeEffective, resolveClaudeTransport } from "../utils/claude-transport";
 import { getContextWindowSize } from "../utils/context-window";
 import { CLAUDE_CREDENTIALS_HINT, validateClaudeCredentials } from "../utils/credentials";
+import { isEnvFlagEnabled } from "../utils/env-flag";
 import {
   parseStderrForErrors,
   redactRateLimitEventLine,
@@ -296,62 +299,88 @@ function withClaudeBridgeAuthArgs(
   return [...argv];
 }
 
+const execFileAsync = promisify(execFile);
+
 /**
- * Pre-seed `~/.claude.json` so the per-project trust-dialog ("Quick safety
- * check: Is this a project you trust?") doesn't block on first run.
+ * Pre-seed `~/.claude.json` so Claude Code treats `dirs` as trusted. Untrusted
+ * workspaces make headless `claude -p` ignore `permissions.allow` from
+ * `.claude/settings.json`, and block the interactive trust dialog in tmux.
  *
- * Mirrors the onboarding-skip hack in `Dockerfile.worker` (which writes
- * `hasCompletedOnboarding` and `bypassPermissionsModeAccepted`). When the
- * resolved binary runs interactive claude inside tmux, claude does NOT
- * reliably auto-accept the dialog, so the pane can hang forever. Writing
- * `projects[cwd].hasTrustDialogAccepted = true` (and `hasCompletedProjectOnboarding`)
- * tells claude-code the cwd is pre-trusted.
- *
- * Idempotent (no-op when already true), read-merge-write (never clobbers
- * other keys), graceful on missing / malformed file.
+ * Read-merge-write: sets `projects[dir].hasTrustDialogAccepted`, keeps every
+ * other key, skips the write when nothing changes, and renames a temp file into
+ * place (mode preserved). A malformed file is backed up, not clobbered. Claude
+ * Code owns `~/.claude.json.lock`; this never touches it.
  *
  * Exported for unit testing.
  */
 export async function preseedClaudeTrustDialog(
-  cwd: string,
-  // Prefer `$HOME` over `homedir()` so callers in tests / sandboxed envs that
-  // override HOME get the override. Bun's `os.homedir()` caches the real
-  // passwd entry at process boot and ignores HOME mutations.
+  dirs: string[],
+  // Prefer `$HOME` over `homedir()`: Bun's `os.homedir()` ignores HOME mutations.
   homeDir: string = process.env.HOME ?? homedir(),
 ): Promise<void> {
   const claudeJsonPath = join(homeDir, ".claude.json");
   let data: Record<string, unknown> = {};
+  let mode: number | undefined;
   try {
-    const raw = await readFile(claudeJsonPath, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      data = parsed as Record<string, unknown>;
+    mode = (await stat(claudeJsonPath)).mode & 0o777;
+    const parsed = JSON.parse(await readFile(claudeJsonPath, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("not a JSON object");
     }
-  } catch {
-    // missing or malformed — start from {}
-    console.warn(
-      `\x1b[33m[claude]\x1b[0m Starting with empty .claude.json for trust pre-seed at ${claudeJsonPath}`,
-    );
+    data = parsed as Record<string, unknown>;
+  } catch (err) {
+    if (mode !== undefined) {
+      const backup = `${claudeJsonPath}.malformed-${Date.now()}`;
+      await copyFile(claudeJsonPath, backup);
+      console.warn(
+        `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} is unreadable (${err}); backed up to ${backup}`,
+      );
+    }
   }
 
   const projects = (data.projects ?? {}) as Record<string, Record<string, unknown>>;
-  const existing = projects[cwd] ?? {};
-  if (existing.hasTrustDialogAccepted === true) {
-    // Already trusted — no-op, no write.
-    return;
+  let changed = false;
+  for (const dir of dirs) {
+    const existing = projects[dir] ?? {};
+    if (existing.hasTrustDialogAccepted === true) continue;
+    projects[dir] = {
+      ...existing,
+      hasTrustDialogAccepted: true,
+      hasCompletedProjectOnboarding: true,
+    };
+    changed = true;
   }
-
-  projects[cwd] = {
-    ...existing,
-    hasTrustDialogAccepted: true,
-    hasCompletedProjectOnboarding: true,
-  };
+  if (!changed) return;
   data.projects = projects;
 
-  await writeFile(claudeJsonPath, `${JSON.stringify(data, null, 2)}\n`);
+  const tmp = `${claudeJsonPath}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: mode ?? 0o600 });
+  await rename(tmp, claudeJsonPath);
   console.log(
-    `\x1b[2m[claude]\x1b[0m Pre-seeded trust dialog acceptance for ${cwd} in ${claudeJsonPath}`,
+    `\x1b[2m[claude]\x1b[0m Pre-seeded trust for ${dirs.join(", ")} in ${claudeJsonPath}`,
   );
+}
+
+/**
+ * Directories Claude Code keys trust by for `cwd`: its real path, plus the main
+ * checkout when `cwd` is a git worktree. Non-repo cwds yield just the real path.
+ */
+export async function resolveClaudeTrustDirs(cwd: string): Promise<string[]> {
+  const dirs = [await realpath(cwd).catch(() => cwd)];
+  try {
+    const { stdout } = await execFileAsync("git", [
+      "-C",
+      cwd,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    const main = dirname(stdout.trim());
+    if (stdout.trim() && !dirs.includes(main)) dirs.push(main);
+  } catch {
+    // git missing or cwd is not a repo
+  }
+  return dirs;
 }
 
 /**
@@ -1170,14 +1199,14 @@ export class ClaudeAdapter implements ProviderAdapter {
       );
     }
 
-    // Claude Bridge and its legacy compatibility path drive interactive
-    // `claude` in tmux, where the first-run trust dialog can block startup.
-    if (isInteractiveTmuxClaude) {
+    // Untrusted workspaces make Claude ignore `.claude/settings.json` permissions
+    // (headless) or block on the trust dialog (tmux), so seed trust for every session.
+    if (isEnvFlagEnabled("CLAUDE_TRUST_PRESEED", true, sourceEnv)) {
       try {
-        await preseedClaudeTrustDialog(config.cwd);
+        await preseedClaudeTrustDialog(await resolveClaudeTrustDirs(config.cwd));
       } catch (err) {
         console.warn(
-          `\x1b[33m[claude]\x1b[0m Failed to pre-seed trust dialog for ${config.cwd}: ${err}`,
+          `\x1b[33m[claude]\x1b[0m ${scrubSecrets(`Failed to pre-seed trust for ${config.cwd}: ${err}`)}`,
         );
       }
     }
