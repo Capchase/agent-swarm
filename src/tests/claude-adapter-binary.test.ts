@@ -40,7 +40,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ClaudeAdapter,
-  claudeJsonLockTestHooks,
   parseClaudeBinary,
   parseClaudeBridgeEnabled,
   preseedClaudeTrustDialog,
@@ -50,6 +49,8 @@ import {
   resolveClaudeTrustDirs,
 } from "../providers/claude-adapter";
 import type { ProviderSessionConfig } from "../providers/types";
+import { setFlockForTests } from "../utils/file-lock";
+import { holdFileLock } from "./fixtures/hold-file-lock";
 import { CHILD_PROCESS_TEST_BUDGET_MS, expectChildOk, runChild } from "./test-proc";
 
 const LEGACY_BRIDGE_COMPAT_BINARY = "shan" + "non";
@@ -516,61 +517,66 @@ describe("preseedClaudeTrustDialog", () => {
     expect(data.projects["/after/stale"].hasTrustDialogAccepted).toBe(true);
   });
 
-  test("two waiters on a stale lock never both enter (stale-recovery race)", async () => {
+  test("a suspended owner whose mkdir lock aged out keeps exclusion", async () => {
+    // Owner A holds the flock and its mkdir lock has expired (as if A was
+    // suspended past the lease). B must not enter until A finishes: otherwise
+    // A's late commit of an older snapshot would erase B's entry.
+    const releaseA = await holdFileLock(join(homeDir, ".claude.json.swarm-lock"));
     const lock = join(homeDir, ".claude.json.lock");
     await mkdir(lock);
     const old = new Date(Date.now() - 60_000);
     await utimes(lock, old, old);
 
-    // Both waiters have seen the stale lock. A takes over and holds the new
-    // lock; only then does B resume its takeover against A's fresh lock.
-    let aHoldsLock!: () => void;
-    const aHolds = new Promise<void>((r) => {
-      aHoldsLock = r;
+    let bDone = false;
+    const b = preseedClaudeTrustDialog(["/b"], homeDir).then(() => {
+      bDone = true;
     });
-    let bTookOver!: () => void;
-    const bDone = new Promise<void>((r) => {
-      bTookOver = r;
-    });
-    claudeJsonLockTestHooks.beforeStaleTakeover = async (label) => {
-      if (label === "/b") {
-        await aHolds;
-        setTimeout(bTookOver, 100); // let B's rename/restore finish
-      }
-    };
-    claudeJsonLockTestHooks.insideLock = async (label) => {
-      if (label === "/a") {
-        aHoldsLock();
-        await bDone; // A is mid-transaction while B attempts the takeover
-      }
-    };
-    try {
-      await Promise.all([
-        preseedClaudeTrustDialog(["/a"], homeDir),
-        preseedClaudeTrustDialog(["/b"], homeDir),
-      ]);
-    } finally {
-      claudeJsonLockTestHooks.beforeStaleTakeover = undefined;
-      claudeJsonLockTestHooks.insideLock = undefined;
-    }
+    await new Promise((r) => setTimeout(r, 300));
+    expect(bDone).toBe(false);
+    await expect(readFile(join(homeDir, ".claude.json"), "utf-8")).rejects.toThrow();
+
+    // A resumes and commits its snapshot, then releases both locks.
+    await writeFile(
+      join(homeDir, ".claude.json"),
+      JSON.stringify({ projects: { "/a": { hasTrustDialogAccepted: true } } }),
+    );
+    await rmdir(lock);
+    await releaseA();
+    await b;
+
     const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
     expect(data.projects["/a"].hasTrustDialogAccepted).toBe(true);
     expect(data.projects["/b"].hasTrustDialogAccepted).toBe(true);
-    expect(await readdir(homeDir)).toEqual([".claude.json"]);
+    expect(await readdir(homeDir)).toEqual([".claude.json", ".claude.json.swarm-lock"]);
   });
 
-  test("many waiters on a stale lock keep every entry", async () => {
+  test("many writers on an expired mkdir lock keep every entry of every round", async () => {
+    const all: string[] = [];
     for (let round = 0; round < 5; round++) {
       const lock = join(homeDir, ".claude.json.lock");
       await mkdir(lock);
       const old = new Date(Date.now() - 60_000);
       await utimes(lock, old, old);
       const dirs = Array.from({ length: 6 }, (_, i) => `/round${round}/${i}`);
+      all.push(...dirs);
       await Promise.all(dirs.map((d) => preseedClaudeTrustDialog([d], homeDir)));
       const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
-      for (const d of dirs) expect(data.projects[d].hasTrustDialogAccepted).toBe(true);
+      for (const d of all) expect(data.projects[d].hasTrustDialogAccepted).toBe(true);
     }
-    expect(await readdir(homeDir)).toEqual([".claude.json"]);
+    expect((await readdir(homeDir)).sort()).toEqual([".claude.json", ".claude.json.swarm-lock"]);
+  });
+
+  test("without flock it still seeds under the mkdir lock", async () => {
+    setFlockForTests(null);
+    try {
+      await mkdir(join(homeDir, ".claude.json.lock"));
+      setTimeout(() => void rmdir(join(homeDir, ".claude.json.lock")), 150);
+      await preseedClaudeTrustDialog(["/noflock"], homeDir);
+    } finally {
+      setFlockForTests(undefined);
+    }
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/noflock"].hasTrustDialogAccepted).toBe(true);
   });
 
   test("non-repo cwd: only its real path", async () => {
