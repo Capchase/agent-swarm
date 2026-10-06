@@ -89,7 +89,7 @@ function modelToCredKeys(modelStr: string | undefined): string[] | null {
     if (provider === "anthropic") return ["ANTHROPIC_API_KEY"];
     if (provider === "openrouter") return ["OPENROUTER_API_KEY"];
     if (provider === "openai") return ["OPENAI_API_KEY"];
-    if (provider === "google") return ["GOOGLE_API_KEY"];
+    if (provider === "google") return ["GOOGLE_API_KEY", "GEMINI_API_KEY"];
   }
   // Bare model name with no provider prefix — adapter falls through to a
   // best-effort resolution against multiple providers, so the boot loop
@@ -437,6 +437,7 @@ const PI_RUNTIME_API_KEYS = [
   ["OPENROUTER_API_KEY", "openrouter"],
   ["ANTHROPIC_API_KEY", "anthropic"],
   ["OPENAI_API_KEY", "openai"],
+  ["GEMINI_API_KEY", "google"],
   ["GOOGLE_API_KEY", "google"],
 ] as const;
 

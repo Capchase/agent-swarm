@@ -232,6 +232,37 @@ describe("checkPiMonoCredentials", () => {
     ).toBe(false);
   });
 
+  test("strict: MODEL_OVERRIDE=google/... accepts GEMINI_API_KEY", async () => {
+    const env = {
+      MODEL_OVERRIDE: "google/gemini-3-flash-preview",
+      GEMINI_API_KEY: "x",
+    };
+
+    const status = await checkPiMonoCredentials(env, {
+      homeDir: HOME,
+      fs: noFiles,
+    });
+
+    expect(status.ready).toBe(true);
+    expect(status.missing).toEqual([]);
+    expect(status.satisfiedBy).toBe("env");
+  });
+
+  test("strict: MODEL_OVERRIDE=google/... lists both Google credential options when missing", async () => {
+    const env = {
+      MODEL_OVERRIDE: "google/gemini-3-flash-preview",
+    };
+
+    const status = await checkPiMonoCredentials(env, {
+      homeDir: HOME,
+      fs: noFiles,
+    });
+
+    expect(status.ready).toBe(false);
+    expect(status.missing).toEqual(["GOOGLE_API_KEY", "GEMINI_API_KEY", AUTH]);
+    expect(status.hint).toContain("GOOGLE_API_KEY / GEMINI_API_KEY");
+  });
+
   test("shortname `sonnet` accepts ANTHROPIC_API_KEY *or* OPENROUTER_API_KEY", async () => {
     // Anthropic-shortname models (sonnet/haiku/opus) prefer the native
     // ANTHROPIC_* credential, but pi-mono-adapter reroutes through the
