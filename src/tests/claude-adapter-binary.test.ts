@@ -566,17 +566,22 @@ describe("preseedClaudeTrustDialog", () => {
     expect((await readdir(homeDir)).sort()).toEqual([".claude.json", ".claude.json.swarm-lock"]);
   });
 
-  test("without flock it still seeds under the mkdir lock", async () => {
+  test("without flock it fails closed and writes nothing", async () => {
     setFlockForTests(null);
     try {
-      await mkdir(join(homeDir, ".claude.json.lock"));
-      setTimeout(() => void rmdir(join(homeDir, ".claude.json.lock")), 150);
-      await preseedClaudeTrustDialog(["/noflock"], homeDir);
+      await expect(preseedClaudeTrustDialog(["/noflock"], homeDir)).rejects.toThrow(
+        /flock unavailable/,
+      );
     } finally {
       setFlockForTests(undefined);
     }
-    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
-    expect(data.projects["/noflock"].hasTrustDialogAccepted).toBe(true);
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
+  });
+
+  test("an unopenable lock file fails closed", async () => {
+    await mkdir(join(homeDir, ".claude.json.swarm-lock"));
+    await expect(preseedClaudeTrustDialog(["/nolockfile"], homeDir)).rejects.toThrow(/cannot open/);
+    expect(await Bun.file(join(homeDir, ".claude.json")).exists()).toBe(false);
   });
 
   test("non-repo cwd: only its real path", async () => {

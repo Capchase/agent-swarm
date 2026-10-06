@@ -355,8 +355,13 @@ export async function preseedClaudeTrustDialog(
   if (locked.reason === "busy") {
     throw new Error(`timed out waiting for ${claudeJsonPath}.swarm-lock`);
   }
-  // No flock here (unsupported platform, unwritable dir): the mkdir lock alone.
-  await seed();
+  // Fail closed: the mkdir lock is lease-based, so without the flock a paused
+  // writer can resume after a takeover and commit an older snapshot over a newer one.
+  throw new Error(
+    locked.reason === "unsupported"
+      ? `flock unavailable; not seeding trust in ${claudeJsonPath}`
+      : `cannot open ${claudeJsonPath}.swarm-lock: ${locked.error}`,
+  );
 }
 
 // Claude Code's own writer (proper-lockfile) takes `mkdir <file>.lock` and
