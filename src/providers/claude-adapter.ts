@@ -333,7 +333,9 @@ export async function preseedClaudeTrustDialog(
       const backup = `${claudeJsonPath}.malformed-${Date.now()}`;
       await copyFile(claudeJsonPath, backup);
       console.warn(
-        `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} is unreadable (${err}); backed up to ${backup}`,
+        scrubSecrets(
+          `\x1b[33m[claude]\x1b[0m ${claudeJsonPath} is unreadable (${err}); backed up to ${backup}`,
+        ),
       );
     }
   }
@@ -357,7 +359,9 @@ export async function preseedClaudeTrustDialog(
   await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: mode ?? 0o600 });
   await rename(tmp, claudeJsonPath);
   console.log(
-    `\x1b[2m[claude]\x1b[0m Pre-seeded trust for ${dirs.join(", ")} in ${claudeJsonPath}`,
+    scrubSecrets(
+      `\x1b[2m[claude]\x1b[0m Pre-seeded trust for ${dirs.join(", ")} in ${claudeJsonPath}`,
+    ),
   );
 }
 

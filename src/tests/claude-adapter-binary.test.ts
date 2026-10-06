@@ -375,6 +375,23 @@ describe("preseedClaudeTrustDialog", () => {
     );
   });
 
+  test("scrubs secrets from the success and malformed-file log lines", async () => {
+    const secret = `ghp_${"a1B2c3D4e5".repeat(4).slice(0, 36)}`;
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await writeFile(join(homeDir, ".claude.json"), "{ not json");
+      await preseedClaudeTrustDialog([`/abs/${secret}`], homeDir);
+      const out = [...logSpy.mock.calls, ...warnSpy.mock.calls].flat().join("\n");
+      expect(out).toContain("Pre-seeded trust");
+      expect(out).toContain("unreadable");
+      expect(out).not.toContain(secret);
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
   test(
     "worktree: seeds the worktree and the main checkout",
     async () => {
