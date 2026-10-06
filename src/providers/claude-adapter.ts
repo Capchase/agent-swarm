@@ -1,7 +1,18 @@
 import { execFile } from "node:child_process";
-import { copyFile, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { deriveDefaultRoute, routeCredentialStatus, routeUnsetEnv } from "@desplega/model-routing";
 import { type Span, trace } from "@opentelemetry/api";
@@ -319,6 +330,45 @@ export async function preseedClaudeTrustDialog(
   homeDir: string = process.env.HOME ?? homedir(),
 ): Promise<void> {
   const claudeJsonPath = join(homeDir, ".claude.json");
+  await withClaudeJsonLock(claudeJsonPath, () => seedTrustLocked(claudeJsonPath, dirs));
+}
+
+// Same protocol as Claude Code's writer (proper-lockfile): `mkdir <file>.lock`
+// is the atomic acquire, and a lock whose mtime is older than 10s is stale.
+const CLAUDE_JSON_LOCK_STALE_MS = 10_000;
+const CLAUDE_JSON_LOCK_TIMEOUT_MS = 15_000;
+
+async function withClaudeJsonLock<T>(claudeJsonPath: string, fn: () => Promise<T>): Promise<T> {
+  const lockPath = `${claudeJsonPath}.lock`;
+  const deadline = Date.now() + CLAUDE_JSON_LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw err;
+      try {
+        const { mtimeMs } = await stat(lockPath);
+        if (Date.now() - mtimeMs > CLAUDE_JSON_LOCK_STALE_MS) {
+          await rmdir(lockPath).catch(() => {});
+          continue;
+        }
+      } catch {
+        continue; // lock vanished between mkdir and stat; retry
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${lockPath}`);
+      await new Promise((r) => setTimeout(r, 20 + Math.random() * 30));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rmdir(lockPath).catch(() => {});
+  }
+}
+
+async function seedTrustLocked(claudeJsonPath: string, dirs: string[]): Promise<void> {
   let data: Record<string, unknown> = {};
   let mode: number | undefined;
   try {
@@ -355,9 +405,14 @@ export async function preseedClaudeTrustDialog(
   if (!changed) return;
   data.projects = projects;
 
-  const tmp = `${claudeJsonPath}.${process.pid}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: mode ?? 0o600 });
-  await rename(tmp, claudeJsonPath);
+  const tmp = `${claudeJsonPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: mode ?? 0o600, flag: "wx" });
+    await rename(tmp, claudeJsonPath);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
   console.log(
     scrubSecrets(
       `\x1b[2m[claude]\x1b[0m Pre-seeded trust for ${dirs.join(", ")} in ${claudeJsonPath}`,
@@ -372,15 +427,37 @@ export async function preseedClaudeTrustDialog(
 export async function resolveClaudeTrustDirs(cwd: string): Promise<string[]> {
   const dirs = [await realpath(cwd).catch(() => cwd)];
   try {
-    const { stdout } = await execFileAsync("git", [
-      "-C",
-      cwd,
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-common-dir",
-    ]);
-    const main = dirname(stdout.trim());
-    if (stdout.trim() && !dirs.includes(main)) dirs.push(main);
+    // The first `worktree` entry is the primary checkout; a bare repo is marked
+    // `bare` and has no checkout. Metadata parents (`dirname(--git-common-dir)`)
+    // are not trusted: with --separate-git-dir they are unrelated paths.
+    const { stdout } = await execFileAsync("git", ["-C", cwd, "worktree", "list", "--porcelain"]);
+    const first = stdout.split("\n\n")[0]?.split("\n") ?? [];
+    const path = first.find((l) => l.startsWith("worktree "))?.slice("worktree ".length);
+    if (path && !first.includes("bare")) {
+      let main = path;
+      // With --separate-git-dir the entry is the git dir; the checkout is `core.worktree`.
+      const configured = await execFileAsync("git", [
+        "--git-dir",
+        path,
+        "config",
+        "--get",
+        "core.worktree",
+      ]).then(
+        (r) => r.stdout.trim(),
+        () => "",
+      );
+      if (configured) main = resolve(path, configured);
+      main = await realpath(main);
+      // A real checkout has a `.git` file or directory at its root.
+      if (
+        await stat(join(main, ".git")).then(
+          () => true,
+          () => false,
+        )
+      ) {
+        if (!dirs.includes(main)) dirs.push(main);
+      }
+    }
   } catch {
     // git missing or cwd is not a repo
   }

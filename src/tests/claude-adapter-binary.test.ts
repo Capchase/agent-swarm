@@ -25,7 +25,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -417,6 +426,78 @@ describe("preseedClaudeTrustDialog", () => {
     },
     CHILD_PROCESS_TEST_BUDGET_MS,
   );
+
+  test(
+    "separate-git-dir: seeds the checkout, not the metadata parent",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-sep-")));
+      try {
+        const checkout = join(root, "checkout");
+        const wt = join(root, "wt");
+        await mkdir(checkout);
+        await mkdir(join(root, "metadata"));
+        for (const args of [
+          ["init", "-q", `--separate-git-dir=${join(root, "metadata", "repo.git")}`, checkout],
+        ]) {
+          expectChildOk(await runChild(["git", ...args]), "git init");
+        }
+        for (const args of [
+          ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+          ["worktree", "add", "-q", wt],
+        ]) {
+          expectChildOk(await runChild(["git", "-C", checkout, ...args]), `git ${args[0]}`);
+        }
+        expect(await resolveClaudeTrustDirs(checkout)).toEqual([checkout]);
+        // The checkout is not discoverable from a linked worktree here; never fall back to metadata.
+        expect(await resolveClaudeTrustDirs(wt)).toEqual([wt]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test(
+    "bare repository: no checkout is trusted beyond cwd",
+    async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "claude-trust-bare-")));
+      try {
+        const bare = join(root, "bare.git");
+        expectChildOk(await runChild(["git", "init", "-q", "--bare", bare]), "git init");
+        expect(await resolveClaudeTrustDirs(bare)).toEqual([bare]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test("concurrent seeding keeps every entry and unrelated keys", async () => {
+    await writeFile(
+      join(homeDir, ".claude.json"),
+      JSON.stringify({ theme: "dark", projects: { "/kept": { custom: 1 } } }),
+    );
+    const dirs = Array.from({ length: 8 }, (_, i) => `/concurrent/${i}`);
+    await Promise.all(dirs.map((d) => preseedClaudeTrustDialog([d], homeDir)));
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.theme).toBe("dark");
+    expect(data.projects["/kept"]).toEqual({ custom: 1 });
+    for (const d of dirs) expect(data.projects[d].hasTrustDialogAccepted).toBe(true);
+    const leftovers = (await readdir(homeDir)).filter(
+      (f) => f.endsWith(".tmp") || f.endsWith(".lock"),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  test("waits for a held lock and clears a stale one", async () => {
+    const lock = join(homeDir, ".claude.json.lock");
+    await mkdir(lock);
+    const old = new Date(Date.now() - 60_000);
+    await utimes(lock, old, old);
+    await preseedClaudeTrustDialog(["/after/stale"], homeDir);
+    const data = JSON.parse(await readFile(join(homeDir, ".claude.json"), "utf-8"));
+    expect(data.projects["/after/stale"].hasTrustDialogAccepted).toBe(true);
+  });
 
   test("non-repo cwd: only its real path", async () => {
     expect(await resolveClaudeTrustDirs(homeDir)).toEqual([await realpath(homeDir)]);
