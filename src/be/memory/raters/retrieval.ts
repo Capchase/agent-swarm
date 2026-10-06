@@ -1,6 +1,7 @@
 import { ensure } from "@desplega.ai/business-use";
 import { getDbClient } from "@/be/db";
 import type { MemoryRetrievalSource } from "@/be/memory/types";
+import type { AgentMemory } from "@/types";
 
 /**
  * Retrieval-bridge helper — appends `memory_retrieval` audit rows so
@@ -23,6 +24,8 @@ import type { MemoryRetrievalSource } from "@/be/memory/types";
 export type RetrievalRecord = {
   memoryId: string;
   similarity: number;
+  /** Pre-boost [0,1] match score (`rawSimilarity`); the injection gate's input. */
+  relevance?: number;
   retrievalSource?: MemoryRetrievalSource;
 };
 
@@ -31,6 +34,45 @@ export type RetrievalExtras = {
   contextKey?: string;
   eventType?: "search" | "get";
 };
+
+type MemoryDocumentRef = Pick<AgentMemory, "id" | "agentId" | "scope" | "sourcePath" | "key">;
+
+/**
+ * Select one search-result row per logical memory document.
+ *
+ * Memory content is stored one row per chunk. The document identity is scoped
+ * by owner and visibility because two agents owning the same-named memory are
+ * separate documents.
+ */
+export function dedupeMemoryDocumentIds(memories: MemoryDocumentRef[]): string[] {
+  const documents = new Map<string, string>();
+
+  for (const memory of memories) {
+    const identity = memory.sourcePath ?? memory.key;
+    if (identity == null) continue;
+
+    const documentKey = JSON.stringify([memory.agentId, memory.scope, identity]);
+    if (!documents.has(documentKey)) documents.set(documentKey, memory.id);
+  }
+
+  return [...documents.values()];
+}
+
+/** Count memory rows returned by agent recall as consumed. */
+export async function recordMemoryAccesses(memoryIds: string[]): Promise<void> {
+  const ids = [...new Set(memoryIds)].filter(Boolean);
+  if (ids.length === 0) return;
+
+  const now = new Date().toISOString();
+  await getDbClient().transaction(async (tx) => {
+    for (const id of ids) {
+      await tx.run(
+        "UPDATE agent_memory SET accessedAt = ?, accessCount = accessCount + 1 WHERE id = ?",
+        [now, id],
+      );
+    }
+  });
+}
 
 export async function recordRetrievals(
   taskId: string | undefined,
@@ -42,8 +84,8 @@ export async function recordRetrievals(
   if (!taskId || results.length === 0) return;
 
   const insertSql = `INSERT INTO memory_retrieval
-       (id, taskId, agentId, sessionId, memoryId, similarity, retrievedAt, contextKey, intent, eventType, retrievalId, rank, retrievalSource)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+       (id, taskId, agentId, sessionId, memoryId, similarity, retrievedAt, contextKey, intent, eventType, retrievalId, rank, retrievalSource, relevance)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
   const now = new Date().toISOString();
   const retrievalId = crypto.randomUUID();
   const contextKey = extras?.contextKey ?? null;
@@ -66,6 +108,7 @@ export async function recordRetrievals(
         retrievalId,
         rank,
         r.retrievalSource ?? null,
+        r.relevance ?? null,
       ]);
     }
   });

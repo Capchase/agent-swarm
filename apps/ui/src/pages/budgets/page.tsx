@@ -13,6 +13,7 @@ import {
   useUpsertBudget,
 } from "@/api/hooks/use-budgets";
 import { useUsageSummary } from "@/api/hooks/use-costs";
+import { useModelsCatalog } from "@/api/hooks/use-models-catalog";
 import { useLogs } from "@/api/hooks/use-stats";
 import type {
   Agent,
@@ -55,6 +56,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { pricingModelOptions } from "@/lib/agent-runtime-models";
 import { formatCost } from "@/lib/cost-format";
 import { cn, formatSmartTime, formatUTCTime } from "@/lib/utils";
 
@@ -81,24 +83,22 @@ function spendBarColor(ratio: number): string {
 }
 
 function SpendBar({ spend, budget }: { spend: number; budget: number | null }) {
+  // No limit set: no bar to fill, so draw none. Spend and the label keep an
+  // explicit gap; inside a grid cell `justify-between` alone collapsed them
+  // into "$342.32no budget".
   if (!budget || budget <= 0) {
     return (
-      <div className="space-y-1">
-        <div className="flex justify-between text-xs">
-          <span className="font-mono">{formatUsd(spend)}</span>
-          <span className="text-muted-foreground">no budget</span>
-        </div>
-        <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-          <div className="h-full w-0" />
-        </div>
+      <div className="flex w-full items-baseline gap-2 text-xs">
+        <span className="font-mono">{formatUsd(spend)}</span>
+        <span className="text-muted-foreground">No limit</span>
       </div>
     );
   }
   const ratio = spend / budget;
   const pct = Math.min(100, Math.round(ratio * 100));
   return (
-    <div className="space-y-1">
-      <div className="flex justify-between text-xs">
+    <div className="w-full space-y-1">
+      <div className="flex justify-between gap-2 text-xs">
         <span className="font-mono">
           {formatUsd(spend)} / {formatUsd(budget)}
         </span>
@@ -113,7 +113,7 @@ function SpendBar({ spend, budget }: { spend: number; budget: number | null }) {
       </div>
       <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
         <div
-          className={cn("h-full transition-all", spendBarColor(ratio))}
+          className={cn("h-full transition-[width,background-color]", spendBarColor(ratio))}
           // inline-style: dynamic computed width %
           style={{ width: `${pct}%` }}
         />
@@ -223,6 +223,12 @@ function AddPricingDialog({
   const [pricePerMillionUsd, setPricePerMillionUsd] = useState("");
   const insert = useInsertPricing();
   const [error, setError] = useState<string | null>(null);
+  const { data: modelsCatalog } = useModelsCatalog();
+  // Suggestions only: any id still works, including one the catalog lacks.
+  const modelSuggestions = useMemo(
+    () => pricingModelOptions(provider, modelsCatalog?.providers),
+    [provider, modelsCatalog?.providers],
+  );
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -292,11 +298,28 @@ function AddPricingDialog({
             <div className="space-y-2">
               <Label>Model *</Label>
               <Input
-                placeholder="gpt-4o, claude-opus-4-7, ..."
+                list="pricing-model-suggestions"
+                placeholder="Type or pick a catalog model ID"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 required
               />
+              <datalist id="pricing-model-suggestions">
+                {modelSuggestions.map((option) => (
+                  <option
+                    key={option.id}
+                    value={option.id}
+                    label={[
+                      option.label,
+                      option.cost
+                        ? `${formatCost(option.cost.input, { precision: 2, placeholder: "?" })} in / ${formatCost(option.cost.output, { precision: 2, placeholder: "?" })} out per 1M`
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  />
+                ))}
+              </datalist>
             </div>
             <div className="space-y-2">
               <Label>Price per 1M tokens (USD) *</Label>
@@ -467,7 +490,7 @@ export default function BudgetsPage() {
               onClick={(e) => e.stopPropagation()}
             >
               {row.agent.name}
-              {row.agent.isLead ? " (Lead)" : ""}
+              {row.agent.isLead && row.agent.name.trim().toLowerCase() !== "lead" ? " (Lead)" : ""}
             </Link>
           );
         },
@@ -524,6 +547,7 @@ export default function BudgetsPage() {
                   })
                 }
                 title={row.budget ? "Edit budget" : "Set budget"}
+                aria-label={`${row.budget ? "Edit" : "Set"} budget for ${row.agent.name}`}
               >
                 <Pencil className="h-3.5 w-3.5" />
               </Button>
@@ -540,6 +564,7 @@ export default function BudgetsPage() {
                     })
                   }
                   title="Remove budget"
+                  aria-label={`Remove budget for ${row.agent.name}`}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </Button>
@@ -736,6 +761,7 @@ export default function BudgetsPage() {
                 className="h-7 w-7"
                 onClick={() => setPricingDeleteTarget(row)}
                 title="Delete row (typo correction)"
+                aria-label={`Delete ${row.tokenClass} price for ${row.model}`}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </Button>

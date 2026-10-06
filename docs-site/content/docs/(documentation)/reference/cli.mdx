@@ -23,19 +23,27 @@ agent-swarm <command>
 
 Set up a new swarm from scratch using Docker Compose. The interactive wizard collects credentials, generates `docker-compose.yml` + `.env`, starts the stack, verifies health, and prints a dashboard deep-link that auto-connects with the generated API URL and key.
 
+The wizard requires Bun. When the published bin runs under Node (for example via `npx`), it re-launches `onboard` under `bun`; install Bun from [bun.sh](https://bun.sh) if it is missing.
+
 ```bash
 bunx @desplega.ai/agent-swarm onboard
 npx @desplega.ai/agent-swarm onboard
 bunx @desplega.ai/agent-swarm onboard --dry-run
+bunx @desplega.ai/agent-swarm onboard --yes --preset=full
 bunx @desplega.ai/agent-swarm onboard --yes --preset=dev
+ANTHROPIC_API_KEY=sk-... bunx @desplega.ai/agent-swarm onboard --yes --preset=dev --pull-policy=missing
 ANTHROPIC_API_KEY=sk-... bunx @desplega.ai/agent-swarm onboard --yes --preset=solo
+bunx @desplega.ai/agent-swarm onboard --container-engine=podman
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--dry-run` | Preview what would be generated without writing |
 | `-y, --yes` | Non-interactive mode (reads from env vars) |
-| `--preset <name>` | Preset: `dev`, `content`, `research`, `solo` |
+| `--preset <name>` | Preset: `full`, `dev`, `content`, `research`, `solo` (required with `--yes`) |
+| `--max-concurrent-tasks <n>` | Tasks per generated agent, from 1 to 100 (defaults: lead 2, worker 1) |
+| `--pull-policy <policy>` | Docker Compose image pull policy: `always`, `missing`, or `never` (default: `always`) |
+| `--container-engine <engine>` | `auto`, `docker`, or `podman` (default: `AGENT_SWARM_CONTAINER_ENGINE` if set, else `auto`, which prefers Docker). See [Rootless Podman](/docs/guides/podman-rootless) |
 
 ### connect
 

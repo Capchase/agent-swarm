@@ -23,10 +23,26 @@ type WorkflowRecord = {
   triggerSchema?: Record<string, unknown>;
   enabled?: boolean;
   nodeCount?: number;
+  createdByAgentId?: string | null;
+  createdAt?: string;
 };
 
+/**
+ * Workflows the worker created during this attempt. The sandbox can carry
+ * seeded or leaked workflows (6 or 11 seen), so only rows created by the
+ * worker, or after the task was created when no creator is recorded, count.
+ */
 async function workflows(ctx: JudgeContext): Promise<WorkflowRecord[]> {
-  return apiList<WorkflowRecord>(ctx, "/api/workflows?fields=full", ["workflows"]);
+  const rows = await apiList<WorkflowRecord>(ctx, "/api/workflows?fields=full", ["workflows"]);
+  const task = ctx.tasks[0];
+  const agentId =
+    typeof task?.agentId === "string" && task.agentId ? task.agentId : ctx.workers[0]?.agentId;
+  const since = typeof task?.createdAt === "string" ? Date.parse(task.createdAt) : Number.NaN;
+  return rows.filter((wf) => {
+    if (wf.createdByAgentId) return agentId === undefined || wf.createdByAgentId === agentId;
+    if (!Number.isFinite(since) || !wf.createdAt) return true;
+    return Date.parse(wf.createdAt) >= since;
+  });
 }
 
 function nextTargets(node: WorkflowNode): string[] {
@@ -56,14 +72,12 @@ function isConnected(nodes: WorkflowNode[]): boolean {
 function interpolationInputsCovered(nodes: WorkflowNode[]): boolean {
   for (const node of nodes) {
     const text = safeStringify(node.config);
-    const refs = [...text.matchAll(/\{\{\s*([a-zA-Z0-9_-]+)\./g)].map((m) => m[1]);
+    const refs = [...text.matchAll(/\{\{\s*([a-zA-Z0-9_-]+)\./g)].map((m) => m[1] ?? "");
     const external = refs.filter((r) => r !== "trigger" && r !== "input");
     for (const ref of external) {
-      if (
-        !Object.values(node.inputs ?? {}).some(
-          (source) => source.startsWith(`${ref}.`) || source === ref,
-        )
-      ) {
+      // A {{ref.x}} placeholder resolves against the node's own inputs KEYS
+      // (inputs: { ref: "<upstream>.<path>" }), not against the source paths.
+      if (!Object.hasOwn(node.inputs ?? {}, ref)) {
         return false;
       }
     }
@@ -101,7 +115,8 @@ const workflowDagCheck: DeterministicCheck = {
     const usedTool = hasTool(tools, ["create-workflow", "create_workflow"]);
     if (!usedTool) return { pass: false, score: 0, detail: "create-workflow tool was not used" };
 
-    const nodeScore = nodes.length >= 4 ? 1 : nodes.length === 3 ? 0.5 : 0;
+    // The prompt asks for script -> agent-task -> final node: three nodes is complete.
+    const nodeScore = nodes.length >= 3 ? 1 : nodes.length === 2 ? 0.5 : 0;
     const hasSwarmScript = nodes.some((n) => n.type === "swarm-script" && n.config?.scriptName);
     const hasAgentTaskWithSchema = nodes.some(
       (n) => n.type === "agent-task" && n.config && "outputSchema" in n.config,
@@ -165,10 +180,25 @@ const workflowCorrectnessCheck: DeterministicCheck = {
 
 export const workflowAuthoring: Scenario = {
   id: "workflow-authoring",
+  version: 1,
   name: "Workflow authoring",
   description:
     "Author a multi-node workflow through the swarm workflow tool, grading the persisted DAG, input mappings, reusable swarm-script selection, and trigger schema.",
   workers: 1,
+  // The seeded global catalog has no lint/check script, so without this the
+  // swarm-script node had nothing sensible to point at and every attempt
+  // capped at 0.67 on a missing option, not a skill gap.
+  seed: {
+    scripts: [
+      {
+        name: "pr-checks",
+        description:
+          "Deterministic lint/check gate for a pull request: validates the repository and PR number and returns a pass/fail verdict with findings.",
+        intent: "Run deterministic PR lint/checks before an agent review step in a workflow.",
+        sourceFile: "pr-checks.script.ts",
+      },
+    ],
+  },
   tasks: [
     {
       title: "Create a deterministic PR-review workflow",
@@ -189,6 +219,11 @@ export const workflowAuthoring: Scenario = {
       { name: "trigger-schema", weight: 2, checks: [triggerSchemaCheck] },
       { name: "correctness", weight: 1, checks: [workflowCorrectnessCheck] },
     ],
+    // v2 (2026-09-28): at the default 0.75 a workflow with no reusable
+    // swarm-script node (the scenario's core ask, 3/9 of the DAG check) still
+    // aggregated ~0.81 and passed, so every Claude model scored 5/5. 0.9 makes
+    // the DAG requirements binding.
+    passThreshold: 0.9,
   },
   timeoutMs: 10 * 60_000,
 };

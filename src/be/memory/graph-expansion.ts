@@ -34,6 +34,8 @@ export interface GraphExpansionOptions {
   scope?: "agent" | "swarm" | "all";
   /** Source filter the search ran with — expansion must not add off-filter rows. */
   source?: AgentMemorySource;
+  /** Key prefix the search ran with — expansion must not add off-prefix rows. */
+  keyPrefix?: string;
   isLead?: boolean;
 }
 
@@ -75,7 +77,7 @@ export async function expandCandidatesWithGraph(
   options: GraphExpansionOptions = {},
 ): Promise<MemoryCandidate[]> {
   if (!isGraphExpansionEnabled()) return candidates;
-  const { cap = 5, damping = 0.7, scope = "all", source, isLead = false } = options;
+  const { cap = 5, damping = 0.7, scope = "all", source, keyPrefix, isLead = false } = options;
   if (candidates.length === 0 || cap <= 0) return candidates;
 
   const parentById = new Map(candidates.map((c) => [c.id, c]));
@@ -94,6 +96,11 @@ export async function expandCandidatesWithGraph(
   if (source) {
     conditions.push("m.source = ?");
     params.push(source);
+  }
+  if (keyPrefix) {
+    // Literal prefix, not GLOB/LIKE: mirrors SqliteMemoryStore.addKeyPrefixCondition.
+    conditions.push("substr(m.key, 1, length(?)) = ?");
+    params.push(keyPrefix, keyPrefix);
   }
 
   let rows: NeighborRow[];
@@ -118,8 +125,9 @@ export async function expandCandidatesWithGraph(
     const parent = parentById.get(row.fromMemoryId);
     if (!parent) continue;
     const strength = typeof row.linkStrength === "number" ? row.linkStrength : 1.0;
-    // Derive from the parent's RAW (pre-decay) similarity — fts/hybrid arms
-    // ship `similarity` with the parent's recency decay already applied, and
+    // Derive from the parent's pre-decay match score on the shared [0,1]
+    // scale (vec cosine, hybrid fused cosine, fts rank). The fts arm ships
+    // `similarity` with the parent's recency decay already applied, and
     // rerank() will apply the NEIGHBOR's own decay to this candidate. Using
     // the decayed value would stack two decay factors on one score.
     const parentBase = parent.rawSimilarity ?? parent.similarity;
@@ -129,6 +137,7 @@ export async function expandCandidatesWithGraph(
     neighbors.set(row.id, {
       ...rowToCandidate(row, similarity),
       retrievalSource: "graph",
+      graphParentId: parent.id,
       // The neighbor's own decay is applied exactly once by rerank().
       recencyDecayApplied: false,
     });
@@ -153,7 +162,12 @@ export async function expandCandidatesWithGraph(
     if (existingIndex !== undefined) {
       // Dedupe against organic candidates: keep whichever entry the reranker
       // will score higher (same memory, so all non-similarity factors match).
-      if (computeScore(neighbor, now) > computeScore(result[existingIndex]!, now)) {
+      // rerank() caps a graph entry at its parent's composite, so compare the
+      // capped graph score; otherwise a low-quality parent's link replaces a
+      // stronger organic match and rerank() then demotes it below the parent.
+      const parent = parentById.get(neighbor.graphParentId!)!;
+      const graphScore = Math.min(computeScore(neighbor, now), computeScore(parent, now));
+      if (graphScore > computeScore(result[existingIndex]!, now)) {
         result[existingIndex] = neighbor;
       }
       continue;

@@ -9,7 +9,7 @@ import { CHILD_PROCESS_TEST_BUDGET_MS, expectChildOk, runChild } from "./test-pr
 
 const config: CodexHookConfig = {
   apiUrl: "http://steering.test",
-  apiKey: "test-key",
+  apiKey: "example-test-key",
   agentId: "11111111-1111-4111-8111-111111111111",
 };
 
@@ -67,6 +67,22 @@ afterAll(() => {
 });
 
 describe("codex steering hook", () => {
+  test("app-server sessions leave steering delivery to the worker", async () => {
+    let fetched = false;
+    for (const event of ["SessionStart", "PostToolUse", "Stop"]) {
+      const output = await handleCodexHookEvent(
+        { hook_event_name: event },
+        config,
+        { ...enabledEnv, SWARM_CODEX_APP_SERVER: "1" },
+        (async () => {
+          fetched = true;
+          return Response.json({ messages: [message()] });
+        }) as typeof fetch,
+      );
+      expect(output).toBeNull();
+    }
+    expect(fetched).toBe(false);
+  });
   test(
     "standalone hook rendering loads the delivery template defaults",
     async () => {
@@ -85,7 +101,7 @@ describe("codex steering hook", () => {
   );
 
   test("PostToolUse injects the envelope and marks the row delivered first", async () => {
-    const pending = message();
+    const pending = message({ createdByKind: "user", senderLabel: "Taras (user)" });
     const deliveredCalls: string[] = [];
     const output = await handleCodexHookEvent(
       { hook_event_name: "PostToolUse" },
@@ -100,7 +116,7 @@ describe("codex steering hook", () => {
       additionalContext: string;
     };
     expect(hookOutput.hookEventName).toBe("PostToolUse");
-    expect(hookOutput.additionalContext).toContain(pending.body);
+    expect(hookOutput.additionalContext).toContain(`From Taras (user): ${pending.body}`);
     expect(hookOutput.additionalContext).toContain(`[steering ${pending.id}]`);
     expect(hookOutput.additionalContext).toContain("accept-steer");
   });

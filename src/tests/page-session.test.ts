@@ -31,7 +31,7 @@ async function forgeToken(payload: PageSessionPayload, secret: string): Promise<
 }
 
 beforeAll(() => {
-  process.env.PAGE_SESSION_SECRET = "test-secret-fixed-vector-key";
+  process.env.PAGE_SESSION_SECRET = "example-test-secret-fixed-vector-key";
 });
 
 afterAll(() => {
@@ -58,6 +58,38 @@ describe("page-session HMAC helpers", () => {
     const token = await signPageSession(payload);
     const got = await verifyPageSession(token);
     expect(got).toEqual(payload);
+  });
+
+  test("round-trip: signed viewer identity survives verification", async () => {
+    const payload = {
+      pageId: "identity-page",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      uid: "user-123",
+      name: "Ada Lovelace",
+    };
+    const token = await signPageSession(payload);
+    expect(await verifyPageSession(token)).toEqual(payload);
+  });
+
+  test("rejects malformed optional viewer identity fields", async () => {
+    const payloadB64 = Buffer.from(
+      JSON.stringify({
+        pageId: "identity-page",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+        uid: 42,
+      }),
+    ).toString("base64url");
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode("example-test-secret-fixed-vector-key"),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const sig = Buffer.from(
+      await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payloadB64)),
+    ).toString("base64url");
+    expect(await verifyPageSession(`${payloadB64}.${sig}`)).toBeNull();
   });
 
   test("expired token (exp in the past) returns null", async () => {
@@ -115,12 +147,12 @@ describe("page-session HMAC helpers", () => {
     const payload = { pageId: "abc123", exp: Math.floor(Date.now() / 1000) + 3600 };
     const token = await signPageSession(payload);
 
-    process.env.PAGE_SESSION_SECRET = "different-secret-after-rotation";
+    process.env.PAGE_SESSION_SECRET = "example-different-secret-after-rotation";
     try {
       const got = await verifyPageSession(token);
       expect(got).toBeNull();
     } finally {
-      process.env.PAGE_SESSION_SECRET = "test-secret-fixed-vector-key";
+      process.env.PAGE_SESSION_SECRET = "example-test-secret-fixed-vector-key";
     }
   });
 
@@ -152,7 +184,7 @@ describe("page-session HMAC helpers", () => {
         const forged = await forgeToken(payload, "123123");
         expect(await verifyPageSession(forged)).toBeNull();
       } finally {
-        process.env.PAGE_SESSION_SECRET = "test-secret-fixed-vector-key";
+        process.env.PAGE_SESSION_SECRET = "example-test-secret-fixed-vector-key";
       }
     });
 
@@ -185,12 +217,12 @@ describe("page-session HMAC helpers", () => {
         expect(await verifyPageSession(token2)).toEqual({ ...payload, pageId: "generated-2" });
         expect(await verifyPageSession(token)).toEqual(payload);
       } finally {
-        process.env.PAGE_SESSION_SECRET = "test-secret-fixed-vector-key";
+        process.env.PAGE_SESSION_SECRET = "example-test-secret-fixed-vector-key";
       }
     });
   });
 
-  test("known-vector regression: payload {pageId:'abc',exp:1893456000} with secret 'test-secret-fixed-vector-key' verifies", async () => {
+  test("known-vector regression: payload {pageId:'abc',exp:1893456000} with secret 'example-test-secret-fixed-vector-key' verifies", async () => {
     const payload = { pageId: "abc", exp: 1893456000 };
     const token = await signPageSession(payload);
     // We don't pin the exact bytes here (Buffer base64url ordering is stable

@@ -1,18 +1,30 @@
 /**
- * Sessions surface — shared floating composer dock.
+ * Sessions surface: the shared floating composer dock.
  *
  * A rounded card-shaped input area inset from the panel edges with a slim
- * action row at the bottom: routing hint on the left, ⌘↵ hint + circular
+ * action row at the bottom: routing hint on the left, keyboard hints + circular
  * primary send button on the right. Used by both the new-session view and
  * the in-session composer so the bottom of the right pane is identical
  * regardless of state.
+ * Enter sends, Shift+Enter inserts a new line, and Cmd/Ctrl+Enter also sends.
+ * On a touch device with a soft keyboard (no hardware Enter key), plain
+ * Enter inserts a newline instead, and the send button submits there.
  */
 
 import { ArrowUp, FileText, Paperclip, X } from "lucide-react";
-import { type ChangeEvent, useEffect, useRef } from "react";
+import {
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useObjectUrl } from "@/hooks/use-object-url";
+import { isCoarsePointerInput, shouldSubmitOnEnterKeyDown } from "@/lib/enter-submit";
 import { cn } from "@/lib/utils";
 
 function formatFileSize(bytes: number): string {
@@ -20,6 +32,69 @@ function formatFileSize(bytes: number): string {
   const kb = bytes / 1024;
   if (kb < 1024) return `${kb.toFixed(1)} KB`;
   return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+// Matches MAX_UPLOAD_BYTES in src/http/fs.ts: reject client-side before a
+// doomed upload round trip instead of after a 413.
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+const ALLOWED_ATTACHMENT_EXTENSIONS = [
+  ".pdf",
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+  ".doc",
+  ".docx",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".zip",
+] as const;
+
+function fileExtension(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot === -1 ? "" : name.slice(dot).toLowerCase();
+}
+
+/** Splits a dropped/selected/pasted file batch into what's safe to attach and a
+ * human-readable reason for anything rejected. Returns at most one message:
+ * multiple bad files still name only the first, to keep the row short. */
+function partitionAttachmentFiles(files: File[]): { valid: File[]; error: string | null } {
+  const valid: File[] = [];
+  let error: string | null = null;
+  for (const file of files) {
+    if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(fileExtension(file.name) as never)) {
+      error ??= `"${file.name}" isn't an allowed file type (${ALLOWED_ATTACHMENT_EXTENSIONS.join(", ")}).`;
+      continue;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      error ??= `"${file.name}" exceeds the 50 MB attachment limit.`;
+      continue;
+    }
+    valid.push(file);
+  }
+  return { valid, error };
+}
+
+/** An image previews as a thumbnail, anything else as a file icon. */
+function AttachmentIcon({ file }: { file: File }) {
+  const isImage = file.type.startsWith("image/");
+  const url = useObjectUrl(isImage ? file : undefined);
+  if (!isImage || !url) return <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />;
+  return (
+    <img
+      src={url}
+      alt=""
+      className="h-8 w-12 shrink-0 rounded-sm border border-border object-cover object-top"
+    />
+  );
 }
 
 export interface ComposerDockProps {
@@ -47,15 +122,64 @@ export interface ComposerDockProps {
   attachments?: File[];
   onAttachmentsChange?: (files: File[]) => void;
   attachmentErrorMessage?: string | null;
+  /**
+   * Extra buttons for the action row, before the attach button. The session
+   * panel's "Add screenshot" goes here.
+   */
+  extraActions?: React.ReactNode;
   /** Focus the textarea on mount. */
   autoFocus?: boolean;
   /**
    * Let the card span the full available width instead of the chat-style
    * centered `max-w-3xl` column. Used by the task-detail steering dock, where
-   * the composer sits under a full-width log viewer.
+   * the composer sits under a full-width log viewer, and by the `/setup`
+   * first task, which spans the setup column.
    */
   fullWidth?: boolean;
+  /**
+   * Optional layer inside the rounded card, drawn above its border (for
+   * example a `BorderBeam`). Must be absolutely positioned and ignore pointer
+   * events. The sessions surfaces pass nothing.
+   */
+  decoration?: React.ReactNode;
+  /**
+   * A bottom bar (the task page's narrow layout). The box is one line until
+   * it gets focus, or while it holds a draft or files. Its buttons are 44 px
+   * touch targets.
+   */
+  bar?: boolean;
   className?: string;
+}
+
+/**
+ * Whether the user is working in a bar-mode box. Focus inside starts it. A
+ * tap outside, or focus that moves to another control, ends it.
+ * - It starts on focus, not on pointerdown: a touch device fires its mouse
+ *   events after pointerup, so a box that grew on pointerdown would move the
+ *   action row under the finger before the tap lands.
+ * - A blur with no new focus target does not end it: Safari does not focus a
+ *   button on a tap, so a tap on Attach would fold the row away.
+ */
+function useBoxEngaged(enabled: boolean, box: React.RefObject<HTMLFormElement | null>) {
+  const [engaged, setEngaged] = useState(false);
+  useEffect(() => {
+    if (!enabled || !engaged) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!box.current?.contains(event.target as Node)) setEngaged(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [enabled, engaged, box]);
+  const handlers = enabled
+    ? {
+        onFocus: () => setEngaged(true),
+        onBlur: (event: React.FocusEvent<HTMLFormElement>) => {
+          const next = event.relatedTarget as Node | null;
+          if (next && !event.currentTarget.contains(next)) setEngaged(false);
+        },
+      }
+    : {};
+  return { engaged, handlers };
 }
 
 export function ComposerDock({
@@ -74,32 +198,67 @@ export function ComposerDock({
   attachments = [],
   onAttachmentsChange,
   attachmentErrorMessage,
+  extraActions,
   autoFocus,
   fullWidth,
+  decoration,
+  bar = false,
   className,
 }: ComposerDockProps) {
   const ref = useRef<HTMLTextAreaElement | null>(null);
+  const formRef = useRef<HTMLFormElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const { engaged, handlers: engageHandlers } = useBoxEngaged(bar, formRef);
+  // A bar folds to one line while the user is elsewhere and the box is empty.
+  const folded = bar && !engaged && value.length === 0 && attachments.length === 0 && !isPending;
+  const dragCounterRef = useRef(0);
+  const [isDragActive, setIsDragActive] = useState(false);
+  const [dropErrorMessage, setDropErrorMessage] = useState<string | null>(null);
   useEffect(() => {
     if (autoFocus) ref.current?.focus();
   }, [autoFocus]);
+  // Clears a stale rejection message once the parent resets attachments
+  // (e.g. after a successful send) rather than leaving it stuck on screen.
+  useEffect(() => {
+    if (attachments.length === 0) setDropErrorMessage(null);
+  }, [attachments.length]);
 
   const canSubmit = !disabled && !isPending && value.trim().length > 0;
   const canAttach = !disabled && !isPending && !!onAttachmentsChange;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      if (canSubmit) onSubmit();
-    }
+    const submit = shouldSubmitOnEnterKeyDown(
+      {
+        key: e.key,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        isComposing: e.nativeEvent.isComposing,
+        keyCode: e.nativeEvent.keyCode,
+      },
+      isCoarsePointerInput(),
+    );
+    if (!submit) return;
+    e.preventDefault();
+    if (canSubmit) onSubmit();
+  };
+
+  const handleIncomingFiles = (incoming: File[]) => {
+    if (incoming.length === 0 || !onAttachmentsChange) return;
+    const { valid, error } = partitionAttachmentFiles(incoming);
+    setDropErrorMessage(error);
+    if (valid.length > 0) onAttachmentsChange([...attachments, ...valid]);
   };
 
   const onFilesSelected = (event: ChangeEvent<HTMLInputElement>) => {
-    const selected = Array.from(event.target.files ?? []);
-    if (selected.length > 0 && onAttachmentsChange) {
-      onAttachmentsChange([...attachments, ...selected]);
-    }
+    handleIncomingFiles(Array.from(event.target.files ?? []));
     event.target.value = "";
+  };
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!canAttach || e.clipboardData.files.length === 0) return;
+    e.preventDefault();
+    handleIncomingFiles(Array.from(e.clipboardData.files));
   };
 
   const removeAttachment = (index: number) => {
@@ -107,34 +266,83 @@ export function ComposerDock({
     onAttachmentsChange(attachments.filter((_, i) => i !== index));
   };
 
+  const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+    dragCounterRef.current += 1;
+    if (e.dataTransfer.types.includes("Files")) setIsDragActive(true);
+  };
+
+  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+  };
+
+  const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+    if (dragCounterRef.current === 0) setIsDragActive(false);
+  };
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    if (!canAttach) return;
+    e.preventDefault();
+    dragCounterRef.current = 0;
+    setIsDragActive(false);
+    handleIncomingFiles(Array.from(e.dataTransfer.files ?? []));
+  };
+
   return (
     <form
-      className={cn("shrink-0 px-4 pt-2 pb-4 bg-background w-full", className)}
+      ref={formRef}
+      // `@container`: the keyboard hint below hides by the dock's own width, so
+      // a narrow side panel drops it even on a wide screen.
+      className={cn("@container shrink-0 px-4 pt-2 pb-4 bg-background w-full", className)}
       onSubmit={(e) => {
         e.preventDefault();
         if (canSubmit) onSubmit();
       }}
+      {...engageHandlers}
     >
       <div
         className={cn(
+          "relative",
           !fullWidth && "max-w-3xl mx-auto",
           "rounded-2xl border border-border bg-card shadow-sm transition",
           "focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/15",
           disabled && "opacity-60",
         )}
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
       >
+        {decoration}
+        {isDragActive ? (
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-0 z-10 flex items-center justify-center",
+              "rounded-2xl border-2 border-dashed border-primary/60 bg-primary/5",
+            )}
+          >
+            <span className="text-xs font-medium text-primary">Drop files to attach</span>
+          </div>
+        ) : null}
         <Textarea
           ref={ref}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           placeholder={placeholder}
           disabled={disabled || isPending}
           rows={1}
           className={cn(
             "field-sizing-content border-0 shadow-none bg-transparent",
             "focus-visible:ring-0 focus-visible:border-0",
-            "min-h-14 max-h-[220px] resize-none px-4 pt-3.5 pb-1.5 text-base md:text-[15px]",
+            "max-h-[220px] resize-none px-4 text-base md:text-[15px]",
+            folded ? "min-h-11 py-2.5" : "min-h-14 pt-3.5 pb-1.5",
             "leading-snug",
           )}
         />
@@ -143,6 +351,7 @@ export function ComposerDock({
             ref={fileInputRef}
             type="file"
             multiple
+            accept={ALLOWED_ATTACHMENT_EXTENSIONS.join(",")}
             className="sr-only"
             onChange={onFilesSelected}
             disabled={!canAttach}
@@ -159,9 +368,9 @@ export function ComposerDock({
                   "bg-muted/55 px-2 py-1 text-xs text-foreground",
                 )}
               >
-                <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <AttachmentIcon file={file} />
                 <span className="truncate max-w-[12rem] sm:max-w-[18rem]">{file.name}</span>
-                <span className="shrink-0 text-[10px] text-muted-foreground">
+                <span className="shrink-0 text-meta text-muted-foreground">
                   {formatFileSize(file.size)}
                 </span>
                 <button
@@ -169,7 +378,7 @@ export function ComposerDock({
                   onClick={() => removeAttachment(index)}
                   disabled={isPending}
                   className={cn(
-                    "ml-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm",
+                    "hit-area ml-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm",
                     "text-muted-foreground hover:bg-background hover:text-foreground",
                     "disabled:pointer-events-none disabled:opacity-50",
                   )}
@@ -181,7 +390,13 @@ export function ComposerDock({
             ))}
           </div>
         ) : null}
-        <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5">
+        <div
+          className={cn(
+            "flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5",
+            // A folded bar is one line: the action row shows once it is used.
+            folded && "hidden",
+          )}
+        >
           <div className="flex items-center gap-2 min-w-0">
             {modeControl}
             <div
@@ -201,6 +416,7 @@ export function ComposerDock({
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {extraActions}
             {onAttachmentsChange ? (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -210,7 +426,10 @@ export function ComposerDock({
                     variant="ghost"
                     disabled={!canAttach}
                     aria-label="Attach files"
-                    className="h-8 w-8 rounded-full text-muted-foreground hover:text-foreground"
+                    className={cn(
+                      "rounded-full text-muted-foreground hover:text-foreground",
+                      bar ? "size-11" : "h-8 w-8",
+                    )}
                     onClick={() => fileInputRef.current?.click()}
                   >
                     <Paperclip className="h-4 w-4" />
@@ -219,8 +438,8 @@ export function ComposerDock({
                 <TooltipContent>Attach files</TooltipContent>
               </Tooltip>
             ) : null}
-            <span className="text-[10px] font-mono text-muted-foreground tracking-wider hidden sm:inline">
-              ⌘↵
+            <span className="text-meta font-mono text-muted-foreground tracking-wider whitespace-nowrap hidden @lg:inline">
+              ↵ send · ⇧↵ newline
             </span>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -229,7 +448,7 @@ export function ComposerDock({
                   size="icon"
                   disabled={!canSubmit}
                   aria-label={sendLabel}
-                  className="h-8 w-8 rounded-full shadow-sm"
+                  className={cn("rounded-full shadow-sm", bar ? "size-11" : "h-8 w-8")}
                 >
                   <ArrowUp className="h-4 w-4" />
                 </Button>
@@ -241,6 +460,9 @@ export function ComposerDock({
       </div>
       {isError && errorMessage ? (
         <p className="mt-2 text-xs text-status-error-strong px-1">{errorMessage}</p>
+      ) : null}
+      {dropErrorMessage ? (
+        <p className="mt-2 text-xs text-status-error-strong px-1">{dropErrorMessage}</p>
       ) : null}
       {attachmentErrorMessage ? (
         <p className="mt-2 text-xs text-status-error-strong px-1">{attachmentErrorMessage}</p>

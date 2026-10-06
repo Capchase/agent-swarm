@@ -8,6 +8,7 @@ import { type ChartMarker, LineChart, type LineSeries } from "../components/char
 import { type MiniBar, MiniBarChart } from "../components/charts/MiniBarChart.tsx";
 import { ScatterChart, type ScatterPoint } from "../components/charts/ScatterChart.tsx";
 import { type Column, DataTable, MultiSelect } from "../components/DataTable.tsx";
+import { EffortChip, effortKeyLabel } from "../components/EffortChip.tsx";
 import { EntityLink } from "../components/EntityLink.tsx";
 import {
   fmtAgo,
@@ -601,7 +602,7 @@ function EfficiencySection(props: { scatter: AnalyticsScatterPoint[] }): ReactNo
     <div className="panel">
       <SectionHead
         title={`Efficiency — ${yKey === "score" ? "Score" : "Pass Rate"} vs ${xDef.label}`}
-        tip="One dot per model: quality on the y axis against the selected spend metric (avg tokens, cost, or duration per attempt) on the x axis — lower is always better on x. Dot size scales with attempts. The green corner is the most attractive quadrant (high quality, low spend) and the red corner the least attractive; the y axis is pinned to the full 0–1 range (Score 0.00–1.00, Pass Rate 0–100%) so the quadrants stay correct and comparable across runs, while the x axis auto-scales to the data."
+        tip="One dot per model: quality on the y axis against the selected spend metric (avg tokens, cost, or duration per attempt) on the x axis — lower is always better on x. Dot size scales with attempts. The green corner is the most attractive quadrant (high quality, low spend) and the red corner the least attractive; the y axis is pinned to the full 0–1 range (Score 0.00–1.00, Pass Rate 0–100%) so the quadrants stay correct and comparable across runs, while the x axis auto-scales to the data. The dashed line is the Pareto frontier of the models shown: none of the plotted models beats them on both axes. It covers only what is plotted, not a full-suite frontier."
       >
         <span className="an-seg-label dim">X</span>
         <Seg
@@ -646,6 +647,9 @@ function EfficiencySection(props: { scatter: AnalyticsScatterPoint[] }): ReactNo
         // range) and the chart stays comparable across runs. Score renders as
         // fixed-decimal ticks (fmtScore), Pass Rate as 0–100% (fmtPct).
         yDomain={[0, 1]}
+        // Always drawn, from the dots on screen only: no suite-coverage rule
+        // here (the Leaderboard frontier and the public benchmark keep theirs).
+        frontier={{ label: "Pareto frontier of the models shown" }}
         showLabels={points.length <= SCATTER_LABEL_CAP}
         emptyText="No graded attempts with this metric yet — v7 runs capture tokens for every attempt"
       />
@@ -812,6 +816,31 @@ const MODEL_COLUMNS: Column<AnalyticsModel>[] = [
       ),
   },
   {
+    key: "efforts",
+    header: "Effort",
+    headerTip:
+      "Reasoning efforts this model's attempts ran at. Narrow to one with the Effort filter in the page header to compare efforts.",
+    width: "120px",
+    sortValue: (m) => m.efforts?.join(" ") ?? null,
+    titleText: (m) => m.efforts?.map(effortKeyLabel).join(", ") ?? "",
+    render: (m) =>
+      m.efforts && m.efforts.length > 0 ? (
+        <span className="an-efforts">
+          {m.efforts.map((e) =>
+            e === "default" ? (
+              <span className="dim" key={e}>
+                default
+              </span>
+            ) : (
+              <EffortChip key={e} effort={e} />
+            ),
+          )}
+        </span>
+      ) : (
+        <span className="dim">—</span>
+      ),
+  },
+  {
     key: "attempts",
     header: "Attempts",
     width: "76px",
@@ -950,26 +979,37 @@ function ModelsSection(props: { models: AnalyticsModel[] }): ReactNode {
 
 // ---- section 5: Rollups — by harness / by vendor (v7 §7.3) ----
 
-function rollupColumns(mode: ColorByKey): Column<AnalyticsGroupRollup>[] {
+type RollupMode = ColorByKey | "effort";
+
+function rollupColumns(mode: RollupMode): Column<AnalyticsGroupRollup>[] {
   return [
     {
       key: "group",
-      header: mode === "harness" ? "Harness" : "Vendor",
+      header: mode === "harness" ? "Harness" : mode === "vendor" ? "Vendor" : "Effort",
       searchText: (r) => r.group,
-      render: (r) => (
-        <span className="an-group">
-          <span
-            className="chart-dot"
-            style={{
-              background: colorForGroup(
-                r.group,
-                mode === "harness" ? HARNESS_COLORS : VENDOR_COLORS,
-              ),
-            }}
-          />
-          {mode === "harness" ? <HarnessIcon harness={r.group} showLabel /> : r.group}
-        </span>
-      ),
+      render: (r) =>
+        mode === "effort" ? (
+          <span className="an-group">
+            {r.group === "default" ? (
+              <span className="dim">{effortKeyLabel(r.group)}</span>
+            ) : (
+              <EffortChip effort={r.group} />
+            )}
+          </span>
+        ) : (
+          <span className="an-group">
+            <span
+              className="chart-dot"
+              style={{
+                background: colorForGroup(
+                  r.group,
+                  mode === "harness" ? HARNESS_COLORS : VENDOR_COLORS,
+                ),
+              }}
+            />
+            {mode === "harness" ? <HarnessIcon harness={r.group} showLabel /> : r.group}
+          </span>
+        ),
     },
     {
       key: "models",
@@ -1082,25 +1122,34 @@ function rollupColumns(mode: ColorByKey): Column<AnalyticsGroupRollup>[] {
 function RollupSection(props: {
   harnesses: AnalyticsGroupRollup[];
   vendors: AnalyticsGroupRollup[];
+  efforts: AnalyticsGroupRollup[];
 }): ReactNode {
-  const [mode, setMode] = useState<ColorByKey>("harness");
-  const rows = mode === "harness" ? props.harnesses : props.vendors;
-  const columns = useMemo(() => rollupColumns(mode), [mode]);
+  const [mode, setMode] = useState<RollupMode>("harness");
+  // The effort tab only earns its place once some attempt ran at a set effort.
+  const hasEfforts = props.efforts.some((r) => r.group !== "default");
+  // A filter can drop the effort tab while it is selected; rows, columns and the
+  // control all follow this one mode so they never disagree.
+  const effectiveMode: RollupMode = mode === "effort" && !hasEfforts ? "harness" : mode;
+  const rows =
+    effectiveMode === "harness"
+      ? props.harnesses
+      : effectiveMode === "vendor"
+        ? props.vendors
+        : props.efforts;
+  const columns = useMemo(() => rollupColumns(effectiveMode), [effectiveMode]);
+  const options: { key: RollupMode; label: string }[] = [
+    { key: "harness", label: "By Harness" },
+    { key: "vendor", label: "By Vendor" },
+    ...(hasEfforts ? [{ key: "effort" as const, label: "By Effort" }] : []),
+  ];
 
   return (
     <div className="panel">
       <SectionHead
-        title="By Harness, By Vendor"
-        tip="The same per-model aggregates rolled up one level: by harness provider (which agent CLI ran the attempt) or by model vendor (who serves the model the attempt actually used). Group colors match the scatter above."
+        title={hasEfforts ? "By Harness, Vendor, Effort" : "By Harness, By Vendor"}
+        tip="The same per-model aggregates rolled up one level: by harness provider (which agent CLI ran the attempt), by model vendor (who serves the model the attempt actually used), or by reasoning effort (what the worker was launched with; attempts at the harness default group together). Group colors match the scatter above."
       >
-        <Seg
-          options={[
-            { key: "harness" as const, label: "By Harness" },
-            { key: "vendor" as const, label: "By Vendor" },
-          ]}
-          value={mode}
-          onChange={setMode}
-        />
+        <Seg options={options} value={effectiveMode} onChange={setMode} />
       </SectionHead>
       <DataTable
         rows={rows}
@@ -1137,8 +1186,10 @@ function PageHead(props: {
   onRefresh: () => void;
   fHarnesses: string[];
   fConfigIds: string[];
+  fEfforts: string[];
   onHarnesses: (next: string[]) => void;
   onConfigIds: (next: string[]) => void;
+  onEfforts: (next: string[]) => void;
 }): ReactNode {
   const { data } = props;
   const configSearchText = useConfigSearchText();
@@ -1147,7 +1198,10 @@ function PageHead(props: {
     [data.matrix],
   );
   const options = useMemo(() => filterOptionsOf(data), [data]);
-  const active = props.fHarnesses.length + props.fConfigIds.length;
+  const active = props.fHarnesses.length + props.fConfigIds.length + props.fEfforts.length;
+  // Offer the filter once any attempt ran at a set effort (else it would list only "default").
+  const effortOptions = options.efforts ?? [];
+  const showEffort = effortOptions.some((e) => e !== "default") || props.fEfforts.length > 0;
   return (
     <div className="an-head">
       <h2 className="an-title">Analytics</h2>
@@ -1167,6 +1221,15 @@ function PageHead(props: {
           renderOption={(o) => <ConfigChip configId={o} />}
           searchText={configSearchText}
         />
+        {showEffort ? (
+          <MultiSelect
+            label="Effort"
+            options={effortOptions}
+            selected={props.fEfforts}
+            onChange={props.onEfforts}
+            renderOption={(o) => effortKeyLabel(o)}
+          />
+        ) : null}
         {active > 0 ? (
           <button
             type="button"
@@ -1175,6 +1238,7 @@ function PageHead(props: {
             onClick={() => {
               props.onHarnesses([]);
               props.onConfigIds([]);
+              props.onEfforts([]);
             }}
           >
             ✕ {active} {active === 1 ? "filter" : "filters"}
@@ -1210,10 +1274,11 @@ function PageHead(props: {
 export default function AnalyticsPage(): ReactNode {
   const [fHarnesses, setFHarnesses] = useState<string[]>([]);
   const [fConfigIds, setFConfigIds] = useState<string[]>([]);
+  const [fEfforts, setFEfforts] = useState<string[]>([]);
   const analytics = usePoll(
-    () => getAnalytics({ harnesses: fHarnesses, configIds: fConfigIds }),
+    () => getAnalytics({ harnesses: fHarnesses, configIds: fConfigIds, efforts: fEfforts }),
     null,
-    [fHarnesses.join(","), fConfigIds.join(",")],
+    [fHarnesses.join(","), fConfigIds.join(","), fEfforts.join(",")],
   );
 
   if (analytics.data === null) {
@@ -1233,8 +1298,10 @@ export default function AnalyticsPage(): ReactNode {
         onRefresh={analytics.refresh}
         fHarnesses={fHarnesses}
         fConfigIds={fConfigIds}
+        fEfforts={fEfforts}
         onHarnesses={setFHarnesses}
         onConfigIds={setFConfigIds}
+        onEfforts={setFEfforts}
       />
       <HighlightsSection models={analytics.data.models} />
       <TrendsSection series={analytics.data.series} />
@@ -1244,6 +1311,7 @@ export default function AnalyticsPage(): ReactNode {
       <RollupSection
         harnesses={analytics.data.harnesses ?? []}
         vendors={analytics.data.vendors ?? []}
+        efforts={analytics.data.efforts ?? []}
       />
     </>
   );

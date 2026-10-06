@@ -1,8 +1,14 @@
 import {
+  autoCancelStaleApprovalRequests,
+  timeoutExpiredApprovalRequests,
+} from "../be/approval-sweeps";
+import {
   assignUnassignedTaskPending,
   backfillSupersedeTaskResumeTaskId,
   buildRoutingAffinityFromAgent,
+  cascadeFailDependents,
   cleanupStaleSessions,
+  createLogEntry,
   createTaskExtended,
   deleteActiveSession,
   failPendingResumeIfUnclaimed,
@@ -11,6 +17,7 @@ import {
   getActiveTaskCount,
   getAllAgents,
   getDbClient,
+  getDependentTasks,
   getIdleWorkersWithCapacity,
   getLeadAgent,
   getPendingSteeringForTask,
@@ -20,6 +27,8 @@ import {
   getStalePinnedResumes,
   getStaleUnassignedAffinityTasks,
   getStalledInProgressTasks,
+  getSupersededTasksWithoutResume,
+  getSupersededTasksWithUnsettledDependents,
   getTaskById,
   getTaskStats,
   getTasksByStatus,
@@ -29,20 +38,25 @@ import {
   isAgentEligibleForTask,
   isPoolAffinityEnforcementEnabled,
   MAX_EMPTY_POLLS,
+  promoteAbandonedDraftTasks,
   releaseStaleMentionProcessing,
   releaseStaleOfferedTasksForOfflineAgents,
   releaseStaleProcessingInbox,
   releaseStaleReviewingTasks,
+  settleSupersededTaskDependents,
   supersedeTask,
   updateAgentStatus,
 } from "../be/db";
 import { repointTrackerSyncBySwarmId } from "../be/db-queries/tracker";
+import { poolTaskRunsOnHarness } from "../be/model-validation";
 import {
   agentsWithLiveRuntime,
   countActiveRuntimeInstancesForAgent,
   expireStaleRuntimeInstances,
 } from "../be/multi-runtime";
 import { promotePendingSteeringForTask } from "../be/steering";
+import type { HeartbeatAction, HeartbeatClassification } from "../extensions/contract";
+import { dispatchPre, extensionIdForAgent } from "../extensions/dispatcher";
 import { resolveTemplate } from "../prompts/resolver";
 import {
   createPoolStarvationDecisionTask,
@@ -52,8 +66,10 @@ import {
   getPinCandidateAgent,
   getResumeGeneration,
   REBOOT_RETRY_PIN_TAG,
+  resolveLeadOnlyRecoveryAssignment,
 } from "../tasks/worker-follow-up";
 import type { AgentTask } from "../types";
+import { isEnvFlagEnabled } from "../utils/env-flag";
 import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { getExecutorRegistry } from "../workflows";
@@ -116,6 +132,16 @@ export const STEERING_STALL_GRACE_MIN = Number(process.env.HEARTBEAT_STEERING_GR
 /** Stale resource cleanup threshold (minutes) */
 const STALE_CLEANUP_THRESHOLD_MINUTES = Number(process.env.HEARTBEAT_STALE_CLEANUP_MIN) || 30;
 
+/**
+ * Abandoned-draft promotion threshold (minutes, #1240). Deliberately much
+ * shorter than STALE_CLEANUP_THRESHOLD_MINUTES: a draft only exists while a
+ * UI-composer attachment batch uploads, which even against slow storage
+ * (#1226) took tens of seconds — 5 minutes is generous headroom above that
+ * worst case while still surfacing an abandoned session (tab closed
+ * mid-upload) to its owner within one coffee break, not half an hour.
+ */
+const DRAFT_TASK_TIMEOUT_MINUTES = Number(process.env.HEARTBEAT_DRAFT_TASK_TIMEOUT_MIN) || 5;
+
 /** Max pool tasks to auto-assign per sweep */
 function maxAutoAssignPerSweep(): number {
   const raw = process.env.HEARTBEAT_MAX_AUTO_ASSIGN?.trim();
@@ -145,6 +171,21 @@ export function maxResumeGenerations(): number {
 }
 
 export const RESUME_BUDGET_EXHAUSTED_REASON = "resume_budget_exhausted";
+
+type StallClassification = HeartbeatClassification;
+type RemediationAction = HeartbeatAction;
+
+type RemediationDecision = { action: RemediationAction; reason: string };
+
+interface RemediationFacts {
+  skipAutoResume: boolean;
+  alreadyResumed: boolean;
+  resumeBudgetExhausted: boolean;
+  supersedeReason: string;
+  legacyFailReason: string;
+}
+
+const REMEDIATION_ACTIONS = new Set<RemediationAction>(["supersede-resume", "fail", "record"]);
 
 /**
  * Grace window (minutes) a crash-recovery resume pinned to its original agent
@@ -180,12 +221,30 @@ export const HEARTBEAT_RESUME_PIN_GRACE_MIN = (() => {
  */
 const POOL_AFFINITY_ESCALATION_MIN = Number(process.env.POOL_AFFINITY_ESCALATION_MIN) || 15;
 
-/** Heartbeat checklist interval: how often to check HEARTBEAT.md (default: 30 min) */
-const HEARTBEAT_CHECKLIST_INTERVAL_MS =
-  Number(process.env.HEARTBEAT_CHECKLIST_INTERVAL_MS) || 30 * 60 * 1000;
+const DEFAULT_HEARTBEAT_CHECKLIST_INTERVAL_MS = 30 * 60 * 1000;
 
-/** Whether to disable the heartbeat checklist entirely */
-const HEARTBEAT_CHECKLIST_DISABLE = Boolean(process.env.HEARTBEAT_CHECKLIST_DISABLE);
+/**
+ * Heartbeat checklist interval: how often to check HEARTBEAT.md (default: 30 min).
+ *
+ * An explicit `0` (or negative) turns the RECURRING checklist tick off; the
+ * one-shot boot triage still runs. Absent, empty, or non-numeric values fall
+ * back to the default (not `Number(x) || default`, which would coerce `0` to 30 min).
+ */
+function heartbeatChecklistIntervalMs(): number {
+  const raw = process.env.HEARTBEAT_CHECKLIST_INTERVAL_MS?.trim();
+  if (!raw) return DEFAULT_HEARTBEAT_CHECKLIST_INTERVAL_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_HEARTBEAT_CHECKLIST_INTERVAL_MS;
+  return Math.max(0, parsed);
+}
+
+/**
+ * Whether to disable the heartbeat checklist entirely (recurring tick AND boot
+ * triage). Parsed with the shared env-flag helper, so `"false"`/`"0"` keep it on.
+ */
+function isHeartbeatChecklistDisabled(): boolean {
+  return isEnvFlagEnabled("HEARTBEAT_CHECKLIST_DISABLE", false);
+}
 
 // ============================================================================
 // Types
@@ -193,6 +252,11 @@ const HEARTBEAT_CHECKLIST_DISABLE = Boolean(process.env.HEARTBEAT_CHECKLIST_DISA
 
 export interface HeartbeatFindings {
   stalledTasks: AgentTask[];
+  extensionSkipped: Array<{
+    taskId: string;
+    extension: { id: string; name: string };
+    reason: string;
+  }>;
   autoFailedTasks: Array<{ taskId: string; agentId: string; reason: string }>;
   autoResumedTasks: Array<{
     taskId: string;
@@ -221,6 +285,9 @@ export interface HeartbeatFindings {
     workflowRuns: number;
     staleRuntimes: number;
     staleOfferedTasks: number;
+    abandonedDraftTasks: number;
+    approvalAutoCancelled: number;
+    approvalTimedOut: number;
   };
 }
 
@@ -230,6 +297,7 @@ export interface HeartbeatFindings {
 
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let checklistInterval: ReturnType<typeof setInterval> | null = null;
+let bootTriageTimeout: ReturnType<typeof setTimeout> | null = null;
 let isSweeping = false;
 let beforeHeartbeatSupersedeForTests: ((task: AgentTask) => void | Promise<void>) | null = null;
 
@@ -282,6 +350,7 @@ export async function preflightGate(): Promise<boolean> {
 export async function codeLevelTriage(): Promise<HeartbeatFindings> {
   const findings: HeartbeatFindings = {
     stalledTasks: [],
+    extensionSkipped: [],
     autoFailedTasks: [],
     autoResumedTasks: [],
     pinnedResumes: [],
@@ -296,6 +365,9 @@ export async function codeLevelTriage(): Promise<HeartbeatFindings> {
       workflowRuns: 0,
       staleRuntimes: 0,
       staleOfferedTasks: 0,
+      abandonedDraftTasks: 0,
+      approvalAutoCancelled: 0,
+      approvalTimedOut: 0,
     },
   };
 
@@ -313,6 +385,10 @@ export async function codeLevelTriage(): Promise<HeartbeatFindings> {
 
   // 1. Detect and remediate stalled tasks (tiered: auto-fail dead workers)
   await detectAndRemediateStalledTasks(findings);
+
+  // 1.5. Give a resume to any task superseded without one (crash between
+  // the supersede write and the resume write).
+  await repairSupersededWithoutResume(findings);
 
   // 2. Check and fix worker health
   await checkWorkerHealth(findings);
@@ -362,131 +438,225 @@ async function detectAndRemediateStalledTasks(findings: HeartbeatFindings): Prom
       continue;
     }
 
+    let classification: StallClassification | undefined;
+    let remediationOpts: RemediationOptions | undefined;
+    let proposed: RemediationDecision | undefined;
+
     if (!session) {
-      // Case A: No active session — worker is dead
       if (taskAgeMs >= stallThresholdNoSessionMin() * 60 * 1000) {
-        await remediateCrashedWorkerTask(findings, task, {
+        classification = "no-session";
+        remediationOpts = {
           supersedeReason:
             "Auto-superseded by heartbeat: worker session not found (no active session for task)",
           legacyFailReason:
             "Auto-failed by heartbeat: worker session not found (no active session for task)",
           shortLabel: "no active session",
-        });
+        };
+        proposed = await defaultRemediationDecision(task, remediationOpts);
       }
     } else {
       const isStaleHeartbeat =
         sessionHeartbeatAgeMs! >= stallThresholdStaleHeartbeatMin() * 60 * 1000;
 
       if (isStaleHeartbeat) {
-        // Case B: Session exists but heartbeat is stale — worker likely crashed
         if (taskAgeMs >= stallThresholdStaleHeartbeatMin() * 60 * 1000) {
-          await remediateCrashedWorkerTask(findings, task, {
+          classification = "stale-session";
+          remediationOpts = {
             supersedeReason:
               "Auto-superseded by heartbeat: worker session heartbeat is stale (likely crashed)",
             legacyFailReason:
               "Auto-failed by heartbeat: worker session heartbeat is stale (likely crashed)",
             shortLabel: "stale session heartbeat",
             cleanupActiveSession: true,
-          });
+          };
+          proposed = await defaultRemediationDecision(task, remediationOpts);
         }
       } else {
-        // Case C: Session exists and heartbeat is fresh — ambiguous
         if (taskAgeMs >= stallThresholdMinutes() * 60 * 1000) {
-          findings.stalledTasks.push(task);
+          classification = "fresh-stalled";
+          remediationOpts = {
+            supersedeReason:
+              "Auto-superseded by heartbeat: task stalled despite a fresh session heartbeat",
+            legacyFailReason:
+              "Auto-failed by heartbeat: task stalled despite a fresh session heartbeat",
+            shortLabel: "fresh session heartbeat",
+          };
+          proposed = {
+            action: "record",
+            reason: "Task stalled despite a fresh session heartbeat",
+          };
         }
       }
     }
+
+    if (!classification || !remediationOpts || !proposed) continue;
+
+    const dispatched = await dispatchPre(
+      "pre.heartbeat.remediate",
+      {
+        task,
+        ...(session ? { session } : {}),
+        classification,
+        proposedAction: proposed.action,
+        reason: proposed.reason,
+        taskAgeMs,
+        ...(sessionHeartbeatAgeMs === null ? {} : { sessionHeartbeatAgeMs }),
+      },
+      { skipExtensionId: extensionIdForAgent(task.creatorAgentId) },
+    );
+
+    if (dispatched.action === "block") {
+      findings.stalledTasks.push(task);
+      findings.extensionSkipped.push({
+        taskId: task.id,
+        extension: dispatched.extension,
+        reason: dispatched.reason,
+      });
+      continue;
+    }
+
+    if (dispatched.action === "modify") {
+      const action = dispatched.data.proposedAction;
+      if (isRemediationAction(action)) {
+        proposed = { ...proposed, action };
+      } else {
+        console.warn(
+          "[Heartbeat] Extension returned an invalid remediation action:",
+          scrubSecrets(String(action)),
+        );
+      }
+    }
+
+    if (proposed.action === "record") {
+      findings.stalledTasks.push(task);
+      continue;
+    }
+
+    await remediateCrashedWorkerTask(findings, task, remediationOpts, proposed);
   }
 }
 
+/** Repair window: skip in-flight supersedes, stop at a day of history. */
+const ORPHAN_SUPERSEDE_MIN_AGE_MS = 60 * 1000;
+const ORPHAN_SUPERSEDE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 /**
- * Shared remediation for Cases A (no active session) and B (stale heartbeat) of the
- * stalled-task detector. Prefers the supersede → resume follow-up path (DES-523) so a
- * crashed worker's task gets a fresh "resume" sibling instead of being silently dropped.
+ * Supersede and resume creation are separate writes. If the API process dies
+ * between them, the task stays `superseded` with no resume and nothing else
+ * picks it up (the stall classifier only reads `in_progress`). This creates
+ * the missing resume. Found by the TLA+ model (specs/tla/heartbeat/).
+ */
+async function repairSupersededWithoutResume(findings: HeartbeatFindings): Promise<void> {
+  const now = Date.now();
+  const orphans = await getSupersededTasksWithoutResume(
+    new Date(now - ORPHAN_SUPERSEDE_MIN_AGE_MS).toISOString(),
+    new Date(now - ORPHAN_SUPERSEDE_MAX_AGE_MS).toISOString(),
+  );
+  for (const task of orphans) {
+    const resume =
+      task.agentId && getNextResumeGeneration(task) <= maxResumeGenerations()
+        ? await createResumeFollowUp({ parentId: task.id, reason: "crash_recovery" })
+        : null;
+    if (resume?.kind !== "created" || !task.agentId) {
+      // No resume will carry the work: its dependents fail as they would have.
+      await settleSupersededTaskDependents(task.id, null);
+      continue;
+    }
+    await backfillSupersedeTaskResumeTaskId(task.id, resume.task.id);
+    findings.autoResumedTasks.push({
+      taskId: task.id,
+      resumeTaskId: resume.task.id,
+      agentId: task.agentId,
+      reason: "repaired superseded task without resume",
+    });
+    console.log(
+      `[Heartbeat] Created missing resume ${resume.task.id.slice(0, 8)} for superseded task ${task.id.slice(0, 8)}`,
+    );
+  }
+
+  // A crash after the resume was created but before the backfill leaves
+  // dependents waiting on the superseded task; settle them onto that resume.
+  const unsettled = await getSupersededTasksWithUnsettledDependents(
+    new Date(now - ORPHAN_SUPERSEDE_MIN_AGE_MS).toISOString(),
+    new Date(now - ORPHAN_SUPERSEDE_MAX_AGE_MS).toISOString(),
+  );
+  for (const { taskId, resumeTaskId } of unsettled) {
+    await settleSupersededTaskDependents(taskId, resumeTaskId);
+  }
+}
+
+function isRemediationAction(value: unknown): value is RemediationAction {
+  return typeof value === "string" && REMEDIATION_ACTIONS.has(value as RemediationAction);
+}
+
+function decideRemediation(task: AgentTask, facts: RemediationFacts): RemediationDecision {
+  if (task.workflowRunStepId != null) {
+    return { action: "fail", reason: "superseded_workflow_task" };
+  }
+  if (facts.skipAutoResume || facts.alreadyResumed) {
+    return { action: "fail", reason: facts.legacyFailReason };
+  }
+  if (facts.resumeBudgetExhausted) {
+    return { action: "fail", reason: RESUME_BUDGET_EXHAUSTED_REASON };
+  }
+  return { action: "supersede-resume", reason: facts.supersedeReason };
+}
+
+async function defaultRemediationDecision(
+  task: AgentTask,
+  opts: RemediationOptions,
+): Promise<RemediationDecision> {
+  const skipAutoResume = SKIP_AUTO_RESUME_TYPES.has(task.taskType ?? "");
+  const isWorkflowStep = task.workflowRunStepId != null;
+  const alreadyResumed =
+    !skipAutoResume && !isWorkflowStep && (await hasNonTerminalResumeChild(task.id));
+  const resumeBudgetExhausted = getNextResumeGeneration(task) > maxResumeGenerations();
+  return decideRemediation(task, {
+    skipAutoResume,
+    alreadyResumed,
+    resumeBudgetExhausted,
+    supersedeReason: opts.supersedeReason,
+    legacyFailReason: opts.legacyFailReason,
+  });
+}
+
+interface RemediationOptions {
+  supersedeReason: string;
+  legacyFailReason: string;
+  shortLabel: string;
+  cleanupActiveSession?: boolean;
+}
+
+/**
+ * Applies a selected remediation action for a stalled task. Extensions can replace
+ * the selected action before this function runs.
  *
- * Falls back to the legacy `failTask` path when:
- *   - the task is a system task (heartbeat / boot-triage) — would loop forever,
- *   - a non-terminal child already exists — a prior sweep already created a resume,
- *   - `createResumeFollowUp` returns `workflow-skip` — workflow engine owns retries.
+ * The supersede and resume path gives crashed work a fresh sibling. The fail path keeps
+ * workflow ownership, excluded task types, idempotency, and resume-budget behavior.
  */
 async function remediateCrashedWorkerTask(
   findings: HeartbeatFindings,
   task: AgentTask,
-  opts: {
-    supersedeReason: string;
-    legacyFailReason: string;
-    shortLabel: string;
-    cleanupActiveSession?: boolean;
-  },
+  opts: RemediationOptions,
+  decision: RemediationDecision,
 ): Promise<void> {
   if (!task.agentId) return; // Type guard — caller already checked.
 
-  const skipAutoResume = SKIP_AUTO_RESUME_TYPES.has(task.taskType ?? "");
-  // Workflow-step tasks: skip supersede entirely so the engine's retry policy
-  // owns recovery. `createResumeFollowUp` would also bail with `workflow-skip`,
-  // but checking here avoids leaving the parent in `superseded` with a dangling
-  // dedicated-reason `failTask` no-op chasing it.
-  const isWorkflowStep = task.workflowRunStepId != null;
-  // Idempotency: if a non-terminal `resume` child already exists for this
-  // parent, a prior sweep already created the resume — fall back to the
-  // legacy fail path. We filter on `taskType = 'resume'` specifically (not
-  // any child task) because `send-task` auto-defaults `parentTaskId` to the
-  // caller's current task, so a crashed worker with delegated subtasks
-  // would otherwise be incorrectly skipped (PR #594 review).
-  const alreadyResumed =
-    !skipAutoResume && !isWorkflowStep && (await hasNonTerminalResumeChild(task.id));
-
-  if (isWorkflowStep) {
-    const failed = await failTask(task.id, "superseded_workflow_task");
+  if (decision.action === "fail") {
+    // CAS on the lastUpdatedAt this sweep read: progress since then wins.
+    const failed = await failTask(task.id, decision.reason, {
+      expectedLastUpdatedAt: task.lastUpdatedAt,
+    });
     if (failed) {
       findings.autoFailedTasks.push({
         taskId: task.id,
         agentId: task.agentId,
-        reason: "superseded_workflow_task",
+        reason: decision.reason,
       });
       if (opts.cleanupActiveSession) await deleteActiveSession(task.id);
-      console.log(
-        `[Heartbeat] Workflow-step task ${task.id.slice(0, 8)} failed — engine will handle retry (${opts.shortLabel})`,
-      );
-      const remaining = await getActiveTaskCount(task.agentId);
-      if (remaining === 0) await restoreAgentIdleAfterRemediation(task.agentId);
-    }
-    return;
-  }
-
-  if (skipAutoResume || alreadyResumed) {
-    const failed = await failTask(task.id, opts.legacyFailReason);
-    if (failed) {
-      findings.autoFailedTasks.push({
-        taskId: task.id,
-        agentId: task.agentId,
-        reason: opts.legacyFailReason,
-      });
-      if (opts.cleanupActiveSession) await deleteActiveSession(task.id);
-      console.log(
-        `[Heartbeat] Auto-failed task ${task.id.slice(0, 8)} — ${opts.shortLabel} (${
-          skipAutoResume ? "skipRetry taskType" : "resume already exists"
-        })`,
-      );
-      const remaining = await getActiveTaskCount(task.agentId);
-      if (remaining === 0) await restoreAgentIdleAfterRemediation(task.agentId);
-    }
-    return;
-  }
-
-  const nextResumeGeneration = getNextResumeGeneration(task);
-  if (nextResumeGeneration > maxResumeGenerations()) {
-    const failed = await failTask(task.id, RESUME_BUDGET_EXHAUSTED_REASON);
-    if (failed) {
-      findings.autoFailedTasks.push({
-        taskId: task.id,
-        agentId: task.agentId,
-        reason: RESUME_BUDGET_EXHAUSTED_REASON,
-      });
-      if (opts.cleanupActiveSession) await deleteActiveSession(task.id);
-      console.warn(
-        `[Heartbeat] Auto-failed task ${task.id.slice(0, 8)} — ${RESUME_BUDGET_EXHAUSTED_REASON} (${opts.shortLabel})`,
-      );
+      const message = `[Heartbeat] Auto-failed task ${task.id.slice(0, 8)}: ${decision.reason} (${opts.shortLabel})`;
+      if (decision.reason === RESUME_BUDGET_EXHAUSTED_REASON) console.warn(message);
+      else console.log(message);
       const remaining = await getActiveTaskCount(task.agentId);
       if (remaining === 0) await restoreAgentIdleAfterRemediation(task.agentId);
     }
@@ -496,8 +666,10 @@ async function remediateCrashedWorkerTask(
   await beforeHeartbeatSupersedeForTests?.(task);
 
   const superseded = await supersedeTask(task.id, {
-    reason: opts.supersedeReason,
+    reason: decision.reason,
     resumeTaskId: null,
+    // CAS on the lastUpdatedAt this sweep read: progress since then wins.
+    expectedLastUpdatedAt: task.lastUpdatedAt,
   });
   if (!superseded) {
     return;
@@ -524,7 +696,7 @@ async function remediateCrashedWorkerTask(
       taskId: task.id,
       resumeTaskId: resume.task.id,
       agentId: task.agentId,
-      reason: opts.supersedeReason,
+      reason: decision.reason,
     });
     // Phase 1 (DES-523): when the resume pinned back to the original
     // (stable-ID) agent, record it so the sweep summary surfaces the pin
@@ -545,6 +717,7 @@ async function remediateCrashedWorkerTask(
       resume.kind === "skipped"
         ? `resume_creation_skipped_${resume.reason}`
         : "resume_creation_skipped_workflow";
+    await settleSupersededTaskDependents(task.id, null);
     const failed = await failTask(task.id, reason);
     if (failed) {
       findings.autoFailedTasks.push({
@@ -586,7 +759,15 @@ const BOOT_EPOCH_SKEW_MS = 5_000;
 
 /**
  * Aggressive sweep that runs once after server restart.
- * Ignores age thresholds — any in_progress task with no active session is auto-failed.
+ * Ignores age thresholds: any in_progress task claimed before this boot that has
+ * no active session is auto-failed.
+ * A task whose `lastUpdatedAt` is at or after the boot epoch (minus skew) is
+ * skipped outright: `claimTask` / `startTask` stamp that column at the
+ * in_progress transition and the API is the sole DB writer, so a post-boot value
+ * proves the claim (or a live worker's write) happened after this process
+ * started. It cannot be a pre-boot orphan. Workers register their active session
+ * only after the provider spawn returns, which can exceed the 5s sweep delay
+ * (opencode cold start), so this check is what keeps a freshly claimed task alive.
  * A session is only considered "live" if it heartbeated AFTER the current API boot
  * (concurrency-safe: workers with multiple tasks keep fresh heartbeats on live ones).
  * Creates exactly one retry task per failed task via parentTaskId.
@@ -625,6 +806,19 @@ export async function runRebootSweep(): Promise<void> {
         continue;
       }
 
+      if (bootEpoch !== null) {
+        // Claimed at or after this boot (see the doc comment above): not a
+        // pre-boot orphan. The regular stalled-task sweep still covers it if
+        // it goes quiet later.
+        const lastUpdated = new Date(task.lastUpdatedAt).getTime();
+        if (Number.isFinite(lastUpdated) && lastUpdated >= bootEpoch - BOOT_EPOCH_SKEW_MS) {
+          console.log(
+            `[Heartbeat] Reboot sweep: skipping task ${task.id.slice(0, 8)}: claimed after boot (lastUpdatedAt=${task.lastUpdatedAt})`,
+          );
+          continue;
+        }
+      }
+
       const session = await getActiveSessionForTask(task.id);
       if (session) {
         if (bootEpoch === null) {
@@ -636,83 +830,146 @@ export async function runRebootSweep(): Promise<void> {
           // Heartbeated after (or within skew of) this boot → genuinely live, skip
           continue;
         }
-        // Pre-boot stale session → fall through to auto-fail + reboot-retry child
+        // Workers run in their own containers and outlive an API restart, and
+        // a session's heartbeat only moves on tool calls or provider output.
+        // A pre-boot heartbeat is therefore not evidence of a dead worker: a
+        // live one inside a long model call has none in the first seconds
+        // after boot. Only a session
+        // stale by the classifier's own threshold counts as dead; anything
+        // fresher is left to the regular stalled-task sweep.
+        if (Date.now() - sessionLastSeen < stallThresholdStaleHeartbeatMin() * 60 * 1000) {
+          continue;
+        }
+        // Stale session → fall through to auto-fail + reboot-retry child
       }
 
       // Clean up pre-boot stale session before failing (if it existed)
       if (session) await deleteActiveSession(task.id);
 
-      // Auto-fail the task
-      const failed = await failTask(task.id, reason);
+      // Auto-fail the task. Its dependents are settled in the `finally` below
+      // (re-pointed to the retry child, or cascade-failed when there is none)
+      // instead of by failTask's unconditional cascade.
+      const failed = await failTask(task.id, reason, { cascadeDependents: false });
       if (!failed) continue;
 
-      // Fix agent status
-      if ((await getActiveTaskCount(task.agentId)) === 0) {
-        await restoreAgentIdleAfterRemediation(task.agentId);
-      }
-
-      // Don't retry system-generated heartbeat tasks
-      if (SKIP_AUTO_RESUME_TYPES.has(task.taskType ?? "")) {
-        rebootAffectedTasks.push({ original: failed, retryTaskId: null });
-        continue;
-      }
-
-      // Auto-retry: create a replacement task with parentTaskId
       let retryTaskId: string | null = null;
+      try {
+        // Fix agent status
+        if ((await getActiveTaskCount(task.agentId)) === 0) {
+          await restoreAgentIdleAfterRemediation(task.agentId);
+        }
 
-      // Guard: only retry if parent doesn't already have a retry child
-      const existingRetry = await getDbClient().get<{ id: string }>(
-        `SELECT id FROM agent_tasks
+        // Don't retry system-generated heartbeat tasks
+        if (SKIP_AUTO_RESUME_TYPES.has(task.taskType ?? "")) {
+          rebootAffectedTasks.push({ original: failed, retryTaskId: null });
+          continue;
+        }
+
+        // Auto-retry: create a replacement task with parentTaskId
+        // A corrupt persisted affinity is never converted into an untagged
+        // retry by this independent recovery path.
+        if (task.routingAffinityInvalid) {
+          console.error(
+            `[Heartbeat] Reboot retry suppressed for ${task.id.slice(0, 8)}: invalid routing affinity`,
+          );
+          rebootAffectedTasks.push({ original: failed, retryTaskId: null });
+          continue;
+        }
+
+        // Guard: only retry if parent doesn't already have a retry child
+        const existingRetry = await getDbClient().get<{ id: string }>(
+          `SELECT id FROM agent_tasks
            WHERE parentTaskId = ?
              AND status NOT IN ('completed', 'failed', 'cancelled')
            LIMIT 1`,
-        [task.id],
-      );
+          [task.id],
+        );
 
-      if (!existingRetry) {
-        try {
-          // Routing affinity (Phase 3): pin the retry child to the original
-          // agent when it still looks recoverable (row exists, not offline,
-          // has capacity) — the same gate `createResumeFollowUp` uses for its
-          // same-agent pin. This keeps the retry off the role-blind pool
-          // whenever the original worker is merely restarting. Always stamp
-          // a `routingAffinity` snapshot from the original agent — even on
-          // the pool-fallback leg (agent gone/offline/at-capacity) — so that
-          // leg is still role/capability-gated instead of role-blind.
-          let preferredAgentId: string | undefined;
-          const candidate = await getPinCandidateAgent(task.agentId);
-          if (candidate) {
-            const activeCount = await getActiveTaskCount(candidate.id);
-            const hasCap = activeCount < (candidate.maxTasks ?? 1);
-            if (hasCap) {
-              preferredAgentId = candidate.id;
-            } else {
-              console.warn(
-                `[Heartbeat] Reboot retry for task ${task.id.slice(0, 8)} NOT pinned: agent ${candidate.id.slice(0, 8)} at capacity (${activeCount}/${candidate.maxTasks ?? 1}); falling back to affinity-gated pool`,
-              );
+        if (!existingRetry) {
+          try {
+            // Routing affinity (Phase 3): pin the retry child to the original
+            // agent when it still looks recoverable (row exists, not offline,
+            // has capacity) — the same gate `createResumeFollowUp` uses for its
+            // same-agent pin. This keeps the retry off the role-blind pool
+            // whenever the original worker is merely restarting. Always stamp
+            // a `routingAffinity` snapshot from the original agent — even on
+            // the pool-fallback leg (agent gone/offline/at-capacity) — so that
+            // leg is still role/capability-gated instead of role-blind.
+            let preferredAgentId: string | undefined;
+            let sourceCandidate = await getPinCandidateAgent(task.agentId);
+            if (sourceCandidate) {
+              const activeCount = await getActiveTaskCount(sourceCandidate.id);
+              const maxTasks = sourceCandidate.maxTasks ?? 1;
+              const hasCap = activeCount < maxTasks;
+              if (hasCap) {
+                preferredAgentId = sourceCandidate.id;
+              } else {
+                sourceCandidate = null;
+                console.warn(
+                  `[Heartbeat] Reboot retry for task ${task.id.slice(0, 8)} NOT pinned: agent ${task.agentId.slice(0, 8)} at capacity (${activeCount}/${maxTasks}); falling back to affinity-gated pool`,
+                );
+              }
             }
+
+            const leadOnly = task.routingAffinity?.leadOnly === true;
+            const authorization = await resolveLeadOnlyRecoveryAssignment(task, sourceCandidate);
+            if (leadOnly) preferredAgentId = authorization.agentId;
+
+            const tags = ["reboot-retry", "auto-generated"];
+            if (preferredAgentId !== undefined) tags.push(REBOOT_RETRY_PIN_TAG);
+            const sourceAffinity = (await buildRoutingAffinityFromAgent(task.agentId)) ?? undefined;
+            const routingAffinity = leadOnly
+              ? {
+                  ...(sourceAffinity ?? task.routingAffinity),
+                  capabilities:
+                    task.routingAffinity?.capabilities ?? sourceAffinity?.capabilities ?? [],
+                  leadOnly: true,
+                }
+              : sourceAffinity;
+
+            const retryTask = await createTaskExtended(task.task, {
+              parentTaskId: task.id,
+              agentId: preferredAgentId,
+              routingReason:
+                preferredAgentId === undefined
+                  ? undefined
+                  : preferredAgentId === task.agentId
+                    ? "continuity"
+                    : "reroute_fault",
+              routingSource: preferredAgentId === undefined ? undefined : "engine_default",
+              tags,
+              priority: task.priority,
+              source: task.source,
+              taskType: task.taskType ?? undefined,
+              // The retry re-runs the same work, so it keeps the creator's
+              // onCompleted/onFailed.
+              inheritParentFollowUpConfig: true,
+              routingAffinity,
+            });
+            if (authorization.decision) {
+              await createLogEntry({
+                eventType: "task_recovery_authorization",
+                taskId: retryTask.id,
+                agentId: preferredAgentId,
+                metadata: {
+                  leadOnly: true,
+                  parentTaskId: task.id,
+                  sourceAgentId: task.agentId,
+                  decision: authorization.decision,
+                },
+              });
+            }
+            retryTaskId = retryTask.id;
+            console.log(`[Heartbeat] Reboot retry created: ${retryTaskId} (parent: ${task.id})`);
+          } catch (err) {
+            console.error(`[Heartbeat] Failed to create retry task for ${task.id}:`, err);
           }
-
-          const tags = ["reboot-retry", "auto-generated"];
-          if (preferredAgentId !== undefined) tags.push(REBOOT_RETRY_PIN_TAG);
-
-          const retryTask = await createTaskExtended(task.task, {
-            parentTaskId: task.id,
-            agentId: preferredAgentId,
-            tags,
-            priority: task.priority,
-            source: task.source,
-            taskType: task.taskType ?? undefined,
-            routingAffinity: (await buildRoutingAffinityFromAgent(task.agentId)) ?? undefined,
-          });
-          retryTaskId = retryTask.id;
-          console.log(`[Heartbeat] Reboot retry created: ${retryTaskId} (parent: ${task.id})`);
-        } catch (err) {
-          console.error(`[Heartbeat] Failed to create retry task for ${task.id}:`, err);
         }
-      }
 
-      rebootAffectedTasks.push({ original: failed, retryTaskId });
+        rebootAffectedTasks.push({ original: failed, retryTaskId });
+      } finally {
+        await settleRebootSweptDependents(task.id, retryTaskId);
+      }
     }
 
     console.log(
@@ -720,6 +977,67 @@ export async function runRebootSweep(): Promise<void> {
     );
   } finally {
     isSweeping = false;
+  }
+}
+
+/** Statuses a dependent can hold before it ever started running. */
+const NEVER_STARTED_STATUSES = new Set([
+  "draft",
+  "backlog",
+  "unassigned",
+  "offered",
+  "reviewing",
+  "pending",
+]);
+
+/**
+ * Settle the dependents of a reboot-swept task. With a retry child, every
+ * never-started dependent has the swept id in `dependsOn` replaced by the
+ * retry id, so it waits on the retry instead of dying with `Blocked dependency
+ * … was failed`. The row keeps its id, agent, Slack fields, follow-up config,
+ * priority and parent. Anything still depending on the swept task afterwards
+ * (no retry, or a dependent that already started) cascade-fails as before.
+ */
+async function settleRebootSweptDependents(
+  sweptId: string,
+  retryTaskId: string | null,
+): Promise<void> {
+  try {
+    if (retryTaskId) {
+      for (const dep of await getDependentTasks(sweptId)) {
+        if (!NEVER_STARTED_STATUSES.has(dep.status)) continue;
+        const dependsOn = [
+          ...new Set(dep.dependsOn.map((id) => (id === sweptId ? retryTaskId : id))),
+        ];
+        // Status + membership predicates make the re-point a no-op if the
+        // dependent was claimed or re-pointed since it was read.
+        const row = await getDbClient().get<{ id: string }>(
+          `UPDATE agent_tasks
+              SET dependsOn = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ? AND status = ?
+              AND EXISTS (SELECT 1 FROM json_each(agent_tasks.dependsOn) WHERE value = ?)
+            RETURNING id`,
+          [JSON.stringify(dependsOn), dep.id, dep.status, sweptId],
+        );
+        if (!row) continue;
+        try {
+          await createLogEntry({
+            eventType: "task_dependency_repointed",
+            taskId: dep.id,
+            agentId: dep.agentId ?? undefined,
+            oldValue: sweptId,
+            newValue: retryTaskId,
+            metadata: { reason: "reboot_retry" },
+          });
+        } catch {}
+        console.log(
+          `[Heartbeat] Reboot sweep: dependent ${dep.id.slice(0, 8)} re-pointed from ${sweptId.slice(0, 8)} to retry ${retryTaskId.slice(0, 8)}`,
+        );
+      }
+    }
+    await cascadeFailDependents(sweptId, "failed");
+  } catch (err) {
+    console.error(`[Heartbeat] Reboot sweep: settling dependents of ${sweptId} failed:`, err);
   }
 }
 
@@ -829,7 +1147,9 @@ async function autoAssignPoolTasks(findings: HeartbeatFindings): Promise<void> {
         for (const w of idleWorkers) {
           if (
             (await reservedForWorker(w.id)) < (w.maxTasks ?? 1) &&
-            isAgentEligibleForTask(w, task)
+            isAgentEligibleForTask(w, task) &&
+            // A pinned model from another harness family waits for a compatible worker.
+            (await poolTaskRunsOnHarness(task, w.harnessProvider ?? w.provider ?? null))
           ) {
             worker = w;
             break;
@@ -986,7 +1306,17 @@ async function escalateStarvedPoolTasks(findings: HeartbeatFindings): Promise<vo
   const registeredAgents = (await getAllAgents()).filter((a) => !a.isLead);
 
   for (const task of candidates) {
-    const hasEligibleAgent = registeredAgents.some((agent) => isAgentEligibleForTask(agent, task));
+    let hasEligibleAgent = false;
+    for (const agent of registeredAgents) {
+      // Eligible means routable AND able to run the task's pinned model on its harness.
+      if (
+        isAgentEligibleForTask(agent, task) &&
+        (await poolTaskRunsOnHarness(task, agent.harnessProvider ?? agent.provider ?? null))
+      ) {
+        hasEligibleAgent = true;
+        break;
+      }
+    }
     if (hasEligibleAgent) continue; // Someone (any status) matches — keep queued.
 
     const decision = await createPoolStarvationDecisionTask({ original: task });
@@ -1026,6 +1356,9 @@ async function cleanupStaleResources(findings: HeartbeatFindings): Promise<void>
   findings.staleCleanup.inboxProcessing = await releaseStaleProcessingInbox(
     STALE_CLEANUP_THRESHOLD_MINUTES,
   );
+  findings.staleCleanup.abandonedDraftTasks = await promoteAbandonedDraftTasks(
+    DRAFT_TASK_TIMEOUT_MINUTES,
+  );
   // DES-523 Phase 3: escalate pinned crash-recovery resumes that were never
   // reclaimed within the grace window to a Lead re-delegation decision.
   await escalateUnreclaimedResumes(findings);
@@ -1037,6 +1370,24 @@ async function cleanupStaleResources(findings: HeartbeatFindings): Promise<void>
   } catch {
     // Workflow engine may not be initialized yet — skip recovery
     findings.staleCleanup.workflowRuns = 0;
+  }
+  // Approval sweeps run after the recovery pass, so a waiting run past its
+  // expiresAt is routed on its timeout port before the timeout sweep reads it.
+  try {
+    findings.staleCleanup.approvalTimedOut = (
+      await timeoutExpiredApprovalRequests()
+    ).timedOut.length;
+  } catch (err) {
+    console.error("[heartbeat] approval timeout sweep failed:", err);
+    findings.staleCleanup.approvalTimedOut = 0;
+  }
+  try {
+    findings.staleCleanup.approvalAutoCancelled = (
+      await autoCancelStaleApprovalRequests()
+    ).cancelled.length;
+  } catch (err) {
+    console.error("[heartbeat] approval auto-cancel sweep failed:", err);
+    findings.staleCleanup.approvalAutoCancelled = 0;
   }
 }
 
@@ -1291,6 +1642,11 @@ export async function checkHeartbeatChecklist(): Promise<void> {
 
   await createTaskExtended(result.text, {
     agentId: lead.id,
+    routingReason: "skill",
+    routingSource: "engine_default",
+    // Not "mcp" (the createTaskExtended default): telemetry reports this as
+    // the swarm's own work, not as a human's MCP usage.
+    source: "system",
     taskType: "heartbeat-checklist",
     tags: ["checklist", "auto-generated"],
     priority: 60,
@@ -1317,6 +1673,7 @@ export async function runHeartbeatSweep(): Promise<void> {
     if (!(await preflightGate())) {
       const cleanupOnlyFindings: HeartbeatFindings = {
         stalledTasks: [],
+        extensionSkipped: [],
         autoFailedTasks: [],
         autoResumedTasks: [],
         pinnedResumes: [],
@@ -1331,6 +1688,9 @@ export async function runHeartbeatSweep(): Promise<void> {
           workflowRuns: 0,
           staleRuntimes: 0,
           staleOfferedTasks: 0,
+          abandonedDraftTasks: 0,
+          approvalAutoCancelled: 0,
+          approvalTimedOut: 0,
         },
       };
       // Expiry runs even on a cleanup-only tick: an idle agent whose runtime
@@ -1382,6 +1742,9 @@ function logFindings(findings: HeartbeatFindings): void {
   if (findings.stalledTasks.length > 0) {
     parts.push(`stalled=${findings.stalledTasks.length}`);
   }
+  if (findings.extensionSkipped.length > 0) {
+    parts.push(`extension_skipped=${findings.extensionSkipped.length}`);
+  }
   if (findings.workerHealthFixes.length > 0) {
     parts.push(`health_fixes=${findings.workerHealthFixes.length}`);
   }
@@ -1396,14 +1759,26 @@ function logFindings(findings: HeartbeatFindings): void {
     inboxProcessing,
     workflowRuns,
     staleOfferedTasks,
+    abandonedDraftTasks,
+    approvalAutoCancelled,
+    approvalTimedOut,
   } = findings.staleCleanup;
   const totalCleanup =
-    sessions + reviewingTasks + mentionProcessing + inboxProcessing + workflowRuns;
+    sessions +
+    reviewingTasks +
+    mentionProcessing +
+    inboxProcessing +
+    workflowRuns +
+    approvalAutoCancelled +
+    approvalTimedOut;
   if (totalCleanup > 0) {
     parts.push(`stale_cleanup=${totalCleanup}`);
   }
   if (staleOfferedTasks > 0) {
     parts.push(`stale_offers_released=${staleOfferedTasks}`);
+  }
+  if (abandonedDraftTasks > 0) {
+    parts.push(`abandoned_drafts_promoted=${abandonedDraftTasks}`);
   }
 
   if (parts.length > 0) {
@@ -1502,6 +1877,9 @@ export async function createBootTriageTask(): Promise<void> {
 
   await createTaskExtended(result.text, {
     agentId: lead.id,
+    routingReason: "skill",
+    routingSource: "engine_default",
+    source: "system",
     taskType: "boot-triage",
     tags: ["boot", "triage", "auto-generated"],
     priority: 70, // Higher than regular checklist (60)
@@ -1513,19 +1891,26 @@ export async function createBootTriageTask(): Promise<void> {
 /**
  * Start the heartbeat checklist polling loop (separate from the infrastructure sweep).
  */
-export function startHeartbeatChecklist(intervalMs = HEARTBEAT_CHECKLIST_INTERVAL_MS): void {
-  if (HEARTBEAT_CHECKLIST_DISABLE) {
+export function startHeartbeatChecklist(intervalMs = heartbeatChecklistIntervalMs()): void {
+  if (isHeartbeatChecklistDisabled()) {
     console.log("[Heartbeat] Checklist disabled via HEARTBEAT_CHECKLIST_DISABLE");
     return;
   }
-  if (checklistInterval) {
+  if (checklistInterval || bootTriageTimeout) {
     return; // Already running
   }
 
-  console.log(`[Heartbeat] Checklist starting with ${intervalMs}ms interval`);
-
   // Boot triage at T+90s — after reboot sweep (T+5s) has completed and results are available
-  setTimeout(() => createBootTriageTask(), 90_000);
+  bootTriageTimeout = setTimeout(() => createBootTriageTask(), 90_000);
+
+  if (intervalMs <= 0) {
+    console.log(
+      "[Heartbeat] Recurring checklist off (HEARTBEAT_CHECKLIST_INTERVAL_MS=0); boot triage still scheduled",
+    );
+    return;
+  }
+
+  console.log(`[Heartbeat] Checklist starting with ${intervalMs}ms interval`);
 
   // Recurring checklist starts from the second interval onward
   checklistInterval = setInterval(() => {
@@ -1542,6 +1927,10 @@ export function startHeartbeatChecklist(intervalMs = HEARTBEAT_CHECKLIST_INTERVA
  * Stop the heartbeat checklist polling loop.
  */
 export function stopHeartbeatChecklist(): void {
+  if (bootTriageTimeout) {
+    clearTimeout(bootTriageTimeout);
+    bootTriageTimeout = null;
+  }
   if (checklistInterval) {
     clearInterval(checklistInterval);
     checklistInterval = null;

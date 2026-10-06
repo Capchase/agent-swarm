@@ -1,14 +1,32 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { unlink } from "node:fs/promises";
 import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
+import { unlink } from "node:fs/promises";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  abandonSlackOutcomeDelivery,
   cancelTask,
   closeDb,
   completeTask,
   createAgent,
+  createInboxMessage,
+  createLogEntry,
+  createScheduledTask,
   createTaskExtended,
+  ensureSlackDelegationActivation,
   ensureSlackRenderV2Activation,
   failTask,
   getDbClient,
+  getInboxMessageById,
+  getLogsByEventType,
   getSlackOutcomeMessage,
   getSlackRenderV2ActivatedAt,
   getSlackTreeMessage,
@@ -16,25 +34,36 @@ import {
   getSlackTreeMessages,
   getTaskById,
   initDb,
+  insertTaskAttachment,
   isPendingSlackMessage,
   markTaskSlackReplySent,
+  noteSlackOutcomeDeliveryFailure,
   startTask,
+  supersedeTask,
   upsertSwarmConfig,
 } from "../be/db";
+import { upsertTaskCitations } from "../be/task-citations";
+import { createStandaloneScheduleTask } from "../scheduler/schedule-task";
 import { getTaskLink, MAX_SECTION_LENGTH } from "../slack/blocks";
 import {
+  _noteOutcomeDeliveryFailureForTests,
   _resetSlackRenderV2ForTests,
   callSlackWithRetry,
+  childOutcomeContent,
   ensureSlackThreadTree,
   formatV2Duration,
   isSlackRenderV2Enabled,
+  isTerminalSlackError,
   processSlackRenderV2,
   renderThreadTree,
+  slackErrorSummary,
   streamOutcomeCard,
+  withStatusLead,
 } from "../slack/render-v2";
 import { getAgentDisplayName, getAgentEmoji } from "../slack/responses";
 import { slackContextKey } from "../tasks/context-key";
-import type { AgentTask } from "../types";
+import { registerSlackReplyTool } from "../tools/slack-reply";
+import type { AgentTask, TaskAttachment } from "../types";
 import { clearVolatileSecretsForTesting } from "../utils/secret-scrubber";
 
 const TEST_DB_PATH = "./test-slack-render-v2.sqlite";
@@ -46,6 +75,18 @@ let permalinkFailuresRemaining = 0;
 let slackAddressSequence = 0;
 let missingMessageTs: string | undefined;
 let updateFailuresRemaining = 0;
+let startStreamFailuresRemaining = 0;
+// A `chat.update` that answers with a Slack verdict other than 404 — the
+// permanent, non-retryable class (`cant_update_message`, `channel_not_found`).
+let rejectedUpdateTs: string | undefined;
+let rejectedUpdateCode = "cant_update_message";
+let rejectedUpdateMessages: string[] = [];
+// A `chat.stopStream` that answers with a Slack API verdict (e.g. the
+// documented `rate_limited` spelling), distinct from `stopCallsUntilFailure`'s
+// bare, uncoded failure.
+let rejectedStopTs: string | undefined;
+let rejectedStopCode = "rate_limited";
+let postMessageErrorCode: string | undefined;
 let disableRenderAfterMethod: string | undefined;
 
 type RemoteMessage = {
@@ -95,6 +136,19 @@ function uniqueSlackAddress(label: string): { channelId: string; threadTs: strin
   };
 }
 
+/**
+ * Backdates `lastUpdatedAt` directly via SQL so a closure appears quiet (or
+ * timed out) without a wall-clock sleep — `closureState` reads real time via
+ * `new Date()`, so tests inject "elapsed time" by moving the stored
+ * timestamp into the past instead.
+ */
+async function backdateLastUpdated(taskIds: string[], secondsAgo: number): Promise<void> {
+  const ts = new Date(Date.now() - secondsAgo * 1_000).toISOString();
+  for (const id of taskIds) {
+    await getDbClient().run(`UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?`, [ts, id]);
+  }
+}
+
 const mockApiCall = mock(async (method: string, payload: Record<string, unknown>) => {
   calls.push({ method, payload });
   if (method === disableRenderAfterMethod) {
@@ -120,6 +174,12 @@ const mockApiCall = mock(async (method: string, payload: Record<string, unknown>
     };
   }
   if (method === "chat.postMessage") {
+    if (
+      postMessageErrorCode &&
+      (payload.blocks as { type?: string }[] | undefined)?.[0]?.type === "markdown"
+    ) {
+      throw { data: { error: postMessageErrorCode } };
+    }
     const ts = `tree.${++treeCounter}`;
     remoteMessages.set(remoteKey(String(payload.channel), ts), {
       channel: String(payload.channel),
@@ -131,6 +191,10 @@ const mockApiCall = mock(async (method: string, payload: Record<string, unknown>
     return { ok: true, ts };
   }
   if (method === "chat.startStream") {
+    if (startStreamFailuresRemaining > 0) {
+      startStreamFailuresRemaining--;
+      throw { data: { error: "user_not_found" } };
+    }
     if (String(payload.markdown_text ?? "").length > 12_000) {
       throw new Error("markdown_text exceeded Slack's streaming limit");
     }
@@ -158,6 +222,7 @@ const mockApiCall = mock(async (method: string, payload: Record<string, unknown>
       }
       stopCallsUntilFailure--;
     }
+    if (rejectedStopTs === payload.ts) throw { data: { error: rejectedStopCode } };
     const message = remoteMessages.get(remoteKey(String(payload.channel), String(payload.ts)));
     if (!message) throw { data: { error: "message_not_found" } };
     if (!message.streaming) throw { data: { error: "message_not_in_streaming_state" } };
@@ -186,8 +251,16 @@ const mockApiCall = mock(async (method: string, payload: Record<string, unknown>
       throw new Error("temporary update failure");
     }
     if (missingMessageTs === payload.ts) throw { data: { error: "message_not_found" } };
+    if (rejectedUpdateTs === payload.ts)
+      throw {
+        data: {
+          error: rejectedUpdateCode,
+          response_metadata: { messages: rejectedUpdateMessages },
+        },
+      };
     const message = remoteMessages.get(remoteKey(String(payload.channel), String(payload.ts)));
     if (!message) throw { data: { error: "message_not_found" } };
+    if (message.streaming) throw { data: { error: "streaming_state_conflict" } };
     const barrier = nextUpdateBarrier;
     if (barrier) {
       nextUpdateBarrier = undefined;
@@ -205,6 +278,9 @@ mock.module("../slack/app", () => ({
   getSlackApp: () => ({
     client: {
       apiCall: mockApiCall,
+      chat: {
+        postMessage: (payload: Record<string, unknown>) => mockApiCall("chat.postMessage", payload),
+      },
       reactions: {
         add: (payload: Record<string, unknown>) => mockApiCall("reactions.add", payload),
         remove: (payload: Record<string, unknown>) => mockApiCall("reactions.remove", payload),
@@ -228,6 +304,7 @@ beforeAll(() => {
 
 beforeEach(async () => {
   clearVolatileSecretsForTesting();
+  process.env.SLACK_RENDER_V2_DELEGATION = "false";
   closeDb();
   await removeDbFiles();
   initDb(TEST_DB_PATH);
@@ -241,6 +318,12 @@ beforeEach(async () => {
   permalinkFailuresRemaining = 0;
   missingMessageTs = undefined;
   updateFailuresRemaining = 0;
+  rejectedUpdateTs = undefined;
+  rejectedUpdateCode = "cant_update_message";
+  rejectedUpdateMessages = [];
+  rejectedStopTs = undefined;
+  rejectedStopCode = "rate_limited";
+  postMessageErrorCode = undefined;
   disableRenderAfterMethod = undefined;
   nextUpdateBarrier = undefined;
   _resetSlackRenderV2ForTests();
@@ -250,6 +333,42 @@ afterAll(async () => {
   _resetSlackRenderV2ForTests();
   closeDb();
   await removeDbFiles();
+});
+
+describe("Slack error classification", () => {
+  test.each([
+    "msg_too_long",
+    "streaming_state_conflict",
+    "message_not_found",
+    "channel_not_found",
+    "cant_update_message",
+    "user_not_found",
+  ])("%s is terminal", (code) => {
+    expect(isTerminalSlackError({ data: { error: code } })).toBe(true);
+  });
+
+  test.each([
+    "ratelimited",
+    "rate_limited",
+    "internal_error",
+    "service_unavailable",
+    "fatal_error",
+    "request_timeout",
+  ])("%s is transient", (code) => {
+    expect(isTerminalSlackError({ data: { error: code } })).toBe(false);
+  });
+
+  test("an error with no Slack code is transient", () => {
+    expect(isTerminalSlackError(new Error("socket hang up"))).toBe(false);
+  });
+
+  test("slackErrorSummary joins the code and response messages", () => {
+    expect(
+      slackErrorSummary({
+        data: { error: "msg_too_long", response_metadata: { messages: ["[ERROR] text too long"] } },
+      }),
+    ).toBe("msg_too_long: [ERROR] text too long");
+  });
 });
 
 describe("Slack renderer v2", () => {
@@ -280,12 +399,179 @@ describe("Slack renderer v2", () => {
     });
   });
 
-  test("defaults off and accepts an explicit opt-in", () => {
+  test("starts Slack's native working status with the tree and clears it after the outcome card", async () => {
+    const lead = await createAgent({ name: "Status Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RENDER_STATUS");
+    const setStatusCalls = () =>
+      calls.filter((call) => call.method === "agents.sessions.setStatus");
+    const ask = await createTaskExtended("status ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    calls.length = 0;
+
+    await ensureSlackThreadTree([ask.id]);
+    expect(setStatusCalls().map((call) => call.payload)).toEqual([
+      { channel_id: channelId, thread_ts: threadTs, status: "processing" },
+    ]);
+
+    // Ticks while the ask runs keep the state without new calls.
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    expect(setStatusCalls()).toHaveLength(1);
+
+    await completeTask(ask.id, "Done");
+    calls.length = 0;
+    await processSlackRenderV2();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const methods = calls.map((call) => call.method);
+    expect(setStatusCalls().map((call) => call.payload.status)).toEqual(["active"]);
+    // Cleared after the card landed, not before, and once.
+    expect(methods.indexOf("agents.sessions.setStatus")).toBeGreaterThan(
+      methods.indexOf("chat.stopStream"),
+    );
+    expect(methods).not.toContain("assistant.threads.setStatus");
+  });
+
+  describe("native status budget across one render tick", () => {
+    const setStatusCalls = () =>
+      calls.filter((call) => call.method === "agents.sessions.setStatus");
+
+    async function slackAsks(count: number, prefix: string) {
+      const lead = await createAgent({ name: `${prefix} Lead`, isLead: true, status: "idle" });
+      const asks = [];
+      for (let i = 0; i < count; i++) {
+        const { channelId, threadTs } = uniqueSlackAddress(`${prefix}_${i}`);
+        const ask = await createTaskExtended(`${prefix} ask ${i}`, {
+          agentId: lead.id,
+          source: "slack",
+          slackChannelId: channelId,
+          slackThreadTs: threadTs,
+          contextKey: slackContextKey({ channelId, threadTs }),
+        });
+        asks.push({ ask, channelId, threadTs });
+      }
+      return asks;
+    }
+
+    test("tree creation for a burst of new asks starts at most eight status writes per tick", async () => {
+      const asks = await slackAsks(12, "C_BURST_TREE");
+      calls.length = 0;
+
+      await processSlackRenderV2();
+      expect(setStatusCalls()).toHaveLength(8);
+      expect(setStatusCalls().every((call) => call.payload.status === "processing")).toBe(true);
+
+      // The threads the cap left out catch up on the next tick, each written once.
+      await processSlackRenderV2();
+      const written = setStatusCalls().map((call) => call.payload.thread_ts);
+      expect(written).toHaveLength(12);
+      expect(new Set(written)).toEqual(new Set(asks.map((a) => a.threadTs)));
+    });
+
+    test("outcome delivery shares the same budget and the rest clear on the next tick", async () => {
+      const asks = await slackAsks(10, "C_BURST_OUTCOME");
+      for (const { ask } of asks) await startTask(ask.id);
+      // Trees and the initial processing writes happen outside a render tick.
+      for (const { ask } of asks) await ensureSlackThreadTree([ask.id]);
+      for (const { ask } of asks) await completeTask(ask.id, "Done");
+      calls.length = 0;
+
+      await processSlackRenderV2();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(setStatusCalls()).toHaveLength(8);
+      expect(setStatusCalls().every((call) => call.payload.status === "active")).toBe(true);
+
+      await processSlackRenderV2();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const cleared = setStatusCalls().map((call) => call.payload.thread_ts);
+      expect(cleared).toHaveLength(10);
+      expect(new Set(cleared)).toEqual(new Set(asks.map((a) => a.threadTs)));
+    });
+  });
+
+  for (const delegationEnabled of [false, true]) {
+    test(`relays a deferred schedule continuation with delegation=${delegationEnabled}`, async () => {
+      process.env.SLACK_RENDER_V2_DELEGATION = String(delegationEnabled);
+      if (delegationEnabled) await ensureSlackDelegationActivation();
+      const lead = await createAgent({ name: "Continuation Lead", isLead: true, status: "idle" });
+      const { channelId, threadTs } = uniqueSlackAddress("C_CONTINUATION");
+      const ask = await createTaskExtended("answer when ready", {
+        agentId: lead.id,
+        source: "slack",
+        slackChannelId: channelId,
+        slackThreadTs: threadTs,
+        contextKey: slackContextKey({ channelId, threadTs }),
+      });
+      await startTask(ask.id);
+      await completeTask(ask.id, "Waiting for the result.", { addTags: ["deferred"] });
+      await backdateLastUpdated([ask.id], 20);
+      await processSlackRenderV2();
+      expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeTruthy();
+
+      const schedule = await createScheduledTask({
+        name: "deferred-answer",
+        scheduleType: "one_time",
+        taskTemplate: "Deliver the result",
+        taskType: "deferred",
+        tags: ["deferred"],
+        parentTaskId: ask.id,
+        targetAgentId: lead.id,
+        createdByAgentId: lead.id,
+        nextRunAt: new Date().toISOString(),
+      });
+      const continuation = await createStandaloneScheduleTask(schedule);
+      expect(continuation.source).toBe("schedule");
+      expect(continuation.scheduleId).toBe(schedule.id);
+      expect(continuation.slackChannelId).toBe(channelId);
+      expect(continuation.slackThreadTs).toBe(threadTs);
+      await startTask(continuation.id);
+      await processSlackRenderV2();
+      expect(await getSlackOutcomeMessage(continuation.id)).toBeNull();
+      await completeTask(continuation.id, "Here is the complete answer.");
+      calls.length = 0;
+
+      await processSlackRenderV2();
+      await processSlackRenderV2();
+
+      expect((await getSlackOutcomeMessage(continuation.id))?.finalizedAt).toBeTruthy();
+      const streams = calls.filter((call) => call.method === "chat.startStream");
+      expect(streams).toHaveLength(1);
+      expect(streams[0]?.payload).toMatchObject({
+        channel: channelId,
+        thread_ts: threadTs,
+        markdown_text: "✅ Here is the complete answer.",
+      });
+    });
+  }
+
+  test("does not relay an ordinary scheduled task without Slack context", async () => {
+    const schedule = await createScheduledTask({
+      name: "ordinary-maintenance",
+      scheduleType: "one_time",
+      taskTemplate: "Run maintenance",
+      taskType: "maintenance",
+      nextRunAt: new Date().toISOString(),
+    });
+    const task = await createStandaloneScheduleTask(schedule);
+    await startTask(task.id);
+    await completeTask(task.id, "Maintenance completed.");
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(task.id)).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  test("defaults on and accepts an explicit opt-out", () => {
     const previous = process.env.SLACK_RENDER_V2;
     delete process.env.SLACK_RENDER_V2;
-    expect(isSlackRenderV2Enabled()).toBe(false);
-    process.env.SLACK_RENDER_V2 = "true";
     expect(isSlackRenderV2Enabled()).toBe(true);
+    process.env.SLACK_RENDER_V2 = "false";
+    expect(isSlackRenderV2Enabled()).toBe(false);
     if (previous === undefined) delete process.env.SLACK_RENDER_V2;
     else process.env.SLACK_RENDER_V2 = previous;
   });
@@ -669,11 +955,11 @@ describe("Slack renderer v2", () => {
 
     expect(text).toBe(
       [
-        "🧵 worked for 8m05s",
-        ` ↳ ⏳ format tests · 8m05s · <https://app.agent-swarm.dev/tasks/${ask.id}|\`${ask.id.slice(0, 8)}\`>`,
-        `    ↳ ⏳ Researcher · 8m05s · <https://app.agent-swarm.dev/tasks/${child.id}|\`${child.id.slice(0, 8)}\`> · Reading *Slack docs* carefully…`,
+        "🧵 🔄 working — 8m05s",
+        ` ↳ ▶️ format tests · 8m05s · <https://app.agent-swarm.dev/tasks/${ask.id}|\`${ask.id.slice(0, 8)}\`>`,
+        `    ↳ ▶️ Researcher · 8m05s · <https://app.agent-swarm.dev/tasks/${child.id}|\`${child.id.slice(0, 8)}\`> · Reading *Slack docs* carefully…`,
         `       ↳ ✅ Researcher · 4m · <https://app.agent-swarm.dev/tasks/${grandchild.id}|\`${grandchild.id.slice(0, 8)}\`>`,
-        ` ↳ ⏳ ship this PR · 8m05s · <https://app.agent-swarm.dev/tasks/${secondAsk.id}|\`${secondAsk.id.slice(0, 8)}\`>`,
+        ` ↳ ▶️ ship this PR · 8m05s · <https://app.agent-swarm.dev/tasks/${secondAsk.id}|\`${secondAsk.id.slice(0, 8)}\`>`,
       ].join("\n"),
     );
     expect(text).not.toContain("workspace.slack.com");
@@ -686,6 +972,143 @@ describe("Slack renderer v2", () => {
     expect(text).not.toContain(":leftwards_arrow_with_hook:");
     const rows = text.split("\n").slice(1);
     expect(rows.slice(0, 3).map((row) => row.match(/^ +/u)?.[0].length)).toEqual([1, 4, 7]);
+  });
+
+  test("glyphs: running vs stalled in_progress, and a pending task blocked on a dependency", async () => {
+    const lead = await createAgent({ name: "Glyph Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Glyph Worker", isLead: false, status: "idle" });
+    const ask = await createTaskExtended("glyph ask", { agentId: lead.id, source: "slack" });
+    const freshRunning = await createTaskExtended("fresh running child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const stalledRunning = await createTaskExtended("stalled running child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const blocker = await createTaskExtended("blocker", { agentId: worker.id, source: "mcp" });
+    const blockedChild = await createTaskExtended("blocked child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      dependsOn: [blocker.id],
+      followUpConfig: { disabled: true },
+    });
+
+    const now = new Date();
+    const sixteenMinAgo = new Date(now.getTime() - 16 * 60_000).toISOString();
+
+    const text = await renderThreadTree(
+      [
+        { ...ask, status: "pending" as const },
+        { ...freshRunning, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+        { ...stalledRunning, status: "in_progress" as const, lastUpdatedAt: sixteenMinAgo },
+        { ...blockedChild, status: "pending" as const },
+      ],
+      new Map(),
+      now,
+    );
+
+    const lines = text.split("\n");
+    const freshLine = lines.find((line) => line.includes(getTaskLink(freshRunning.id)));
+    const stalledLine = lines.find((line) => line.includes(getTaskLink(stalledRunning.id)));
+    const blockedLine = lines.find((line) => line.includes(getTaskLink(blockedChild.id)));
+    expect(freshLine).toContain("🔄");
+    expect(stalledLine).toContain("⚠️");
+    expect(blockedLine).toContain("⛔");
+  });
+
+  test("header transitions from active to stalled to done", async () => {
+    const lead = await createAgent({ name: "Header Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Header Worker", isLead: false, status: "idle" });
+    const ask = await createTaskExtended("header ask", { agentId: lead.id, source: "slack" });
+    const child = await createTaskExtended("header child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const now = new Date();
+
+    const activeText = await renderThreadTree(
+      [
+        { ...ask, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+        { ...child, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+      ],
+      new Map(),
+      now,
+    );
+    expect(activeText.startsWith("🧵 🔄 working")).toBe(true);
+
+    const sixteenMinAgo = new Date(now.getTime() - 16 * 60_000).toISOString();
+    const stalledText = await renderThreadTree(
+      [
+        { ...ask, status: "in_progress" as const, lastUpdatedAt: now.toISOString() },
+        { ...child, status: "in_progress" as const, lastUpdatedAt: sixteenMinAgo },
+      ],
+      new Map(),
+      now,
+    );
+    expect(stalledText.startsWith("🧵 ⚠️ stalled")).toBe(true);
+
+    const doneText = await renderThreadTree(
+      [
+        {
+          ...ask,
+          status: "completed" as const,
+          lastUpdatedAt: now.toISOString(),
+          finishedAt: now.toISOString(),
+        },
+        {
+          ...child,
+          status: "completed" as const,
+          lastUpdatedAt: now.toISOString(),
+          finishedAt: now.toISOString(),
+        },
+      ],
+      new Map(),
+      now,
+    );
+    expect(doneText.startsWith("🧵 ✅ done")).toBe(true);
+  });
+
+  test("a parked deferral reads waiting, and done once its wake-up settles", async () => {
+    const lead = await createAgent({ name: "Parked Header Lead", isLead: true, status: "idle" });
+    const ask = await createTaskExtended("parked header ask", {
+      agentId: lead.id,
+      source: "slack",
+    });
+    const now = new Date();
+    const parked = {
+      ...ask,
+      status: "completed" as const,
+      deferredAt: now.toISOString(),
+      lastUpdatedAt: now.toISOString(),
+      finishedAt: now.toISOString(),
+    };
+
+    // Stored `completed`, but nothing has answered the ask yet.
+    const waitingText = await renderThreadTree([parked], new Map(), now);
+    expect(waitingText.startsWith("🧵 ⏳ waiting")).toBe(true);
+    expect(waitingText).toContain("↳ ⏳ parked header ask");
+
+    const wake = {
+      ...parked,
+      id: crypto.randomUUID(),
+      source: "schedule" as const,
+      taskType: "deferred",
+      parentTaskId: ask.id,
+      deferredAt: undefined,
+    };
+    const doneText = await renderThreadTree([parked, wake], new Map(), now);
+    expect(doneText.startsWith("🧵 ✅ done")).toBe(true);
+    // The ask's own line settles with its wake-up, not only the header.
+    expect(doneText).not.toContain("⏳");
+    expect(doneText).toContain("↳ ✅ parked header ask");
   });
 
   test("does not resolve or render direct-trigger permalink backlinks", async () => {
@@ -950,7 +1373,7 @@ describe("Slack renderer v2", () => {
     const outcomeBody = outcomeChunks.join("");
     expect(outcomeChunks).toHaveLength(1);
     expect(outcomeBody).toBe(
-      "✅\n\nImplemented the Slack renderer and opened a focused pull request.\n\nSecond paragraph that must be rendered.",
+      "✅ Implemented the Slack renderer and opened a focused pull request.\n\nSecond paragraph that must be rendered.",
     );
     expect(outcomeBody).not.toMatch(/\n{3,}/);
     expect(outcomeBody).toBe(outcomeBody.trim());
@@ -960,7 +1383,7 @@ describe("Slack renderer v2", () => {
     expect(started.payload.thread_ts).toBe(threadTs);
     expect(started.payload.recipient_user_id).toBe("U_REQUESTER");
     expect(started.payload.recipient_team_id).toBe("T_TEST");
-    expect(String(started.payload.markdown_text).startsWith("✅\n\nImplemented")).toBe(true);
+    expect(String(started.payload.markdown_text).startsWith("✅ Implemented")).toBe(true);
     expect(Object.keys(started.payload).sort()).toEqual([
       "channel",
       "icon_emoji",
@@ -1014,6 +1437,290 @@ describe("Slack renderer v2", () => {
     expect(outcome?.permalink).toContain("outcome1");
   });
 
+  test.each([
+    false,
+    true,
+  ])("slack-reply renders citations with custom blocks=%s", async (withBlocks) => {
+    const agent = await createAgent({ name: "Citation reply", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CITATION_REPLY");
+    const task = await createTaskExtended("Cited reply", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+    });
+    await upsertTaskCitations(task.id, [
+      { index: 1, kind: "url", ref: "https://example.com/", label: "Evidence" },
+    ]);
+    const server = new McpServer({ name: "citation-reply", version: "1" });
+    registerSlackReplyTool(server);
+    const tool = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (args: unknown, meta: unknown) => Promise<unknown> }
+        >;
+      }
+    )._registeredTools["slack-reply"]!;
+    await tool.handler(
+      {
+        taskId: task.id,
+        message: "Claim [citation:1] [citation:9] remains",
+        ...(withBlocks
+          ? {
+              blocks: [
+                {
+                  type: "section",
+                  text: { type: "mrkdwn", text: "Claim [citation:1] [citation:9] remains" },
+                },
+              ],
+            }
+          : {}),
+      },
+      { requestInfo: { headers: { "x-agent-id": agent.id } } },
+    );
+    const payload = calls.find((call) => call.method === "chat.postMessage")?.payload;
+    expect(payload?.text).toContain("<https://example.com/|[1]>");
+    // Sources are a caption: never in the body or the notification text.
+    expect(payload?.text).not.toContain("Sources");
+    const blocks = payload?.blocks as { type: string; text?: { text: string } }[];
+    expect(JSON.stringify(blocks.filter((block) => block.type !== "context"))).not.toContain(
+      "Sources",
+    );
+    expect(blocks).toContainEqual({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: "Sources: <https://example.com/|[1]> Evidence" }],
+    });
+    expect(JSON.stringify(payload?.blocks)).not.toContain("[citation:");
+    expect(JSON.stringify(payload?.blocks)).not.toContain("[9]");
+    expect(payload?.text).toContain("|[1]> remains");
+  });
+
+  test("slack-reply rejects a mixed inbox/task context before reading or posting task citations", async () => {
+    const owner = await createAgent({ name: "Citation owner", isLead: false, status: "idle" });
+    const caller = await createAgent({ name: "Inbox caller", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_MIXED_CITATIONS");
+    const inbox = await createInboxMessage(caller.id, "Reply here", {
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+    });
+    const task = await createTaskExtended("Private source", {
+      agentId: owner.id,
+      source: "system",
+    });
+    await upsertTaskCitations(task.id, [
+      { index: 1, kind: "url", ref: "https://example.com/private", label: "Private evidence" },
+    ]);
+    const server = new McpServer({ name: "mixed-citation-reply", version: "1" });
+    registerSlackReplyTool(server);
+    const handler = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          {
+            handler: (
+              args: unknown,
+              meta: unknown,
+            ) => Promise<{ structuredContent: { success: boolean; message: string } }>;
+          }
+        >;
+      }
+    )._registeredTools["slack-reply"]!.handler;
+    const meta = { requestInfo: { headers: { "x-agent-id": caller.id } } };
+    const result = await handler(
+      { inboxMessageId: inbox.id, taskId: task.id, message: "Claim [citation:1]" },
+      meta,
+    );
+    expect(result.structuredContent.success).toBe(false);
+    expect(result.structuredContent.message).toContain("not both");
+    expect(calls.some((call) => call.method === "chat.postMessage")).toBe(false);
+    expect((await getInboxMessageById(inbox.id))?.status).toBe("unread");
+    expect((await getTaskById(task.id))?.slackReplySent).toBe(false);
+
+    // The authorized inbox path still works and never pulls another task's sources.
+    const authorized = await handler(
+      { inboxMessageId: inbox.id, message: "Reply [citation:1] here" },
+      meta,
+    );
+    expect(authorized.structuredContent.success).toBe(true);
+    const payload = calls.find((call) => call.method === "chat.postMessage")?.payload;
+    expect(payload?.text).toBe("Reply here");
+    expect(JSON.stringify(payload)).not.toContain("Private evidence");
+    expect((await getInboxMessageById(inbox.id))?.status).toBe("responded");
+  });
+
+  test("slack-reply drops invalid sources and markers from every custom text object", async () => {
+    const agent = await createAgent({
+      name: "Invalid citation reply",
+      isLead: false,
+      status: "idle",
+    });
+    const { channelId, threadTs } = uniqueSlackAddress("C_BAD_CITATION_REPLY");
+    const task = await createTaskExtended("Invalid cited reply", {
+      agentId: agent.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+    });
+    await upsertTaskCitations(task.id, [
+      { index: 1, kind: "page", ref: "missing-page", label: "Bad evidence" },
+    ]);
+    const server = new McpServer({ name: "invalid-citation-reply", version: "1" });
+    registerSlackReplyTool(server);
+    const tool = (
+      server as unknown as {
+        _registeredTools: Record<
+          string,
+          {
+            handler: (args: unknown, meta: unknown) => Promise<unknown>;
+          }
+        >;
+      }
+    )._registeredTools["slack-reply"]!;
+    await tool.handler(
+      {
+        taskId: task.id,
+        message: "Claim [citation:1] [citation:9] remains",
+        blocks: [
+          { type: "header", text: { type: "plain_text", text: "Heading [citation:1]" } },
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: "Claim [citation:1] [citation:9] remains" },
+          },
+          {
+            type: "rich_text",
+            elements: [
+              {
+                type: "rich_text_section",
+                elements: [{ type: "text", text: "Rich [citation:9] text" }],
+              },
+            ],
+          },
+        ],
+      },
+      { requestInfo: { headers: { "x-agent-id": agent.id } } },
+    );
+    const payload = calls.find((call) => call.method === "chat.postMessage")?.payload;
+    expect(payload?.text).toBe("Claim remains");
+    const rendered = JSON.stringify(payload?.blocks);
+    expect(rendered).toContain('"text":"Heading"');
+    expect(rendered).toContain('"text":"Claim remains"');
+    expect(rendered).toContain('"text":"Rich text"');
+    expect(rendered).not.toContain("citation:");
+    expect(rendered).not.toContain("Bad evidence");
+    expect(rendered).not.toContain("Sources:");
+    expect(payload?.blocks).toHaveLength(3);
+  });
+
+  test("outcome cards resolve stored citations and strip unknown markers", async () => {
+    const lead = await createAgent({ name: "Citation Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CITATIONS");
+    const ask = await createTaskExtended("Cited outcome", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await upsertTaskCitations(ask.id, [
+      { index: 1, kind: "url", ref: "https://example.com/", label: "Evidence" },
+    ]);
+    await completeTask(ask.id, "Supported [citation:1], unknown [citation:9].");
+    await backdateLastUpdated([ask.id], 20);
+    await processSlackRenderV2();
+    const content = calls.find((call) => call.method === "chat.startStream")?.payload.markdown_text;
+    expect(content).toBe("✅ Supported <https://example.com/|[1]>, unknown.");
+  });
+
+  test("outcome cards caption sources and attachments under the answer, footer last", async () => {
+    const originalHost = process.env.AGENT_FS_LIVE_URL;
+    process.env.AGENT_FS_LIVE_URL = "https://files.example.test";
+    try {
+      const lead = await createAgent({ name: "Caption Lead", isLead: true, status: "idle" });
+      const { channelId, threadTs } = uniqueSlackAddress("C_CAPTIONS");
+      const ask = await createTaskExtended("Captioned outcome", {
+        agentId: lead.id,
+        source: "slack",
+        slackChannelId: channelId,
+        slackThreadTs: threadTs,
+        contextKey: slackContextKey({ channelId, threadTs }),
+      });
+      await startTask(ask.id);
+      await upsertTaskCitations(ask.id, [
+        { index: 1, kind: "url", ref: "https://example.com/a", label: "Cited" },
+        { index: 2, kind: "url", ref: "https://example.com/b", label: "Whole answer" },
+      ]);
+      await insertTaskAttachment({
+        taskId: ask.id,
+        agentId: lead.id,
+        kind: "url",
+        name: "report.md",
+        url: "https://example.com/report.md",
+        isPrimary: true,
+      });
+      await completeTask(ask.id, "The answer [citation:1].");
+      await backdateLastUpdated([ask.id], 20);
+      await processSlackRenderV2();
+
+      const started = calls.find((call) => call.method === "chat.startStream");
+      expect(started?.payload.markdown_text).toBe("✅ The answer <https://example.com/a|[1]>.");
+      const stopped = calls.find((call) => call.method === "chat.stopStream");
+      const blocks = stopped?.payload.blocks as { type: string; elements: { text: string }[] }[];
+      expect(blocks.every((block) => block.type === "context")).toBe(true);
+      expect(blocks.map((block) => block.elements.map((element) => element.text))).toEqual([
+        ["Sources: <https://example.com/a|[1]> Cited"],
+        ["General sources: <https://example.com/b|[2]> Whole answer"],
+        ["📎 <https://example.com/report.md|report.md>"],
+        [expect.stringContaining(ask.id.slice(0, 8))],
+      ]);
+    } finally {
+      if (originalHost === undefined) delete process.env.AGENT_FS_LIVE_URL;
+      else process.env.AGENT_FS_LIVE_URL = originalHost;
+    }
+  });
+
+  test("the postMessage fallback keeps captions out of the notification text", async () => {
+    const lead = await createAgent({ name: "Fallback Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CAPTION_FALLBACK");
+    const ask = await createTaskExtended("Fallback outcome", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await upsertTaskCitations(ask.id, [
+      { index: 1, kind: "url", ref: "https://example.com/", label: "Evidence" },
+    ]);
+    await completeTask(ask.id, "Supported [citation:1].");
+    await backdateLastUpdated([ask.id], 20);
+    await ensureSlackThreadTree([ask.id]);
+    calls.length = 0;
+    startStreamFailuresRemaining = 1;
+    try {
+      await processSlackRenderV2();
+    } finally {
+      startStreamFailuresRemaining = 0;
+    }
+
+    const posted = calls.find(
+      (call) =>
+        call.method === "chat.postMessage" &&
+        call.payload.text !== undefined &&
+        String(call.payload.text).startsWith("✅"),
+    );
+    const answer = "✅ Supported <https://example.com/|[1]>.";
+    expect(posted?.payload.text).toBe(answer);
+    const blocks = posted?.payload.blocks as { type: string; text?: string }[];
+    expect(blocks[0]).toEqual({ type: "markdown", text: answer });
+    expect(blocks.slice(1).every((block) => block.type === "context")).toBe(true);
+    expect(JSON.stringify(blocks.slice(1))).toContain(
+      "Sources: <https://example.com/|[1]> Evidence",
+    );
+  });
+
   test("preserves complete native Markdown beyond the Block Kit text ceiling", async () => {
     const lead = await createAgent({ name: "Markdown Lead", isLead: true, status: "idle" });
     const { channelId, threadTs } = uniqueSlackAddress("C_OUTCOME_MARKDOWN");
@@ -1060,6 +1767,111 @@ describe("Slack renderer v2", () => {
       '```ts\nconst message = "preserved";\n```',
     );
     expect(calls.some((call) => call.method === "chat.appendStream")).toBe(false);
+  });
+
+  test.each<{
+    label: string;
+    attachment: Partial<TaskAttachment> & Pick<TaskAttachment, "kind" | "name">;
+    expected: string;
+  }>([
+    {
+      label: "plain ASCII positive control",
+      attachment: { kind: "agent-fs", name: "report.txt", path: "/reports/report.txt" },
+      expected:
+        "📎 <https://files.example.test/file/~/org-1/drive-1/reports/report.txt|report.txt>",
+    },
+    {
+      label: "raw path spaces and parentheses",
+      attachment: { kind: "agent-fs", name: "final report", path: "/shared reports/final (v1).md" },
+      expected:
+        "📎 <https://files.example.test/file/~/org-1/drive-1/shared%20reports/final%20(v1).md|final report>",
+    },
+    {
+      label: "already encoded positive control",
+      attachment: { kind: "agent-fs", name: "report", path: "/reports/final%20%28v1%29.md" },
+      expected:
+        "📎 <https://files.example.test/file/~/org-1/drive-1/reports/final%20%28v1%29.md|report>",
+    },
+    {
+      label: "label delimiters, backslashes, and whitespace",
+      attachment: {
+        kind: "url",
+        name: " \t[report] <final> & (copy)\\\r\n\t two  ",
+        url: "https://example.test/report",
+      },
+      expected: "📎 <https://example.test/report|[report] &lt;final&gt; &amp; (copy)\\ two>",
+    },
+    {
+      label: "URL positive control with an IPv6 host",
+      attachment: { kind: "url", name: "report", url: "http://[::1]/report.txt?q=a%20b&x=1#part" },
+      expected: "📎 <http://[::1]/report.txt?q=a%20b&x=1#part|report>",
+    },
+    {
+      label: "URL delimiters with existing escapes and query parameters",
+      attachment: {
+        kind: "url",
+        name: "report",
+        url: "https://example.test/a%20b) [c]<(d)>|\\file?q=one two&x=1#part",
+      },
+      expected:
+        "📎 <https://example.test/a%20b)%20[c]%3C(d)%3E%7C%5Cfile?q=one%20two&x=1#part|report>",
+    },
+    {
+      label: "non-HTTP fallback stays omitted",
+      attachment: { kind: "url", name: "report", url: "agent-fs:/reports/report.md" },
+      expected: "",
+    },
+  ])("captions safe attachment links: $label", async ({ attachment, expected }) => {
+    const originalHost = process.env.AGENT_FS_LIVE_URL;
+    process.env.AGENT_FS_LIVE_URL = "https://files.example.test";
+    try {
+      const lead = await createAgent({ name: "Attachment Lead", isLead: true, status: "idle" });
+      const { channelId, threadTs } = uniqueSlackAddress("C_OUTCOME_ATTACHMENT");
+      const ask = await createTaskExtended("render attachment link", {
+        agentId: lead.id,
+        source: "slack",
+        slackChannelId: channelId,
+        slackThreadTs: threadTs,
+        contextKey: slackContextKey({ channelId, threadTs }),
+      });
+      for (const intent of ["user-upload", "slack-file"]) {
+        await insertTaskAttachment({
+          taskId: ask.id,
+          name: "input.png",
+          kind: "url",
+          url: "https://example.com/input.png",
+          intent,
+          isPrimary: true,
+        });
+      }
+      await insertTaskAttachment({
+        ...attachment,
+        taskId: ask.id,
+        agentId: lead.id,
+        orgId: "org-1",
+        driveId: "drive-1",
+        isPrimary: true,
+      });
+      await startTask(ask.id);
+      await ensureSlackThreadTree([ask.id]);
+      await completeTask(ask.id, "Done");
+      calls.length = 0;
+      _resetSlackRenderV2ForTests();
+
+      await processSlackRenderV2();
+
+      // The attachment is a caption under the answer, never part of the streamed text.
+      const started = calls.find((call) => call.method === "chat.startStream");
+      expect(started?.payload.markdown_text).toBe("✅ Done");
+      const stopped = calls.find((call) => call.method === "chat.stopStream");
+      const captions = (stopped?.payload.blocks as { type: string; elements: { text: string }[] }[])
+        .filter((block) => block.type === "context")
+        .map((block) => block.elements.map((element) => element.text).join(" "));
+      expect(captions.filter((text) => text.startsWith("📎"))).toEqual(expected ? [expected] : []);
+    } finally {
+      if (originalHost === undefined) delete process.env.AGENT_FS_LIVE_URL;
+      else process.env.AGENT_FS_LIVE_URL = originalHost;
+    }
   });
 
   test("truncates oversized Markdown before a code fence and links the full task", async () => {
@@ -1133,10 +1945,10 @@ describe("Slack renderer v2", () => {
     await processSlackRenderV2();
 
     const started = calls.find((call) => call.method === "chat.startStream");
-    expect(started?.payload.markdown_text).toContain("❌ **Failed**");
+    expect(started?.payload.markdown_text).toContain("❌ **Failed:**");
     const outcome = await getSlackOutcomeMessage(ask.id);
     const remote = remoteMessages.get(remoteKey(channelId, outcome!.ts));
-    expect(remote?.text).toBe(`❌ **Failed**\n\n${reason.trim()}`);
+    expect(remote?.text).toBe(`❌ **Failed:** ${reason.trim()}`);
     expect(remote?.text).not.toContain(getTaskLink(ask.id));
     expect(calls.some((call) => call.method === "chat.appendStream")).toBe(false);
     const update = calls.find(
@@ -1166,11 +1978,11 @@ describe("Slack renderer v2", () => {
     await processSlackRenderV2();
 
     const started = calls.find((call) => call.method === "chat.startStream");
-    expect(started?.payload.markdown_text).toContain("🚫 **Cancelled**");
+    expect(started?.payload.markdown_text).toContain("🚫 **Cancelled:**");
     const outcome = (await getSlackOutcomeMessage(ask.id))!;
     const remote = remoteMessages.get(remoteKey(channelId, outcome.ts));
     expect(remote?.text).toBe(
-      `🚫 **Cancelled**\n\nrequester changed direction ${"context ".repeat(200)}`.trim(),
+      `🚫 **Cancelled:** requester changed direction ${"context ".repeat(200)}`.trim(),
     );
     expect(remote?.text).not.toContain(getTaskLink(ask.id));
     expect(calls.some((call) => call.method === "chat.appendStream")).toBe(false);
@@ -1435,7 +2247,7 @@ describe("Slack renderer v2", () => {
 
     const started = calls.find((call) => call.method === "chat.startStream");
     expect(started?.payload.markdown_text).toBe(
-      "✅\n\nThis output must reach Slack since no slack-reply was sent.",
+      "✅ This output must reach Slack since no slack-reply was sent.",
     );
   });
 
@@ -1474,7 +2286,7 @@ describe("Slack renderer v2", () => {
 
     const started = calls.find((call) => call.method === "chat.startStream");
     expect(started?.payload.markdown_text).toBe(
-      `✅\n\nArtifact: https://example.test/downloads/${redacted}/result.json`,
+      `✅ Artifact: https://example.test/downloads/${redacted}/result.json`,
     );
     expect(started?.payload.markdown_text).not.toContain(secret);
   });
@@ -1503,6 +2315,414 @@ describe("Slack renderer v2", () => {
     expect(started?.payload.markdown_text).toBe(`✅ ${lead.name} completed`);
     expect(started?.payload.markdown_text).not.toContain("PRIVATE OUTPUT");
     expect(outcome?.finalizedAt).toBeDefined();
+  });
+
+  test("renders a legacy deferral as ⏳ with its ETA, even after a slack-reply", async () => {
+    const lead = await createAgent({ name: "Deferring Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RENDER_DEFER_AFTER_REPLY");
+    const ask = await createTaskExtended("defer after replying by hand", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await ensureSlackThreadTree([ask.id]);
+    // Agent posts a hand-written slack-reply first (e.g. a transcription),
+    // then defer-task completes the task with the engine-authored deferral
+    // line and tags it "deferred" (mirrors defer-task.ts's completeTask call).
+    await markTaskSlackReplySent(ask.id);
+    const deferralLine =
+      "Deferred until today 17:30:19 UTC ([715bf847](https://app.agent-swarm.dev/schedules/715bf847-fe3e-40e9-9fef-3297a62d9afd)) -> checking the new defer card";
+    await completeTask(ask.id, deferralLine, { addTags: ["deferred"] });
+    calls.length = 0;
+    _resetSlackRenderV2ForTests();
+
+    await processSlackRenderV2();
+
+    const started = calls.find((call) => call.method === "chat.startStream");
+    // ⏳ not ✅: the ask was parked, not answered. The ETA, the agent's
+    // internal note, and the schedule link are all dropped from Slack.
+    expect(started?.payload.markdown_text).toBe("⏳ Checking back later");
+    expect(JSON.stringify(calls)).not.toContain("17:30");
+    expect(JSON.stringify(calls)).not.toContain("checking the new defer card");
+    expect(JSON.stringify(calls)).not.toContain("715bf847-fe3e");
+    expect(JSON.stringify(calls)).not.toContain("Deferred until");
+    expect((await getTaskById(ask.id))?.output).toBe(deferralLine);
+    expect(started?.payload.markdown_text).not.toBe(`✅ ${lead.name} completed`);
+  });
+
+  test("a deferral card opens with ⏳ and closes in place when the wake-up settles", async () => {
+    const lead = await createAgent({ name: "Parking Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_DEFER_RESOLVE");
+    const ask = await createTaskExtended("answer when the build is done", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    // Mirrors defer-task.ts: the human card as stored output, plus the marker
+    // that tells "parked" from "done" on a row whose status is `completed`.
+    await completeTask(ask.id, "Checking back today at 18:38", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    await backdateLastUpdated([ask.id], 20);
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    const opening = calls.find((call) => call.method === "chat.startStream");
+    expect(opening?.payload.markdown_text).toBe("⏳ Checking back later");
+    const card = await getSlackOutcomeMessage(ask.id);
+    expect(card?.finalizedAt).toBeTruthy();
+    expect(card?.deferralResolvedAt).toBeUndefined();
+
+    // The wake-up task runs and finishes.
+    const schedule = await createScheduledTask({
+      name: "deferred-resolve",
+      scheduleType: "one_time",
+      taskTemplate: "Deliver the result",
+      taskType: "deferred",
+      tags: ["deferred"],
+      parentTaskId: ask.id,
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      nextRunAt: new Date().toISOString(),
+    });
+    const wake = await createStandaloneScheduleTask(schedule);
+    await startTask(wake.id);
+    await completeTask(wake.id, "The build passed.");
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    // The SAME message is rewritten — no new opening card for the ask.
+    const rewrite = calls.find(
+      (call) => call.method === "chat.update" && call.payload.ts === card?.ts,
+    );
+    expect(rewrite).toBeDefined();
+    expect(rewrite?.payload.text).toBe("✅ The build passed.");
+    expect(rewrite?.payload.blocks).toEqual([{ type: "markdown", text: "✅ The build passed." }]);
+    expect(rewrite?.payload.text).not.toContain("Checking back");
+    expect((await getSlackOutcomeMessage(ask.id))?.deferralResolvedAt).toBeTruthy();
+    // The rewrite IS the wake-up's answer: no second card repeating it.
+    expect(calls.filter((call) => call.method === "chat.startStream")).toHaveLength(0);
+    expect(await getSlackOutcomeMessage(wake.id)).toBeNull();
+
+    // Idempotent: a second tick must not rewrite it again.
+    calls.length = 0;
+    await processSlackRenderV2();
+    expect(
+      calls.filter((call) => call.method === "chat.update" && call.payload.ts === card?.ts),
+    ).toHaveLength(0);
+  });
+
+  test("a parked ask keeps 👀 and settles to ✅ only when its wake-up answers", async () => {
+    const lead = await createAgent({ name: "Parked Reaction Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_DEFER_REACTION");
+    const triggerTs = `${slackAddressSequence}.2`;
+    const ask = await createTaskExtended("answer when the build is done", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await completeTask(ask.id, "Checking back today at 18:38", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    await backdateLastUpdated([ask.id], 20);
+    calls.length = 0;
+    await processSlackRenderV2();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const doneReaction = {
+      method: "reactions.add",
+      payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },
+    };
+    expect(calls).not.toContainEqual(doneReaction);
+
+    const schedule = await createScheduledTask({
+      name: "deferred-reaction",
+      scheduleType: "one_time",
+      taskTemplate: "Deliver the result",
+      taskType: "deferred",
+      tags: ["deferred"],
+      parentTaskId: ask.id,
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      nextRunAt: new Date().toISOString(),
+    });
+    const wake = await createStandaloneScheduleTask(schedule);
+    // The wake-up does not inherit the trigger ts; the reaction path walks back.
+    expect(wake.slackTriggerMessageTs).toBeUndefined();
+    await startTask(wake.id);
+    await completeTask(wake.id, "The build passed.");
+    calls.length = 0;
+    await processSlackRenderV2();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toContainEqual(doneReaction);
+  });
+
+  test("a wake-up that deferred again posts the next ⏳ card, and the old card points at it", async () => {
+    const lead = await createAgent({ name: "Chained Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_DEFER_CHAIN");
+    const ask = await createTaskExtended("answer when the build is done", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await completeTask(ask.id, "Checking back today at 18:38", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    await backdateLastUpdated([ask.id], 20);
+    await processSlackRenderV2();
+    const card = await getSlackOutcomeMessage(ask.id);
+
+    const schedule = await createScheduledTask({
+      name: "deferred-chain",
+      scheduleType: "one_time",
+      taskTemplate: "Deliver the result",
+      taskType: "deferred",
+      tags: ["deferred"],
+      parentTaskId: ask.id,
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      nextRunAt: new Date().toISOString(),
+    });
+    const wake = await createStandaloneScheduleTask(schedule);
+    await startTask(wake.id);
+    await completeTask(wake.id, "Checking back today at 20:00", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    // The chain continues on a new ⏳ card, which the next wake-up resolves.
+    const next = calls.find((call) => call.method === "chat.startStream");
+    expect(next?.payload.markdown_text).toBe("⏳ Checking back later");
+    const nextCard = await getSlackOutcomeMessage(wake.id);
+    expect(nextCard?.permalink).toBeTruthy();
+    // The old card hands over to it rather than repeating the new ETA.
+    const rewrite = calls.find(
+      (call) => call.method === "chat.update" && call.payload.ts === card?.ts,
+    );
+    expect(rewrite?.payload.text).toBe(
+      `↪️ Resumed by ${lead.name} and deferred again — ${nextCard?.permalink}`,
+    );
+  });
+
+  test("a wake-up that failed closes the deferral card as failed, not as done", async () => {
+    const lead = await createAgent({ name: "Failing Wake Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_DEFER_RESOLVE_FAIL");
+    const ask = await createTaskExtended("answer later", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await completeTask(ask.id, "Waiting on Researcher — or today at 18:38 at the latest", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    await backdateLastUpdated([ask.id], 20);
+    calls.length = 0;
+    await processSlackRenderV2();
+    const card = await getSlackOutcomeMessage(ask.id);
+    // The event-based card names who it waits on; the ceiling time stays out of Slack.
+    const opening = calls.find((call) => call.method === "chat.startStream");
+    expect(opening?.payload.markdown_text).toBe("⏳ Waiting on Researcher");
+    expect(JSON.stringify(calls)).not.toContain("at the latest");
+
+    const schedule = await createScheduledTask({
+      name: "deferred-resolve-fail",
+      scheduleType: "one_time",
+      taskTemplate: "Deliver the result",
+      taskType: "deferred",
+      tags: ["deferred"],
+      parentTaskId: ask.id,
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      nextRunAt: new Date().toISOString(),
+    });
+    const wake = await createStandaloneScheduleTask(schedule);
+    await startTask(wake.id);
+    await failTask(wake.id, "the build never finished");
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    const rewrite = calls.find(
+      (call) => call.method === "chat.update" && call.payload.ts === card?.ts,
+    );
+    expect(rewrite?.payload.text).toContain("❌");
+    expect(rewrite?.payload.text).toContain("the build never finished");
+    expect(rewrite?.payload.text).not.toContain("Waiting on Researcher");
+    expect(calls.filter((call) => call.method === "chat.startStream")).toHaveLength(0);
+  });
+
+  test("a deferral whose wake-up is still running keeps its ⏳ card untouched", async () => {
+    const lead = await createAgent({ name: "Pending Wake Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_DEFER_STILL_WAITING");
+    const ask = await createTaskExtended("answer eventually", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await completeTask(ask.id, "Checking back today at 18:38", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    await backdateLastUpdated([ask.id], 20);
+    await processSlackRenderV2();
+    const card = await getSlackOutcomeMessage(ask.id);
+
+    const schedule = await createScheduledTask({
+      name: "deferred-still-running",
+      scheduleType: "one_time",
+      taskTemplate: "Deliver the result",
+      taskType: "deferred",
+      tags: ["deferred"],
+      parentTaskId: ask.id,
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      nextRunAt: new Date().toISOString(),
+    });
+    const wake = await createStandaloneScheduleTask(schedule);
+    await startTask(wake.id);
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    expect(
+      calls.filter((call) => call.method === "chat.update" && call.payload.ts === card?.ts),
+    ).toHaveLength(0);
+    expect((await getSlackOutcomeMessage(ask.id))?.deferralResolvedAt).toBeUndefined();
+  });
+
+  /**
+   * Sets up a deferral card whose wake-up has already settled, so the next
+   * tick is the one that tries to rewrite the card in place.
+   */
+  async function resolvableDeferralCard(label: string) {
+    const lead = await createAgent({ name: `${label} Lead`, isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress(label);
+    const ask = await createTaskExtended("answer when the build is done", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await completeTask(ask.id, "Checking back today at 18:38", {
+      addTags: ["deferred"],
+      deferredAt: new Date().toISOString(),
+    });
+    await backdateLastUpdated([ask.id], 20);
+    await processSlackRenderV2();
+    const card = await getSlackOutcomeMessage(ask.id);
+
+    const schedule = await createScheduledTask({
+      name: `${label}-resolve`,
+      scheduleType: "one_time",
+      taskTemplate: "Deliver the result",
+      taskType: "deferred",
+      tags: ["deferred"],
+      parentTaskId: ask.id,
+      targetAgentId: lead.id,
+      createdByAgentId: lead.id,
+      nextRunAt: new Date().toISOString(),
+    });
+    const wake = await createStandaloneScheduleTask(schedule);
+    await startTask(wake.id);
+    await completeTask(wake.id, "The build passed.");
+    return { askId: ask.id, wakeId: wake.id, ts: card!.ts };
+  }
+
+  test("a deferral card Slack refuses for good stops being retried", async () => {
+    const card = await resolvableDeferralCard("C_DEFER_REJECTED");
+    // Not a 404: the message is still there, Slack just will not accept the
+    // rewrite. The old code logged this and left the row eligible, so the
+    // same doomed chat.update ran on every single tick from then on.
+    rejectedUpdateTs = card.ts;
+    calls.length = 0;
+    await processSlackRenderV2();
+    expect(
+      calls.filter((call) => call.method === "chat.update" && call.payload.ts === card.ts),
+    ).toHaveLength(1);
+    const abandoned = await getSlackOutcomeMessage(card.askId);
+    expect(abandoned?.deferralResolvedAt).toBeTruthy();
+    expect(abandoned?.deferralAbandonedAt).toBeTruthy();
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    expect(
+      calls.filter((call) => call.method === "chat.update" && call.payload.ts === card.ts),
+    ).toHaveLength(0);
+    // The answer never reached the card, so the wake-up delivers it itself.
+    const fallback = calls.filter((call) => call.method === "chat.startStream");
+    expect(fallback).toHaveLength(1);
+    expect(fallback[0]?.payload.markdown_text).toBe("✅ The build passed.");
+    expect((await getSlackOutcomeMessage(card.wakeId))?.finalizedAt).toBeTruthy();
+  });
+
+  test("a deferral card failing for an unclassifiable reason is retried, but bounded", async () => {
+    const card = await resolvableDeferralCard("C_DEFER_BOUNDED");
+    // No Slack verdict attached, so this class stays retryable — up to a
+    // ceiling. Keep the failure count far above the ceiling to prove the
+    // ceiling, not the mock, is what ends it.
+    updateFailuresRemaining = 100;
+    const attempts = () =>
+      calls.filter((call) => call.method === "chat.update" && call.payload.ts === card.ts).length;
+
+    calls.length = 0;
+    for (let tick = 0; tick < 4; tick++) await processSlackRenderV2();
+    expect(attempts()).toBe(4);
+    expect((await getSlackOutcomeMessage(card.askId))?.deferralResolvedAt).toBeUndefined();
+
+    await processSlackRenderV2();
+    expect(attempts()).toBe(5);
+    expect((await getSlackOutcomeMessage(card.askId))?.deferralResolvedAt).toBeTruthy();
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    expect(attempts()).toBe(0);
+  });
+
+  test("a deferral with no pending text still posts its ETA", async () => {
+    const { channelId, threadTs } = uniqueSlackAddress("C_ETA_ONLY");
+    const ask = await createTaskExtended("wait", {
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+    });
+    await startTask(ask.id);
+    await completeTask(
+      ask.id,
+      "Deferred until today 17:30 UTC ([12345678](https://example.com/schedules/12345678)) -> ",
+      { addTags: ["deferred"] },
+    );
+    calls.length = 0;
+    await processSlackRenderV2();
+    // An empty legacy notice still posts a card — a thread that says nothing
+    // is the bug — but without its ETA.
+    const started = calls.find((call) => call.method === "chat.startStream");
+    expect(started?.payload.markdown_text).toBe("⏳ Checking back later");
   });
 
   test("refreshes a stream started with stale content before finalizing it", async () => {
@@ -1551,5 +2771,1420 @@ describe("Slack renderer v2", () => {
       "PRIVATE OUTPUT",
     );
     expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeDefined();
+    expect(
+      calls
+        .filter((c) => c.payload.ts === interrupted!.ts || c.payload.message_ts === interrupted!.ts)
+        .map((c) => c.method),
+    ).toEqual(["chat.stopStream", "chat.update", "chat.getPermalink"]);
+  });
+
+  test("an outcome stream with empty text left open by an earlier process is stopped, then filled", async () => {
+    const lead = await createAgent({ name: "Empty Stream Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RENDER_EMPTY_STREAM");
+    const ask = await createTaskExtended("ask whose stream was left open and empty", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await ensureSlackThreadTree([ask.id]);
+    await completeTask(ask.id, "The answer.");
+    calls.length = 0;
+    _resetSlackRenderV2ForTests();
+    stopCallsUntilFailure = 0;
+
+    await processSlackRenderV2();
+
+    const interrupted = await getSlackOutcomeMessage(ask.id);
+    remoteMessages.get(remoteKey(channelId, interrupted!.ts))!.text = "";
+    calls.length = 0;
+    _resetSlackRenderV2ForTests();
+
+    await processSlackRenderV2();
+
+    const remote = remoteMessages.get(remoteKey(channelId, interrupted!.ts));
+    expect(remote?.streaming).toBe(false);
+    expect(remote?.text).toBe("✅ The answer.");
+    expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeDefined();
+  });
+});
+
+describe("Outcome delivery give-up", () => {
+  /** A completed ask whose stream was started, then orphaned before chat.stopStream. */
+  async function orphanedOutcomeStream(label: string) {
+    const lead = await createAgent({ name: `${label} Lead`, isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress(label);
+    const ask = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await ensureSlackThreadTree([ask.id]);
+    await completeTask(ask.id, "The answer.");
+    stopCallsUntilFailure = 0;
+    await processSlackRenderV2();
+    const card = (await getSlackOutcomeMessage(ask.id))!;
+    calls.length = 0;
+    _resetSlackRenderV2ForTests();
+    return { askId: ask.id, channelId, threadTs, ts: card.ts };
+  }
+
+  test.each([
+    "msg_too_long",
+    "streaming_state_conflict",
+  ])("a %s verdict on the outcome card ends delivery on the first attempt", async (code) => {
+    const { askId, ts } = await orphanedOutcomeStream(`C_GIVEUP_${code}`);
+    rejectedUpdateTs = ts;
+    rejectedUpdateCode = code;
+
+    await processSlackRenderV2();
+
+    expect(calls.filter((c) => c.method === "chat.update" && c.payload.ts === ts)).toHaveLength(1);
+    const card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    // orphanedOutcomeStream's own setup tick already burns 1 attempt (the
+    // injected chat.stopStream failure it uses to leave the stream open),
+    // so the terminal verdict below lands on attempt 2, not attempt 1.
+    expect(card?.deliveryAttempts).toBe(2);
+    expect(card?.deliveryLastError?.startsWith(code)).toBe(true);
+    const warnings = calls.filter(
+      (c) =>
+        c.method === "chat.postMessage" &&
+        String(c.payload.text ?? "").startsWith(
+          `⚠️ Couldn't deliver this task's reply after 2 attempt(s) (${code}`,
+        ),
+    );
+    expect(warnings).toHaveLength(1);
+
+    _resetSlackRenderV2ForTests();
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+
+    expect(calls.filter((c) => c.method === "chat.update" && c.payload.ts === ts)).toHaveLength(1);
+    expect(
+      calls.filter(
+        (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("a rate_limited verdict on chat.stopStream stays retryable and succeeds once the limit clears", async () => {
+    const { askId, ts } = await orphanedOutcomeStream("C_GIVEUP_RATE_LIMITED");
+    rejectedStopTs = ts;
+
+    await processSlackRenderV2();
+
+    // orphanedOutcomeStream's own setup tick already burns 1 attempt, so the
+    // rate_limited verdict lands on attempt 2 — and, being transient, must
+    // not abandon delivery there.
+    let card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeUndefined();
+    expect(card?.deliveryAttempts).toBe(2);
+    expect(card?.deliveryLastError?.startsWith("rate_limited")).toBe(true);
+    expect(
+      calls.some(
+        (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+      ),
+    ).toBe(false);
+
+    // The rate limit clears; the next attempt succeeds and finalizes the card.
+    rejectedStopTs = undefined;
+    _resetSlackRenderV2ForTests();
+    await processSlackRenderV2();
+
+    card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeUndefined();
+    expect(card?.finalizedAt).toBeDefined();
+    expect(calls.filter((c) => c.method === "chat.update" && c.payload.ts === ts)).toHaveLength(1);
+  });
+
+  test("an unclassifiable outcome failure is retried across restarts, bounded by the persisted count", async () => {
+    // orphanedOutcomeStream's own setup tick already burns 1 attempt, so 3
+    // more (not 4) reach attempt 4, and a 4th (not 5th) reaches the ceiling.
+    const { askId } = await orphanedOutcomeStream("C_GIVEUP_PERSIST");
+    updateFailuresRemaining = 100;
+
+    for (let tick = 1; tick <= 3; tick++) {
+      _resetSlackRenderV2ForTests();
+      await processSlackRenderV2();
+    }
+    let card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAttempts).toBe(4);
+    expect(card?.deliveryAbandonedAt).toBeUndefined();
+    expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(0);
+
+    _resetSlackRenderV2ForTests();
+    await processSlackRenderV2();
+    card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAttempts).toBe(5);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    const warnings = calls.filter(
+      (c) =>
+        c.method === "chat.postMessage" &&
+        String(c.payload.text ?? "").includes("after 5 attempt(s)"),
+    );
+    expect(warnings).toHaveLength(1);
+
+    const cardTs = card?.ts;
+    calls.length = 0;
+    _resetSlackRenderV2ForTests();
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    // Scoped to the abandoned card's own ts: the tree message keeps updating
+    // independently and is not part of this card's delivery gate.
+    expect(calls.some((c) => c.method === "chat.update" && c.payload.ts === cardTs)).toBe(false);
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(false);
+    expect(
+      calls.some(
+        (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+      ),
+    ).toBe(false);
+  });
+
+  test("the give-up transition is claimed by exactly one caller", async () => {
+    const { askId } = await orphanedOutcomeStream("C_GIVEUP_ONCE");
+    const first = await abandonSlackOutcomeDelivery(askId, "x");
+    const second = await abandonSlackOutcomeDelivery(askId, "x");
+    expect(first?.deliveryAbandonedAt).toBeDefined();
+    expect(second).toBeNull();
+  });
+
+  test("a delivery that fails before any stream exists still persists its give-up", async () => {
+    const lead = await createAgent({ name: "No Row Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_GIVEUP_NO_ROW");
+    const ask = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await ensureSlackThreadTree([ask.id]);
+    await completeTask(ask.id, "The answer.");
+    calls.length = 0;
+    startStreamFailuresRemaining = 1;
+    postMessageErrorCode = "channel_not_found";
+
+    await processSlackRenderV2();
+
+    const card = await getSlackOutcomeMessage(ask.id);
+    expect(card?.ts.startsWith("pending:")).toBe(true);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    expect(
+      calls.filter(
+        (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+      ),
+    ).toHaveLength(1);
+
+    calls.length = 0;
+    _resetSlackRenderV2ForTests();
+    await processSlackRenderV2();
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(false);
+  });
+
+  test("a delivery failure logs Slack's code and response messages, scrubbed", async () => {
+    const { ts } = await orphanedOutcomeStream("C_GIVEUP_LOG");
+    rejectedUpdateTs = ts;
+    rejectedUpdateCode = "msg_too_long";
+    rejectedUpdateMessages = ["[ERROR] text too long", "token xoxb-1234567890-abcdefghij"];
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await processSlackRenderV2();
+      const joined = logged.mock.calls.map((call) => call.map(String).join(" ")).join("\n");
+      expect(joined).toContain(`"code":"msg_too_long"`);
+      expect(joined).toContain("text too long");
+      expect(joined).not.toContain("xoxb-1234567890");
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  test("a non-terminal failure waits before the next attempt", async () => {
+    const { ts } = await orphanedOutcomeStream("C_GIVEUP_BACKOFF");
+    updateFailuresRemaining = 100;
+
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+
+    expect(calls.filter((c) => c.method === "chat.update" && c.payload.ts === ts)).toHaveLength(1);
+  });
+
+  test("recovers a card crashed between the attempts ceiling and the abandon transition", async () => {
+    const { askId } = await orphanedOutcomeStream("C_GIVEUP_STUCK");
+    // Simulate a crash: delivery_attempts reached the ceiling via
+    // noteSlackOutcomeDeliveryFailure, but abandonSlackOutcomeDelivery never
+    // ran, leaving delivery_abandoned_at NULL. Without the fix,
+    // outcomeDeliveryGate's attempts check would block this card forever.
+    for (let i = 0; i < 4; i++) {
+      await noteSlackOutcomeDeliveryFailure(askId, "boom");
+    }
+    let card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAttempts).toBe(5);
+    expect(card?.deliveryAbandonedAt).toBeUndefined();
+
+    calls.length = 0;
+    await processSlackRenderV2();
+
+    card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    expect(card?.deliveryAttempts).toBe(5);
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(false);
+    const warnings = calls.filter(
+      (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+    );
+    expect(warnings).toHaveLength(1);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    expect(
+      calls.filter(
+        (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("scrubs a secret-shaped error from the persisted give-up and its Slack warning", async () => {
+    const { askId, ts } = await orphanedOutcomeStream("C_GIVEUP_SCRUB_PERSIST");
+    rejectedUpdateTs = ts;
+    rejectedUpdateCode = "msg_too_long";
+    rejectedUpdateMessages = ["token xoxb-1234567890-abcdefghij"];
+
+    await processSlackRenderV2();
+
+    const card = await getSlackOutcomeMessage(askId);
+    expect(card?.deliveryAbandonedAt).toBeDefined();
+    expect(card?.deliveryLastError).not.toContain("xoxb-1234567890");
+    const warning = calls.find(
+      (c) => c.method === "chat.postMessage" && String(c.payload.text ?? "").startsWith("⚠️"),
+    );
+    expect(warning).toBeDefined();
+    expect(String(warning?.payload.text)).not.toContain("xoxb-1234567890");
+  });
+
+  test("a reservation from the failure path is not reconciled against an identical older message", async () => {
+    const lead = await createAgent({ name: "Recon Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RECON");
+    const contextKey = slackContextKey({ channelId, threadTs });
+
+    // taskA posts first and settles normally; its outcome text will be
+    // identical to taskB's, since both complete with the same output.
+    const taskA = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey,
+    });
+    await startTask(taskA.id);
+    await ensureSlackThreadTree([taskA.id]);
+    await completeTask(taskA.id, "The answer.");
+    await processSlackRenderV2();
+    const cardA = await getSlackOutcomeMessage(taskA.id);
+    expect(cardA?.finalizedAt).toBeDefined();
+
+    const taskB0 = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey,
+    });
+    await startTask(taskB0.id);
+    await completeTask(taskB0.id, "The answer.");
+    const taskB = (await getTaskById(taskB0.id))!;
+
+    const tree = (await getSlackTreeMessageByThread(channelId, threadTs))!;
+    // Simulate a failure before streamOutcomeCard's own reservation (e.g. a
+    // DB read throwing while building content) — noteOutcomeDeliveryFailure
+    // eagerly reserves a row with no Slack call ever attempted.
+    await _noteOutcomeDeliveryFailureForTests(taskB, tree, new Error("content build blew up"));
+    const reservedB = await getSlackOutcomeMessage(taskB.id);
+    expect(reservedB?.ts.startsWith("pending:")).toBe(true);
+    expect(reservedB?.deliveryAttempts).toBe(1);
+
+    calls.length = 0;
+    const outcome = await streamOutcomeCard(taskB, tree);
+
+    // Without the fix, this reconciles by presentation text against taskA's
+    // identical, unrelated message instead of posting a fresh one.
+    expect(calls.some((c) => c.method === "conversations.replies")).toBe(false);
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(true);
+    expect(outcome?.finalizedAt).toBeDefined();
+    expect(outcome?.ts).not.toBe(cardA?.ts);
+  });
+
+  test("a restart-cleared reservation marker is still not reconciled against an identical older message", async () => {
+    const lead = await createAgent({ name: "Recon Restart Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RECON_RESTART");
+    const contextKey = slackContextKey({ channelId, threadTs });
+
+    const taskA = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey,
+    });
+    await startTask(taskA.id);
+    await ensureSlackThreadTree([taskA.id]);
+    await completeTask(taskA.id, "The answer.");
+    await processSlackRenderV2();
+    const cardA = await getSlackOutcomeMessage(taskA.id);
+    expect(cardA?.finalizedAt).toBeDefined();
+
+    const taskB0 = await createTaskExtended("answer", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey,
+    });
+    await startTask(taskB0.id);
+    await completeTask(taskB0.id, "The answer.");
+    const taskB = (await getTaskById(taskB0.id))!;
+
+    const tree = (await getSlackTreeMessageByThread(channelId, threadTs))!;
+    await _noteOutcomeDeliveryFailureForTests(taskB, tree, new Error("content build blew up"));
+
+    calls.length = 0;
+    // A process restart clears the in-memory `outcomeReservedWithoutAttempt`
+    // marker, so the reconciliation search runs and finds taskA's identical
+    // message. The DB-truth ownership check must still reject binding onto
+    // it — without it, this throws `UNIQUE constraint failed:
+    // slack_messages.channel_id, slack_messages.ts` at bindSlackMessageTimestamp.
+    _resetSlackRenderV2ForTests();
+    const outcome = await streamOutcomeCard(taskB, tree);
+
+    expect(calls.some((c) => c.method === "conversations.replies")).toBe(true);
+    expect(calls.some((c) => c.method === "chat.startStream")).toBe(true);
+    expect(outcome?.finalizedAt).toBeDefined();
+    expect(outcome?.ts).not.toBe(cardA?.ts);
+  });
+});
+
+describe("Slack renderer v2 delegation (SLACK_RENDER_V2_DELEGATION)", () => {
+  beforeEach(async () => {
+    process.env.SLACK_RENDER_V2_DELEGATION = "true";
+    // Pre-activate so every fixture task, created after this point, is a
+    // post-activation task — matching how a real deployment (flag flipped
+    // on, then work dispatched) behaves. The lazy activation call inside
+    // processSlackRenderV2 is a no-op once this row already exists.
+    await ensureSlackDelegationActivation();
+  });
+
+  afterEach(() => {
+    delete process.env.SLACK_RENDER_V2_DELEGATION;
+    delete process.env.SLACK_CONCLUSION_SETTLE_SEC;
+    delete process.env.SLACK_CONCLUSION_TIMEOUT_MIN;
+  });
+
+  // --- T3: child result cards ---------------------------------------------
+
+  test("an eligible mcp child posts once and never twice across 3 ticks", async () => {
+    const lead = await createAgent({ name: "Delegation Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Delegation Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CHILD_ONCE");
+    const ask = await createTaskExtended("delegate research", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("research the API", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "Found the answer.");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+
+    const startStreamCalls = calls.filter((call) => call.method === "chat.startStream");
+    expect(startStreamCalls).toHaveLength(1);
+    expect(String(startStreamCalls[0]!.payload.markdown_text)).toContain(
+      "↳ ✅ Delegation Worker — result",
+    );
+    expect((await getSlackOutcomeMessage(child.id))?.finalizedAt).toBeDefined();
+  });
+
+  test("follow-up and reroute-decision children never get a card; a resume child does", async () => {
+    const lead = await createAgent({ name: "Tasktype Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Tasktype Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_TASKTYPE");
+    const ask = await createTaskExtended("tasktype ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+
+    const followUp = await createTaskExtended("[Thread follow-up] wrap up", {
+      agentId: lead.id,
+      source: "system",
+      taskType: "follow-up",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(followUp.id);
+    await completeTask(followUp.id, "follow-up output");
+
+    const reroute = await createTaskExtended("reroute decision", {
+      agentId: lead.id,
+      source: "system",
+      taskType: "reroute-decision",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(reroute.id);
+    await completeTask(reroute.id, "reroute output");
+
+    const crashed = await createTaskExtended("crashed work", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(crashed.id);
+    const resume = await createTaskExtended("resume the crashed work", {
+      agentId: worker.id,
+      source: "system",
+      taskType: "resume",
+      parentTaskId: crashed.id,
+      followUpConfig: { disabled: true },
+    });
+    await supersedeTask(crashed.id, { reason: "crash_recovery", resumeTaskId: resume.id });
+    await startTask(resume.id);
+    await completeTask(resume.id, "resume result");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+    await processSlackRenderV2();
+
+    expect(await getSlackOutcomeMessage(followUp.id)).toBeNull();
+    expect(await getSlackOutcomeMessage(reroute.id)).toBeNull();
+    expect((await getSlackOutcomeMessage(resume.id))?.finalizedAt).toBeDefined();
+  });
+
+  test("a child that already sent its own Slack reply does not get a card", async () => {
+    const lead = await createAgent({ name: "Replied Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Replied Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_REPLIED_CHILD");
+    const ask = await createTaskExtended("replied ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("child that already replied", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await markTaskSlackReplySent(child.id);
+    await completeTask(child.id, "Child output that duplicates the Slack reply.");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+  });
+
+  test("re-reads slackReplySent inside streamOutcomeCard so a child card doesn't duplicate a late Slack reply", async () => {
+    const lead = await createAgent({
+      name: "Child Stale Snapshot Lead",
+      isLead: true,
+      status: "idle",
+    });
+    const worker = await createAgent({
+      name: "Child Stale Snapshot Worker",
+      isLead: false,
+      status: "idle",
+    });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CHILD_STALE_SNAPSHOT");
+    const ask = await createTaskExtended("ask with a child whose reply lands before its card", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const tree = await ensureSlackThreadTree([ask.id]);
+    const child = await createTaskExtended("child whose reply lands before its card", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "PRIVATE CHILD OUTPUT THAT MUST NOT DUPLICATE THE REPLY");
+    // Simulate the render loop's tick-start snapshot: fetched before slack-reply
+    // committed, same technique as the ask-level "stale snapshot" test above.
+    const staleChildSnapshot = { ...(await getTaskById(child.id))!, slackReplySent: false };
+    await markTaskSlackReplySent(child.id);
+    calls.length = 0;
+
+    const outcome = await streamOutcomeCard(staleChildSnapshot, tree!, {
+      buildContent: childOutcomeContent,
+    });
+
+    const started = calls.find((call) => call.method === "chat.startStream");
+    expect(started?.payload.markdown_text).toBe(`↳ ✅ ${worker.name} completed`);
+    expect(started?.payload.markdown_text).not.toContain("PRIVATE CHILD OUTPUT");
+    expect(outcome?.finalizedAt).toBeDefined();
+  });
+
+  test("5 simultaneous children post 3 then 2 across 2 ticks", async () => {
+    const lead = await createAgent({ name: "Burst Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_BURST_5");
+    const ask = await createTaskExtended("burst ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const children: AgentTask[] = [];
+    for (let index = 0; index < 5; index++) {
+      const worker = await createAgent({
+        name: `Burst Worker ${index}`,
+        isLead: false,
+        status: "idle",
+      });
+      const child = await createTaskExtended(`burst child ${index}`, {
+        agentId: worker.id,
+        source: "mcp",
+        parentTaskId: ask.id,
+        followUpConfig: { disabled: true },
+      });
+      await startTask(child.id);
+      await completeTask(child.id, `child ${index} output`);
+      children.push(child);
+    }
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(calls.filter((call) => call.method === "chat.startStream")).toHaveLength(3);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    expect(calls.filter((call) => call.method === "chat.startStream")).toHaveLength(2);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    expect(calls.filter((call) => call.method === "chat.startStream")).toHaveLength(0);
+
+    for (const child of children) {
+      expect((await getSlackOutcomeMessage(child.id))?.finalizedAt).toBeDefined();
+    }
+  });
+
+  test("12 children stop at the 10-card-per-ask cap", async () => {
+    const lead = await createAgent({ name: "Cap Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CAP_12");
+    const ask = await createTaskExtended("cap ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const children: AgentTask[] = [];
+    for (let index = 0; index < 12; index++) {
+      const worker = await createAgent({
+        name: `Cap Worker ${index}`,
+        isLead: false,
+        status: "idle",
+      });
+      const child = await createTaskExtended(`cap child ${index}`, {
+        agentId: worker.id,
+        source: "mcp",
+        parentTaskId: ask.id,
+        followUpConfig: { disabled: true },
+      });
+      await startTask(child.id);
+      await completeTask(child.id, `child ${index} output`);
+      children.push(child);
+    }
+    calls.length = 0;
+
+    for (let tick = 0; tick < 6; tick++) {
+      await processSlackRenderV2();
+    }
+
+    const cardedCount = (
+      await Promise.all(children.map((child) => getSlackOutcomeMessage(child.id)))
+    ).filter((card) => card?.finalizedAt).length;
+    expect(cardedCount).toBe(10);
+  });
+
+  test("flag off: a completed child gets no card, matching today's behavior", async () => {
+    process.env.SLACK_RENDER_V2_DELEGATION = "false";
+    const lead = await createAgent({ name: "Flag Off Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Flag Off Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_FLAG_OFF");
+    const ask = await createTaskExtended("flag off ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("flag off child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "child output");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+  });
+
+  test("does not apply delegation cards to tasks created before activation", async () => {
+    const lead = await createAgent({ name: "Legacy Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Legacy Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_LEGACY_ACTIVATION");
+    const ask = await createTaskExtended("legacy ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("legacy child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "Legacy child result.");
+    await completeTask(ask.id, "Legacy ask result.");
+    await getDbClient().run(
+      `UPDATE slack_render_v2_state SET delegation_activated_at = ? WHERE id = 1`,
+      ["2099-01-01T00:00:00.000Z"],
+    );
+
+    await processSlackRenderV2();
+    expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeDefined();
+    expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+  });
+
+  test("acceptance: 1 ask + 2 completed mcp children yields exactly 2 finalized child rows and 2 slack_delivery logs; re-tick adds nothing", async () => {
+    const lead = await createAgent({ name: "Acceptance T3 Lead", isLead: true, status: "idle" });
+    const workerA = await createAgent({
+      name: "Acceptance T3 Worker A",
+      isLead: false,
+      status: "idle",
+    });
+    const workerB = await createAgent({
+      name: "Acceptance T3 Worker B",
+      isLead: false,
+      status: "idle",
+    });
+    const { channelId, threadTs } = uniqueSlackAddress("C_T3_ACCEPTANCE");
+    const ask = await createTaskExtended("acceptance ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const childA = await createTaskExtended("child A", {
+      agentId: workerA.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    const childB = await createTaskExtended("child B", {
+      agentId: workerB.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(childA.id);
+    await completeTask(childA.id, "A done.");
+    await startTask(childB.id);
+    await completeTask(childB.id, "B done.");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const rows = await getDbClient().query<{ permalink: string | null }>(
+      `SELECT permalink FROM slack_messages WHERE kind = 'outcome' AND task_id IN (?, ?)`,
+      [childA.id, childB.id],
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => !!row.permalink)).toBe(true);
+    const deliveryLogs = (await getLogsByEventType("slack_delivery")).filter((log) =>
+      [childA.id, childB.id].includes(log.taskId ?? ""),
+    );
+    expect(deliveryLogs).toHaveLength(2);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    expect(calls.filter((call) => call.method === "chat.startStream")).toHaveLength(0);
+  });
+
+  // --- T4: deferred conclusion, timeout, reaction gate --------------------
+
+  test("an ask that completes while a child still runs posts no card and no reaction across ticks", async () => {
+    const lead = await createAgent({ name: "Open Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Open Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_OPEN_CLOSURE");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("open ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("still running child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(ask.id, "Ask output while the child keeps working.");
+    calls.length = 0;
+
+    for (let tick = 0; tick < 5; tick++) {
+      await processSlackRenderV2();
+    }
+
+    expect(await getSlackOutcomeMessage(ask.id)).toBeNull();
+    expect(
+      calls.some(
+        (call) =>
+          call.method === "reactions.add" &&
+          ["white_check_mark", "x", "warning"].includes(String(call.payload.name)),
+      ),
+    ).toBe(false);
+  });
+
+  test("child completes, follow-up completes, and the settle window elapses: conclusion card with Results, reaction white_check_mark", async () => {
+    const lead = await createAgent({ name: "Settle Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Settle Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_SETTLE");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("settle ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("do the work", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "Child result body.");
+    calls.length = 0;
+
+    // Tick 1: the ask is still open, so only the child's own card posts —
+    // this is what gives the conclusion card a permalink to link to below.
+    await processSlackRenderV2();
+    const childCard = await getSlackOutcomeMessage(child.id);
+    expect(childCard?.finalizedAt).toBeDefined();
+    expect(await getSlackOutcomeMessage(ask.id)).toBeNull();
+
+    const followUp = await createTaskExtended("[Thread follow-up] wrap up", {
+      agentId: lead.id,
+      source: "system",
+      taskType: "follow-up",
+      parentTaskId: child.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(followUp.id);
+    await completeTask(followUp.id, "wrap-up done");
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, child.id, followUp.id], 60);
+    calls.length = 0;
+
+    // Tick 2: the closure is all-terminal and quiet — the conclusion posts.
+    await processSlackRenderV2();
+
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(askCard?.conclusionKind).toBe("complete");
+    const conclusionStream = calls.find(
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(conclusionStream).toBeDefined();
+    expect(String(conclusionStream?.payload.markdown_text)).toContain(childCard!.permalink);
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },
+    });
+  });
+
+  test("one failed child produces reaction x", async () => {
+    const lead = await createAgent({ name: "Fail Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Fail Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_FAIL_CHILD");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("fail ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("do the failing work", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await failTask(child.id, "It broke.");
+    await completeTask(ask.id, "Ask completed despite the failure.");
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "x", timestamp: triggerTs },
+    });
+    expect((await getSlackOutcomeMessage(ask.id))?.conclusionKind).toBe("complete");
+  });
+
+  test("cancelled closure members have no card, appear in Results, and do not fail the conclusion", async () => {
+    const lead = await createAgent({ name: "Cancel Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Cancel Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_CANCELLED_MEMBER");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("cancelled member ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("cancelled member", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await cancelTask(child.id, "No longer needed.");
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(child.id)).toBeNull();
+    expect((await getSlackOutcomeMessage(ask.id))?.conclusionKind).toBe("complete");
+    const conclusion = calls.find(
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(String(conclusion?.payload.markdown_text)).toContain("Cancel Worker");
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },
+    });
+  });
+
+  test("a deferred conclusion finalizes the acknowledgement reaction on a steer message", async () => {
+    const lead = await createAgent({ name: "Steer Reaction Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({
+      name: "Steer Reaction Worker",
+      isLead: false,
+      status: "idle",
+    });
+    const { channelId, threadTs } = uniqueSlackAddress("C_STEER_REACTION");
+    const ask = await createTaskExtended("steer reaction ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: `${slackAddressSequence}.9`,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("steer reaction child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(child.id, "Child result.");
+    await completeTask(ask.id, "Ask result.");
+    await createLogEntry({
+      eventType: "task_steering",
+      taskId: ask.id,
+      newValue: "slack_reaction",
+      metadata: { slackChannelId: channelId, slackMessageTs: `${slackAddressSequence}.8` },
+    });
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: {
+        channel: channelId,
+        name: "white_check_mark",
+        timestamp: `${slackAddressSequence}.8`,
+      },
+    });
+  });
+
+  test("an abandoned child idle past the timeout concludes with timeout, warning, and the member listed", async () => {
+    process.env.SLACK_CONCLUSION_TIMEOUT_MIN = "1";
+    const lead = await createAgent({ name: "Timeout Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Timeout Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_TIMEOUT");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("timeout ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("stuck work", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(ask.id, "Ask completed; the child never finished.");
+    await backdateLastUpdated([ask.id, child.id], 120);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(askCard?.conclusionKind).toBe("timeout");
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "warning", timestamp: triggerTs },
+    });
+    const conclusionStream = calls.find(
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("Concluded with unfinished work"),
+    );
+    expect(conclusionStream).toBeDefined();
+    expect(String(conclusionStream?.payload.markdown_text)).toContain(getTaskLink(child.id));
+  });
+
+  test("a stale in-progress ask times out without a completed outcome", async () => {
+    process.env.SLACK_CONCLUSION_TIMEOUT_MIN = "1";
+    const lead = await createAgent({ name: "Stale Ask Lead", isLead: true, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_STALE_ASK_TIMEOUT");
+    const ask = await createTaskExtended("stale in-progress ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    await backdateLastUpdated([ask.id], 120);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.conclusionKind).toBe("timeout");
+    const conclusionStream = calls.find((call) => call.method === "chat.startStream");
+    const body = String(conclusionStream?.payload.markdown_text);
+    expect(body).toContain("Concluded with unfinished work");
+    expect(body).toContain("Still in progress");
+    expect(body).toContain(getTaskLink(ask.id));
+    expect(body).not.toContain("✅");
+  });
+
+  test("a superseded member's resume chain gates the conclusion until the resume ends", async () => {
+    const lead = await createAgent({ name: "Resume Gate Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Resume Gate Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_RESUME_GATE");
+    const ask = await createTaskExtended("resume gate ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const crashed = await createTaskExtended("work that crashes", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(crashed.id);
+    const resume = await createTaskExtended("resume the crashed work", {
+      agentId: worker.id,
+      source: "system",
+      taskType: "resume",
+      parentTaskId: crashed.id,
+      followUpConfig: { disabled: true },
+    });
+    await supersedeTask(crashed.id, { reason: "crash_recovery", resumeTaskId: resume.id });
+    await startTask(resume.id);
+    await completeTask(ask.id, "Ask completed while the resume is still running.");
+    await backdateLastUpdated([ask.id, crashed.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(ask.id)).toBeNull();
+
+    await completeTask(resume.id, "Resume finished.");
+    await backdateLastUpdated([ask.id, crashed.id, resume.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect((await getSlackOutcomeMessage(ask.id))?.finalizedAt).toBeDefined();
+  });
+
+  test("two asks in one thread resolve independently", async () => {
+    const lead = await createAgent({ name: "Independent Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Independent Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_TWO_ASKS");
+    const contextKey = slackContextKey({ channelId, threadTs });
+    const first = await createTaskExtended("first ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: `${slackAddressSequence}.8`,
+      contextKey,
+    });
+    await startTask(first.id);
+    const firstChild = await createTaskExtended("first child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: first.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(firstChild.id);
+    await completeTask(firstChild.id, "First child done.");
+    await completeTask(first.id, "First ask done.");
+    await backdateLastUpdated([first.id, firstChild.id], 60);
+
+    const second = await createTaskExtended("second ask", {
+      agentId: lead.id,
+      source: "slack",
+      parentTaskId: first.id,
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: `${slackAddressSequence}.9`,
+      contextKey,
+    });
+    await startTask(second.id);
+    const secondChild = await createTaskExtended("second child, still running", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: second.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(secondChild.id);
+    await completeTask(second.id, "Second ask done, but its child is still running.");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    expect((await getSlackOutcomeMessage(first.id))?.finalizedAt).toBeDefined();
+    expect(await getSlackOutcomeMessage(second.id)).toBeNull();
+  });
+
+  test("rollback: flipping the flag off finalizes a deferred ask immediately under the old rule", async () => {
+    const lead = await createAgent({ name: "Rollback Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Rollback Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_ROLLBACK");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("rollback ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("child still running at rollback", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(ask.id, "Ask completed before the rollback.");
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(ask.id)).toBeNull();
+
+    // Rollback: the flag flips off mid-defer. The child is still running,
+    // but the old rule only ever looked at tasks sharing the ask's own
+    // trigger timestamp — the child never gets one — so it finalizes now.
+    process.env.SLACK_RENDER_V2_DELEGATION = "false";
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(askCard?.conclusionKind).toBeUndefined();
+    expect(calls).toContainEqual({
+      method: "reactions.add",
+      payload: { channel: channelId, name: "white_check_mark", timestamp: triggerTs },
+    });
+  });
+
+  test("acceptance: ask done + child running yields zero outcome rows across 10 ticks, then exactly one within 2 ticks after settling", async () => {
+    const lead = await createAgent({ name: "Acceptance T4 Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({
+      name: "Acceptance T4 Worker",
+      isLead: false,
+      status: "idle",
+    });
+    const { channelId, threadTs } = uniqueSlackAddress("C_T4_ACCEPTANCE");
+    const ask = await createTaskExtended("acceptance ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("acceptance child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    await completeTask(ask.id, "Ask done; child still running.");
+    calls.length = 0;
+
+    for (let tick = 0; tick < 10; tick++) {
+      await processSlackRenderV2();
+    }
+    const openRows = await getDbClient().query(
+      `SELECT * FROM slack_messages WHERE task_id = ? AND kind = 'outcome'`,
+      [ask.id],
+    );
+    expect(openRows).toHaveLength(0);
+
+    await completeTask(child.id, "Child finished.");
+    await backdateLastUpdated([ask.id, child.id], 60);
+
+    let ticksToFinalize = 0;
+    for (let tick = 0; tick < 2 && !(await getSlackOutcomeMessage(ask.id))?.finalizedAt; tick++) {
+      await processSlackRenderV2();
+      ticksToFinalize = tick + 1;
+    }
+
+    expect(ticksToFinalize).toBeLessThanOrEqual(2);
+    const finalRows = await getDbClient().query<{ conclusion_kind: string | null }>(
+      `SELECT conclusion_kind FROM slack_messages WHERE task_id = ? AND kind = 'outcome'`,
+      [ask.id],
+    );
+    expect(finalRows).toHaveLength(1);
+    expect(finalRows[0]?.conclusion_kind).toBe("complete");
+  });
+
+  test("ask and child both terminal before the first tick: conclusion still links the child's permalink, not a digest", async () => {
+    const lead = await createAgent({ name: "First Tick Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "First Tick Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_FIRST_TICK");
+    const triggerTs = `${slackAddressSequence}.9`;
+    const ask = await createTaskExtended("first tick ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: triggerTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const child = await createTaskExtended("first tick child", {
+      agentId: worker.id,
+      source: "mcp",
+      parentTaskId: ask.id,
+      followUpConfig: { disabled: true },
+    });
+    await startTask(child.id);
+    // Both members reach a terminal state before processSlackRenderV2 ever
+    // runs for this thread — there is no earlier tick in which the child
+    // could have picked up its own card first.
+    await completeTask(child.id, "Child result body.");
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, child.id], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+
+    const childCard = await getSlackOutcomeMessage(child.id);
+    expect(childCard?.finalizedAt).toBeDefined();
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(askCard?.conclusionKind).toBe("complete");
+    const conclusionStream = calls.find(
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(conclusionStream).toBeDefined();
+    expect(String(conclusionStream?.payload.markdown_text)).toContain(childCard!.permalink);
+    expect(String(conclusionStream?.payload.markdown_text)).not.toContain(getTaskLink(child.id));
+  });
+
+  test("defers a conclusion until overflow child cards are posted", async () => {
+    const lead = await createAgent({ name: "Overflow Lead", isLead: true, status: "idle" });
+    const worker = await createAgent({ name: "Overflow Worker", isLead: false, status: "idle" });
+    const { channelId, threadTs } = uniqueSlackAddress("C_OVERFLOW_ORDER");
+    const ask = await createTaskExtended("overflow ask", {
+      agentId: lead.id,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    });
+    await startTask(ask.id);
+    const children = [];
+    for (let index = 0; index < 4; index++) {
+      const child = await createTaskExtended(`overflow child ${index}`, {
+        agentId: worker.id,
+        source: "mcp",
+        parentTaskId: ask.id,
+        followUpConfig: { disabled: true },
+      });
+      await startTask(child.id);
+      await completeTask(child.id, `Child ${index} result.`);
+      children.push(child);
+    }
+    await completeTask(ask.id, "Ask completed.");
+    await backdateLastUpdated([ask.id, ...children.map((child) => child.id)], 60);
+    calls.length = 0;
+
+    await processSlackRenderV2();
+    expect(await getSlackOutcomeMessage(ask.id)).toBeNull();
+    expect(
+      (await Promise.all(children.map((child) => getSlackOutcomeMessage(child.id)))).filter(
+        (card) => card?.finalizedAt,
+      ),
+    ).toHaveLength(3);
+
+    calls.length = 0;
+    await processSlackRenderV2();
+    const askCard = await getSlackOutcomeMessage(ask.id);
+    expect(askCard?.finalizedAt).toBeDefined();
+    expect(
+      (await Promise.all(children.map((child) => getSlackOutcomeMessage(child.id)))).filter(
+        (card) => card?.finalizedAt,
+      ),
+    ).toHaveLength(4);
+    const conclusion = calls.find(
+      (call) =>
+        call.method === "chat.startStream" &&
+        String(call.payload.markdown_text).includes("**Results**"),
+    );
+    expect(conclusion).toBeDefined();
+    for (const child of children) {
+      expect(String(conclusion?.payload.markdown_text)).toContain(
+        (await getSlackOutcomeMessage(child.id))?.permalink,
+      );
+    }
+  });
+});
+
+describe("withStatusLead", () => {
+  test.each([
+    ["✅", "Hybrid and graph already match.", "✅ Hybrid and graph already match."],
+    ["⏳", "Checking back at 18:00.", "⏳ Checking back at 18:00."],
+    ["❌ **Failed:**", "build broke", "❌ **Failed:** build broke"],
+    [
+      "🚫 **Cancelled:**",
+      "requester changed direction",
+      "🚫 **Cancelled:** requester changed direction",
+    ],
+    [
+      "↳ ✅ Worker — result:",
+      "Opened PR.\n\nDetails.",
+      "↳ ✅ Worker — result: Opened PR.\n\nDetails.",
+    ],
+    ["✅", "\n\n  Leading blank lines drop.", "✅ Leading blank lines drop."],
+    ["✅", "**Bold** opener stays inline.", "✅ **Bold** opener stays inline."],
+    ["✅", "1.5x faster than before.", "✅ 1.5x faster than before."],
+  ])("inlines %p with a plain opener", (lead, body, expected) => {
+    expect(withStatusLead(lead, body)).toBe(expected);
+  });
+
+  test.each([
+    ["code fence", "```ts\nconst x = 1;\n```"],
+    ["tilde fence", "~~~\nraw\n~~~"],
+    ["dash list", "- first\n- second"],
+    ["star list", "* first"],
+    ["ordered list", "1. first\n2. second"],
+    ["blockquote", "> quoted"],
+    ["heading", "# Title\n\nBody"],
+    ["table", "| a | b |\n| - | - |"],
+    ["thematic break", "---\nafter"],
+    ["indented code", "    indented"],
+  ])("keeps the blank line before a %s", (_name, body) => {
+    expect(withStatusLead("✅", body)).toBe(`✅\n\n${body}`);
+    expect(withStatusLead("❌ **Failed:**", body)).toBe(`❌ **Failed:**\n\n${body}`);
   });
 });

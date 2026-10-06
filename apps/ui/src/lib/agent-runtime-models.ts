@@ -1,44 +1,62 @@
-import type { ProviderName, ReasoningEffortLevel, SwarmConfig } from "@/api/types";
+import {
+  buildClaudeShortnameMap,
+  claudeCatalogModelId,
+  cursorCatalogRef,
+  dshCatalogRef,
+  harnessModelIds,
+  isReasoningHarness,
+  modelDisplayName,
+  type ReasoningEffortLevel,
+  reasoningLevelsFor,
+} from "@desplega/model-catalog";
+import type { ProviderName, SwarmConfig } from "@/api/types";
 import modelsCache from "./modelsdev-cache.json";
 
-/**
- * Local mirror of the value in `@/api/types` (kept type-only there). This
- * module is imported directly (via a relative path, no bundler) by backend
- * unit tests (`src/tests/agents-list-model-display.test.ts`,
- * `src/tests/bedrock-model-groups.test.ts`) — every other `@/api/types`
- * import in `ui/src/lib/` is `import type` for exactly this reason: a
- * non-type-only import needs the `@/` alias resolved at runtime, which plain
- * Bun module resolution (no Vite bundler) can't do.
- */
-const REASONING_EFFORT_LEVELS: readonly ReasoningEffortLevel[] = [
-  "off",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-];
+// Every `@/api/types` import here is `import type`: backend unit tests import
+// this module by relative path with no bundler (`src/tests/agents-list-model-display.test.ts`,
+// `src/tests/bedrock-model-groups.test.ts`), and a runtime `@/` import cannot
+// resolve there.
 
-export type LocalHarnessProvider = "claude" | "codex" | "pi" | "opencode";
+export type LocalHarnessProvider =
+  | "claude"
+  | "codex"
+  | "pi"
+  | "opencode"
+  | "acp"
+  | "dsh"
+  | "cursor"
+  | "amp";
+
+/** USD per 1M tokens, as models.dev names the rates. Cache rates are absent for models without prompt caching. */
+export interface ModelCost {
+  input?: number;
+  output?: number;
+  cache_read?: number;
+  cache_write?: number;
+}
 
 export interface ModelOption {
   id: string;
   label: string;
   provider: string;
-  providerId: ProviderIconKey;
+  providerId: ProviderIconKey | null;
   requiredKey: string;
-  cost?: { input?: number; output?: number };
+  cost?: ModelCost;
   contextWindow?: number;
+  /** Catalog lifecycle flag (`deprecated`, `legacy`, `beta`, `alpha`); absent for a stable model. */
+  status?: string;
+  /** ISO release date from the catalog, when it has one. */
+  releaseDate?: string;
   /**
-   * Reasoning-effort levels this model supports, client-side mirror of the
-   * server's hybrid capability lookup (`src/providers/reasoning-effort.ts`).
-   * `undefined` means no capability data was found (custom/unknown model) —
-   * the effort selector should NOT grey out any segment in that case.
+   * The effort levels the harness this option was listed for accepts on this
+   * model (`reasoningLevelsFor`, the rule the API validates with). Empty when
+   * the model takes no effort. Absent on options built outside a harness list
+   * (`findKnownModel`): use `effortLevelsFor` when the harness is known.
    */
   reasoningLevels?: ReadonlyArray<ReasoningEffortLevel>;
 }
 
-export type ProviderIconKey = "anthropic" | "openai" | "openrouter" | "amazon-bedrock";
+export type ProviderIconKey = "anthropic" | "openai" | "openrouter" | "amazon-bedrock" | "amp";
 
 export interface ModelGroup {
   provider: string;
@@ -56,6 +74,8 @@ export interface ModelGroup {
 
 export type SnapshotProviderId = "openrouter" | "anthropic" | "openai" | "amazon-bedrock";
 
+type CatalogProviderId = SnapshotProviderId | "opencode" | "deepseek";
+
 interface CachedReasoningOption {
   type: string;
   values?: string[];
@@ -64,8 +84,10 @@ interface CachedReasoningOption {
 interface CachedModel {
   id: string;
   name?: string;
-  cost?: { input?: number; output?: number };
+  cost?: ModelCost;
   limit?: { context?: number };
+  release_date?: string;
+  status?: string;
   reasoning?: boolean;
   reasoning_options?: CachedReasoningOption[];
 }
@@ -83,104 +105,163 @@ interface CachedProvider {
  * provider is present here it is preferred over the build-time snapshot;
  * when the fetch hasn't resolved the snapshot keeps the picker non-blank.
  */
-export type LiveModelsCatalog = Partial<Record<SnapshotProviderId, CachedProvider>>;
+export type LiveModelsCatalog = Partial<Record<CatalogProviderId, CachedProvider>>;
 
-const CACHE = modelsCache as Record<SnapshotProviderId, CachedProvider | undefined>;
+const CACHE = modelsCache as unknown as Record<string, CachedProvider | undefined>;
 
-// --- Reasoning-effort capability mirror ---------------------------------------
-// Client-side mirror of the resolution order in `reasoningCapability()`
-// (`src/providers/reasoning-effort.ts`, Phase 1). Kept in sync by hand — see
-// that module's doc comment for the accepted-tradeoff rationale (same
-// duplication already accepted for the harness/model registry itself).
-
-/** Shared-safe subset accepted by all four harnesses on at least their default models (see research doc). */
-const REASONING_FALLBACK_LEVELS: ReasoningEffortLevel[] = ["low", "medium", "high"];
-
-/** models.dev `reasoning_options[].type === "effort"` value → our normalized enum. `minimal` intentionally dropped. */
-const REASONING_EFFORT_VALUE_MAP: Partial<Record<string, ReasoningEffortLevel>> = {
-  none: "off",
-  low: "low",
-  medium: "medium",
-  high: "high",
-  xhigh: "xhigh",
-  max: "max",
-};
-
-function levelsFromReasoningOptions(
-  options: CachedReasoningOption[] | undefined,
-): ReasoningEffortLevel[] {
-  const effortEntry = options?.find((o) => o.type === "effort");
-  if (!effortEntry?.values?.length) return [];
-  const mapped = new Set(
-    effortEntry.values
-      .map((v) => REASONING_EFFORT_VALUE_MAP[v])
-      .filter((v): v is ReasoningEffortLevel => v !== undefined),
-  );
-  return REASONING_EFFORT_LEVELS.filter((level) => mapped.has(level));
+/** A provider section of `source`, or undefined for a key it does not own (never a prototype member). */
+function sectionOf(
+  source: Partial<Record<string, CachedProvider>> | null | undefined,
+  providerId: string,
+): CachedProvider | undefined {
+  return source && Object.hasOwn(source, providerId) ? source[providerId] : undefined;
 }
 
-function hasBudgetTokensOption(model: CachedModel): boolean {
-  return Boolean(model.reasoning_options?.some((o) => o.type === "budget_tokens"));
-}
-
-/**
- * Harness-specific quirks the cache doesn't (fully) encode — mirrors
- * `applyHarnessOverrides()` server-side. Only fires for the literal `claude`/
- * `codex` harness values (direct models); `pi`/`opencode` selecting an
- * underlying Anthropic/OpenAI model never triggers these, matching the
- * backend (its override table also keys off the harness param, not the
- * model's provider).
- */
-function applyReasoningHarnessOverrides(
-  harness: LocalHarnessProvider,
-  modelId: string,
+/** The catalog facts every `ModelOption` carries, read from one catalog row. */
+function catalogFacts(
   model: CachedModel,
-  levels: ReasoningEffortLevel[],
-): ReasoningEffortLevel[] {
-  let result = levels;
+): Pick<ModelOption, "cost" | "contextWindow" | "status" | "releaseDate"> {
+  return {
+    cost: model.cost,
+    contextWindow: model.limit?.context,
+    status: model.status,
+    releaseDate: model.release_date,
+  };
+}
 
-  if (harness === "claude" && hasBudgetTokensOption(model) && !result.includes("off")) {
-    result = ["off", ...result];
-  }
+// --- Reasoning-effort capability --------------------------------------------
+// The rule lives in `@desplega/model-catalog` (`reasoningLevelsFor`), shared with
+// the API, which rejects an effort outside it. This is only the catalog lookup.
 
-  if (harness !== "codex") {
-    result = result.filter((l) => l !== "max");
-  }
-
-  if (harness === "codex") {
-    const isCodexMax = /-codex-max$/.test(modelId);
-    const isCodexNonMax = /-codex$/.test(modelId) && !isCodexMax;
-    if (isCodexMax && !result.includes("xhigh")) {
-      result = [...result, "xhigh"];
-    }
-    if (isCodexNonMax) {
-      result = result.filter((l) => l !== "xhigh");
-    }
-  }
-
-  return REASONING_EFFORT_LEVELS.filter((level) => result.includes(level));
+/**
+ * A provider section as the API's runtime catalog holds it: the bundled
+ * snapshot overlaid by the live catalog, the live row winning per model id.
+ */
+function runtimeSectionModels(
+  providerId: string,
+  liveCatalog: LiveModelsCatalog | null | undefined,
+): Record<string, CachedModel> {
+  const snapshot = sectionOf(CACHE, providerId)?.models;
+  const live = sectionOf(liveCatalog, providerId)?.models;
+  return live ? { ...snapshot, ...live } : (snapshot ?? {});
 }
 
 /**
- * Client-side mirror of `reasoningCapability().levels` — returns `undefined`
- * when there's no usable capability data (unknown model, or `reasoning:
- * false`), which the effort selector treats as "don't grey out anything".
+ * The reasoning-effort levels `harness` accepts for `modelId`: exactly what
+ * `PATCH /api/agents/:id/runtime` allows, so an effort picker offers these and
+ * nothing else. Empty for a harness with no effort control (acp, devin,
+ * claude-managed), a model the catalog does not list (custom strings), and a
+ * model that does not reason.
+ *
+ * `modelId` is the string the harness stores: a bare id for claude and codex
+ * (a Claude CLI shortname such as `opus` resolves to the newest model of its
+ * family), `<provider>/<id>` for pi and opencode, `openrouter/<id>` or a bare
+ * DeepSeek API id for dsh, a bare Cursor model id for cursor.
  */
-function reasoningLevelsFromCache(
-  harness: LocalHarnessProvider,
-  modelId: string,
-  model: CachedModel | undefined,
-): ReadonlyArray<ReasoningEffortLevel> | undefined {
-  if (!model?.reasoning) return undefined;
-
-  let levels = levelsFromReasoningOptions(model.reasoning_options);
-  if (levels.length === 0) levels = [...REASONING_FALLBACK_LEVELS];
-  levels = applyReasoningHarnessOverrides(harness, modelId, model, levels);
-
-  return levels.length > 0 ? levels : undefined;
+export function effortLevelsFor(
+  harness: string,
+  modelId: string | null | undefined,
+  liveCatalog?: LiveModelsCatalog | null,
+): ReasoningEffortLevel[] {
+  if (!modelId || !isReasoningHarness(harness)) return [];
+  let providerId: string;
+  let catalogId: string;
+  if (harness === "claude") {
+    providerId = "anthropic";
+    catalogId = claudeCatalogModelId(modelId, runtimeSectionModels(providerId, liveCatalog));
+  } else if (harness === "codex") {
+    providerId = "openai";
+    catalogId = modelId;
+  } else if (harness === "dsh") {
+    ({ providerId, modelId: catalogId } = dshCatalogRef(modelId));
+  } else if (harness === "cursor") {
+    ({ providerId, modelId: catalogId } = cursorCatalogRef(modelId));
+  } else {
+    // The id may hold more slashes (`openrouter/google/gemini-3-flash-preview`).
+    const slash = modelId.indexOf("/");
+    if (slash <= 0) return [];
+    providerId = modelId.slice(0, slash);
+    catalogId = modelId.slice(slash + 1);
+  }
+  const facts =
+    sectionOf(liveCatalog, providerId)?.models?.[catalogId] ??
+    sectionOf(CACHE, providerId)?.models?.[catalogId];
+  return reasoningLevelsFor(harness, catalogId, facts);
 }
 
-export const LOCAL_HARNESSES: LocalHarnessProvider[] = ["claude", "codex", "pi", "opencode"];
+/**
+ * The effort to keep when the harness or model changes: `current` when the new
+ * (harness, model) pair takes it, else `""` (Auto, no override). An effort the
+ * pair cannot take resets to Auto and is never coerced to a neighbour, so the
+ * operator sees the change instead of a level they did not pick.
+ */
+export function effortAfterChange(
+  current: ReasoningEffortLevel | "",
+  harness: string,
+  modelId: string | null | undefined,
+  liveCatalog?: LiveModelsCatalog | null,
+): ReasoningEffortLevel | "" {
+  if (!current) return "";
+  return effortLevelsFor(harness, modelId, liveCatalog).includes(current) ? current : "";
+}
+
+/**
+ * The catalog id a Claude CLI shortname (`opus`, `sonnet`, `fable`) stands for:
+ * the newest model of that family. A catalog id comes back unchanged.
+ */
+export function claudeModelId(modelId: string, liveCatalog?: LiveModelsCatalog | null): string {
+  return claudeCatalogModelId(modelId, runtimeSectionModels("anthropic", liveCatalog));
+}
+
+/**
+ * The DeepSeek-direct catalog section (the bare ids dsh reads with
+ * `DEEPSEEK_API_KEY`). The API's live catalog does not carry it, so this is
+ * the bundled snapshot until it does.
+ */
+export function deepseekCatalogModels(
+  liveCatalog?: LiveModelsCatalog | null,
+): Record<string, CachedModel> {
+  return runtimeSectionModels("deepseek", liveCatalog);
+}
+
+export const LOCAL_HARNESSES: LocalHarnessProvider[] = [
+  "claude",
+  "codex",
+  "pi",
+  "opencode",
+  "dsh",
+  "amp",
+  "cursor",
+  "acp",
+];
+
+/**
+ * The Cursor models the picker offers: a curated subset of what
+ * `Cursor.models.list()` returns. The real list is per account, so a custom
+ * id still goes through; labels and rates come from the vendor's catalog row.
+ */
+export const CURSOR_MODELS = [
+  "composer-2.5",
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-fable-5-1",
+  "claude-haiku-4-5",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.4-mini",
+  "gpt-5.4-nano",
+  "gemini-3.5-flash",
+  "gemini-3.8-flash",
+  "grok-4.6",
+] as const;
+
+/**
+ * The models dsh's DeepSeek-direct route serves out of the box (its bundled
+ * `deepseek-official` catalog). dsh rejects other bare ids, so the picker
+ * offers only these; anything else goes through OpenRouter or a custom id.
+ */
+export const DSH_DIRECT_MODELS = ["deepseek-flash", "deepseek-v4-pro"] as const;
 
 export const HARNESS_LABEL: Record<ProviderName | string, string> = {
   claude: "Claude",
@@ -189,7 +270,15 @@ export const HARNESS_LABEL: Record<ProviderName | string, string> = {
   devin: "Devin",
   opencode: "Opencode",
   pi: "Pi-Mono",
-};
+  acp: "ACP",
+  dsh: "DeepSeek (dsh)",
+  amp: "Amp",
+  cursor: "Cursor",
+} satisfies Record<ProviderName, string>;
+
+export function harnessSupportsModelSelection(harness: LocalHarnessProvider): boolean {
+  return harness !== "acp";
+}
 
 const ANTHROPIC_META = {
   provider: "Anthropic",
@@ -202,45 +291,37 @@ const OPENAI_META = {
   requiredKey: "OPENAI_API_KEY",
 };
 
-/** Builds a direct-registry `ModelOption`, populating `reasoningLevels` from the same cache snapshot the picker's `cost`/`contextWindow` already read. */
+/** Builds a direct-registry `ModelOption` from one catalog row (live or snapshot). */
 function directModel(
   harness: "claude" | "codex",
-  id: string,
-  label: string,
+  model: CachedModel,
   meta: typeof ANTHROPIC_META | typeof OPENAI_META,
 ): ModelOption {
-  const snapshotProviderId: SnapshotProviderId = harness === "claude" ? "anthropic" : "openai";
   return {
-    id,
-    label,
+    id: model.id,
+    label: modelDisplayName(model.name) ?? humanizeModelId(model.id),
     ...meta,
-    reasoningLevels: reasoningLevelsFromCache(harness, id, CACHE[snapshotProviderId]?.models[id]),
+    ...catalogFacts(model),
+    reasoningLevels: reasoningLevelsFor(harness, model.id, model),
   };
 }
 
-const DIRECT_MODELS: Record<"claude" | "codex", ModelOption[]> = {
-  claude: [
-    directModel("claude", "claude-opus-5", "Claude Opus 5", ANTHROPIC_META),
-    directModel("claude", "claude-fable-5", "Claude Fable 5", ANTHROPIC_META),
-    directModel("claude", "claude-mythos-5", "Claude Mythos 5", ANTHROPIC_META),
-    directModel("claude", "claude-sonnet-5", "Claude Sonnet 5", ANTHROPIC_META),
-    directModel("claude", "claude-opus-4-8", "Claude Opus 4.8", ANTHROPIC_META),
-    directModel("claude", "claude-opus-4-7", "Claude Opus 4.7", ANTHROPIC_META),
-    directModel("claude", "claude-opus-4-6", "Claude Opus 4.6", ANTHROPIC_META),
-    directModel("claude", "claude-sonnet-4-6", "Claude Sonnet 4.6", ANTHROPIC_META),
-    directModel("claude", "claude-haiku-4-5", "Claude Haiku 4.5", ANTHROPIC_META),
-  ],
-  codex: [
-    directModel("codex", "gpt-5.6-sol", "GPT-5.6 Sol", OPENAI_META),
-    directModel("codex", "gpt-5.6-terra", "GPT-5.6 Terra", OPENAI_META),
-    directModel("codex", "gpt-5.6-luna", "GPT-5.6 Luna", OPENAI_META),
-    directModel("codex", "gpt-5.5", "GPT-5.5", OPENAI_META),
-    directModel("codex", "gpt-5.4", "GPT-5.4", OPENAI_META),
-    directModel("codex", "gpt-5.4-mini", "GPT-5.4 Mini", OPENAI_META),
-    directModel("codex", "gpt-5.3-codex", "GPT-5.3 Codex", OPENAI_META),
-    directModel("codex", "gpt-5.2-codex", "GPT-5.2 Codex", OPENAI_META),
-  ],
-};
+/**
+ * Direct-harness picker options, derived from the catalog (newest first). No
+ * hand-maintained list: a model added to the API's `model_catalog` (refresh
+ * or overlay row) shows up here on the next catalog fetch.
+ */
+function directModels(
+  harness: "claude" | "codex",
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelOption[] {
+  const section: SnapshotProviderId = harness === "claude" ? "anthropic" : "openai";
+  const models = (liveCatalog?.[section] ?? CACHE[section])?.models ?? {};
+  const meta = harness === "claude" ? ANTHROPIC_META : OPENAI_META;
+  return harnessModelIds(harness, models).map((id) =>
+    directModel(harness, { ...models[id], id }, meta),
+  );
+}
 
 // Mirrors the any-of credential checks in the harness adapters:
 // `claude-adapter.ts` accepts `CLAUDE_CODE_OAUTH_TOKEN` OR `ANTHROPIC_API_KEY`;
@@ -280,11 +361,19 @@ const SNAPSHOT_META: Record<
   },
 };
 
+/** Preferred picker default per harness; empty = the newest catalog model (Opus for claude). */
 const FALLBACK_MODEL: Record<LocalHarnessProvider, string> = {
-  claude: "claude-opus-5",
-  codex: "gpt-5.6-terra",
+  claude: "",
+  codex: "",
   pi: "openrouter/google/gemini-3-flash-preview",
   opencode: "openrouter/qwen/qwen3-coder-flash",
+  // The dsh regular-tier default (DEFAULT_MODEL_TIER_MAP.dsh in src/types.ts).
+  dsh: "openrouter/deepseek/deepseek-v4.1-flash",
+  // The cursor regular-tier default (DEFAULT_MODEL_TIER_MAP.cursor in src/types.ts).
+  cursor: "claude-sonnet-5-5",
+  // `low` is Amp's cheapest mode; the regular tier (`medium`) runs an Opus-class model.
+  amp: "low",
+  acp: "",
 };
 
 function hasConfigKey(configs: SwarmConfig[] | undefined, key: string): boolean {
@@ -332,11 +421,13 @@ export function modelGroupsForHarness(
   liveBedrockStatus?: LiveBedrockStatus | null,
   liveCatalog?: LiveModelsCatalog | null,
 ): ModelGroup[] {
+  if (harness === "acp") return [];
+
   const providerCache = (providerId: SnapshotProviderId): CachedProvider | undefined =>
     liveCatalog?.[providerId] ?? CACHE[providerId];
 
   if (harness === "claude" || harness === "codex") {
-    const models = DIRECT_MODELS[harness];
+    const models = directModels(harness, liveCatalog);
     const requiredKey = models[0]?.requiredKey ?? "";
     const acceptedKeys = DIRECT_HARNESS_ACCEPTED_KEYS[harness];
     return [
@@ -349,19 +440,22 @@ export function modelGroupsForHarness(
     ];
   }
 
+  if (harness === "dsh") return dshModelGroups(configs, envPresence, liveCatalog);
+  if (harness === "amp") return ampModelGroups(configs, envPresence, liveCatalog);
+  if (harness === "cursor") return cursorModelGroups(configs, envPresence, liveCatalog);
+
   const snapshotGroups = SNAPSHOT_ORDER.map((providerId) => {
     const meta = SNAPSHOT_META[providerId];
     const cache = providerCache(providerId);
     const models: ModelOption[] = Object.values(cache?.models ?? {})
       .map((m) => ({
         id: `${providerId}/${m.id}`,
-        label: m.name ?? m.id,
+        label: modelDisplayName(m.name) ?? m.id,
         provider: meta.label,
         providerId: meta.iconKey,
         requiredKey: meta.requiredKey,
-        cost: m.cost,
-        contextWindow: m.limit?.context,
-        reasoningLevels: reasoningLevelsFromCache(harness, m.id, m),
+        ...catalogFacts(m),
+        reasoningLevels: reasoningLevelsFor(harness, m.id, m),
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
     return {
@@ -388,11 +482,11 @@ export function modelGroupsForHarness(
       // the snapshot doesn't know, which the selector treats as unrestricted).
       bedrockModels = liveBedrockStatus.models.map((m) => ({
         id: `amazon-bedrock/${m.id}`,
-        label: m.name,
+        label: modelDisplayName(m.name),
         provider: bedrockMeta.label,
         providerId: bedrockMeta.iconKey,
         requiredKey: bedrockMeta.requiredKey,
-        reasoningLevels: reasoningLevelsFromCache("pi", m.id, bedrockCache?.models[m.id]),
+        reasoningLevels: reasoningLevelsFor("pi", m.id, bedrockCache?.models[m.id]),
       }));
       bedrockEnabled = liveBedrockStatus.ready;
       // Probe ran but failed — surface the reason instead of a silent disable.
@@ -405,13 +499,12 @@ export function modelGroupsForHarness(
       bedrockModels = Object.values(bedrockCache?.models ?? {})
         .map((m) => ({
           id: `amazon-bedrock/${m.id}`,
-          label: m.name ?? m.id,
+          label: modelDisplayName(m.name) ?? m.id,
           provider: bedrockMeta.label,
           providerId: bedrockMeta.iconKey,
           requiredKey: bedrockMeta.requiredKey,
-          cost: m.cost,
-          contextWindow: m.limit?.context,
-          reasoningLevels: reasoningLevelsFromCache("pi", m.id, m),
+          ...catalogFacts(m),
+          reasoningLevels: reasoningLevelsFor("pi", m.id, m),
         }))
         .sort((a, b) => a.label.localeCompare(b.label));
       // Unknown auth state before first worker report — treat as not enabled.
@@ -433,6 +526,242 @@ export function modelGroupsForHarness(
   return snapshotGroups;
 }
 
+/**
+ * Amp has no model flag. A mode (`low`..`ultra`) lets Amp choose the model, and
+ * a `provider/model` id pins one (`src/providers/amp-adapter.ts`). Both need
+ * AMP_API_KEY: the vendor bills the usage.
+ */
+export const AMP_MODES: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "low", label: "Low (cheapest)" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+  { id: "ultra", label: "Ultra" },
+];
+
+function ampModelGroups(
+  configs: SwarmConfig[] | undefined,
+  envPresence: Record<string, boolean> | undefined,
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelGroup[] {
+  const enabled = hasRuntimeCredential("AMP_API_KEY", configs, envPresence);
+  const pins = (["anthropic", "openai"] as const).map((providerId) => {
+    const meta = SNAPSHOT_META[providerId];
+    const models: ModelOption[] = Object.values(
+      (liveCatalog?.[providerId] ?? CACHE[providerId])?.models ?? {},
+    )
+      .map((m) => ({
+        id: `${providerId}/${m.id}`,
+        label: modelDisplayName(m.name) ?? m.id,
+        provider: `${meta.label} (pinned)`,
+        providerId: meta.iconKey,
+        requiredKey: "AMP_API_KEY",
+        ...catalogFacts(m),
+        reasoningLevels: reasoningLevelsFor("amp", m.id, m),
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    return {
+      provider: `${meta.label} (pinned)`,
+      models,
+      requiredKey: "AMP_API_KEY",
+      enabled,
+    };
+  });
+  return [
+    {
+      provider: "Amp modes",
+      models: AMP_MODES.map((mode) => ({
+        id: mode.id,
+        label: mode.label,
+        provider: "Amp modes",
+        providerId: "amp",
+        requiredKey: "AMP_API_KEY",
+        reasoningLevels: [],
+      })),
+      requiredKey: "AMP_API_KEY",
+      enabled,
+    },
+    ...pins,
+  ];
+}
+
+/**
+ * dsh reaches models two ways: `openrouter/<id>` with OPENROUTER_API_KEY, or a
+ * bare DeepSeek API id with DEEPSEEK_API_KEY (see `src/providers/dsh-adapter.ts`).
+ */
+function dshModelGroups(
+  configs: SwarmConfig[] | undefined,
+  envPresence: Record<string, boolean> | undefined,
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelGroup[] {
+  const openrouterMeta = SNAPSHOT_META.openrouter;
+  const openrouter = Object.values((liveCatalog?.openrouter ?? CACHE.openrouter)?.models ?? {})
+    .map((m) => ({
+      id: `openrouter/${m.id}`,
+      label: modelDisplayName(m.name) ?? m.id,
+      provider: openrouterMeta.label,
+      providerId: openrouterMeta.iconKey,
+      requiredKey: openrouterMeta.requiredKey,
+      ...catalogFacts(m),
+      reasoningLevels: reasoningLevelsFor("dsh", m.id, m),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  const deepseek = deepseekCatalogModels(liveCatalog);
+  const direct: ModelOption[] = DSH_DIRECT_MODELS.map((id) => {
+    const m = deepseek[id];
+    return {
+      id,
+      label: m ? (modelDisplayName(m.name) ?? id) : id,
+      provider: "DeepSeek",
+      providerId: null,
+      requiredKey: "DEEPSEEK_API_KEY",
+      ...(m ? catalogFacts(m) : {}),
+      reasoningLevels: m ? reasoningLevelsFor("dsh", id, m) : [],
+    };
+  });
+  return [
+    {
+      provider: openrouterMeta.label,
+      models: openrouter,
+      requiredKey: openrouterMeta.requiredKey,
+      enabled: hasRuntimeCredential(openrouterMeta.requiredKey, configs, envPresence),
+    },
+    {
+      provider: "DeepSeek",
+      models: direct,
+      requiredKey: "DEEPSEEK_API_KEY",
+      enabled: hasRuntimeCredential("DEEPSEEK_API_KEY", configs, envPresence),
+    },
+  ];
+}
+
+/** Cursor serves every model through one key; see `src/providers/cursor-adapter.ts`. */
+function cursorModelGroups(
+  configs: SwarmConfig[] | undefined,
+  envPresence: Record<string, boolean> | undefined,
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelGroup[] {
+  const models: ModelOption[] = CURSOR_MODELS.map((id) => {
+    const { providerId, modelId } = cursorCatalogRef(id);
+    const m = runtimeSectionModels(providerId, liveCatalog)[modelId];
+    return {
+      id,
+      label: m ? (modelDisplayName(m.name) ?? id) : id,
+      provider: "Cursor",
+      providerId: null,
+      requiredKey: "CURSOR_API_KEY",
+      ...(m ? catalogFacts(m) : {}),
+      reasoningLevels: m ? reasoningLevelsFor("cursor", modelId, m) : [],
+    };
+  });
+  return [
+    {
+      provider: "Cursor",
+      models,
+      requiredKey: "CURSOR_API_KEY",
+      enabled: hasRuntimeCredential("CURSOR_API_KEY", configs, envPresence),
+    },
+  ];
+}
+
+/**
+ * Best-effort model suggestions for ACP targets whose model namespace is known.
+ * The value remains free-form because ACP servers can expose models outside
+ * models.dev and custom targets have no catalog we can infer safely.
+ */
+export function modelGroupsForAcpTarget(
+  target: "opencode" | "custom",
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelGroup[] {
+  if (target !== "opencode") return [];
+
+  const opencodeCache = liveCatalog?.opencode ?? CACHE.opencode;
+  const opencodeModels: ModelOption[] = Object.values(opencodeCache?.models ?? {})
+    .map((model) => ({
+      id: `opencode/${model.id}`,
+      label: modelDisplayName(model.name) ?? model.id,
+      provider: opencodeCache?.name ?? "OpenCode Zen",
+      providerId: null,
+      requiredKey: "",
+      ...catalogFacts(model),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  const providerGroups = modelGroupsForHarness(
+    "opencode",
+    undefined,
+    undefined,
+    null,
+    liveCatalog,
+  ).map((group) => ({ ...group, enabled: true, disabledReason: undefined }));
+
+  return [
+    {
+      provider: opencodeCache?.name ?? "OpenCode Zen",
+      models: opencodeModels,
+      requiredKey: "",
+      enabled: true,
+    },
+    ...providerGroups,
+  ];
+}
+
+/**
+ * Every model a schedule can name, across harnesses, for a picker that is not
+ * tied to one agent: the Claude CLI shortnames (`opus` = the newest Opus, kept
+ * because existing schedules store them), then the Claude, Codex and OpenRouter
+ * catalog models. No group is credential-gated: the schedule runs on whichever
+ * worker claims it.
+ */
+export function modelGroupsForSchedule(liveCatalog?: LiveModelsCatalog | null): ModelGroup[] {
+  const anthropic = (liveCatalog?.anthropic ?? CACHE.anthropic)?.models ?? {};
+  const aliasOptions: ModelOption[] = Object.entries(buildClaudeShortnameMap(anthropic)).map(
+    ([alias, target]) => {
+      const model = anthropic[target];
+      return {
+        id: alias,
+        label: `${alias[0].toUpperCase()}${alias.slice(1)} (${modelDisplayName(model?.name) ?? humanizeModelId(target)})`,
+        ...ANTHROPIC_META,
+        provider: "Claude CLI alias",
+        requiredKey: "",
+        ...(model ? catalogFacts(model) : {}),
+      };
+    },
+  );
+  const groups: ModelGroup[] = [
+    { provider: "Claude CLI alias", models: aliasOptions, requiredKey: "", enabled: true },
+    ...modelGroupsForHarness("claude", undefined, undefined, null, liveCatalog),
+    ...modelGroupsForHarness("codex", undefined, undefined, null, liveCatalog),
+    ...modelGroupsForHarness("opencode", undefined, undefined, null, liveCatalog).filter(
+      (group) => group.requiredKey === SNAPSHOT_META.openrouter.requiredKey,
+    ),
+  ];
+  return groups
+    .filter((group) => group.models.length > 0)
+    .map((group) => ({ ...group, enabled: true, disabledReason: undefined }));
+}
+
+/**
+ * Catalog models as the pricing table keys them (`claude-opus-5-5`, `gpt-5.6`,
+ * `deepseek/deepseek-v4.1-flash`), for the rate dialog's suggestions. Empty for
+ * a provider the pricing table has no catalog section for.
+ */
+export function pricingModelOptions(
+  provider: string,
+  liveCatalog?: LiveModelsCatalog | null,
+): ModelOption[] {
+  if (provider === "claude" || provider === "codex") {
+    return modelGroupsForHarness(provider, undefined, undefined, null, liveCatalog)[0].models;
+  }
+  if (provider === "pi") {
+    // Routed through OpenRouter: the table keys them without the router prefix.
+    return modelGroupsForHarness("pi", undefined, undefined, null, liveCatalog)
+      .filter((group) => group.requiredKey === SNAPSHOT_META.openrouter.requiredKey)
+      .flatMap((group) => group.models)
+      .map((model) => ({ ...model, id: model.id.replace(/^openrouter\//, "") }));
+  }
+  return [];
+}
+
 export function findModelOption(
   model: string | null | undefined,
   groups: ModelGroup[],
@@ -446,26 +775,27 @@ export function findModelOption(
 }
 
 // CLI shortnames Anthropic ships in their tools (`--model opus`, etc.). Workers
-// may report these verbatim — we map them to the canonical id so the row reads
-// "Claude Sonnet 5" instead of a bare "sonnet".
-const ANTHROPIC_SHORTNAME_TO_ID: Record<string, string> = {
-  fable: "claude-fable-5",
-  mythos: "claude-mythos-5",
-  opus: "claude-opus-5",
-  sonnet: "claude-sonnet-5",
-  haiku: "claude-haiku-4-5",
-};
+// may report these verbatim — map them to the newest canonical id in the
+// catalog so the row reads "Claude Sonnet 5.5" instead of a bare "sonnet".
+function anthropicShortnameToId(liveCatalog?: LiveModelsCatalog | null): Record<string, string> {
+  return buildClaudeShortnameMap((liveCatalog?.anthropic ?? CACHE.anthropic)?.models);
+}
 
 /**
- * Stateless lookup across every known harness/snapshot — for read-only surfaces
- * (agent list, telemetry rows) that don't have configs/env presence in scope.
- * Returns `null` for custom or unknown model ids.
+ * Lookup across the live catalog first, then every known harness/snapshot — for
+ * read-only surfaces (agent list, telemetry rows) that don't have configs/env
+ * presence in scope. Returns `null` for custom or unknown model ids.
  */
-export function findKnownModel(model: string | null | undefined): ModelOption | null {
+export function findKnownModel(
+  model: string | null | undefined,
+  liveCatalog?: LiveModelsCatalog,
+): ModelOption | null {
   if (!model) return null;
-  const aliased = ANTHROPIC_SHORTNAME_TO_ID[model] ?? model;
-  for (const arr of Object.values(DIRECT_MODELS)) {
-    const found = arr.find((m) => m.id === aliased);
+  const live = findLiveModel(model, liveCatalog);
+  if (live) return live;
+  const aliased = anthropicShortnameToId(liveCatalog)[model] ?? model;
+  for (const harness of ["claude", "codex"] as const) {
+    const found = directModels(harness, liveCatalog).find((m) => m.id === aliased);
     if (found) return found;
   }
   for (const providerId of SNAPSHOT_ORDER) {
@@ -478,12 +808,11 @@ export function findKnownModel(model: string | null | undefined): ModelOption | 
     if (cached) {
       return {
         id: model,
-        label: cached.name ?? cached.id,
+        label: modelDisplayName(cached.name) ?? cached.id,
         provider: meta.label,
         providerId: meta.iconKey,
         requiredKey: meta.requiredKey,
-        cost: cached.cost,
-        contextWindow: cached.limit?.context,
+        ...catalogFacts(cached),
       };
     }
     // Provider prefix matched but model not in the snapshot (e.g. brand-new
@@ -501,33 +830,82 @@ export function findKnownModel(model: string | null | undefined): ModelOption | 
   // pi-mono historically reported `"DeepSeek: DeepSeek V4 Flash"`) instead
   // of a slug. Match against snapshot `name` directly, and against the
   // suffix after the first `": "` (handles the `${vendor}: ${name}` form).
-  const byLabel = findByLabel(model);
+  const byLabel = findByLabel(model, liveCatalog);
   if (byLabel) return byLabel;
   return null;
 }
 
-function findByLabel(raw: string): ModelOption | null {
+function findLiveModel(model: string, catalog?: LiveModelsCatalog): ModelOption | null {
+  if (!catalog) return null;
+  const separator = model.indexOf("/");
+  const providerId = separator < 0 ? null : model.slice(0, separator);
+  const tail = separator < 0 ? model : model.slice(separator + 1);
+
+  // Provider-qualified IDs are resolved first, preserving nested OpenRouter
+  // IDs such as `openrouter/deepseek/deepseek-v4.1-flash`.
+  if (providerId && Object.hasOwn(catalog, providerId)) {
+    const provider = catalog[providerId as keyof LiveModelsCatalog];
+    const cached = provider?.models[tail];
+    if (cached && provider) return liveModelOption(model, providerId, provider, cached);
+  }
+
+  // Bare model IDs can be reported by harnesses that omit the provider.
+  for (const [id, provider] of Object.entries(catalog)) {
+    if (!provider) continue;
+    const cached = provider.models[model];
+    if (cached) return liveModelOption(model, id, provider, cached);
+  }
+  return null;
+}
+
+function liveModelOption(
+  id: string,
+  providerId: string,
+  provider: CachedProvider,
+  model: CachedModel,
+): ModelOption {
+  const iconByProvider: Partial<Record<string, ProviderIconKey>> = {
+    anthropic: "anthropic",
+    openai: "openai",
+    openrouter: "openrouter",
+    "amazon-bedrock": "amazon-bedrock",
+  };
+  return {
+    id,
+    label: modelDisplayName(model.name) ?? model.id,
+    provider: provider.name ?? providerId,
+    providerId: iconByProvider[providerId] ?? null,
+    requiredKey: "",
+    ...catalogFacts(model),
+  };
+}
+
+function findByLabel(raw: string, liveCatalog?: LiveModelsCatalog | null): ModelOption | null {
   const candidates = new Set<string>();
   candidates.add(raw);
   const colonIdx = raw.indexOf(": ");
   if (colonIdx >= 0) candidates.add(raw.slice(colonIdx + 2));
   const lowered = [...candidates].map((c) => c.toLowerCase().trim());
-  for (const providerId of SNAPSHOT_ORDER) {
-    const meta = SNAPSHOT_META[providerId];
-    const cache = CACHE[providerId];
-    for (const cached of Object.values(cache?.models ?? {})) {
-      const name = (cached.name ?? "").toLowerCase().trim();
-      if (!name) continue;
-      if (!lowered.includes(name)) continue;
-      return {
-        id: `${providerId}/${cached.id}`,
-        label: cached.name ?? cached.id,
-        provider: meta.label,
-        providerId: meta.iconKey,
-        requiredKey: meta.requiredKey,
-        cost: cached.cost,
-        contextWindow: cached.limit?.context,
-      };
+  // The live catalog first (it names models the snapshot does not know yet),
+  // then the bundled snapshot for anything the live sections dropped.
+  for (const source of liveCatalog ? [liveCatalog, CACHE] : [CACHE]) {
+    for (const providerId of SNAPSHOT_ORDER) {
+      const meta = SNAPSHOT_META[providerId];
+      for (const cached of Object.values(source[providerId]?.models ?? {})) {
+        const name = (cached.name ?? "").toLowerCase().trim();
+        if (!name) continue;
+        // A harness reports "Claude Haiku 4.5" for models.dev's "Claude Haiku 4.5 (latest)".
+        const shown = (modelDisplayName(cached.name) ?? "").toLowerCase().trim();
+        if (!lowered.includes(name) && !lowered.includes(shown)) continue;
+        return {
+          id: `${providerId}/${cached.id}`,
+          label: modelDisplayName(cached.name) ?? cached.id,
+          provider: meta.label,
+          providerId: meta.iconKey,
+          requiredKey: meta.requiredKey,
+          ...catalogFacts(cached),
+        };
+      }
     }
   }
   return null;
@@ -541,21 +919,51 @@ function findByLabel(raw: string): ModelOption | null {
 function humanizeModelTail(tail: string): string {
   const last = tail.split("/").pop() ?? tail;
   if (!last) return tail;
-  return last.charAt(0).toUpperCase() + last.slice(1);
+  return humanizeModelId(last);
 }
 
+/** Title-case slug segments while preserving dotted numeric versions. */
+export function humanizeModelId(id: string): string {
+  const words = id.match(/[a-z]+\d+(?:\.\d+)+|[a-z]+\d*|\d+(?:\.\d+)+|[A-Z]+\d*|\d+/g) ?? [id];
+  return words
+    .map((word) => (/[a-z]/i.test(word) ? word[0].toUpperCase() + word.slice(1) : word))
+    .join(" ");
+}
+
+/**
+ * The model a harness starts on when nothing is configured: the harness's
+ * preferred model when the catalog lists it under an enabled provider, else the
+ * first model of the first enabled provider that has no lifecycle status
+ * (deprecated, beta, ...). Claude prefers the newest Opus, read from the live
+ * catalog when one is passed. The open harnesses prefer `FALLBACK_MODEL`: a
+ * catalog rule (newest, first, cheapest) picks an obscure OpenRouter model
+ * there, and the live groups already drop a preferred id the catalog lost.
+ */
 export function pickDefaultModelForHarness(
   harness: LocalHarnessProvider,
   groups: ModelGroup[],
+  liveCatalog?: LiveModelsCatalog | null,
 ): string {
-  const fallback = FALLBACK_MODEL[harness];
-  const fallbackGroup = groups.find((g) => g.enabled && g.models.some((m) => m.id === fallback));
-  if (fallbackGroup) return fallback;
-  return groups.find((g) => g.enabled)?.models[0]?.id ?? fallback;
+  const preferred =
+    FALLBACK_MODEL[harness] ||
+    (harness === "claude" ? (anthropicShortnameToId(liveCatalog).opus ?? "") : "");
+  const enabled = groups.filter((g) => g.enabled);
+  if (enabled.some((g) => g.models.some((m) => m.id === preferred))) return preferred;
+  const first = enabled[0]?.models;
+  return (first?.find((m) => !m.status) ?? first?.[0])?.id ?? preferred;
 }
 
 export function isLocalHarness(
   value: ProviderName | string | null | undefined,
 ): value is LocalHarnessProvider {
-  return value === "claude" || value === "codex" || value === "pi" || value === "opencode";
+  return (
+    value === "claude" ||
+    value === "codex" ||
+    value === "pi" ||
+    value === "opencode" ||
+    value === "dsh" ||
+    value === "amp" ||
+    value === "cursor" ||
+    value === "acp"
+  );
 }

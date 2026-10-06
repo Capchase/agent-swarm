@@ -1,8 +1,9 @@
 import { ArrowLeft, Clock, ListTodo, Pencil, Play, Timer, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useAgents } from "@/api/hooks/use-agents";
 import { useFavoriteToggle } from "@/api/hooks/use-favorites";
+import { useModelsCatalog } from "@/api/hooks/use-models-catalog";
 import {
   useDeleteSchedule,
   useRunScheduleNow,
@@ -13,6 +14,7 @@ import { useScripts } from "@/api/hooks/use-scripts";
 import { useTasks } from "@/api/hooks/use-tasks";
 import { useWorkflows } from "@/api/hooks/use-workflows";
 import type { AgentTask, ScheduledTask } from "@/api/types";
+import { AutomationParamsFields } from "@/components/automations/automation-params-fields";
 import {
   EMPTY_SCHEDULE_TARGET,
   isScheduleTargetInvalid,
@@ -21,6 +23,8 @@ import {
 } from "@/components/schedules/schedule-target-fields";
 import { FavoriteButton } from "@/components/shared/favorite-button";
 import { MarkdownView } from "@/components/shared/markdown-view";
+import { ModelCombobox } from "@/components/shared/model-combobox";
+import { ModelLabel } from "@/components/shared/model-logo";
 import {
   ignoreRowClickFromInteractives,
   TasksColumnsMenu,
@@ -69,8 +73,9 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { findModelOption, modelGroupsForSchedule } from "@/lib/agent-runtime-models";
 import { MODEL_TIER_OPTIONS, modelTierLabel } from "@/lib/model-tiers";
-import { describeCron, formatInterval } from "@/lib/schedule-format";
+import { cronTimezone, describeCron, formatInterval } from "@/lib/schedule-format";
 import { formatSmartTime, formatUTCTime } from "@/lib/utils";
 
 function ScheduleTasks({ scheduleId }: { scheduleId: string }) {
@@ -136,6 +141,15 @@ export default function ScheduleDetailPage() {
 
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = searchParams.get("tab") === "tasks" ? "tasks" : "schedule";
+  const focusedParam = searchParams.get("param") ?? undefined;
+  const autoOpenedParam = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!focusedParam || !schedule?.requiredParams?.includes(focusedParam)) return;
+    if (autoOpenedParam.current === focusedParam) return;
+    autoOpenedParam.current = focusedParam;
+    setEditOpen(true);
+  }, [focusedParam, schedule?.requiredParams]);
 
   const agentMap = useMemo(() => {
     const m = new Map<string, string>();
@@ -178,7 +192,7 @@ export default function ScheduleDetailPage() {
       </button>
 
       <div className="flex items-center gap-3 flex-wrap">
-        <h1 className="text-xl font-semibold">{schedule.name}</h1>
+        <h1 className="min-w-0 text-xl font-semibold break-words">{schedule.name}</h1>
         <div className="flex items-center gap-2">
           <Switch
             checked={schedule.enabled}
@@ -213,7 +227,9 @@ export default function ScheduleDetailPage() {
             {schedule.taskType}
           </Badge>
         )}
-        <div className="ml-auto flex items-center gap-1.5 shrink-0">
+        {/* On a phone the actions take their own row, left-aligned under the
+            badges, instead of hanging off the right edge. */}
+        <div className="flex w-full flex-wrap items-center gap-1.5 sm:ml-auto sm:w-auto sm:shrink-0">
           <FavoriteButton
             favorite={schedule.favorite}
             disabled={favoriteToggle.isPending}
@@ -270,7 +286,7 @@ export default function ScheduleDetailPage() {
 
             <TabsContent value="schedule" className="space-y-4">
               <div className="grid gap-4 md:grid-cols-2">
-                <Card>
+                <Card className="gap-2">
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm text-muted-foreground">Schedule Info</CardTitle>
                   </CardHeader>
@@ -306,7 +322,7 @@ export default function ScheduleDetailPage() {
                               <p className="text-xs text-muted-foreground">
                                 {describeCron(schedule.cronExpression)}
                                 <span className="ml-1 opacity-60">
-                                  ({schedule.timezone || "UTC"})
+                                  ({cronTimezone(schedule.timezone)})
                                 </span>
                               </p>
                             </div>
@@ -325,7 +341,7 @@ export default function ScheduleDetailPage() {
                     </InfoRow>
 
                     {schedule.cronExpression && (
-                      <InfoRow label="Timezone">{schedule.timezone || "UTC"}</InfoRow>
+                      <InfoRow label="Timezone">{cronTimezone(schedule.timezone)}</InfoRow>
                     )}
 
                     <InfoRow label="Target Agent">
@@ -360,7 +376,7 @@ export default function ScheduleDetailPage() {
                   </CardContent>
                 </Card>
 
-                <Card>
+                <Card className="gap-2">
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm text-muted-foreground">Timing</CardTitle>
                   </CardHeader>
@@ -398,7 +414,7 @@ export default function ScheduleDetailPage() {
               </div>
 
               {schedule.targetType === "workflow" ? (
-                <Card>
+                <Card className="gap-2">
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm text-muted-foreground">Linked Workflow</CardTitle>
                   </CardHeader>
@@ -416,7 +432,7 @@ export default function ScheduleDetailPage() {
                   </CardContent>
                 </Card>
               ) : schedule.targetType === "script" ? (
-                <Card>
+                <Card className="gap-2">
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm text-muted-foreground">Linked Script</CardTitle>
                   </CardHeader>
@@ -430,7 +446,7 @@ export default function ScheduleDetailPage() {
                   </CardContent>
                 </Card>
               ) : (
-                <Card>
+                <Card className="gap-2">
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm text-muted-foreground">Task Template</CardTitle>
                   </CardHeader>
@@ -471,9 +487,14 @@ export default function ScheduleDetailPage() {
                 <QuickStat
                   label="Model"
                   value={
-                    schedule.model ? schedule.model : `tier: ${modelTierLabel(schedule.modelTier)}`
+                    schedule.model ? (
+                      <span title={schedule.model}>
+                        <ModelLabel model={schedule.model} />
+                      </span>
+                    ) : (
+                      `tier: ${modelTierLabel(schedule.modelTier)}`
+                    )
                   }
-                  mono={Boolean(schedule.model)}
                 />
               )}
               <QuickStat label="Created" value={formatSmartTime(schedule.createdAt)} />
@@ -512,6 +533,7 @@ export default function ScheduleDetailPage() {
           schedule={schedule}
           agents={agents}
           open={editOpen}
+          focusParam={focusedParam}
           onOpenChange={setEditOpen}
           onSubmit={(data) => {
             updateSchedule.mutate({ id: schedule.id, data });
@@ -551,12 +573,14 @@ function EditScheduleDialog({
   schedule,
   agents,
   open,
+  focusParam,
   onOpenChange,
   onSubmit,
 }: {
   schedule: ScheduledTask;
   agents: { id: string; name: string; isLead?: boolean }[] | undefined;
   open: boolean;
+  focusParam?: string;
   onOpenChange: (open: boolean) => void;
   onSubmit: (data: Record<string, unknown>) => void;
 }) {
@@ -584,7 +608,13 @@ function EditScheduleDialog({
   const [targetAgentId, setTargetAgentId] = useState(schedule.targetAgentId ?? "");
   const [timezone, setTimezone] = useState(schedule.timezone);
   const [model, setModel] = useState(schedule.model ?? "");
+  const { data: modelsCatalog } = useModelsCatalog();
+  const modelGroups = useMemo(
+    () => modelGroupsForSchedule(modelsCatalog?.providers),
+    [modelsCatalog?.providers],
+  );
   const [modelTier, setModelTier] = useState(schedule.modelTier ?? "");
+  const [params, setParams] = useState<Record<string, unknown>>(schedule.params ?? {});
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -613,6 +643,7 @@ function EditScheduleDialog({
       timezone,
       model: model || null,
       modelTier: modelTier || null,
+      params,
     });
   }
 
@@ -629,6 +660,12 @@ function EditScheduleDialog({
               <Label>Name *</Label>
               <Input value={name} onChange={(e) => setName(e.target.value)} required />
             </div>
+            <AutomationParamsFields
+              requiredParams={schedule.requiredParams}
+              params={params}
+              focusParam={focusParam}
+              onChange={setParams}
+            />
             <ScheduleTargetFields value={target} onChange={setTarget} />
             <div className="space-y-2">
               <Label>Schedule Type</Label>
@@ -727,17 +764,15 @@ function EditScheduleDialog({
               </div>
               <div className="space-y-2">
                 <Label>Model</Label>
-                <Select value={model} onValueChange={(v) => setModel(v === "_none" ? "" : v)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Default" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="_none">Default</SelectItem>
-                    <SelectItem value="haiku">Haiku</SelectItem>
-                    <SelectItem value="sonnet">Sonnet</SelectItem>
-                    <SelectItem value="opus">Opus</SelectItem>
-                  </SelectContent>
-                </Select>
+                <ModelCombobox
+                  value={model}
+                  onChange={setModel}
+                  groups={modelGroups}
+                  selected={findModelOption(model, modelGroups)}
+                  placeholder="Default"
+                  clearLabel="Default"
+                  creatable
+                />
               </div>
             </div>
             <div className="grid grid-cols-2 gap-4">

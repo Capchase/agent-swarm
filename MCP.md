@@ -46,12 +46,21 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
   - [list-config](#list-config)
   - [delete-config](#delete-config)
   - [credential-bindings](#credential-bindings)
+  - [model-catalog-refresh](#model-catalog-refresh)
+  - [model-catalog-overlay-upsert](#model-catalog-overlay-upsert)
 - [Scripts Tools](#scripts-tools)
   - [script-search](#script-search)
   - [script-connections](#script-connections)
   - [script-apis](#script-apis)
   - [script-run](#script-run)
   - [script-upsert](#script-upsert)
+  - [extension-delete](#extension-delete)
+  - [extension-enable](#extension-enable)
+  - [extension-disable](#extension-disable)
+  - [extension-activate-version](#extension-activate-version)
+  - [extension-catalog](#extension-catalog)
+  - [extension-install](#extension-install)
+  - [extension-list](#extension-list)
   - [script-delete](#script-delete)
   - [script-query-types](#script-query-types)
   - [launch-script-run](#launch-script-run)
@@ -75,6 +84,7 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
 - [Scheduling Tools](#scheduling-tools)
   - [list-schedules](#list-schedules)
   - [create-schedule](#create-schedule)
+  - [defer-task](#defer-task)
   - [update-schedule](#update-schedule)
   - [patch-schedule](#patch-schedule)
   - [delete-schedule](#delete-schedule)
@@ -107,6 +117,7 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
   - [retry-workflow-run](#retry-workflow-run)
   - [cancel-workflow-run](#cancel-workflow-run)
   - [request-human-input](#request-human-input)
+  - [cancel-approval-request](#cancel-approval-request)
 - [Skills Tools](#skills-tools)
   - [skill-create](#skill-create)
   - [skill-update](#skill-update)
@@ -140,6 +151,10 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
   - [kv-delete](#kv-delete)
   - [kv-incr](#kv-incr)
   - [kv-list](#kv-list)
+  - [room-get](#room-get)
+  - [room-change](#room-change)
+  - [room-reset](#room-reset)
+  - [room-decode](#room-decode)
 - [Slack Tools](#slack-tools)
   - [slack-reply](#slack-reply)
   - [slack-read](#slack-read)
@@ -230,7 +245,7 @@ Returns a list of tasks in the swarm with various filters. Sorted by priority (d
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `status` | `backlog \| unassigned \| offered \| reviewing \| pending \| in_progress \| paused \| completed \| failed \| cancelled \| superseded` | No | - | Filter by task status (unassigned, offered, pending, in_progress, completed, failed). |
+| `status` | `draft \| backlog \| unassigned \| offered \| reviewing \| pending \| in_progress \| paused \| completed \| failed \| cancelled \| superseded` | No | - | Filter by task status (unassigned, offered, pending, in_progress, completed, failed). |
 | `mineOnly` | `boolean` | No | - | Only return tasks assigned to you. |
 | `unassigned` | `boolean` | No | - | Only return unassigned tasks in the pool. |
 | `offeredToMe` | `boolean` | No | - | Only return tasks offered to you (awaiting accept/reject). |
@@ -262,27 +277,32 @@ Sends a task to a specific agent, creates an unassigned task for the pool, or of
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `agentId` | `string` | No | - | The agent to assign/offer task to. Omit to create unassigned task for pool. |
+| `routingReason` | `skill \| continuity \| overflow \| human_pinned \| reroute_fault` | No | - | Why this agent was selected. Required when agentId is supplied; omit for pool routing. |
+| `routingNote` | `string` | No | - | Why this worker fits the task. Required when agentId is supplied: at least 10 characters after trimming whitespace, maximum 200 characters. Optional for implicit parent or pool routing. |
 | `task` | `string` | Yes | - | The task description to send. |
 | `key` | `unknown` | No | - | Logical namespace key. Child tasks inherit their parent namespace when provided. |
 | `offerMode` | `boolean` | No | false | If true, offer the task instead of direct assign (agent must accept/reject). |
 | `taskType` | `string` | No | - | Task type (e.g., 'bug', 'feature', 'review'). |
 | `tags` | `array` | No | - | Tags for filtering (e.g., ['urgent', 'frontend']). |
-| `requiredCapabilities` | `array` | No | - | Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset — only enforced when the pool auto-claim/claim-tool paths check it). Most useful when omitting agentId (unassigned pool task); a no-op for a task with an explicit agentId, which bypasses the pool gate entirely. |
+| `requiredCapabilities` | `array` | No | - | Capabilities required for pool routing. |
+| `leadOnly` | `boolean` | No | false | Structured authorization constraint for merge or other privileged work. Only Lead agents may be assigned, offered, or claim it; never inferred from task text. |
 | `priority` | `number` | No | - | Priority 0-100 (default: 50). |
 | `dependsOn` | `array` | No | - | Task IDs this task depends on. |
 | `parentTaskId` | `uuid` | No | - | Parent task ID for session continuity. Child task will resume the parent's Claude session. Auto-routes to the same worker unless agentId is explicitly provided. |
 | `dir` | `string` | No | - | Working directory (absolute path) for the agent to start in. If the directory doesn't exist, falls back to the default working directory. |
 | `vcsRepo` | `string` | No | - | VCS repo identifier (e.g., 'desplega-ai/agent-swarm' for GitHub or 'group/project' for GitLab). Links the task to a registered repo for workspace context. |
-| `model` | `string` | No | - | Concrete model override for this task, interpreted by the assignee's harness/provider. This does not switch providers. Prefer modelTier for portable intent. |
+| `model` | `string` | No | - | Concrete model override for this task, interpreted by the assignee's harness/provider. This does not switch providers. Prefer modelTier for portable intent. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. |
 | `modelTier` | `smol \| regular \| smart \| ultra` | No | - | Portable model tier for this task: 'smol', 'regular', 'smart', or 'ultra'. Resolved at claim/run time using the assignee's harness/provider. Legacy model shortnames map as haiku→smol, sonnet→regular, opus→smart, fable→ultra. |
+| `allowCustomModel` | `boolean` | No | - | Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet (a fresh launch, a private deployment). |
 | `effort` | `off \| low \| medium \| high \| xhigh \| max` | No | - | Reasoning effort for this task: 'off', 'low', 'medium', 'high', 'xhigh', or 'max'. If omitted, the assignee's REASONING_EFFORT_OVERRIDE/default applies. |
 | `allowDuplicate` | `boolean` | No | false | If true, skip duplicate detection and create the task even if a similar one exists. |
 | `slackChannelId` | `string` | No | - | Slack channel ID to post progress updates to. Use this to propagate Slack context when delegating from a Slack thread. |
 | `slackThreadTs` | `string` | No | - | Slack thread timestamp. Required with slackChannelId for thread-level updates. |
 | `slackUserId` | `string` | No | - | Slack user ID of the original requester. |
 | `overrideSlackContext` | `boolean` | No | false | Explicitly route this task's Slack updates to a different channel/thread than its parent/contextKey. Requires slackChannelId AND slackThreadTs. Use only for deliberate cross-channel dispatch (e.g. escalation to another human's DM); logged for audit. Without this flag, a slackChannelId/slackThreadTs that disagrees with the parent task or inherited contextKey is rejected — omit the three Slack fields to inherit them from the parent as a unit instead. |
-| `requestedByUserId` | `string` | No | - | ID of the human user who originally requested this task chain. When omitted, inherited from the caller's current task so the attribution flows through multi-hop delegation automatically. |
+| `requestedByUserId` | `string` | No | - | Registered requester ID (32 lowercase hexadecimal characters). When omitted, inherited from the caller's current task so the attribution flows through multi-hop delegation automatically. Only lead agents can name a user other than the requester of their current task. |
 | `followUpConfig` | `unknown` | No | - | Control the lead follow-up created when this task finishes. When to use `followUpConfig`: set `disabled: true` when you'll wait for this task to complete inline and no follow-up is needed; set `onCompleted` / `onFailed` with specific instructions when you need to follow up effectively on a particular outcome of a long-running flow; for normal one-shot tasks, leave it unset because defaults are fine. It is most valuable for long-running / complex flows. |
+| `outputSchema` | `object` | No | - | Optional JSON Schema the assignee's final output must satisfy. store-progress rejects a completion that does not match. Supported keywords: type, required, properties, enum, const, items. |
 
 ### get-task-details
 
@@ -302,12 +322,13 @@ Stores the progress of a specific task. Can also mark task as completed or faile
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `taskId` | `uuid` | Yes | - | The ID of the task to update progress for. |
+| `taskId` | `uuid` | No | - | Full task UUID. Defaults to the caller-owned task in X-Source-Task-Id; required outside task context. |
 | `progress` | `string` | No | - | The progress update to store. |
-| `status` | `completed \| failed` | No | - | Set to 'completed' or 'failed' to finish the task. |
-| `output` | `string` | No | - | The task result (used when completing). For Slack-originated tasks, this is published verbatim in the thread's outcome card: provide a concrete summary scaled to what was asked, including only the outcome and any links or IDs the human needs—not process narration, a transcript, or a restatement of the brief. |
+| `status` | `completed \| failed \| in_progress \| pending` | No | - | Set to 'completed' or 'failed' to finish the task. 'in_progress' and 'pending' store progress only and do not change task status. |
+| `output` | `string` | No | - | The task result (used when completing). For Slack-originated tasks, this is published verbatim in the thread's outcome card. Keep free-text output under 120 words by default. Name the result and every artifact link, plus any IDs the human needs. Link documents instead of inlining them; omit process narration, transcripts, and restatements of the brief. Exceed the target only when requested depth, enumerated results, essential evidence, caveats, or instructions require it, or when the task's outputSchema requires longer output. When the task carries an outputSchema, output must be JSON matching it. |
 | `failureReason` | `string` | No | - | The reason for failure (used when failing). |
 | `attachments` | `array` | No | - | Pointer-based artifacts produced by this step — agent-fs path, URL, shared-fs path, or swarm Page. No inline file data; upload to agent-fs first and attach by path. Agent-fs pointers are verified before task state changes, using the explicit org/drive pair or the registering agent's configured defaults. May be sent on any call (progress or completion) and accumulates across calls; duplicates are de-duped by sha256 (when present) or by (kind, pointer, name). |
+| `citations` | `array` | No | - | Claim sources, upserted by index across calls. Use only for factual claims the reader cannot already see in the thread or task tree, 1-2 sources; none on delegation, routing, acks, or status replies. Reference each one in output with [citation:N], or set general: true for a source that backs the whole answer (it renders under "General sources"). ref per kind: task = task UUID; memory = memory UUID (optional quote must appear verbatim in it); github = owner/repo#N, owner/repo@<sha>, or a github.com pull, issues, or commit URL; slack = permalink or channel/ts; agent-fs = file path; page = page id; script-run = script run id; url = http(s) URL. The first completing call is refused, and the task stays in progress, if a marker has no entry, a citation fails validation, or a non-general citation is unreferenced; the response lists each problem. After one refusal, completion proceeds and those markers and sources are dropped from rendered output. At most 50 citations per call/task, refs up to 2048 characters, labels up to 200. Invalid or oversized batches are ignored; existing indices can still be updated at capacity. |
 | `persistMemory` | `boolean` | No | - | Opt in to task_completion memory persistence for automatic/recurring tasks. Manual tasks are persisted by default; scheduled, system, heartbeat/boot-triage, monitor, and digest tasks are skipped unless this is true. |
 | `force` | `boolean` | No | - | On an already-terminal task, overwrite explicitly provided output and/or failureReason text while preserving status and finishedAt and without replaying events, memory writes, follow-up creation, business-use ensure, or capacity updates. Differing terminal text is otherwise discarded and reported as a failure. |
 
@@ -406,7 +427,7 @@ Acknowledge a live steering message after you have incorporated it into your cur
 
 **Steer Task**
 
-Send a message to a task that is already running. `mode:"steer"` is honored on pi and claude-managed; claude, devin, opencode and codex support queue only (codex delivery lands at the next tool-call boundary via its lifecycle hooks). Pass `onUnsupported:"fail"` to get an error instead of a downgrade.
+Send a message to a task that is already running. `mode:"steer"` is honored on pi, claude-managed, codex and cursor; claude, devin, opencode and amp support queue only (amp delivery lands at the next tool result). Pass `onUnsupported:"fail"` to get an error instead of a downgrade.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -439,10 +460,12 @@ Perform task pool operations: create unassigned tasks, claim/release tasks from 
 | `taskId` | `uuid` | No | - | Task ID (required for claim/release/accept/reject). |
 | `reason` | `string` | No | - | Reason for rejection (optional for 'reject'). |
 | `dir` | `string` | No | - | Working directory (absolute path) for the agent to start in. Only used with 'create' action. |
-| `model` | `string` | No | - | Concrete model override for the created task, interpreted by the claiming worker's harness/provider. This does not switch providers. Only used with 'create' action. |
+| `model` | `string` | No | - | Concrete model override for the created task, interpreted by the claiming worker's harness/provider. This does not switch providers. Only used with 'create' action. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. |
 | `modelTier` | `smol \| regular \| smart \| ultra` | No | - | Portable model tier for the created task: 'smol', 'regular', 'smart', or 'ultra'. Resolved when a worker claims/runs the task. Only used with 'create' action. |
+| `allowCustomModel` | `boolean` | No | - | Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only used with 'create' action. |
 | `effort` | `off \| low \| medium \| high \| xhigh \| max` | No | - | Reasoning effort for the created task: 'off', 'low', 'medium', 'high', 'xhigh', or 'max'. Only used with 'create' action. |
-| `requiredCapabilities` | `array` | No | - | Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset). Only used with 'create' action. |
+| `requiredCapabilities` | `array` | No | - | Capabilities required for pool routing. |
+| `leadOnly` | `boolean` | No | false | Structured authorization constraint: only Lead agents may claim this privileged task. |
 
 ## Config Tools
 
@@ -534,6 +557,35 @@ Advanced, lead-only management for standalone scripts-runtime credential broker 
 | `tokenAuthStyle` | `body \| basic` | No | - | How client credentials reach the token endpoint: body params (default) or HTTP Basic auth (required by e.g. Notion). |
 | `tokenBodyFormat` | `form \| json` | No | - | Token request body encoding: form-urlencoded (default) or JSON (required by e.g. Notion). |
 
+### model-catalog-refresh
+
+**Refresh Model Catalog**
+
+Refresh the swarm model catalog (and pricing rows) from models.dev, like `pi update --models`. Without force, skips the network when the last check is under 4h old. A forced refresh is accepted once per minute; a second one inside that window returns `skipped-cooldown` with `retryAfterMs`. Lead agent only. Returns the status, model count, and newly added provider/modelId keys.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `force` | `boolean` | No | - | Fetch even if the last check is under 4h old (default false). Rate limited to one per minute. |
+
+### model-catalog-overlay-upsert
+
+**Upsert Model Catalog Overlay**
+
+Add or update hand-verified facts for one model (e.g. a launch models.dev has not listed yet). Overlay fields win over models.dev; overlay prices fill pricing-table gaps so cost recompute prices the model. The row auto-expires once models.dev matches every fact you set.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `provider` | `string` | Yes | - | models.dev provider id: anthropic, openai, openrouter, amazon-bedrock, opencode. |
+| `modelId` | `string` | Yes | - | Model id as models.dev keys it (e.g. claude-opus-5-5). |
+| `name` | `string` | No | - | Display name. |
+| `releaseDate` | `string` | No | - | Release date, YYYY-MM-DD. |
+| `contextWindow` | `number` | No | - | Context window, tokens. |
+| `maxOutput` | `number` | No | - | Max output tokens. |
+| `reasoningOptions` | `array` | No | - | Reasoning options, models.dev shape: [{type, values?}]. |
+| `pricing` | `object` | No | - | USD per million tokens. |
+| `reason` | `string` | Yes | - | Why this overlay exists (source of the facts). |
+| `verifiedBy` | `string` | No | - | Who verified the facts (URL, person, agent). |
+
 ## Scripts Tools
 
 *Scripts capability - reusable script catalog (HTTP MCP only in v1)*
@@ -621,6 +673,73 @@ Manage external HTTP API endpoints for swarm scripts (POST /api/x/script/<id>). 
 | `scope` | `unknown` | No | "agent" | Persist under agent or global scope. |
 | `fsMode` | `unknown` | No | "none" | Filesystem mode. v1 supports none only. |
 
+### extension-delete
+
+**Extension Delete**
+
+Uninstall a disabled extension and delete its stored history. Disable it first with extension-disable. Requires a lead, operator, or dashboard user.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Installed extension ID from extension-list. |
+
+### extension-enable
+
+**Extension Enable**
+
+Load and enable an installed extension. Requires a lead, operator, or dashboard user.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Installed extension ID from extension-list. |
+
+### extension-disable
+
+**Extension Disable**
+
+Unload and disable an installed extension. Requires a lead, operator, or dashboard user.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Installed extension ID from extension-list. |
+
+### extension-activate-version
+
+**Extension Activate Version**
+
+Activate a stored extension version, reloading it if enabled. Requires a lead, operator, or dashboard user.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `id` | `string` | Yes | - | Installed extension ID from extension-list. |
+| `version` | `number` | Yes | - | Stored version number to activate. |
+
+### extension-catalog
+
+**Extension Catalog**
+
+*No parameters*
+
+### extension-install
+
+**Extension Install**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `template` | `string` | No | - | Name of a predefined extension from extension-catalog. Mutually exclusive with manifest and files. |
+| `manifest` | `unknown` | No | - | Inline bundle manifest. Requires files. Needs EXTENSION_ALLOW_INLINE_INSTALL and a lead, operator, or dashboard-user caller. |
+| `files` | `object` | No | - | Inline bundle files keyed by relative path. Requires manifest. |
+| `priority` | `number` | No | - | Handler priority. Lower values run first. |
+| `config` | `object` | No | - | Extension configuration. |
+
+### extension-list
+
+**Extension List**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `enabledOnly` | `boolean` | No | - | Return only enabled extensions. |
+
 ### script-delete
 
 **Script Delete**
@@ -680,7 +799,7 @@ Capability: `mcp` (enabled by default)
 
 **Create MCP Server**
 
-Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope requires lead.
+Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope and stdio servers require lead.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -700,7 +819,7 @@ Create a new MCP server definition. Agent-scope servers are auto-installed for t
 
 **Update MCP Server**
 
-Update an MCP server's configuration. Only the owner or lead can update.
+Update an MCP server's configuration. Only the owner or lead can update. Changing or enabling what a stdio server runs requires lead.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -843,7 +962,7 @@ List registered repos with their guidelines (PR checks, merge policy, review gui
 
 **Update Repo**
 
-Update a repo's configuration including guidelines (PR checks, merge policy, review guidance). The lead uses this to set guidelines after asking the user. Pass null for guidelines to clear them.
+Update a repo's configuration including guidelines (PR checks, merge policy, review guidance). The lead uses this to set guidelines after asking the user. Pass null for guidelines to clear them. Only the lead can change allowMerge: resend its current value to edit other guidelines.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -876,8 +995,8 @@ View all scheduled tasks with optional filters. Use this to discover existing sc
 | `keyPrefix` | `unknown` | No | - | Filter by namespace subtree. |
 | `scheduleType` | `recurring \| one_time` | No | - | Filter by schedule type |
 | `hideCompleted` | `boolean` | No | true | Hide completed one-time schedules (default: true) |
-| `consecutiveErrorsMin` | `number` | No | - | Only return schedules with at least this many consecutive errors. |
-| `lastRunStatus` | `failed \| succeeded` | No | - | Filter by derived last run status. `failed` means consecutiveErrors > 0; `succeeded` means lastRunAt is set and consecutiveErrors is 0. |
+| `consecutiveErrorsMin` | `number` | No | - | Only return schedules with at least this many consecutive dispatch errors (the scheduler failed to create the task, workflow run, or script run). Does not count spawned tasks that later failed; for those use get-tasks with scheduleId and status failed. |
+| `lastRunStatus` | `failed \| succeeded` | No | - | Filter by derived last dispatch status. `failed` means consecutiveErrors > 0 (the last dispatch attempt errored); `succeeded` means lastRunAt is set and consecutiveErrors is 0. Reflects dispatch only, not the outcome of spawned tasks; for those use get-tasks with scheduleId and status failed. |
 | `includeFull` | `boolean` | No | - | Return the full `taskTemplate` instead of a short `taskTemplatePreview`. Default false. |
 
 ### create-schedule
@@ -907,8 +1026,26 @@ Create a new scheduled task. For recurring: provide cronExpression or intervalMs
 | `targetAgentId` | `string` | No | - | Agent to assign tasks to (omit for task pool) |
 | `timezone` | `string` | No | "UTC" | Timezone for cron schedules |
 | `enabled` | `boolean` | No | true | Whether the schedule is enabled (default: true) |
-| `model` | `string` | No | - | Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent. |
+| `model` | `string` | No | - | Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. |
 | `modelTier` | `smol \| regular \| smart \| ultra` | No | - | Portable model tier for tasks created by this schedule: 'smol', 'regular', 'smart', or 'ultra'. Resolved by each assignee's harness/provider at run time. |
+| `allowCustomModel` | `boolean` | No | - | Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet. |
+
+### defer-task
+
+**Defer Task**
+
+Completes this task now with status `completed` and books a wake-up for you. Use when the result needs time: a build, a deploy, a reply. The task reaches its final state on this call; the lead sees your summary as its output unless the task has an outputSchema. For a task with an outputSchema, provide output as a JSON string matching that schema; it is stored verbatim as terminal output, while deferral details remain visible in the task log. A one-off schedule wakes you up later with a child task that carries this task as its parent. Optionally provide wakeOn with taskId or taskIds to wake early on task outcomes; mode defaults to all, or use any for the first match. delayMs or runAt remains required as the ceiling for the whole set. Provide delayMs or runAt, a summary of what you did, and a note that says what is pending and what to check.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `taskId` | `string` | Yes | - | The ID of the task you are working on. |
+| `delayMs` | `number` | No | - | Wake up after this many milliseconds (e.g. 1800000 for 30 min). |
+| `runAt` | `string` | No | - | Wake up at this ISO datetime (e.g. '2026-03-06T15:00:00Z'). Must be future. |
+| `wakeOn` | `object` | No | - | Wake early on a task event. Provide taskId or nonempty, unique taskIds. mode defaults to all (every member must match); any wakes on the first match. settled covers completed, failed, or cancelled. Deferred and superseded members follow their continuations; a superseded member without a resume child holds to the ceiling. Any already-terminal member rejects the request; one delayMs/runAt ceiling is still required for the whole set. The member whose settlement wakes you creates no separate lead follow-up for your agent unless its followUpConfig sets onCompleted/onFailed; an all-mode member that settles while others are pending still does. |
+| `summary` | `string` | Yes | - | What you did so far and where things stand. Stored in the task log for tasks with an outputSchema; otherwise becomes the task's output. |
+| `output` | `string` | No | - | Required when the task has an outputSchema: a JSON string matching that schema, stored verbatim as terminal output. Ignored for tasks without an outputSchema. |
+| `note` | `string` | Yes | - | What is pending, and what to check on wake-up. |
+| `checks` | `array` | No | - | Concrete things to verify on wake-up, one per entry. |
 
 ### update-schedule
 
@@ -936,8 +1073,9 @@ Update an existing scheduled task. Any registered agent can update schedules.
 | `targetAgentId` | `string` | No | - | New target agent ID |
 | `timezone` | `string` | No | - | New timezone |
 | `enabled` | `boolean` | No | - | Enable or disable the schedule |
-| `model` | `string` | No | - | Concrete model override for tasks created by this schedule. Set to null to clear. |
+| `model` | `string` | No | - | Concrete model override for tasks created by this schedule. Set to null to clear. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. |
 | `modelTier` | `smol \| regular \| smart \| ultra` | No | - | Portable model tier for tasks created by this schedule. Set to null to clear. |
+| `allowCustomModel` | `boolean` | No | - | Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet. |
 
 ### patch-schedule
 
@@ -965,8 +1103,9 @@ Patch an existing scheduled task by shallow-merging provided fields over the cur
 | `targetAgentId` | `string` | No | - | New target agent ID |
 | `timezone` | `string` | No | - | New timezone |
 | `enabled` | `boolean` | No | - | Enable or disable the schedule |
-| `model` | `string` | No | - | Concrete model override for tasks created by this schedule. Set to null to clear. |
+| `model` | `string` | No | - | Concrete model override for tasks created by this schedule. Set to null to clear. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. |
 | `modelTier` | `smol \| regular \| smart \| ultra` | No | - | Portable model tier for tasks created by this schedule. Set to null to clear. |
+| `allowCustomModel` | `boolean` | No | - | Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet. |
 
 ### delete-schedule
 
@@ -1005,10 +1144,11 @@ Search your accumulated memories using natural language. Returns summaries with 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | `string` | Yes | - | Natural language search query. |
-| `intent` | `string` | Yes | - | Why you are searching for this memory. Required. E.g. 'looking for auth pattern to fix login bug'. |
+| `intent` | `string` | No | - | Optional reason for searching for this memory. E.g. 'looking for auth pattern to fix login bug'. |
 | `scope` | `all \| agent \| swarm` | No | "all" | Search scope: 'all' (own + swarm), 'agent' (own only), 'swarm' (shared only). |
 | `limit` | `number` | No | 10 | Max results to return. |
 | `source` | `manual \| file_index \| session_summary \| task_completion` | No | - | Filter by memory source type. |
+| `keyPrefix` | `string` | No | - | Only return memories whose key starts with this text, for example '/longterm/facts/' or '/longterm/entities/people/'. Matched literally, case-sensitive. Include the trailing '/' to stay inside one folder. |
 
 ### memory-store
 
@@ -1019,11 +1159,12 @@ Store a learning as a searchable memory: a fix, a pattern, a gotcha, a fact abou
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `content` | `string` | Yes | - | The memory body. Markdown is fine. State the fact, the context it applies to, and the evidence. |
-| `name` | `string` | Yes | - | Short title, one line, used in search results and the UI. |
+| `name` | `string` | No | - | Short title used in search results and the UI. Defaults to the first non-empty content line (up to 200 characters). A name that starts with /longterm/ is also used as the key when no key is given. |
 | `scope` | `agent \| swarm` | No | "agent" | 'agent' (default): only you can recall it. 'swarm': every agent can recall it. |
-| `tags` | `array` | No | - | Free-form tags, for example a repo name or a topic. |
+| `tags` | `unknown` | No | - | Free-form tags as an array or a comma-separated string, for example a repo name or a topic. |
 | `taskId` | `uuid` | No | - | The task this learning came from, when there is one. |
 | `intent` | `string` | No | - | Why this is worth remembering. Kept in the audit trail. |
+| `key` | `string` | No | - | Optional logical path for this memory, for example '/longterm/facts/swarm-runtime/sqlite-busy-retry'. Lowercase segments joined by '/', starting with '/'. Search it with memory-search keyPrefix and move it with memory-edit newKey. Fails when you already have a memory with this key in this scope. A key under /longterm marks the memory as curated: it never expires and is protected from cleanup. It must start with /longterm/company-story, /longterm/entities/people, /longterm/entities/customers, /longterm/facts, /longterm/decisions, /longterm/workstreams or /longterm/timeline. Paths under /longterm/company-story, /longterm/entities and /longterm/timeline are lead-only. Defaults to an auto key, which makes the memory inbox material. |
 
 ### memory-get
 
@@ -1033,14 +1174,15 @@ Retrieve the full content of a specific memory by its ID. Use memory-search to f
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `memoryId` | `uuid` | Yes | - | The ID of the memory to retrieve. |
-| `intent` | `string` | Yes | - | Why you are retrieving this memory. Required. E.g. 'need full details of the auth fix pattern'. |
+| `memoryId` | `uuid` | No | - | The ID of the memory to retrieve (or use id). |
+| `id` | `uuid` | No | - | Alias for memoryId, matching memory-search results. |
+| `intent` | `string` | No | - | Optional reason for retrieving this memory. E.g. 'need full details of the auth fix pattern'. |
 
 ### memory-edit
 
 **Edit a memory**
 
-Edit a single memory in place while preserving its ID, usefulness posterior, and audit history. Two modes: 'replace' overwrites the entire content (requires `content`); 'exact' performs a surgical find-and-replace of `oldString` with `newString` within the existing content (fails if `oldString` is missing or ambiguous). Use 'replace' for full rewrites, 'exact' for targeted edits.
+Edit a single memory in place while preserving its ID, usefulness posterior, and audit history. Two modes: 'replace' overwrites the entire content (requires `content`); 'exact' performs a surgical find-and-replace of `oldString` with `newString` within the existing content (fails if `oldString` is missing or ambiguous). Use 'replace' for full rewrites, 'exact' for targeted edits. Pass `newKey` alone to move the memory to another logical path (every chunk, same ID, posterior, access counts and author). A move into /longterm also clears the expiry. Agents can edit their own memories; lead agents can edit any scope.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1053,12 +1195,13 @@ Edit a single memory in place while preserving its ID, usefulness posterior, and
 | `newString` | `string` | No | - | Replacement for oldString. Required for 'exact' mode. Can be empty to delete. |
 | `intent` | `string` | Yes | - | Why you are editing this memory. |
 | `expectedVersion` | `number` | No | - | - |
+| `newKey` | `string` | No | - | Move the memory to this logical path, for example '/longterm/facts/swarm-runtime/slug'. Alone it is a pure move: omit content/oldString/newString. Fails when the key is already used in this scope by the same owner. Moving into /longterm marks the memory as curated on every chunk: it stops expiring and is protected from cleanup, and moving it out later does not bring the expiry back. A key under /longterm must start with /longterm/company-story, /longterm/entities/people, /longterm/entities/customers, /longterm/facts, /longterm/decisions, /longterm/workstreams or /longterm/timeline. Paths under /longterm/company-story, /longterm/entities and /longterm/timeline are lead-only. |
 
 ### memory-delete
 
 **Delete a memory**
 
-Delete a specific memory by its ID. Agents can delete their own memories; lead agents can also delete swarm-scoped memories.
+Delete a specific memory by its ID. Agents can delete their own agent-scoped memories; only the lead can delete swarm-scoped memories.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1072,9 +1215,10 @@ Rate a memory you used in the current task. Call this when a retrieved memory wa
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `id` | `string` | Yes | - | Memory ID returned by memory_search. |
+| `id` | `string` | No | - | Memory ID returned by memory-search (or use memoryId). |
+| `memoryId` | `string` | No | - | Alias for id, matching memory-get. |
 | `useful` | `boolean` | Yes | - | true = this memory helped solve the task; false = misled or wasted time. |
-| `note` | `string` | No | - | Short reason. Captured for telemetry; not surfaced to other agents. |
+| `note` | `string` | No | - | Reason, stored up to 500 characters for telemetry; not surfaced to other agents. |
 | `referencesSource` | `string` | No | - | Optional external source ID this memory references. Free-form string, convention "<source>:<identifier>" (e.g. "github:owner/repo#N", "linear:KEY-N", "customer:<slug>", "slack:<channel>:<ts>", "agentmail:<thread-id>"). Pick any prefix that fits — no closed enum. When present, an edge from this memory to the external source is created/updated. |
 
 ### inject-learning
@@ -1161,7 +1305,7 @@ Capability: `workflows` (enabled by default)
 
 **Create Workflow**
 
-Create a new automation workflow. Key concepts: - Nodes are linked via 'next' (string or port-based record). - CROSS-NODE DATA: To use output from an upstream node, you MUST declare an 'inputs' mapping on the downstream node. Example: inputs: { "cityData": "generate-city" } → then use {{cityData.taskOutput.field}} in config templates. Without 'inputs', built-in trigger/input/workflow/swarm/run context remains available, but upstream outputs do not. Agent-task templates may interpolate trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not: inline script source allows only input/workflow/swarm/run values, while named swarm-script source is not workflow-interpolated. Pass dynamic trigger or upstream values through config.args (argv for inline scripts; the args object for swarm-script). - STRUCTURED OUTPUT: For agent-task nodes, put outputSchema inside 'config' to validate the agent's raw JSON output. Node-level outputSchema validates the executor's return ({taskId, taskOutput}), which is different. - Agent-task config: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. - FOREACH NODE: type 'foreach' fans out one agent-task per item. Config: { over: <array or exact {{input}} token>, itemKey: <property name>, body: { type: 'agent-task', config: {...} } }. The body config is interpolated once per item with {{item.*}} and {{index}}. Child steps use synthetic IDs '<foreachNodeId>#<itemKey>'; the parent waits for every child and exposes one aggregate result to successors. concurrency is not supported in v1; use definition-level onNodeFailure: 'continue' to aggregate failed children. - TRIGGER SCHEMA: Optional 'triggerSchema' is a JSON-Schema object that validates incoming trigger payloads. Supported keywords: type, required, properties, enum, const, items (recursive into arrays). Other JSON-Schema keywords (oneOf/anyOf/$ref/pattern/format/additionalProperties) are silently ignored. - WEBHOOK VERIFICATION: Webhook triggers use hmacSecret for all verification formats. Omit verification for legacy HMAC-SHA256 over the raw body with fallback header scanning; or set verification to { format: 'hmac-sha256', header }, { format: 'timestamped-hmac-sha256', header, toleranceSeconds? }, or { format: 'token-equality', header }. Example: { type: 'webhook', hmacSecret: 'secret.SUPERAGENT_WEBHOOK_SECRET', verification: { format: 'timestamped-hmac-sha256', header: 'X-Superagent-Signature', toleranceSeconds: 300 } }. - WAIT NODE: type 'wait' pauses a workflow for a duration or until a named workflowEventBus event arrives. See runbooks/workflows.md#wait-nodes for config shapes, ordering caveats, and built-in event names.
+Create a new automation workflow. Key concepts: - Nodes are linked via 'next' (string or port-based record). - CROSS-NODE DATA: To use output from an upstream node, you MUST declare an 'inputs' mapping on the downstream node. Example: inputs: { "cityData": "generate-city" } → then use {{cityData.taskOutput.field}} in config templates. Without 'inputs', built-in trigger/input/workflow/swarm/run context remains available, but upstream outputs do not. Agent-task templates may interpolate trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not: inline script source allows only input/workflow/swarm/run values, while named swarm-script source is not workflow-interpolated. Pass dynamic trigger or upstream values through config.args (argv for inline scripts; the args object for swarm-script). - STRUCTURED OUTPUT: For agent-task nodes, put outputSchema inside 'config' to validate the agent's raw JSON output. Node-level outputSchema validates the executor's return ({taskId, taskOutput}), which is different. - Agent-task config: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. - FOREACH NODE: type 'foreach' fans out one agent-task per item. Config: { over: <array or exact {{input}} token>, itemKey: <property name>, body: { type: 'agent-task', config: {...} } }. The body config is interpolated once per item with {{item.*}} and {{index}}. Child steps use synthetic IDs '<foreachNodeId>#<itemKey>'; the parent waits for every child and exposes one aggregate result to successors. concurrency is not supported in v1; use definition-level onNodeFailure: 'continue' to aggregate failed children. - TRIGGER SCHEMA: Optional 'triggerSchema' is a JSON-Schema object that validates incoming trigger payloads. Supported keywords: type, required, properties, enum, const, items (recursive into arrays). Other JSON-Schema keywords (oneOf/anyOf/$ref/pattern/format/additionalProperties) are silently ignored. - WEBHOOK VERIFICATION: Webhook triggers use hmacSecret for all verification formats. Omit verification for legacy HMAC-SHA256 over the raw body with fallback header scanning; or set verification to { format: 'hmac-sha256', header }, { format: 'timestamped-hmac-sha256', header, toleranceSeconds? }, { format: 'token-equality', header }, or { format: 'standard-webhooks', toleranceSeconds? } (standardwebhooks.com: webhook-id/webhook-timestamp/webhook-signature headers, hmacSecret is the whsec_ signing secret). Example: { type: 'webhook', hmacSecret: 'secret.SUPERAGENT_WEBHOOK_SECRET', verification: { format: 'timestamped-hmac-sha256', header: 'X-Superagent-Signature', toleranceSeconds: 300 } }. - WAIT NODE: type 'wait' pauses a workflow for a duration or until a named workflowEventBus event arrives. See runbooks/workflows.md#wait-nodes for config shapes, ordering caveats, and built-in event names.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1169,7 +1313,7 @@ Create a new automation workflow. Key concepts: - Nodes are linked via 'next' (s
 | `key` | `unknown` | No | - | Logical namespace. Defaults to a shared/workflow:<id>/ resource key. |
 | `description` | `string` | No | - | Description of what this workflow does |
 | `definition` | `unknown` | Yes | - | The workflow definition with nodes (each node has id, type, config, and optional next/retry/validation) |
-| `triggers` | `array` | No | - | Optional trigger configurations (webhook, schedule). Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality. |
+| `triggers` | `array` | No | - | Optional trigger configurations (webhook, schedule, event). Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality, standard-webhooks. |
 | `cooldown` | `unknown` | No | - | Optional cooldown configuration to prevent re-triggering too frequently |
 | `input` | `object` | No | - | Optional input values resolved at execution time (env vars like VAR_NAME, secrets secret.NAME, or literals) |
 | `dir` | `string` | No | - | Default working directory for all agent-task nodes (absolute path, e.g. /tmp/workspace) |
@@ -1205,7 +1349,7 @@ Get a workflow by ID, including its definition, triggers, cooldown, input, and a
 
 **Update Workflow**
 
-Update an existing workflow's name, description, definition, triggers, cooldown, input, triggerSchema, or enabled state. Creates a version snapshot before applying changes. TRIGGER SCHEMA: pass 'triggerSchema' as a JSON-Schema object to set/replace, or 'null' to clear. Supported JSON-Schema keywords: type, required, properties, enum, const, items (recursive into arrays). Other JSON-Schema keywords (oneOf/anyOf/$ref/pattern/format/additionalProperties) are silently ignored. WEBHOOK VERIFICATION: webhook triggers use hmacSecret for all verification formats. Omit verification for legacy HMAC-SHA256 over the raw body with fallback header scanning; or set verification to { format: 'hmac-sha256', header }, { format: 'timestamped-hmac-sha256', header, toleranceSeconds? }, or { format: 'token-equality', header }.
+Update an existing workflow's name, description, definition, triggers, cooldown, input, triggerSchema, or enabled state. Creates a version snapshot before applying changes. TRIGGER SCHEMA: pass 'triggerSchema' as a JSON-Schema object to set/replace, or 'null' to clear. Supported JSON-Schema keywords: type, required, properties, enum, const, items (recursive into arrays). Other JSON-Schema keywords (oneOf/anyOf/$ref/pattern/format/additionalProperties) are silently ignored. WEBHOOK VERIFICATION: webhook triggers use hmacSecret for all verification formats. Omit verification for legacy HMAC-SHA256 over the raw body with fallback header scanning; or set verification to { format: 'hmac-sha256', header }, { format: 'timestamped-hmac-sha256', header, toleranceSeconds? }, { format: 'token-equality', header }, or { format: 'standard-webhooks', toleranceSeconds? } (standardwebhooks.com: webhook-id/webhook-timestamp/webhook-signature headers, hmacSecret is the whsec_ signing secret).
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1214,7 +1358,7 @@ Update an existing workflow's name, description, definition, triggers, cooldown,
 | `name` | `string` | No | - | New name for the workflow |
 | `description` | `string` | No | - | New description |
 | `definition` | `unknown` | No | - | New workflow definition |
-| `triggers` | `array` | No | - | New trigger configurations. Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality. |
+| `triggers` | `array` | No | - | New trigger configurations. Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality, standard-webhooks. |
 | `cooldown` | `unknown` | No | - | New cooldown configuration (null to remove) |
 | `input` | `object` | No | - | New input values (null to remove) |
 | `dir` | `string` | No | - | Default working directory for all agent-task nodes (null to remove) |
@@ -1319,13 +1463,24 @@ Cancel a running or waiting workflow run. Cancels all non-terminal steps and the
 
 **Request human input**
 
-Create an approval request that pauses until a human responds. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond.
+Create an approval request and return at once with the request id and URL. The answer arrives later as a hitl-follow-up task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `title` | `string` | Yes | - | Title of the approval request |
 | `questions` | `array` | Yes | - | Questions to ask the human |
-| `timeoutSeconds` | `number` | No | - | Timeout in seconds (auto-rejects on timeout) |
+| `timeoutSeconds` | `number` | No | - | Seconds until the request expires. After that the request becomes 'timeout' and you get a hitl-follow-up task. A request with no timeout is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7). |
+
+### cancel-approval-request
+
+**Cancel approval request**
+
+Cancel a pending approval request by id. Allowed for a lead agent, or for the agent that owns the request's source task. If the request gates a running or waiting workflow run, that run is cancelled too. A request whose explicit timeout passed is already 'timeout' and cannot be cancelled.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `requestId` | `uuid` | Yes | - | The ID of the approval request to cancel. |
+| `reason` | `string` | No | - | Reason for cancellation. |
 
 ## Skills Tools
 
@@ -1595,8 +1750,8 @@ Stores an HTML or JSON page in the swarm and returns shareable URLs. Calls are u
 | `key` | `unknown` | No | - | Logical namespace. Defaults to a shared/page:<id>/ resource key. |
 | `title` | `string` | Yes | - | Human-readable title shown in listings. |
 | `slug` | `string` | No | - | URL slug. Defaults to the kebab-cased title. Same slug → updates the existing row. |
-| `body` | `string` | Yes | - | Full page body (HTML document or JSON-render spec, per contentType). |
-| `contentType` | `text/html \| application/json` | Yes | - | 'text/html' renders directly at /p/:id; 'application/json' is rendered by the SPA. |
+| `body` | `string` | Yes | - | Full page body (HTML document, SVG image, or JSON-render spec, per contentType). |
+| `contentType` | `text/html \| application/json \| image/svg+xml` | Yes | - | 'text/html' and 'image/svg+xml' render directly at /p/:id; 'application/json' is rendered by the SPA. |
 | `authMode` | `public \| authed \| password` | No | "authed" | 'authed' — requires page-session cookie (default); 'public' — no gate and must be explicit; 'password' — requires key. |
 | `password` | `string` | No | - | Plaintext password, hashed before storage. Only meaningful for authMode='password'. |
 | `description` | `string` | No | - | Optional short description, used in listings + OG-tag unfurl. |
@@ -1699,6 +1854,52 @@ List KV entries in the resolved namespace (optionally filtered by key prefix). E
 | `offset` | `number` | No | - | - |
 | `namespace` | `unknown` | No | - | - |
 
+### room-get
+
+**Room Get**
+
+Read the current state of a realtime room.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | "default" | - |
+| `namespace` | `unknown` | No | - | - |
+| `schemaVersion` | `number` | No | 1 | - |
+
+### room-change
+
+**Room Change**
+
+Apply operations to the live state of a realtime room.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | "default" | - |
+| `namespace` | `unknown` | No | - | - |
+| `schemaVersion` | `number` | No | 1 | - |
+
+### room-reset
+
+**Room Reset**
+
+Replace a realtime room with a new state and schema version.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | "default" | - |
+| `namespace` | `unknown` | No | - | - |
+| `schemaVersion` | `number` | No | 1 | - |
+
+### room-decode
+
+**Room Decode**
+
+Decode a room snapshot value that the caller already holds.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `value` | `unknown` | Yes | - | - |
+
 ## Slack Tools
 
 *Slack capability - Slack integration tools (no-op if Slack is not configured)*
@@ -1722,7 +1923,7 @@ Send a reply to a Slack thread. Use inboxMessageId for inbox messages, or taskId
 
 **Read Slack thread/channel history**
 
-Read messages from a Slack thread or channel. Use inboxMessageId or taskId to read from a thread you have context for, or provide channelId directly for channel history (leads only).
+Read messages from a Slack thread or channel. Use inboxMessageId or taskId to read from a thread you have context for, or provide channelId directly for channel history (leads only). From a task, files in the messages are stored as attachments of that task, each with a ready-to-run `fetchCommand`.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1731,7 +1932,7 @@ Read messages from a Slack thread or channel. Use inboxMessageId or taskId to re
 | `channelId` | `string` | No | - | Slack channel ID to read from (requires lead privileges). |
 | `threadTs` | `string` | No | - | Thread timestamp (required with channelId for thread history). |
 | `limit` | `number` | No | 20 | Maximum number of messages to retrieve (default: 20, max: 100). |
-| `includeFiles` | `boolean` | No | true | Include file attachments in the response (default: true). |
+| `includeFiles` | `boolean` | No | true | Include file attachments in the response (default: true). From a task, they are also stored as attachments of that task. |
 
 ### slack-post
 
@@ -1822,13 +2023,14 @@ Upload a file (image, document, etc.) to a Slack channel or thread. Use inboxMes
 
 **Download file from Slack**
 
-Download a file from Slack by file ID or URL. Files are saved to the agent's download directory on the shared disk by default.
+Download a file from Slack by file ID or URL. From a task, the file is stored as an attachment of that task and the result carries a ready-to-run `fetchCommand` to get the bytes into your container. Without a task, the file is saved on the API server's disk, which your container usually can't read.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `fileId` | `string` | No | - | The Slack file ID to download (e.g., 'F0RDC39U1'). |
 | `url` | `string` | No | - | Direct URL to download (url_private_download from a file object). |
-| `savePath` | `string` | No | - | Where to save the file. Can be a directory or full path. Defaults to /workspace/shared/downloads/{agentId}/slack/ |
+| `taskId` | `uuid` | No | - | Task to attach the file to. Defaults to the task you are working on; must be a task you own or created. |
+| `savePath` | `string` | No | - | Only without a task: where to save the file on the API server (directory or full path). Defaults to /workspace/shared/downloads/{agentId}/slack/. |
 | `filename` | `string` | No | - | Filename to use when saving. Only used if savePath is a directory. |
 
 ### slack-delete

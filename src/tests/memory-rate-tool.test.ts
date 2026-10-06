@@ -64,7 +64,7 @@ const memoryId = "22222222-2222-4222-8222-222222222222";
 describe("memory_rate MCP tool", () => {
   beforeEach(() => {
     process.env.MCP_BASE_URL = "http://test-host:9999";
-    process.env.API_KEY = "test-key";
+    process.env.API_KEY = "example-test-key";
   });
 
   afterEach(() => {
@@ -89,7 +89,7 @@ describe("memory_rate MCP tool", () => {
     expect(calls[0]!.init?.method).toBe("POST");
     const headers = calls[0]!.init?.headers as Record<string, string>;
     expect(headers["X-Agent-ID"]).toBe("agent-abc");
-    expect(headers.Authorization).toBe("Bearer test-key");
+    expect(headers.Authorization).toBe("Bearer example-test-key");
     const body = JSON.parse(calls[0]!.init?.body as string);
     expect(body).toEqual({
       events: [
@@ -212,16 +212,13 @@ describe("renderMemoriesPrompt — conditional rate-tool hint", () => {
     expect(result).toBeNull();
   });
 
-  test("MEMORY_RATERS unset → no rate-tool hint (byte-identical to pre-step-5)", () => {
-    const result = renderMemoriesPrompt(sampleMemories);
-    expect(result).not.toBeNull();
-    expect(result).not.toContain("memory_rate");
-    expect(result).toContain("### Relevant Past Knowledge");
-    expect(result).toContain("- **Foo bug fix** (id: m-1):");
-    // Snapshot — exact byte parity with main's runner.ts:1579 block.
-    expect(result).toBe(
-      `\n\n### Relevant Past Knowledge\n\nThese memories from your previous sessions may be useful. Use \`memory-get\` with the memory ID to retrieve full details.\n\n- **Foo bug fix** (id: m-1): use Bun.serve not express\n`,
-    );
+  test("MEMORY_RATERS unset → self-rating hint", () => {
+    expect(renderMemoriesPrompt(sampleMemories)).toContain("memory_rate");
+  });
+
+  test("MEMORY_RATERS=llm → no self-rating hint", () => {
+    process.env.MEMORY_RATERS = "llm";
+    expect(renderMemoriesPrompt(sampleMemories)).not.toContain("memory_rate");
   });
 
   test("MEMORY_RATERS empty string → no hint", () => {

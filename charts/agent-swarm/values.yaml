@@ -107,6 +107,17 @@ config:
   # -- Free-form additional env vars layered on top of the chart defaults.
   # Useful for less-common knobs (TEMPLATE_REGISTRY_URL, SCHEDULER_INTERVAL_MS, etc.).
   extraEnv: {}
+  # -- Let a freshly-seeded workflow/schedule template arrive ENABLED instead
+  # of merely inventoried. This is not a blanket switch: an individual
+  # template still only auto-enables when it needs no integration and no
+  # required param/placeholder (so it can't fail on a stranger's cluster for
+  # lack of a credential), and when the template itself doesn't recommend
+  # staying off. Everything else still seeds disabled, same as before this
+  # flag existed. Default true so a fresh install has its zero-config
+  # automations (e.g. the daily status report, the update-check schedule)
+  # running out of the box, not just present. Set false to restore the old
+  # "inventory everything, enable nothing automatically" behavior.
+  seedAutomationsEnabled: true
 
 # API — single-replica StatefulSet running the SQLite-backed control plane.
 # replicas is fixed at 1 (SQLite single-writer); the chart fails to render
@@ -115,6 +126,23 @@ api:
   replicas: 1
   port: 3013
   resources: {}
+  # -- Optional Kubernetes RuntimeClass for the API pod (the pod that
+  # actually spawns sandboxed script subprocesses — see
+  # src/utils/sandboxed-process.ts). `resources.limits` has no pids field
+  # (only cpu/memory/ephemeral-storage), and neither does the RuntimeClass
+  # API itself — a RuntimeClass only selects a CRI runtime handler by name,
+  # it has no OCI PID-resource field. Setting this alone applies NO pids
+  # ceiling. It only helps if the cluster administrator has separately
+  # provisioned a specifically customized runtime handler (e.g. a `runc`
+  # handler whose own config carries a tighter `pids.max`, or an
+  # equivalently configured gVisor/Kata handler) and confirmed it actually
+  # injects the limit — a stock handler under any of these runtimes does
+  # nothing. Empty = no runtimeClassName set, i.e. zero behavior change from
+  # before this field existed. See charts/agent-swarm/README.md's
+  # "Sandboxed-script pids containment" section for the cluster-wide
+  # alternative (kubelet `--pod-max-pids`) that works with no such
+  # provisioning and should be preferred.
+  runtimeClassName: ""
   storage:
     size: 10Gi
     # -- StorageClass used for the API PVC. Empty = cluster default.
@@ -140,6 +168,14 @@ service:
 # Defaults shared by every pool. A pool may override `resources`, `storage`,
 # `harnessProvider`, `modelOverride`, etc.
 poolDefaults:
+  # -- Baseline for outbound-polling workers. Increase requests for sustained
+  # builds/browser workloads; pools.<name>.resources replaces this entire map.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 4Gi
   storage:
     # -- Default size for each pool pod's personal PVC. Override per pool
     # via `pools.<name>.storage.personalSize` if you need different sizing.
@@ -176,9 +212,10 @@ poolDefaults:
 # one pool may have `role: lead`, and it must have `replicas: 1`. The chart
 # enforces both at render time.
 #
-# The default values include a single lead and a single coder pool — enough
-# to run a minimal swarm. Override entirely in your own values.yaml for real
-# deployments.
+# Defaults match the CLI's Full Swarm preset in src/commands/onboard/presets.ts:
+# one lead and ten specialist workers, requesting 3 CPU / 6Gi in total.
+# For only lead + coder, use examples/values-minimal.yaml. Helm merges pool
+# maps, so set unwanted entries to null to remove them.
 pools:
   lead:
     replicas: 1
@@ -193,14 +230,45 @@ pools:
         memory: 4Gi
   coder:
     replicas: 1
+    role: coder
     templateId: official/coder
     maxConcurrentTasks: 3
-    resources:
-      requests:
-        cpu: 500m
-        memory: 1Gi
-      limits:
-        memory: 4Gi
+  content-reviewer:
+    replicas: 1
+    role: content-reviewer
+    templateId: official/content-reviewer
+  content-strategist:
+    replicas: 1
+    role: content-strategist
+    templateId: official/content-strategist
+  content-writer:
+    replicas: 1
+    role: content-writer
+    templateId: official/content-writer
+  discoverability-optimizer:
+    replicas: 1
+    role: discoverability-optimizer
+    templateId: official/discoverability-optimizer
+  forward-deployed-engineer:
+    replicas: 1
+    role: forward-deployed-engineer
+    templateId: official/forward-deployed-engineer
+  researcher:
+    replicas: 1
+    role: researcher
+    templateId: official/researcher
+  reviewer:
+    replicas: 1
+    role: reviewer
+    templateId: official/reviewer
+  tester:
+    replicas: 1
+    role: tester
+    templateId: official/tester
+  ux-principles:
+    replicas: 1
+    role: ux-principles
+    templateId: official/ux-principles
 
 # Ingress for the API. Disabled by default — most consumers run the swarm
 # cluster-internal and don't expose the API publicly.
@@ -210,7 +278,17 @@ ingress:
   className: ""
   annotations: {}
   host: ""
+  # -- Explicit TLS entries (`hosts` + `secretName`). Leave empty when using
+  # `certManager` below; the chart then generates the entry for `host`.
   tls: []
+  # -- HTTPS shortcut for clusters running cert-manager. Set ONE of
+  # `clusterIssuer` or `issuer` to the name of an existing Issuer. The chart
+  # adds the cert-manager annotation, requests a certificate for `host`
+  # into the Secret `<release>-api-tls`, and derives an https public URL.
+  # No TLS Secret needs to be created by hand.
+  certManager:
+    clusterIssuer: ""
+    issuer: ""
 
 # agent-fs — optional persistent shared filesystem service.
 #
@@ -227,27 +305,40 @@ agentFs:
     registry: ghcr.io
     repository: desplega-ai/agent-fs
     pullPolicy: IfNotPresent
-    tag: 0.13.1
+    tag: 0.15.1
   port: 7433
+  # -- Blob storage backend for agent-fs. `s3` (default) stores objects in
+  # the bucket configured below. `local` stores objects on the agent-fs PVC
+  # under /data/storage (single replica, no S3 credentials needed); the
+  # `bucket` and `s3.*` values are ignored.
+  storageProvider: s3
   # -- Optional API-owned bootstrap key for agent-fs. When blank, the swarm API
   # boot seeder registers a service user and persists its generated key in
   # encrypted swarm_config as API_AGENT_FS_API_KEY.
   apiKey: ""
   # -- Public app URL used by agent-fs when it emits browser-facing file links.
   appUrl: ""
-  # -- Bucket name for agent-fs's object storage backend.
+  # -- Bucket name for agent-fs's object storage backend (storageProvider=s3).
   bucket: ""
   resources: {}
   storage:
     size: 10Gi
     storageClassName: ""
+  # Public ingress for agent-fs. Needed when browsers open agent-fs file links
+  # (signed URLs point at agent-fs itself when storageProvider=local).
   ingress:
     enabled: false
     className: ""
     annotations: {}
     host: ""
     tls: []
-  # S3-compatible credentials. Either inline or pre-existing Secret.
+    # -- Same semantics as `ingress.certManager`; certificate lands in
+    # `<release>-agent-fs-tls`.
+    certManager:
+      clusterIssuer: ""
+      issuer: ""
+  # S3-compatible credentials (storageProvider=s3). Either inline or
+  # pre-existing Secret.
   s3:
     accessKeyId: ""
     secretAccessKey: ""

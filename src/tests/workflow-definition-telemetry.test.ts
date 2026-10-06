@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { unlink } from "node:fs/promises";
-import { closeDb, createWorkflow, deleteWorkflow, initDb } from "../be/db";
+import { closeDb, createWorkflow, deleteWorkflow, getDbClient, initDb } from "../be/db";
 import { telemetry } from "../telemetry";
 
 const TEST_DB_PATH = "./test-workflow-definition-telemetry.sqlite";
@@ -13,6 +13,11 @@ async function removeTestDb(): Promise<void> {
       // File does not exist.
     }
   }
+}
+
+async function flushAfterCommit(): Promise<void> {
+  // Workflow telemetry runs through DbClient.afterCommit, which queues behind the client lock.
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("workflow definition telemetry", () => {
@@ -39,7 +44,7 @@ describe("workflow definition telemetry", () => {
     await removeTestDb();
   });
 
-  test("emits workflow.created with definition size and known source", async () => {
+  test("emits workflow.created with definition size and known interface (via)", async () => {
     const workflow = await createWorkflow(
       {
         name: "created telemetry",
@@ -52,6 +57,7 @@ describe("workflow definition telemetry", () => {
       },
       "api",
     );
+    await flushAfterCommit();
 
     expect(calls).toEqual([
       {
@@ -59,7 +65,7 @@ describe("workflow definition telemetry", () => {
         props: {
           workflowId: workflow.id,
           nodeCount: 2,
-          source: "api",
+          via: "api",
         },
       },
     ]);
@@ -73,27 +79,30 @@ describe("workflow definition telemetry", () => {
       },
       "mcp",
     );
+    await flushAfterCommit();
     calls = [];
 
     expect(await deleteWorkflow(workflow.id, "mcp")).toBe(true);
     expect(await deleteWorkflow(workflow.id, "mcp")).toBe(false);
+    await flushAfterCommit();
 
     expect(calls).toEqual([
       {
         event: "deleted",
         props: {
           workflowId: workflow.id,
-          source: "mcp",
+          via: "mcp",
         },
       },
     ]);
   });
 
-  test("omits source for direct internal workflow mutations", async () => {
+  test("omits via for direct internal workflow mutations", async () => {
     const workflow = await createWorkflow({
       name: "internal telemetry",
       definition: { nodes: [] },
     });
+    await flushAfterCommit();
 
     expect(calls).toEqual([
       {
@@ -104,5 +113,22 @@ describe("workflow definition telemetry", () => {
         },
       },
     ]);
+  });
+
+  test("emits nothing when the caller's transaction rolls back", async () => {
+    const kept = await createWorkflow({ name: "kept", definition: { nodes: [] } });
+    await flushAfterCommit();
+    calls = [];
+
+    await expect(
+      getDbClient().transaction(async () => {
+        await createWorkflow({ name: "rolled back", definition: { nodes: [] } }, "api");
+        await deleteWorkflow(kept.id, "api");
+        throw new Error("roll back");
+      }),
+    ).rejects.toThrow("roll back");
+    await flushAfterCommit();
+
+    expect(calls).toEqual([]);
   });
 });

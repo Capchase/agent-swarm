@@ -19,6 +19,8 @@ export interface IntegrationField {
   type: IntegrationFieldType;
   required?: boolean;
   isSecret?: boolean;
+  /** The API reports presence but never returns the persisted row or value. */
+  writeOnly?: boolean;
   placeholder?: string;
   helpText?: string;
   /** Options for `type: "select"`. */
@@ -54,7 +56,8 @@ export type IntegrationSpecialFlow =
   | "linear-oauth"
   | "jira-oauth"
   | "codex-cli"
-  | "claude-managed-cli";
+  | "claude-managed-cli"
+  | "memory-embeddings";
 
 /** Which agent role(s) the swarm needs to have a given skill installed on. */
 export type AgentRole = "lead" | "worker";
@@ -119,7 +122,11 @@ export interface IntegrationDef {
   disableKey?: string;
   /** Changes require API server restart to take effect. */
   restartRequired?: boolean;
-  /** Custom flow that overrides the generic field form. */
+  /**
+   * Custom section rendered above the generic field form. Its component, and
+   * whether the generic form stays shown, moves under Advanced, or is replaced,
+   * live in `SPECIAL_FLOWS` (components/integrations/special-flows.tsx).
+   */
   specialFlow?: IntegrationSpecialFlow;
   /**
    * Skills recommended alongside this integration. Env-var configuration is
@@ -152,10 +159,21 @@ export const INTEGRATIONS: IntegrationDef[] = [
     description: "Chat with the swarm from Slack — assign tasks, get alerts, follow-up in threads.",
     category: "comm",
     iconKey: "message-square",
-    docsUrl: "https://docs.agent-swarm.dev/docs/guides/slack-integration",
+    docsUrl: "https://docs.agent-swarm.dev/docs/integrations/slack",
     disableKey: "SLACK_DISABLE",
     restartRequired: true,
     fields: [
+      {
+        key: "SLACK_MODE",
+        label: "Transport",
+        type: "select",
+        default: "socket",
+        options: [
+          { value: "socket", label: "Socket Mode" },
+          { value: "http", label: "HTTP (not available yet)" },
+        ],
+        helpText: "HTTP configuration is preparatory; its receiver is not installed yet.",
+      },
       {
         key: "SLACK_BOT_TOKEN",
         label: "Bot token",
@@ -168,9 +186,8 @@ export const INTEGRATIONS: IntegrationDef[] = [
       },
       {
         key: "SLACK_APP_TOKEN",
-        label: "App-level token",
+        label: "App-level token (required for Socket Mode)",
         type: "password",
-        required: true,
         isSecret: true,
         placeholder: "xapp-...",
         helpText: "App-level token with `connections:write` scope, used for Socket Mode.",
@@ -181,6 +198,7 @@ export const INTEGRATIONS: IntegrationDef[] = [
         label: "Signing secret",
         type: "password",
         isSecret: true,
+        writeOnly: true,
         helpText:
           "Only required for HTTP events. Socket Mode (the default) doesn't use it. Found under Basic Information → App Credentials.",
         affectsRestart: true,
@@ -299,7 +317,7 @@ export const INTEGRATIONS: IntegrationDef[] = [
       "React to issues/PRs, run CI, open PRs from agents. Defaults to PAT mode; App mode available under Advanced.",
     category: "issues",
     iconKey: "github",
-    docsUrl: "https://docs.agent-swarm.dev/docs/guides/github-integration",
+    docsUrl: "https://docs.agent-swarm.dev/docs/integrations/github",
     disableKey: "GITHUB_DISABLE",
     restartRequired: true,
     fields: [
@@ -392,7 +410,7 @@ export const INTEGRATIONS: IntegrationDef[] = [
       "React to GitLab issues/MRs and push commits from agents. Supports self-hosted instances.",
     category: "issues",
     iconKey: "git-merge",
-    docsUrl: "https://docs.agent-swarm.dev/docs/guides/gitlab-integration",
+    docsUrl: "https://docs.agent-swarm.dev/docs/integrations/gitlab",
     disableKey: "GITLAB_DISABLE",
     restartRequired: true,
     fields: [
@@ -499,7 +517,7 @@ export const INTEGRATIONS: IntegrationDef[] = [
       "Sync Jira Cloud issues to tasks via OAuth 3LO. Inbound on assignee→bot or @-mention; outbound lifecycle comments back to the issue.",
     category: "issues",
     iconKey: "square-check-big",
-    docsUrl: "https://docs.agent-swarm.dev/docs/guides/jira-integration",
+    docsUrl: "https://docs.agent-swarm.dev/docs/integrations/jira",
     disableKey: "JIRA_DISABLE",
     restartRequired: true,
     specialFlow: "jira-oauth",
@@ -589,7 +607,7 @@ export const INTEGRATIONS: IntegrationDef[] = [
     description: "Give agents access to Sentry issues and project info via the Sentry CLI.",
     category: "observability",
     iconKey: "activity",
-    docsUrl: "https://docs.agent-swarm.dev/docs/guides/sentry-integration",
+    docsUrl: "https://docs.agent-swarm.dev/docs/integrations/sentry",
     fields: [
       {
         key: "SENTRY_AUTH_TOKEN",
@@ -618,7 +636,7 @@ export const INTEGRATIONS: IntegrationDef[] = [
     description: "Receive email and reply from agents. Useful for customer-support-like flows.",
     category: "email",
     iconKey: "mail",
-    docsUrl: "https://docs.agent-swarm.dev/docs/guides/agentmail-integration",
+    docsUrl: "https://docs.agent-swarm.dev/docs/integrations/agentmail",
     disableKey: "AGENTMAIL_DISABLE",
     restartRequired: true,
     recommendedSkills: [
@@ -718,6 +736,40 @@ export const INTEGRATIONS: IntegrationDef[] = [
     ],
   },
 
+  // --------------------------------------------------------------- Serply
+  {
+    id: "serply",
+    name: "Serply",
+    description:
+      "Google search, news and scholar results for agent research, over the Serply REST API.",
+    category: "other",
+    iconKey: "search",
+    docsUrl: "https://serply.io/docs",
+    recommendedSkills: [
+      {
+        name: "serply-search",
+        source: "template",
+        templateRepo: "desplega-ai/agent-swarm",
+        templatePath: "templates/skills/serply-search",
+        roles: ["lead", "worker"],
+        reason:
+          "Endpoints, response field names, and the Cloudflare User-Agent requirement. The key on its own does not tell an agent that scholar rows live under `articles` while `results` comes back empty.",
+        installOnSetup: true,
+      },
+    ],
+    fields: [
+      {
+        key: "SERPLY_API_KEY",
+        label: "API key",
+        type: "password",
+        required: true,
+        isSecret: true,
+        helpText:
+          "Serply API key, read by the serply-search skill and sent as the `X-Api-Key` header. Get one at https://serply.io",
+      },
+    ],
+  },
+
   // -------------------------------------------------------------- Anthropic
   {
     id: "anthropic",
@@ -796,6 +848,43 @@ export const INTEGRATIONS: IntegrationDef[] = [
         placeholder: "sk-...",
         helpText: "OpenAI API key. Used by the codex provider when no ChatGPT OAuth is stored.",
         affectsRestart: true,
+      },
+    ],
+  },
+
+  // ------------------------------------------------------ Memory (embeddings)
+  {
+    id: "memory",
+    name: "Memory (embeddings)",
+    description:
+      "Embed agent memories for semantic recall through any OpenAI-compatible embeddings endpoint.",
+    category: "llm",
+    iconKey: "brain",
+    docsUrl: "https://docs.agent-swarm.dev/docs/architecture/memory",
+    specialFlow: "memory-embeddings",
+    fields: [
+      {
+        key: "EMBEDDING_API_KEY",
+        label: "API key",
+        type: "password",
+        required: true,
+        isSecret: true,
+        helpText: "Key for the embeddings endpoint. Falls back to OPENAI_API_KEY when unset.",
+      },
+      {
+        key: "EMBEDDING_API_BASE_URL",
+        label: "Base URL",
+        type: "text",
+        placeholder: "https://api.openai.com/v1",
+        helpText:
+          "OpenAI-compatible base URL. Azure / Microsoft Foundry: https://<resource>.services.ai.azure.com/openai/v1.",
+      },
+      {
+        key: "EMBEDDING_MODEL",
+        label: "Model",
+        type: "text",
+        placeholder: "text-embedding-3-small",
+        helpText: "Embedding model id. On Azure, the embedding deployment name.",
       },
     ],
   },
@@ -1082,6 +1171,82 @@ export const INTEGRATIONS: IntegrationDef[] = [
         type: "text",
         placeholder: "claude-sonnet-5",
         helpText: "Optional override. Defaults to claude-sonnet-5.",
+      },
+    ],
+  },
+
+  // ----------------------------------------------- Google Search Console
+  {
+    id: "gsc",
+    name: "Google Search Console",
+    description: "Let reporting automations query Search Console performance data.",
+    category: "observability",
+    iconKey: "chart-line",
+    docsUrl:
+      "https://docs.agent-swarm.dev/docs/reference/environment-variables#google-search-console",
+    fields: [
+      {
+        key: "GSC_SERVICE_ACCOUNT_BASE64",
+        label: "Service account JSON (base64)",
+        type: "textarea",
+        required: true,
+        isSecret: true,
+        placeholder: "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50IiwgLi4ufQ==",
+        helpText:
+          "Base64-encoded Google service-account JSON with access to the Search Console property.",
+      },
+      {
+        key: "GSC_SERVICE_ACCOUNT_JSON",
+        label: "Service account JSON (plain)",
+        type: "textarea",
+        isSecret: true,
+        advanced: true,
+        placeholder: '{"type":"service_account", ...}',
+        helpText:
+          "Optional alternative to the base64 field. Use one service-account format, not both.",
+      },
+    ],
+  },
+
+  // -------------------------------------------------------------- AgentFS
+  {
+    id: "agentfs",
+    name: "AgentFS",
+    description: "Use shared persistent storage for agent work and task attachments.",
+    category: "other",
+    iconKey: "cloud",
+    docsUrl: "https://docs.agent-swarm.dev/docs/guides/agent-fs-co-deployment",
+    fields: [
+      {
+        key: "AGENT_FS_API_URL",
+        label: "API URL",
+        type: "text",
+        required: true,
+        placeholder: "http://agent-fs:7433",
+        helpText: "AgentFS API endpoint reachable from the Agent Swarm API server.",
+      },
+      {
+        key: "API_AGENT_FS_API_KEY",
+        label: "Service API key",
+        type: "password",
+        required: true,
+        isSecret: true,
+        writeOnly: true,
+        helpText: "API-owned bootstrap key used to provision the shared organization and agents.",
+      },
+      {
+        key: "AGENT_FS_DEFAULT_ORG_ID",
+        label: "Default organization ID",
+        type: "text",
+        required: true,
+        helpText: "Organization used for shared swarm files and attachment pointers.",
+      },
+      {
+        key: "AGENT_FS_DEFAULT_DRIVE_ID",
+        label: "Default drive ID",
+        type: "text",
+        required: true,
+        helpText: "Shared drive used when an attachment does not provide a drive explicitly.",
       },
     ],
   },

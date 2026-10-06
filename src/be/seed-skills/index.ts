@@ -8,6 +8,12 @@
  */
 
 import { join } from "node:path";
+import agentBrowserConfig from "../../../templates/skills/agent-browser/config.json" with {
+  type: "text",
+};
+import agentBrowserContent from "../../../templates/skills/agent-browser/content.md" with {
+  type: "text",
+};
 import appsConfig from "../../../templates/skills/apps/config.json" with { type: "text" };
 import appsContent from "../../../templates/skills/apps/content.md" with { type: "text" };
 import artifactsConfig from "../../../templates/skills/artifacts/config.json" with { type: "text" };
@@ -44,6 +50,8 @@ import codeReviewingConfig from "../../../templates/skills/code-reviewing/config
 import codeReviewingContent from "../../../templates/skills/code-reviewing/content.md" with {
   type: "text",
 };
+import commsConfig from "../../../templates/skills/comms/config.json" with { type: "text" };
+import commsContent from "../../../templates/skills/comms/content.md" with { type: "text" };
 import composioConfig from "../../../templates/skills/composio/config.json" with { type: "text" };
 import composioContent from "../../../templates/skills/composio/content.md" with { type: "text" };
 import composioGmailConfig from "../../../templates/skills/composio-gmail/config.json" with {
@@ -148,6 +156,12 @@ import researchingConfig from "../../../templates/skills/researching/config.json
 import researchingContent from "../../../templates/skills/researching/content.md" with {
   type: "text",
 };
+import reviewOfferedTaskConfig from "../../../templates/skills/review-offered-task/config.json" with {
+  type: "text",
+};
+import reviewOfferedTaskContent from "../../../templates/skills/review-offered-task/content.md" with {
+  type: "text",
+};
 import reviewingConfig from "../../../templates/skills/reviewing/config.json" with { type: "text" };
 import reviewingContent from "../../../templates/skills/reviewing/content.md" with { type: "text" };
 import scheduledTaskResilienceConfig from "../../../templates/skills/scheduled-task-resilience/config.json" with {
@@ -184,6 +198,12 @@ import stepRunningConfig from "../../../templates/skills/step-running/config.jso
   type: "text",
 };
 import stepRunningContent from "../../../templates/skills/step-running/content.md" with {
+  type: "text",
+};
+import swarmExtensionsConfig from "../../../templates/skills/swarm-extensions/config.json" with {
+  type: "text",
+};
+import swarmExtensionsContent from "../../../templates/skills/swarm-extensions/content.md" with {
   type: "text",
 };
 import swarmScriptsConfig from "../../../templates/skills/swarm-scripts/config.json" with {
@@ -224,6 +244,12 @@ import vPlanningContent from "../../../templates/skills/v-planning/content.md" w
 };
 import verifyingConfig from "../../../templates/skills/verifying/config.json" with { type: "text" };
 import verifyingContent from "../../../templates/skills/verifying/content.md" with { type: "text" };
+import workOnTaskConfig from "../../../templates/skills/work-on-task/config.json" with {
+  type: "text",
+};
+import workOnTaskContent from "../../../templates/skills/work-on-task/content.md" with {
+  type: "text",
+};
 import workflowIterateConfig from "../../../templates/skills/workflow-iterate/config.json" with {
   type: "text",
 };
@@ -291,6 +317,7 @@ export type SeedSkill = {
 const BUILT_IN_SKILL_FILES = bundledFilesManifest as Record<string, SeedSkillFile[]>;
 
 const BUILT_IN_SKILL_SOURCES = [
+  { config: agentBrowserConfig, body: agentBrowserContent },
   { config: appsConfig, body: appsContent },
   { config: artifactsConfig, body: artifactsContent },
   { config: askUserConfig, body: askUserContent },
@@ -299,6 +326,7 @@ const BUILT_IN_SKILL_SOURCES = [
   { config: brainstormingConfig, body: brainstormingContent },
   { config: codeQualityConfig, body: codeQualityContent },
   { config: codeReviewingConfig, body: codeReviewingContent },
+  { config: commsConfig, body: commsContent },
   { config: composioConfig, body: composioContent },
   { config: composioGmailConfig, body: composioGmailContent },
   { config: composioGoogleCalendarConfig, body: composioGoogleCalendarContent },
@@ -321,9 +349,11 @@ const BUILT_IN_SKILL_SOURCES = [
   { config: qaConfig, body: qaContent },
   { config: questioningConfig, body: questioningContent },
   { config: researchingConfig, body: researchingContent },
+  { config: reviewOfferedTaskConfig, body: reviewOfferedTaskContent },
   { config: reviewingConfig, body: reviewingContent },
   { config: scheduledTaskResilienceConfig, body: scheduledTaskResilienceContent },
   { config: schedulingConfig, body: schedulingContent },
+  { config: swarmExtensionsConfig, body: swarmExtensionsContent },
   { config: scriptBuilderConfig, body: scriptBuilderContent },
   { config: scriptWorkflowsConfig, body: scriptWorkflowsContent },
   { config: slackInteractionConfig, body: slackInteractionContent },
@@ -335,6 +365,7 @@ const BUILT_IN_SKILL_SOURCES = [
   { config: vImplementingConfig, body: vImplementingContent },
   { config: vPlanningConfig, body: vPlanningContent },
   { config: verifyingConfig, body: verifyingContent },
+  { config: workOnTaskConfig, body: workOnTaskContent },
   { config: workflowIterateConfig, body: workflowIterateContent },
   { config: workflowStructuredOutputConfig, body: workflowStructuredOutputContent },
   { config: wtsExpertConfig, body: wtsExpertContent },

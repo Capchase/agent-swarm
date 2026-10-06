@@ -1,5 +1,5 @@
 import type { ChatUpdateArguments, WebClient } from "@slack/web-api";
-import { getAgentById, getTaskAttachments, markTaskSlackReplySent } from "../be/db";
+import { getAgentById, markTaskSlackReplySent } from "../be/db";
 import type { Agent, AgentTask } from "../types";
 import { getSlackApp } from "./app";
 import {
@@ -15,6 +15,8 @@ import {
   markdownToSlack,
   splitSlackSectionText,
 } from "./blocks";
+import { getSlackOutputAttachments } from "./task-attachments";
+import { slackTaskOutput } from "./task-output";
 
 // Re-export for backward compatibility
 export { markdownToSlack } from "./blocks";
@@ -56,7 +58,7 @@ export function shouldPostInlineCompletionOutput(task: AgentTask): boolean {
   if (!task.slackChannelId || !task.slackThreadTs) return false;
   if (task.slackReplySent) return false;
 
-  const output = task.output?.trim();
+  const output = slackTaskOutput(task)?.trim();
   return !!output && isTreeOutputTruncated(markdownToSlack(output));
 }
 
@@ -85,7 +87,7 @@ export async function sendInlineTaskOutput(task: AgentTask): Promise<boolean> {
   const chunks = formatInlineCompletionOutputChunks({
     agentName: agent.name,
     taskId: task.id,
-    output: task.output,
+    output: slackTaskOutput(task) ?? "",
   });
 
   try {
@@ -136,9 +138,11 @@ export async function sendTaskResponse(task: AgentTask): Promise<boolean> {
 
   try {
     if (task.status === "completed") {
-      const output = task.output || "Task completed.";
+      const output = slackTaskOutput(task) || "Task completed.";
       const slackOutput = markdownToSlack(output);
-      const attachmentsBlock = formatAttachmentsBlockForSlack(await getTaskAttachments(task.id));
+      const attachmentsBlock = formatAttachmentsBlockForSlack(
+        await getSlackOutputAttachments(task.id),
+      );
       const body = slackOutput + attachmentsBlock;
       const duration =
         task.finishedAt && task.createdAt
@@ -179,6 +183,16 @@ export async function sendTaskResponse(task: AgentTask): Promise<boolean> {
         channel: task.slackChannelId,
         thread_ts: task.slackThreadTs,
         text: `Task failed: ${reason}`,
+        username: getAgentDisplayName(agent),
+        icon_emoji: getAgentEmoji(agent),
+        blocks,
+      });
+    } else if (task.status === "cancelled") {
+      const blocks = buildCancelledBlocks({ agentName, taskId: task.id });
+      await sendWithPersona(client, {
+        channel: task.slackChannelId,
+        thread_ts: task.slackThreadTs,
+        text: "Task cancelled",
         username: getAgentDisplayName(agent),
         icon_emoji: getAgentEmoji(agent),
         blocks,
@@ -271,12 +285,15 @@ export async function updateProgressInPlace(
  * Update the task message to its final state (completed/failed) via chat.update.
  * Uses full blocks (not compact) since this is the only message for the task.
  */
-export async function updateToFinal(task: AgentTask, messageTs: string): Promise<boolean> {
+export async function updateToFinal(
+  task: AgentTask,
+  messageTs: string,
+): Promise<SlackUpdateResult> {
   const app = getSlackApp();
-  if (!app || !task.slackChannelId || !task.agentId) return false;
+  if (!app || !task.slackChannelId || !task.agentId) return "failed";
 
   const agent = await getAgentById(task.agentId);
-  if (!agent) return false;
+  if (!agent) return "failed";
 
   const agentName = agent.name;
   let blocks: unknown[];
@@ -284,9 +301,11 @@ export async function updateToFinal(task: AgentTask, messageTs: string): Promise
   let completionBlockBatches: unknown[][] | undefined;
 
   if (task.status === "completed") {
-    const output = task.output || "Task completed.";
+    const output = slackTaskOutput(task) || "Task completed.";
     const slackOutput = markdownToSlack(output);
-    const attachmentsBlock = formatAttachmentsBlockForSlack(await getTaskAttachments(task.id));
+    const attachmentsBlock = formatAttachmentsBlockForSlack(
+      await getSlackOutputAttachments(task.id),
+    );
     const body = slackOutput + attachmentsBlock;
     const duration =
       task.finishedAt && task.createdAt
@@ -339,10 +358,17 @@ export async function updateToFinal(task: AgentTask, messageTs: string): Promise
         });
       }
     }
-    return true;
+    return "ok";
   } catch (error) {
-    console.error(`[Slack] Failed to update task message to final state:`, error);
-    return false;
+    const result = classifySlackUpdateError(error);
+    if (result === "not_found") {
+      console.warn(
+        `[Slack] Final task message missing for task ${task.id} ts=${messageTs}; will repost`,
+      );
+    } else {
+      console.error(`[Slack] Failed to update task message to final state:`, error);
+    }
+    return result;
   }
 }
 

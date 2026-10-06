@@ -118,18 +118,18 @@ describe("resolveHarnessProvider", () => {
   });
 
   test("prefers 'pi' when unset and only an OpenRouter key is present (fallbackEnv)", () => {
-    expect(resolveHarnessProvider({}, { OPENROUTER_API_KEY: "sk-or-v1-xxx" })).toBe("pi");
+    expect(resolveHarnessProvider({}, { OPENROUTER_API_KEY: "example-sk-or-v1-xxx" })).toBe("pi");
   });
 
   test("prefers 'pi' when unset and only an OpenRouter key is present (resolvedEnv)", () => {
-    expect(resolveHarnessProvider({ OPENROUTER_API_KEY: "sk-or-v1-xxx" }, {})).toBe("pi");
+    expect(resolveHarnessProvider({ OPENROUTER_API_KEY: "example-sk-or-v1-xxx" }, {})).toBe("pi");
   });
 
   test("prefers 'pi' when invalid and only an OpenRouter key is present", () => {
     expect(
       resolveHarnessProvider(
         { HARNESS_PROVIDER: "not-a-provider" },
-        { OPENROUTER_API_KEY: "sk-or-v1-xxx" },
+        { OPENROUTER_API_KEY: "example-sk-or-v1-xxx" },
       ),
     ).toBe("pi");
   });
@@ -138,7 +138,7 @@ describe("resolveHarnessProvider", () => {
     expect(
       resolveHarnessProvider(
         {},
-        { OPENROUTER_API_KEY: "sk-or-v1-xxx", ANTHROPIC_API_KEY: "sk-ant-xxx" },
+        { OPENROUTER_API_KEY: "example-sk-or-v1-xxx", ANTHROPIC_API_KEY: "example-sk-ant-xxx" },
       ),
     ).toBe("claude");
   });
@@ -147,7 +147,10 @@ describe("resolveHarnessProvider", () => {
     expect(
       resolveHarnessProvider(
         {},
-        { OPENROUTER_API_KEY: "sk-or-v1-xxx", CLAUDE_CODE_OAUTH_TOKEN: "token-xxx" },
+        {
+          OPENROUTER_API_KEY: "example-sk-or-v1-xxx",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-token-xxx",
+        },
       ),
     ).toBe("claude");
   });
@@ -181,6 +184,13 @@ describe("validateConfigValue", () => {
   test("rejects non-string values for HARNESS_PROVIDER", () => {
     expect(validateConfigValue("HARNESS_PROVIDER", 42)).not.toBeNull();
     expect(validateConfigValue("HARNESS_PROVIDER", null)).not.toBeNull();
+  });
+
+  test("accepts only supported CLAUDE_TRANSPORT values", () => {
+    expect(validateConfigValue("CLAUDE_TRANSPORT", "cli")).toBeNull();
+    expect(validateConfigValue("claude_transport", "sdk")).toBeNull();
+    expect(validateConfigValue("CLAUDE_TRANSPORT", "SDK")).toMatch(/CLAUDE_TRANSPORT/);
+    expect(validateConfigValue("CLAUDE_TRANSPORT", "bridge")).toMatch(/CLAUDE_TRANSPORT/);
   });
 
   test("accepts a valid CODEX_CREDITS_EXHAUSTED_COOLDOWN_MS", () => {

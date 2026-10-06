@@ -28,6 +28,7 @@
 
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { Message, Part } from "@opencode-ai/sdk";
+import { getMemoryRaterNames } from "./memory-raters";
 import { type ResolvedCredential, resolveOpencodeAuth } from "./opencode-auth";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -68,6 +69,8 @@ export interface RatingEvent {
   source: string;
   reasoning?: string;
   referencesSource?: string;
+  /** Model that produced the rating; mirrors `RatingEvent.model` in `src/be/memory/raters/types.ts`. */
+  model?: string;
 }
 
 // Mirrored from src/be/memory/raters/llm.ts.
@@ -399,6 +402,7 @@ function sanitizeReferencesSource(s: string): string | null {
 export function buildRatingsFromLlm(
   ratings: LlmRating[],
   retrievals: { id: string }[],
+  model?: string,
 ): RatingEvent[] {
   const allowed = new Set(retrievals.map((r) => r.id));
   const events: RatingEvent[] = [];
@@ -419,6 +423,7 @@ export function buildRatingsFromLlm(
     if (cleanedReferencesSource !== undefined) {
       ev.referencesSource = cleanedReferencesSource;
     }
+    if (model) ev.model = model;
     events.push(ev);
   }
   return events;
@@ -481,6 +486,7 @@ export async function postRatings(opts: {
     source: e.source,
     ...(e.reasoning !== undefined ? { reasoning: e.reasoning } : {}),
     ...(e.referencesSource !== undefined ? { referencesSource: e.referencesSource } : {}),
+    ...(e.model !== undefined ? { model: e.model } : {}),
     ...(opts.taskId ? { taskId: opts.taskId } : {}),
   }));
   try {
@@ -576,11 +582,7 @@ export async function summarizeSessionForOpencode(
 
     const taskDetails = await _fetchTaskDetails(config).catch(() => null);
 
-    const memoryRaters = (process.env.MEMORY_RATERS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const wantRatings = memoryRaters.includes("llm");
+    const wantRatings = getMemoryRaterNames().includes("llm");
     const retrievals = wantRatings
       ? await _fetchRetrievals({
           apiUrl: config.apiUrl,
@@ -641,7 +643,7 @@ export async function summarizeSessionForOpencode(
     }
 
     if (wantRatings && result.ratings && result.ratings.length > 0) {
-      const ratingEvents = _buildRatings(result.ratings, retrievals);
+      const ratingEvents = _buildRatings(result.ratings, retrievals, cred.modelDefault);
       if (ratingEvents.length > 0) {
         await _postRatings({
           apiUrl: config.apiUrl,

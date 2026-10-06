@@ -1,13 +1,22 @@
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { format } from "node:util";
 import {
+  type BatchObservableResult,
   type Counter,
   context,
+  type Gauge,
+  type Histogram,
+  type Meter,
   metrics,
   propagation,
   ROOT_CONTEXT,
   type Span,
+  SpanKind,
   SpanStatusCode,
+  type Tracer,
   trace,
 } from "@opentelemetry/api";
+import { logs, SeverityNumber } from "@opentelemetry/api-logs";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import {
@@ -20,7 +29,7 @@ import { PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import pkg from "../package.json";
-import type { SwarmSpan } from "./otel";
+import type { DbRetentionSweepMetric, SpanOptions, SwarmSpan, SwarmSpanKind } from "./otel";
 import { scrubSecrets } from "./utils/secret-scrubber";
 
 type AttributeValue = string | number | boolean | string[] | number[] | boolean[];
@@ -34,6 +43,15 @@ let sdk: NodeSDK | undefined;
 let costCounter: Counter | undefined;
 let tokenCounter: Counter | undefined;
 let costDriftCounter: Counter | undefined;
+let retentionSweepCounter: Counter | undefined;
+let retentionRowsDeletedCounter: Counter | undefined;
+let retentionBacklogGauge: Gauge | undefined;
+let retentionBatchesCounter: Counter | undefined;
+let retentionTableDurationHistogram: Histogram | undefined;
+let retentionSlowestStatementGauge: Gauge | undefined;
+let retentionStatementDurationHistogram: Histogram | undefined;
+let retentionBatchSizeGauge: Gauge | undefined;
+let slackReactionInvalidNameCounter: Counter | undefined;
 
 function decodeResourceAttributeValue(value: string): string {
   try {
@@ -136,7 +154,12 @@ export function resolveServiceName(serviceRole: string): string {
   return serviceRole === "api" ? `${baseServiceName}-api` : baseServiceName;
 }
 
-export async function boot(serviceRole: string): Promise<void> {
+export interface BootOptions {
+  /** Mirror console output into OTel log records (API role only). */
+  exportConsoleLogs?: boolean;
+}
+
+export async function boot(serviceRole: string, options: BootOptions = {}): Promise<void> {
   if (sdk) return;
 
   const configuredResourceAttributes = parseResourceAttributes();
@@ -178,6 +201,14 @@ export async function boot(serviceRole: string): Promise<void> {
 
   sdk.start();
 
+  if (serviceRole === "api") {
+    startEventLoopDelayMetrics(metrics.getMeter(METER_NAME));
+    // NodeSDK already registers a global LoggerProvider exporting over OTLP
+    // to the same endpoint and resource as traces (OTEL_LOGS_EXPORTER
+    // defaults to otlp); nothing feeds it until the bridge is installed.
+    if (options.exportConsoleLogs) installConsoleLogBridge();
+  }
+
   const shutdown = async () => {
     try {
       await sdk?.shutdown();
@@ -191,8 +222,140 @@ export async function boot(serviceRole: string): Promise<void> {
 }
 
 export async function shutdown(): Promise<void> {
+  // SDK first: its final flush still reads the event-loop gauges and drains
+  // bridged log records.
   await sdk?.shutdown();
   sdk = undefined;
+  stopEventLoopDelayMetrics();
+  uninstallConsoleLogBridge();
+}
+
+let stopEventLoopDelay: (() => void) | undefined;
+
+/**
+ * Event-loop delay from `perf_hooks.monitorEventLoopDelay`, exported as the
+ * semconv `nodejs.eventloop.delay.*` gauges (seconds). Each collection reads
+ * the histogram and resets it, so `max` is the worst stall since the last
+ * export. Server spans only start once the loop frees, so a stall never shows
+ * in span durations: a request queued behind a 3s synchronous query still
+ * reports a 14ms span. This metric is what sees the stall.
+ */
+export function startEventLoopDelayMetrics(meter: Meter): void {
+  if (stopEventLoopDelay) return;
+  const histogram = monitorEventLoopDelay({ resolution: 10 });
+  histogram.enable();
+  const gauges = {
+    min: meter.createObservableGauge("nodejs.eventloop.delay.min", {
+      description: "Minimum event loop delay since the last export",
+      unit: "s",
+    }),
+    max: meter.createObservableGauge("nodejs.eventloop.delay.max", {
+      description: "Maximum event loop delay since the last export: the longest stall",
+      unit: "s",
+    }),
+    mean: meter.createObservableGauge("nodejs.eventloop.delay.mean", {
+      description: "Mean event loop delay since the last export",
+      unit: "s",
+    }),
+    p50: meter.createObservableGauge("nodejs.eventloop.delay.p50", {
+      description: "50th percentile event loop delay since the last export",
+      unit: "s",
+    }),
+    p90: meter.createObservableGauge("nodejs.eventloop.delay.p90", {
+      description: "90th percentile event loop delay since the last export",
+      unit: "s",
+    }),
+    p99: meter.createObservableGauge("nodejs.eventloop.delay.p99", {
+      description: "99th percentile event loop delay since the last export",
+      unit: "s",
+    }),
+  };
+  const seconds = (ns: number) => ns / 1e9;
+  const collect = (observer: BatchObservableResult) => {
+    // No sample yet (first interval shorter than the resolution): the
+    // histogram's min is a sentinel then, so report nothing.
+    if (histogram.count === 0) return;
+    observer.observe(gauges.min, seconds(histogram.min));
+    observer.observe(gauges.max, seconds(histogram.max));
+    observer.observe(gauges.mean, seconds(histogram.mean));
+    observer.observe(gauges.p50, seconds(histogram.percentile(50)));
+    observer.observe(gauges.p90, seconds(histogram.percentile(90)));
+    observer.observe(gauges.p99, seconds(histogram.percentile(99)));
+    histogram.reset();
+  };
+  const observables = Object.values(gauges);
+  meter.addBatchObservableCallback(collect, observables);
+  stopEventLoopDelay = () => {
+    meter.removeBatchObservableCallback(collect, observables);
+    histogram.disable();
+    stopEventLoopDelay = undefined;
+  };
+}
+
+export function stopEventLoopDelayMetrics(): void {
+  stopEventLoopDelay?.();
+}
+
+const CONSOLE_LOG_BODY_MAX_CHARS = 16_384;
+const CONSOLE_SEVERITY = {
+  debug: { number: SeverityNumber.DEBUG, text: "DEBUG" },
+  log: { number: SeverityNumber.INFO, text: "INFO" },
+  info: { number: SeverityNumber.INFO, text: "INFO" },
+  warn: { number: SeverityNumber.WARN, text: "WARN" },
+  error: { number: SeverityNumber.ERROR, text: "ERROR" },
+} as const;
+type ConsoleMethod = keyof typeof CONSOLE_SEVERITY;
+
+let restoreConsole: (() => void) | undefined;
+
+/**
+ * Mirror console output into OTel log records (opt-in: OTEL_EXPORT_API_LOGS).
+ * stdout/stderr stay the primary sink; each line is also emitted to the
+ * global LoggerProvider, scrubbed at this egress point and correlated with
+ * the active span.
+ */
+export function installConsoleLogBridge(): void {
+  if (restoreConsole) return;
+  const logger = logs.getLogger(METER_NAME);
+  const originals = new Map<ConsoleMethod, (...args: unknown[]) => void>();
+  let emitting = false;
+  for (const method of Object.keys(CONSOLE_SEVERITY) as ConsoleMethod[]) {
+    const original = console[method].bind(console);
+    originals.set(method, console[method]);
+    console[method] = (...args: unknown[]) => {
+      original(...args);
+      // An exporter or scrubber that logs must not recurse into itself.
+      if (emitting) return;
+      emitting = true;
+      try {
+        // Scrub before truncating so a cut can never split a secret into an
+        // unrecognizable fragment.
+        const text = scrubSecrets(format(...args));
+        const body =
+          text.length > CONSOLE_LOG_BODY_MAX_CHARS
+            ? `${text.slice(0, CONSOLE_LOG_BODY_MAX_CHARS)}…`
+            : text;
+        logger.emit({
+          severityNumber: CONSOLE_SEVERITY[method].number,
+          severityText: CONSOLE_SEVERITY[method].text,
+          body,
+          attributes: { "log.source": "console" },
+        });
+      } catch {
+        // Log export is best-effort; never break the caller's console call.
+      } finally {
+        emitting = false;
+      }
+    };
+  }
+  restoreConsole = () => {
+    for (const [method, original] of originals) console[method] = original;
+    restoreConsole = undefined;
+  };
+}
+
+export function uninstallConsoleLogBridge(): void {
+  restoreConsole?.();
 }
 
 export async function withSpan<T>(
@@ -219,9 +382,21 @@ export async function withSpan<T>(
   });
 }
 
-export function startSpan(name: string, attributes?: Attributes): SwarmSpan {
-  const span = trace.getTracer(TRACER_NAME).startSpan(name, {
+const SPAN_KIND_MAP: Record<SwarmSpanKind, SpanKind> = {
+  internal: SpanKind.INTERNAL,
+  server: SpanKind.SERVER,
+  client: SpanKind.CLIENT,
+  producer: SpanKind.PRODUCER,
+  consumer: SpanKind.CONSUMER,
+};
+
+let tracerOverrideForTests: Tracer | undefined;
+
+export function startSpan(name: string, attributes?: Attributes, options?: SpanOptions): SwarmSpan {
+  const tracer = tracerOverrideForTests ?? trace.getTracer(TRACER_NAME);
+  const span = tracer.startSpan(name, {
     attributes: cleanAttributes(attributes),
+    kind: options?.kind ? SPAN_KIND_MAP[options.kind] : undefined,
   });
   return spanAdapter(span);
 }
@@ -277,6 +452,51 @@ function ensureInstruments(): void {
     description: "Absolute USD drift between stored and harness-reported session costs",
     unit: "{usd}",
   });
+  retentionSweepCounter = meter.createCounter("agentswarm.db.retention.sweeps", {
+    description: "One point per table attempt per tick, tagged with the terminal outcome",
+    unit: "{sweep}",
+  });
+  retentionRowsDeletedCounter = meter.createCounter("agentswarm.db.retention.rows_deleted", {
+    description: "Rows deleted per table per tick (always 0 in dry run)",
+    unit: "{row}",
+  });
+  retentionBacklogGauge = meter.createGauge("agentswarm.db.retention.backlog", {
+    description: "Rows still older than the horizon at the end of a table's slice",
+    unit: "{row}",
+  });
+  retentionBatchesCounter = meter.createCounter("agentswarm.db.retention.batches", {
+    description: "DELETE statements issued per table per tick",
+    unit: "{batch}",
+  });
+  retentionTableDurationHistogram = meter.createHistogram(
+    "agentswarm.db.retention.table_duration_ms",
+    {
+      description: "Wall clock of one table's slice",
+      unit: "ms",
+    },
+  );
+  retentionSlowestStatementGauge = meter.createGauge(
+    "agentswarm.db.retention.slowest_statement_ms",
+    {
+      description: "Slowest single DELETE in a table's slice — the event-loop stall signal",
+      unit: "ms",
+    },
+  );
+  retentionStatementDurationHistogram = meter.createHistogram(
+    "agentswarm.db.retention.statement_duration_ms",
+    {
+      description: "Distribution of individual DELETE statement durations",
+      unit: "ms",
+    },
+  );
+  retentionBatchSizeGauge = meter.createGauge("agentswarm.db.retention.batch_size", {
+    description: "The adaptive batch size a table settled on for a tick",
+    unit: "{row}",
+  });
+  slackReactionInvalidNameCounter = meter.createCounter("agentswarm.slack.reaction.invalid_name", {
+    description: "Slack rejected a configured reaction shortcode with invalid_name",
+    unit: "{reaction}",
+  });
 }
 
 export function recordSessionCost(m: SessionCostMetric): void {
@@ -317,6 +537,39 @@ export function recordSessionCost(m: SessionCostMetric): void {
   }
 }
 
+export function recordDbRetentionSweep(m: DbRetentionSweepMetric): void {
+  ensureInstruments();
+  // Table names are code literals from the closed descriptor list in
+  // src/be/db-retention.ts, not operator input, so no scrubbing is needed.
+  const outcomeAttrs = { table: m.table, dry_run: m.dryRun, outcome: m.outcome };
+  const tableAttrs = { table: m.table, dry_run: m.dryRun };
+  retentionSweepCounter!.add(1, outcomeAttrs);
+  retentionRowsDeletedCounter!.add(m.rowsDeleted, tableAttrs);
+  retentionBacklogGauge!.record(m.backlogRemaining, tableAttrs);
+  retentionBatchesCounter!.add(m.batches, tableAttrs);
+  retentionTableDurationHistogram!.record(m.tableDurationMs, outcomeAttrs);
+  retentionSlowestStatementGauge!.record(m.slowestStatementMs, tableAttrs);
+  retentionBatchSizeGauge!.record(m.batchSize, tableAttrs);
+}
+
+export function recordDbRetentionStatement(
+  table: string,
+  dryRun: boolean,
+  durationMs: number,
+): void {
+  ensureInstruments();
+  retentionStatementDurationHistogram!.record(durationMs, { table, dry_run: dryRun });
+}
+
+export function recordSlackReactionInvalidName(event: string): void {
+  ensureInstruments();
+  // `event` is one of the 6 known SlackReactionEvent literals or "unknown" —
+  // bounded cardinality. The operator-configured shortcode that was rejected
+  // must never become a metric label (unbounded) or reach this attribute set;
+  // callers log it separately, through the secret scrubber.
+  slackReactionInvalidNameCounter!.add(1, { event, verdict: "invalid_name" });
+}
+
 export function _injectCountersForTests(
   cost: Counter | undefined,
   token: Counter | undefined,
@@ -325,4 +578,28 @@ export function _injectCountersForTests(
   costCounter = cost;
   tokenCounter = token;
   costDriftCounter = drift;
+}
+
+export function _injectRetentionInstrumentsForTests(instruments: {
+  sweeps?: Counter;
+  rowsDeleted?: Counter;
+  backlog?: Gauge;
+  batches?: Counter;
+  tableDuration?: Histogram;
+  slowestStatement?: Gauge;
+  statementDuration?: Histogram;
+  batchSize?: Gauge;
+}): void {
+  retentionSweepCounter = instruments.sweeps;
+  retentionRowsDeletedCounter = instruments.rowsDeleted;
+  retentionBacklogGauge = instruments.backlog;
+  retentionBatchesCounter = instruments.batches;
+  retentionTableDurationHistogram = instruments.tableDuration;
+  retentionSlowestStatementGauge = instruments.slowestStatement;
+  retentionStatementDurationHistogram = instruments.statementDuration;
+  retentionBatchSizeGauge = instruments.batchSize;
+}
+
+export function _injectTracerForTests(tracer: Tracer | undefined): void {
+  tracerOverrideForTests = tracer;
 }

@@ -2,14 +2,16 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
   closeDb,
+  createAgent,
   createWorkflow,
   createWorkflowRun,
   createWorkflowRunStep,
   getTaskById,
   initDb,
+  startTask,
 } from "../be/db";
 import type { ExecutorMeta } from "../types";
-import { AgentTaskExecutor } from "../workflows/executors/agent-task";
+import { AgentTaskConfigSchema, AgentTaskExecutor } from "../workflows/executors/agent-task";
 import type { ExecutorDependencies } from "../workflows/executors/base";
 
 const TEST_DB_PATH = "./test-workflow-agent-task.sqlite";
@@ -36,7 +38,6 @@ const mockDeps: ExecutorDependencies = {
 // IDs for workflow prerequisites (set in beforeAll)
 let workflowId: string;
 let runId: string;
-let stepId1: string;
 let stepId2: string;
 
 // ─── Setup / Teardown ────────────────────────────────────────
@@ -63,14 +64,6 @@ beforeAll(async () => {
   const run = await createWorkflowRun({ id: crypto.randomUUID(), workflowId: wf.id });
   runId = run.id;
 
-  const step1 = await createWorkflowRunStep({
-    id: crypto.randomUUID(),
-    runId: run.id,
-    nodeId: "test-node-1",
-    nodeType: "agent-task",
-  });
-  stepId1 = step1.id;
-
   const step2 = await createWorkflowRunStep({
     id: crypto.randomUUID(),
     runId: run.id,
@@ -94,6 +87,20 @@ afterAll(async () => {
 // ─── Tests ───────────────────────────────────────────────────
 
 describe("AgentTaskExecutor — workspace scoping", () => {
+  test("existing configured agent pins accept optional routing metadata", () => {
+    expect(AgentTaskConfigSchema.safeParse({ template: "work", agentId: "worker" }).success).toBe(
+      true,
+    );
+    expect(
+      AgentTaskConfigSchema.safeParse({
+        template: "work",
+        agentId: "worker",
+        routingReason: "human_pinned",
+        routingNote: "workflow author chose this worker",
+      }).success,
+    ).toBe(true);
+  });
+
   test("config schema accepts dir, vcsRepo, model, modelTier, parentTaskId", () => {
     const executor = new AgentTaskExecutor(mockDeps);
     const config = {
@@ -144,18 +151,34 @@ describe("AgentTaskExecutor — workspace scoping", () => {
     expect(parsed.success).toBe(false);
   });
 
-  test("execute() creates task with workspace fields forwarded", async () => {
+  test.each([
+    undefined,
+    "skill",
+  ] as const)("execute() forwards workspace fields and routing provenance for %s", async (routingReason) => {
     const executor = new AgentTaskExecutor(mockDeps);
+    const worker = await createAgent({
+      name: "Pinned workflow worker",
+      isLead: false,
+      status: "idle",
+    });
     const config = {
+      agentId: worker.id,
+      routingReason,
       template: "List files in workspace",
       dir: "/workspace/repos/agent-swarm",
       vcsRepo: "desplega-ai/agent-swarm",
       model: "sonnet",
     };
+    const step = await createWorkflowRunStep({
+      id: crypto.randomUUID(),
+      runId,
+      nodeId: `routing-${routingReason ?? "default"}`,
+      nodeType: "agent-task",
+    });
     const meta: ExecutorMeta = {
       runId,
-      stepId: stepId1,
-      nodeId: "test-node-1",
+      stepId: step.id,
+      nodeId: step.nodeId,
       workflowId,
       dryRun: false,
     };
@@ -173,6 +196,9 @@ describe("AgentTaskExecutor — workspace scoping", () => {
     expect(task!.model).toBeUndefined();
     expect(task!.modelTier).toBe("regular");
     expect(task!.source).toBe("workflow");
+    expect(task!.agentId).toBe(worker.id);
+    expect(task!.routingReason).toBe(routingReason ?? "human_pinned");
+    expect(task!.routingSource).toBe(routingReason ? "declared" : "engine_default");
   });
 
   test("execute() creates task without workspace fields (backward compat)", async () => {
@@ -197,5 +223,34 @@ describe("AgentTaskExecutor — workspace scoping", () => {
     expect(task!.dir).toBeUndefined();
     expect(task!.vcsRepo).toBeUndefined();
     expect(task!.model).toBeUndefined();
+  });
+
+  test("parallel tasks of one run get no sibling block and no sibling parent", async () => {
+    const executor = new AgentTaskExecutor(mockDeps);
+    const worker = await createAgent({ name: "Foreach worker", isLead: false, status: "idle" });
+    const run = await createWorkflowRun({ id: crypto.randomUUID(), workflowId });
+    const runChild = async (nodeId: string) => {
+      const step = await createWorkflowRunStep({
+        id: crypto.randomUUID(),
+        runId: run.id,
+        nodeId,
+        nodeType: "agent-task",
+      });
+      const result = await executor.run({
+        config: { agentId: worker.id, template: `Review ${nodeId}` },
+        context: {},
+        meta: { runId: run.id, stepId: step.id, nodeId, workflowId, dryRun: false },
+      });
+      return (await getTaskById((result as { correlationId: string }).correlationId))!;
+    };
+
+    const first = await runChild("item-0");
+    await startTask(first.id);
+    const second = await runChild("item-1");
+
+    expect(second.contextKey).toBe(first.contextKey);
+    expect(second.task).toBe("Review item-1");
+    expect(second.task).not.toContain(first.id);
+    expect(second.parentTaskId).toBeUndefined();
   });
 });

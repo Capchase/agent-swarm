@@ -1,27 +1,48 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import {
+  cancelApprovalRequestById,
+  cancelPendingApprovalRequestsForRun,
+  claimApprovalCancellationNotification,
   closeDb,
+  completeApprovalCancellationNotificationClaim,
   createAgent,
   createApprovalRequest,
   createTaskExtended,
   createUser,
+  createWorkflow,
+  createWorkflowRun,
+  createWorkflowRunStep,
   getAgentCurrentTask,
   getApprovalRequestById,
   getApprovalRequestByStepId,
   getDbClient,
   getExpiredPendingApprovals,
+  getTaskById,
+  getWorkflowRun,
+  getWorkflowRunStep,
   initDb,
   listApprovalRequests,
+  releaseApprovalCancellationNotificationClaim,
   resolveApprovalRequest,
   startTask,
   updateApprovalRequestNotifications,
+  updateWorkflowRun,
+  updateWorkflowRunStep,
 } from "../be/db";
-import { type ApprovalQuestion, missingRequiredResponseIds } from "../http/approval-requests";
+import {
+  type ApprovalQuestion,
+  getWorkflowApprovalUnavailableReason,
+  handleApprovalRequests,
+  missingRequiredResponseIds,
+} from "../http/approval-requests";
 import type { ExecutorMeta } from "../types";
+import { postApprovalCancellationUpdates } from "../workflows/approval-notifications";
+import { checkpointStepWaiting } from "../workflows/checkpoint";
 import type { ExecutorDependencies, ExecutorInput } from "../workflows/executors/base";
 import { HumanInTheLoopExecutor } from "../workflows/executors/human-in-the-loop";
+import { cancelWorkflowRunStep } from "../workflows/resume";
 import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-approval-requests.sqlite";
@@ -168,6 +189,22 @@ function createTestServer(): Server {
     const result = await handleRequest({ method: req.method || "GET", url: req.url || "/" }, body);
     res.writeHead(result.status);
     res.end(JSON.stringify(result.body));
+  });
+}
+
+function createProductionApprovalServer(): Server {
+  return createHttpServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const handled = await handleApprovalRequests(
+      req,
+      res,
+      url.pathname.split("/").filter(Boolean),
+      url.searchParams,
+    );
+    if (!handled) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    }
   });
 }
 
@@ -337,6 +374,26 @@ describe("Approval Requests", () => {
       expect(result!.resolvedAt).toBeTruthy();
     });
 
+    test("stores a resolutionReason when given", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+
+      const result = await resolveApprovalRequest(data.id, {
+        status: "timeout",
+        resolutionReason: "x",
+      });
+      expect(result!.status).toBe("timeout");
+      expect(result!.resolutionReason).toBe("x");
+    });
+
+    test("leaves resolutionReason NULL when absent", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+
+      const result = await resolveApprovalRequest(data.id, { status: "approved" });
+      expect(result!.resolutionReason).toBeNull();
+    });
+
     test("resolves a pending request to rejected", async () => {
       const data = makeApprovalData();
       await createApprovalRequest(data);
@@ -359,6 +416,317 @@ describe("Approval Requests", () => {
     test("returns null for nonexistent ID", async () => {
       const result = await resolveApprovalRequest(crypto.randomUUID(), { status: "approved" });
       expect(result).toBeNull();
+    });
+
+    test("does not resolve a workflow approval after its run and HITL step are cancelled", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-cancel-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      await updateWorkflowRun(runId, { status: "cancelled" });
+      await updateWorkflowRunStep(stepId, { status: "cancelled" });
+      const approval = await createApprovalRequest(
+        makeApprovalData({ workflowRunId: runId, workflowRunStepId: stepId }),
+      );
+
+      const result = await resolveApprovalRequest(
+        approval.id,
+        { status: "approved", responses: { q1: { approved: true } } },
+        { requireActionableWorkflow: true },
+      );
+
+      expect(result).toBeNull();
+      expect(await getWorkflowApprovalUnavailableReason(approval)).toBe(
+        "The workflow run is cancelled and this approval is no longer actionable",
+      );
+      expect((await getApprovalRequestById(approval.id))?.status).toBe("pending");
+    });
+
+    test("does not resolve an approval linked to a step from another run", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-mismatched-run-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const firstRunId = crypto.randomUUID();
+      const secondRunId = crypto.randomUUID();
+      const secondStepId = crypto.randomUUID();
+      await createWorkflowRun({ id: firstRunId, workflowId: workflow.id });
+      await createWorkflowRun({ id: secondRunId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: secondStepId,
+        runId: secondRunId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      await updateWorkflowRunStep(secondStepId, { status: "waiting" });
+      const approval = await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: firstRunId,
+          workflowRunStepId: secondStepId,
+        }),
+      );
+
+      expect(
+        await resolveApprovalRequest(
+          approval.id,
+          { status: "approved", responses: { q1: { approved: true } } },
+          { requireActionableWorkflow: true },
+        ),
+      ).toBeNull();
+      expect(await getWorkflowApprovalUnavailableReason(approval)).toBe(
+        "The human-in-the-loop step belongs to a different workflow run",
+      );
+    });
+  });
+
+  describe("DB: cancelPendingApprovalRequestsForRun", () => {
+    test("records cancellation and posts one line to the stored Slack thread", async () => {
+      const runId = crypto.randomUUID();
+      const approval = await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: runId,
+          workflowRunStepId: crypto.randomUUID(),
+          notificationChannels: [
+            { channel: "slack", target: "C123", messageTs: "1234567890.123456" },
+          ],
+        }),
+      );
+
+      const cancelled = await cancelPendingApprovalRequestsForRun(runId, "Superseded by v2");
+      expect(cancelled).toHaveLength(1);
+      expect(cancelled[0]?.status).toBe("cancelled");
+      expect(cancelled[0]?.resolutionReason).toBe("Superseded by v2");
+      expect(cancelled[0]?.resolvedAt).toBeTruthy();
+
+      const postMessage = mock(async () => ({}));
+      await postApprovalCancellationUpdates(cancelled, "Superseded by v2", {
+        chat: { postMessage },
+      });
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(postMessage.mock.calls[0]?.[0]).toEqual({
+        channel: "C123",
+        thread_ts: "1234567890.123456",
+        text: "This approval is no longer actionable: Superseded by v2",
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+      await postApprovalCancellationUpdates(cancelled, "Superseded by v2", {
+        chat: { postMessage },
+      });
+      expect(postMessage).toHaveBeenCalledTimes(1);
+
+      expect(await cancelPendingApprovalRequestsForRun(runId, "again")).toEqual([]);
+      expect((await getApprovalRequestById(approval.id))?.resolutionReason).toBe(
+        "Superseded by v2",
+      );
+    });
+
+    test("posts after a late Slack timestamp is stored", async () => {
+      const runId = crypto.randomUUID();
+      const approval = await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: runId,
+          workflowRunStepId: crypto.randomUUID(),
+          notificationChannels: [{ channel: "slack", target: "C123" }],
+        }),
+      );
+      const cancelled = await cancelPendingApprovalRequestsForRun(runId, "Superseded");
+      const postMessage = mock(async () => ({}));
+
+      await postApprovalCancellationUpdates(cancelled, "Superseded", {
+        chat: { postMessage },
+      });
+      expect(postMessage).not.toHaveBeenCalled();
+
+      await updateApprovalRequestNotifications(approval.id, [
+        { channel: "slack", target: "C123", messageTs: "123.456" },
+      ]);
+      const latest = await getApprovalRequestById(approval.id);
+      await postApprovalCancellationUpdates([latest!], "Superseded", {
+        chat: { postMessage },
+      });
+      expect(postMessage).toHaveBeenCalledTimes(1);
+    });
+
+    test("retries only the Slack thread whose delivery failed", async () => {
+      const runId = crypto.randomUUID();
+      const approval = await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: runId,
+          workflowRunStepId: crypto.randomUUID(),
+          notificationChannels: [
+            { channel: "slack", target: "C_OK", messageTs: "123.456" },
+            { channel: "slack", target: "C_RETRY", messageTs: "789.012" },
+          ],
+        }),
+      );
+      const cancelled = await cancelPendingApprovalRequestsForRun(runId, "Superseded");
+      let retryFailures = 0;
+      const postMessage = mock(async ({ channel }: { channel: string }) => {
+        if (channel === "C_RETRY" && retryFailures++ === 0) {
+          throw new Error("temporary Slack outage");
+        }
+        return {};
+      });
+
+      await postApprovalCancellationUpdates(cancelled, "Superseded", {
+        chat: { postMessage },
+      });
+      const latest = await getApprovalRequestById(approval.id);
+      await postApprovalCancellationUpdates([latest!], "Superseded", {
+        chat: { postMessage },
+      });
+      expect(postMessage.mock.calls.map(([input]) => input.channel)).toEqual([
+        "C_OK",
+        "C_RETRY",
+        "C_RETRY",
+      ]);
+    });
+
+    test("a stale lease owner cannot finalize or release a reclaimed notification", async () => {
+      const runId = crypto.randomUUID();
+      const approval = await createApprovalRequest(
+        makeApprovalData({ workflowRunId: runId, workflowRunStepId: crypto.randomUUID() }),
+      );
+      await cancelPendingApprovalRequestsForRun(runId, "Superseded");
+      const key = "C123:123.456";
+      const first = await claimApprovalCancellationNotification(approval.id, key);
+      expect(first).not.toBeNull();
+
+      const staleAt = new Date(Date.now() - 61_000).toISOString();
+      await getDbClient().run(
+        "UPDATE approval_requests SET cancellationNotificationClaims = ? WHERE id = ?",
+        [
+          JSON.stringify({
+            [key]: { claimedAt: staleAt, leaseToken: first!.leaseToken },
+          }),
+          approval.id,
+        ],
+      );
+      const second = await claimApprovalCancellationNotification(approval.id, key);
+      expect(second).not.toBeNull();
+      expect(second!.leaseToken).not.toBe(first!.leaseToken);
+
+      await releaseApprovalCancellationNotificationClaim(approval.id, key, first!.leaseToken);
+      expect(await claimApprovalCancellationNotification(approval.id, key)).toBeNull();
+      await completeApprovalCancellationNotificationClaim(approval.id, key, first!.leaseToken);
+      expect(await claimApprovalCancellationNotification(approval.id, key)).toBeNull();
+
+      await completeApprovalCancellationNotificationClaim(approval.id, key, second!.leaseToken);
+      expect(await claimApprovalCancellationNotification(approval.id, key)).toBeNull();
+    });
+
+    test("a late waiting checkpoint cannot revive a cancelled run and step", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-checkpoint-race-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      await updateWorkflowRun(runId, { status: "cancelled", error: "Superseded" });
+      await updateWorkflowRunStep(stepId, { status: "cancelled", error: "Superseded" });
+
+      expect(await checkpointStepWaiting(runId, stepId, {})).toBe(false);
+      const approval = await createApprovalRequest(
+        makeApprovalData({ workflowRunId: runId, workflowRunStepId: stepId }),
+      );
+      expect(await getWorkflowApprovalUnavailableReason(approval)).toContain(
+        "workflow run is cancelled",
+      );
+    });
+
+    test("direct HITL step cancellation terminalizes its pending approval", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-step-cancel-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      const approval = await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: runId,
+          workflowRunStepId: stepId,
+          notificationChannels: [{ channel: "slack", target: "C123", messageTs: "123.456" }],
+        }),
+      );
+
+      const postMessage = mock(async () => ({}));
+      await cancelWorkflowRunStep(stepId, "Step superseded", {
+        chat: { postMessage },
+      });
+
+      expect(await getApprovalRequestById(approval.id)).toMatchObject({
+        status: "cancelled",
+        resolutionReason: "Step superseded",
+      });
+      expect(postMessage).toHaveBeenCalledWith({
+        channel: "C123",
+        thread_ts: "123.456",
+        text: "This approval is no longer actionable: Step superseded",
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+    });
+
+    test("retrying a cancelled HITL step reuses its persisted reason", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-step-retry-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: runId,
+          workflowRunStepId: stepId,
+          notificationChannels: [{ channel: "slack", target: "C123", messageTs: "123.456" }],
+        }),
+      );
+
+      const failedPost = mock(async () => {
+        throw new Error("temporary Slack outage");
+      });
+      await cancelWorkflowRunStep(stepId, "Original reason", {
+        chat: { postMessage: failedPost },
+      });
+
+      const retryPost = mock(async () => ({}));
+      await cancelWorkflowRunStep(stepId, "Different retry reason", {
+        chat: { postMessage: retryPost },
+      });
+      expect(retryPost.mock.calls[0]?.[0].text).toBe(
+        "This approval is no longer actionable: Original reason",
+      );
     });
   });
 
@@ -393,6 +761,78 @@ describe("Approval Requests", () => {
     test("respects limit", async () => {
       const results = await listApprovalRequests({ limit: 1 });
       expect(results).toHaveLength(1);
+    });
+  });
+
+  describe("DB: cancelApprovalRequestById", () => {
+    test("cancels a pending request with reason and actor", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+
+      const result = await cancelApprovalRequestById(data.id, {
+        reason: "not needed",
+        resolvedBy: "user-1",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.status).toBe("cancelled");
+      expect(result!.resolutionReason).toBe("not needed");
+      expect(result!.resolvedBy).toBe("user-1");
+      expect(result!.resolvedAt).toBeTruthy();
+    });
+
+    test("leaves resolvedBy NULL when no actor is given", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+
+      const result = await cancelApprovalRequestById(data.id, {
+        reason: "sweep",
+        resolvedBy: null,
+      });
+      expect(result!.status).toBe("cancelled");
+      expect(result!.resolvedBy).toBeNull();
+    });
+
+    test("a second call returns null and changes nothing", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+      const first = await cancelApprovalRequestById(data.id, { reason: "first", resolvedBy: null });
+
+      const second = await cancelApprovalRequestById(data.id, {
+        reason: "second",
+        resolvedBy: "user-2",
+      });
+      expect(second).toBeNull();
+      const row = await getApprovalRequestById(data.id);
+      expect(row!.resolutionReason).toBe("first");
+      expect(row!.resolvedBy).toBeNull();
+      expect(row!.resolvedAt).toBe(first!.resolvedAt);
+    });
+
+    test("returns null for approved and timeout requests", async () => {
+      const approved = makeApprovalData();
+      await createApprovalRequest(approved);
+      await resolveApprovalRequest(approved.id, { status: "approved" });
+      const timedOut = makeApprovalData();
+      await createApprovalRequest(timedOut);
+      await resolveApprovalRequest(timedOut.id, { status: "timeout" });
+
+      expect(
+        await cancelApprovalRequestById(approved.id, { reason: "x", resolvedBy: null }),
+      ).toBeNull();
+      expect(
+        await cancelApprovalRequestById(timedOut.id, { reason: "x", resolvedBy: null }),
+      ).toBeNull();
+      expect((await getApprovalRequestById(approved.id))!.status).toBe("approved");
+      expect((await getApprovalRequestById(timedOut.id))!.status).toBe("timeout");
+    });
+
+    test("a cancelled row matches the Slack cancellation claim", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+      await cancelApprovalRequestById(data.id, { reason: "gone", resolvedBy: null });
+
+      const claim = await claimApprovalCancellationNotification(data.id, "slack:C1:1.0");
+      expect(claim).not.toBeNull();
     });
   });
 
@@ -517,6 +957,49 @@ describe("Approval Requests", () => {
   });
 
   describe("HTTP: POST /api/approval-requests/:id/respond", () => {
+    test("production route rejects a late response after workflow cancellation", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-http-cancel-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      const approval = await createApprovalRequest(
+        makeApprovalData({ workflowRunId: runId, workflowRunStepId: stepId }),
+      );
+      await updateWorkflowRun(runId, { status: "cancelled", error: "Superseded" });
+      await updateWorkflowRunStep(stepId, { status: "cancelled", error: "Superseded" });
+
+      const productionServer = createProductionApprovalServer();
+      const port = await listenOnFreePort(productionServer);
+      try {
+        const response = await fetch(
+          `http://127.0.0.1:${port}/api/approval-requests/${approval.id}/respond`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ responses: { q1: { approved: true } } }),
+          },
+        );
+        expect(response.status).toBe(409);
+        expect(await response.json()).toEqual({
+          error: "Approval request already resolved with status: cancelled: Superseded",
+        });
+        expect((await getApprovalRequestById(approval.id))?.status).toBe("cancelled");
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          productionServer.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    });
+
     test("approves a pending request", async () => {
       const created = await createApprovalRequest(makeApprovalData());
 
@@ -689,6 +1172,43 @@ describe("Approval Requests", () => {
       expect(created!.workflowRunStepId).toBe(stepId);
     });
 
+    test("creates a terminal approval when cancellation wins the creation race", async () => {
+      const workflow = await createWorkflow({
+        name: `approval-create-race-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      await updateWorkflowRun(runId, { status: "cancelled", error: "Superseded" });
+      await updateWorkflowRunStep(stepId, { status: "cancelled", error: "Superseded" });
+
+      const executor = new HumanInTheLoopExecutor({
+        ...mockDeps,
+        db: (await import("../be/db")) as typeof import("../be/db"),
+      });
+      const result = await executor.run({
+        config: {
+          title: "Stale approval",
+          questions: [{ id: "q1", type: "approval", label: "Approve?" }],
+          approvers: { policy: "any" },
+        },
+        context: {},
+        meta: { ...mockMeta, runId, stepId },
+      });
+
+      expect(result.status).toBe("success");
+      expect((result as { async?: boolean }).async).toBe(true);
+      expect((await getApprovalRequestByStepId(stepId))?.status).toBe("cancelled");
+      expect((await getApprovalRequestByStepId(stepId))?.resolutionReason).toBe("Superseded");
+    });
+
     test("stamps createdBy from meta.requestedByUserId (workflow-run provenance)", async () => {
       const requester = await createUser({
         name: "HITL Requester",
@@ -793,6 +1313,36 @@ describe("Approval Requests", () => {
       expect(result.output!.requestId).toBe(existingId);
       expect(result.output!.status).toBe("approved");
       expect(result.nextPort).toBe("approved");
+    });
+
+    test("idempotency: fails instead of routing a cancelled request as approved", async () => {
+      const stepId = crypto.randomUUID();
+      const existingId = crypto.randomUUID();
+      await createApprovalRequest({
+        id: existingId,
+        title: "Cancelled request",
+        questions: [{ id: "q1", type: "approval", label: "Approve?" }],
+        approvers: { policy: "any" },
+        workflowRunId: mockMeta.runId,
+        workflowRunStepId: stepId,
+      });
+      await cancelPendingApprovalRequestsForRun(mockMeta.runId, "Run superseded");
+
+      const executor = new HumanInTheLoopExecutor(mockDeps);
+      const result = await executor.run({
+        config: {
+          title: "Deploy approval",
+          questions: [{ id: "q1", type: "approval", label: "Approve?" }],
+          approvers: { policy: "any" },
+        },
+        context: {},
+        meta: { ...mockMeta, stepId },
+      });
+
+      expect(result).toEqual({
+        status: "failed",
+        error: "Approval request was cancelled: Run superseded",
+      });
     });
 
     test("idempotency: returns rejected result with correct nextPort", async () => {
@@ -1082,6 +1632,305 @@ describe("Approval Requests", () => {
       const fetched = await getApprovalRequestById(approval.id);
       expect(fetched).not.toBeNull();
       expect(fetched!.notificationChannels).toEqual(updatedChannels);
+    });
+  });
+
+  describe("HTTP (production handler): late answers and cancel", () => {
+    let prodServer: Server;
+    let prodUrl = "";
+    let lead: { id: string };
+    let owner: { id: string };
+    let worker: { id: string };
+
+    beforeAll(async () => {
+      prodServer = createProductionApprovalServer();
+      prodUrl = `http://127.0.0.1:${await listenOnFreePort(prodServer)}`;
+      lead = await createAgent({ name: "cancel-lead", isLead: true, status: "idle" });
+      owner = await createAgent({ name: "cancel-owner", isLead: false, status: "idle" });
+      worker = await createAgent({ name: "cancel-other", isLead: false, status: "idle" });
+    });
+
+    afterAll(async () => {
+      await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+    });
+
+    async function post(path: string, body: unknown, agentId?: string) {
+      const response = await fetch(`${prodUrl}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(agentId ? { "X-Agent-ID": agentId } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: (await response.json()) as Record<string, any> };
+    }
+
+    async function sourceTask(status = "in_progress") {
+      const task = await createTaskExtended(`approval source ${crypto.randomUUID()}`, {
+        agentId: owner.id,
+        source: "mcp",
+      });
+      await getDbClient().run("UPDATE agent_tasks SET status = ? WHERE id = ?", [status, task.id]);
+      return task.id;
+    }
+
+    async function followUps(parentTaskId: string) {
+      return getDbClient().query<{ task: string }>(
+        "SELECT task FROM agent_tasks WHERE taskType = 'hitl-follow-up' AND parentTaskId = ?",
+        [parentTaskId],
+      );
+    }
+
+    async function setTimes(id: string, times: { expiresAt?: string | null; createdAt?: string }) {
+      if (times.expiresAt !== undefined) {
+        await getDbClient().run("UPDATE approval_requests SET expiresAt = ? WHERE id = ?", [
+          times.expiresAt,
+          id,
+        ]);
+      }
+      if (times.createdAt) {
+        await getDbClient().run("UPDATE approval_requests SET createdAt = ? WHERE id = ?", [
+          times.createdAt,
+          id,
+        ]);
+      }
+    }
+
+    const approve = { responses: { q1: { approved: true } } };
+
+    test("a respond on a standalone request still creates the hitl.follow_up task", async () => {
+      const taskId = await sourceTask();
+      const data = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(data);
+
+      const res = await post(`/api/approval-requests/${data.id}/respond`, approve);
+
+      expect(res.status).toBe(200);
+      const tasks = await followUps(taskId);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.task).toContain("Human responded to your approval request");
+    });
+
+    test("a respond still creates the hitl.follow_up task after the source task completes", async () => {
+      const taskId = await sourceTask("completed");
+      const data = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(data);
+
+      const res = await post(`/api/approval-requests/${data.id}/respond`, approve);
+
+      expect(res.status).toBe(200);
+      expect(res.body.approvalRequest.status).toBe("approved");
+      const tasks = await followUps(taskId);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.task).toContain("Human responded to your approval request");
+    });
+
+    test("a late answer gets 409 and the request becomes timeout", async () => {
+      const taskId = await sourceTask();
+      const data = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(data);
+      await setTimes(data.id, { expiresAt: new Date(Date.now() - 60_000).toISOString() });
+
+      const res = await post(`/api/approval-requests/${data.id}/respond`, approve);
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("Approval request expired at");
+      const row = await getApprovalRequestById(data.id);
+      expect(row!.status).toBe("timeout");
+      expect(row!.responses).toBeNull();
+      expect(row!.resolutionReason).toStartWith("Timed out: the answer arrived after the deadline");
+      const tasks = await followUps(taskId);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.task).toContain("timed out with no answer");
+      expect(tasks[0]!.task).not.toContain("Human responded");
+
+      const again = await post(`/api/approval-requests/${data.id}/respond`, approve);
+      expect(again.status).toBe(409);
+      expect(again.body.error).toContain("already resolved with status: timeout");
+    });
+
+    test("an answer before expiresAt is accepted", async () => {
+      const data = makeApprovalData({ timeoutSeconds: 3600 });
+      await createApprovalRequest(data);
+      const res = await post(`/api/approval-requests/${data.id}/respond`, approve);
+      expect(res.status).toBe(200);
+      expect(res.body.approvalRequest.status).toBe("approved");
+    });
+
+    test("age alone never refuses an answer", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+      await setTimes(data.id, { createdAt: new Date(Date.now() - 100 * 86_400_000).toISOString() });
+      const res = await post(`/api/approval-requests/${data.id}/respond`, approve);
+      expect(res.status).toBe(200);
+    });
+
+    test("cancel sets cancelled with reason and caller, then is idempotent", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+
+      const first = await post(
+        `/api/approval-requests/${data.id}/cancel`,
+        { reason: "no longer needed" },
+        lead.id,
+      );
+      expect(first.status).toBe(200);
+      expect(first.body.approvalRequest.status).toBe("cancelled");
+      expect(first.body.approvalRequest.resolutionReason).toBe("no longer needed");
+      expect(first.body.approvalRequest.resolvedBy).toBe(lead.id);
+      expect(first.body.alreadyCancelled).toBe(false);
+      expect(first.body.runCancelled).toBe(false);
+
+      const second = await post(`/api/approval-requests/${data.id}/cancel`, {}, lead.id);
+      expect(second.status).toBe(200);
+      expect(second.body.alreadyCancelled).toBe(true);
+    });
+
+    test("cancel on a sweep-closed request reports alreadyCancelled", async () => {
+      const data = makeApprovalData();
+      await createApprovalRequest(data);
+      await cancelApprovalRequestById(data.id, {
+        reason: "Auto-cancelled by the approval sweep after 7 days with no response",
+        resolvedBy: null,
+      });
+
+      const res = await post(`/api/approval-requests/${data.id}/cancel`, {}, lead.id);
+      expect(res.status).toBe(200);
+      expect(res.body.alreadyCancelled).toBe(true);
+
+      const respond = await post(`/api/approval-requests/${data.id}/respond`, approve);
+      expect(respond.status).toBe(409);
+      expect(respond.body.error).toContain(
+        "Auto-cancelled by the approval sweep after 7 days with no response",
+      );
+    });
+
+    test("cancel on approved or timeout requests returns 409", async () => {
+      for (const status of ["approved", "timeout"] as const) {
+        const data = makeApprovalData();
+        await createApprovalRequest(data);
+        await resolveApprovalRequest(data.id, { status });
+        const res = await post(`/api/approval-requests/${data.id}/cancel`, {}, lead.id);
+        expect(res.status).toBe(409);
+      }
+    });
+
+    test("cancel on an unknown id returns 404", async () => {
+      const res = await post(`/api/approval-requests/${crypto.randomUUID()}/cancel`, {}, lead.id);
+      expect(res.status).toBe(404);
+    });
+
+    test("only a lead or the source task owner agent may cancel", async () => {
+      const taskId = await sourceTask();
+      const denied = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(denied);
+      expect((await post(`/api/approval-requests/${denied.id}/cancel`, {}, worker.id)).status).toBe(
+        403,
+      );
+      expect((await post(`/api/approval-requests/${denied.id}/cancel`, {}, owner.id)).status).toBe(
+        200,
+      );
+
+      const byLead = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(byLead);
+      expect((await post(`/api/approval-requests/${byLead.id}/cancel`, {}, lead.id)).status).toBe(
+        200,
+      );
+      expect(await followUps(taskId)).toHaveLength(0);
+    });
+
+    async function makeRun(status: "waiting" | "cancelled" | "completed") {
+      const workflow = await createWorkflow({
+        name: `approval-cancel-${crypto.randomUUID()}`,
+        definition: { nodes: [] },
+      });
+      const runId = crypto.randomUUID();
+      const stepId = crypto.randomUUID();
+      await createWorkflowRun({ id: runId, workflowId: workflow.id });
+      await createWorkflowRunStep({
+        id: stepId,
+        runId,
+        nodeId: "approval",
+        nodeType: "human-in-the-loop",
+      });
+      await updateWorkflowRunStep(stepId, { status: "waiting" });
+      const approval = await createApprovalRequest(
+        makeApprovalData({ workflowRunId: runId, workflowRunStepId: stepId }),
+      );
+      await updateWorkflowRun(runId, { status });
+      return { runId, stepId, approvalId: approval.id };
+    }
+
+    test("cancel on a waiting run cancels the run, its step, and its task", async () => {
+      const { runId, stepId, approvalId } = await makeRun("waiting");
+      const task = await createTaskExtended("step task", {
+        agentId: owner.id,
+        source: "mcp",
+        workflowRunId: runId,
+        workflowRunStepId: stepId,
+      });
+      await getDbClient().run("UPDATE agent_tasks SET status = 'in_progress' WHERE id = ?", [
+        task.id,
+      ]);
+
+      const res = await post(
+        `/api/approval-requests/${approvalId}/cancel`,
+        { reason: "stop the run" },
+        lead.id,
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.approvalRequest.status).toBe("cancelled");
+      expect(res.body.approvalRequest.resolvedBy).toBe(lead.id);
+      expect(res.body.runCancelled).toBe(true);
+      const run = await getWorkflowRun(runId);
+      expect(run!.status).toBe("cancelled");
+      expect(run!.error).toBe("stop the run");
+      expect((await getWorkflowRunStep(stepId))!.status).toBe("cancelled");
+      expect((await getTaskById(task.id))!.status).toBe("cancelled");
+    });
+
+    test("cancel on an expired pending request returns 409 and times it out", async () => {
+      const taskId = await sourceTask();
+      const data = makeApprovalData({ sourceTaskId: taskId });
+      await createApprovalRequest(data);
+      await setTimes(data.id, { expiresAt: new Date(Date.now() - 60_000).toISOString() });
+
+      const res = await post(`/api/approval-requests/${data.id}/cancel`, {}, lead.id);
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain("Approval request expired at");
+      const row = await getApprovalRequestById(data.id);
+      expect(row!.status).toBe("timeout");
+      expect(row!.resolutionReason).toStartWith(
+        "Timed out: the cancellation arrived after the deadline",
+      );
+      const tasks = await followUps(taskId);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.task).toContain("timed out with no answer");
+    });
+
+    test("cancel on an expired request of a waiting run leaves the run for its timeout branch", async () => {
+      const { runId, stepId, approvalId } = await makeRun("waiting");
+      await setTimes(approvalId, { expiresAt: new Date(Date.now() - 60_000).toISOString() });
+
+      const res = await post(`/api/approval-requests/${approvalId}/cancel`, {}, lead.id);
+
+      expect(res.status).toBe(409);
+      expect((await getApprovalRequestById(approvalId))!.status).toBe("timeout");
+      expect((await getWorkflowRun(runId))!.status).toBe("waiting");
+      expect((await getWorkflowRunStep(stepId))!.status).toBe("waiting");
+    });
+
+    test("cancel on a dead run leaves the run alone", async () => {
+      for (const status of ["cancelled", "completed"] as const) {
+        const { runId, approvalId } = await makeRun(status);
+        const res = await post(`/api/approval-requests/${approvalId}/cancel`, {}, lead.id);
+        expect(res.status).toBe(200);
+        expect(res.body.runCancelled).toBe(false);
+        expect((await getWorkflowRun(runId))!.status).toBe(status);
+      }
     });
   });
 });

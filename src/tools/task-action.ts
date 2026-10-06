@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
+import { isApiDraining } from "@/be/api-drain";
 import { AssetKeyAuthorizationError, authorizeAssetKeyWrite } from "@/be/asset-key-auth";
 import { resolveTaskAuditUserId } from "@/be/audit-user";
 import { canClaim } from "@/be/budget-admission";
@@ -27,7 +28,9 @@ import {
   releaseTask,
   updateTaskClaudeSessionId,
 } from "@/be/db";
+import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { touchRuntimeInstance } from "@/be/multi-runtime";
+import { applyPreTaskCreate } from "@/extensions/apply-task-create";
 import { assertOwnsTask, ownerCtx, type ToolCtx } from "@/tools/task-tool-ctx";
 import {
   createToolRegistrar,
@@ -39,6 +42,7 @@ import {
 import {
   AssetKeySchema,
   BudgetRefusalCauseSchema,
+  type CreateTaskOptions,
   ModelTierSchema,
   ReasoningEffortSchema,
   splitLegacyModelAlias,
@@ -91,19 +95,29 @@ export const taskActionInputSchema = z.object({
     .min(1)
     .optional()
     .describe(
-      "Concrete model override for the created task, interpreted by the claiming worker's harness/provider. This does not switch providers. Only used with 'create' action.",
+      "Concrete model override for the created task, interpreted by the claiming worker's harness/provider. This does not switch providers. Only used with 'create' action. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
     ),
   modelTier: ModelTierSchema.optional().describe(
     "Portable model tier for the created task: 'smol', 'regular', 'smart', or 'ultra'. Resolved when a worker claims/runs the task. Only used with 'create' action.",
   ),
+  allowCustomModel: z
+    .boolean()
+    .optional()
+    .describe(
+      "Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only used with 'create' action.",
+    ),
   effort: ReasoningEffortSchema.optional().describe(
     "Reasoning effort for the created task: 'off', 'low', 'medium', 'high', 'xhigh', or 'max'. Only used with 'create' action.",
   ),
   requiredCapabilities: z
     .array(z.string())
     .optional()
+    .describe("Capabilities required for pool routing."),
+  leadOnly: z
+    .boolean()
+    .default(false)
     .describe(
-      "Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset). Only used with 'create' action.",
+      "Structured authorization constraint: only Lead agents may claim this privileged task.",
     ),
 });
 
@@ -164,6 +178,14 @@ async function staleRuntimeResult(ctx: ToolCtx, agentId: string): Promise<TaskAc
   };
 }
 
+/** A draining API dispatches nothing (src/be/api-drain.ts); claim and accept wait for the next API. */
+function apiDrainingResult(action: "claim" | "accept"): TaskActionResult {
+  return {
+    success: false,
+    message: `The API is draining for a restart and dispatches no new work, so this ${action} was not made. Retry shortly.`,
+  };
+}
+
 function taskActionResult(result: TaskActionResult, agentId?: string): SwarmToolResult {
   const { refusalSideEffects: _omit, success, message, ...rest } = result;
   const data = {
@@ -193,6 +215,7 @@ export async function taskActionHandler(
     dir,
     model,
     requiredCapabilities,
+    leadOnly,
   } = input;
   const normalizedModel = splitLegacyModelAlias({ model, modelTier: input.modelTier });
 
@@ -260,7 +283,19 @@ export async function taskActionHandler(
 
   const agentId = ctx.agentId;
   let assetKey: string | undefined;
+  let preparedCreate: { description: string; options: CreateTaskOptions } | undefined;
   if (action === "create") {
+    if (!task) {
+      return taskActionResult(
+        { success: false, message: "Task description is required for 'create' action." },
+        agentId,
+      );
+    }
+    const modelError = await explicitModelErrorForAgent({
+      model: normalizedModel.model,
+      allowCustomModel: input.allowCustomModel,
+    });
+    if (modelError) return taskActionResult({ success: false, message: modelError }, agentId);
     try {
       assetKey = key
         ? await authorizeAssetKeyWrite(key, await resolveTaskAuditUserId(ctx.sourceTaskId, agentId))
@@ -274,32 +309,46 @@ export async function taskActionHandler(
             : String(error);
       return taskActionResult({ success: false, message }, agentId);
     }
+
+    const preCreate = await applyPreTaskCreate({
+      description: task,
+      options: {
+        key: assetKey,
+        creatorAgentId: agentId,
+        source: "mcp",
+        taskType,
+        tags,
+        priority,
+        dependsOn,
+        dir,
+        model: normalizedModel.model,
+        modelTier: normalizedModel.modelTier,
+        effort: input.effort,
+        routingAffinity:
+          leadOnly || requiredCapabilities?.length
+            ? { leadOnly, capabilities: requiredCapabilities ?? [] }
+            : undefined,
+      },
+      origin: "mcp",
+      requestInfo: ctx.requestInfo,
+      allowCustomModel: input.allowCustomModel,
+    });
+    if (preCreate.kind === "blocked") {
+      return taskActionResult({ success: false, message: preCreate.reason }, agentId);
+    }
+    preparedCreate = {
+      description: preCreate.description,
+      options: preCreate.options,
+    };
   }
 
   const result = await getDbClient().transaction(async (): Promise<TaskActionResult> => {
     switch (action) {
       case "create": {
-        if (!task) {
-          return {
-            success: false,
-            message: "Task description is required for 'create' action.",
-          };
-        }
-        const newTask = await createTaskExtended(task, {
-          key: assetKey,
-          creatorAgentId: agentId,
-          taskType,
-          tags,
-          priority,
-          dependsOn,
-          dir,
-          model: normalizedModel.model,
-          modelTier: normalizedModel.modelTier,
-          effort: input.effort,
-          routingAffinity: requiredCapabilities?.length
-            ? { capabilities: requiredCapabilities }
-            : undefined,
-        });
+        const newTask = await createTaskExtended(
+          preparedCreate!.description,
+          preparedCreate!.options,
+        );
         return {
           success: true,
           message: `Created unassigned task "${newTask.id}".`,
@@ -313,6 +362,7 @@ export async function taskActionHandler(
         }
         const staleClaimRuntime = await staleRuntimeResult(ctx, agentId);
         if (staleClaimRuntime) return staleClaimRuntime;
+        if (isApiDraining()) return apiDrainingResult("claim");
         // Check capacity before claiming
         if (!(await hasCapacity(agentId))) {
           const activeCount = await getActiveTaskCount(agentId);
@@ -349,7 +399,9 @@ export async function taskActionHandler(
         if (claimingAgent && !isAgentEligibleForTask(claimingAgent, existingTask)) {
           return {
             success: false,
-            message: `Task "${taskId}" requires role "${existingTask.routingAffinity?.role ?? "(unspecified)"}"; yours is "${claimingAgent.role ?? "(unspecified)"}". Cannot claim.`,
+            message: existingTask.routingAffinity?.leadOnly
+              ? `Task "${taskId}" is Lead-only; you are not authorized to claim it.`
+              : `Task "${taskId}" requires role "${existingTask.routingAffinity?.role ?? "(unspecified)"}"; yours is "${claimingAgent.role ?? "(unspecified)"}". Cannot claim.`,
           };
         }
         // Atomic claim — only one agent can win this race
@@ -420,6 +472,7 @@ export async function taskActionHandler(
         // budget admission below so a retired process cannot take the offer.
         const staleAcceptRuntime = await staleRuntimeResult(ctx, agentId);
         if (staleAcceptRuntime) return staleAcceptRuntime;
+        if (isApiDraining()) return apiDrainingResult("accept");
         const existingTask = await getTaskById(taskId);
         if (!existingTask) {
           return { success: false, message: `Task "${taskId}" not found.` };

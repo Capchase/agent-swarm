@@ -12,11 +12,38 @@ kubectl create secret generic agent-swarm-secrets \
 
 # 2. Install.
 helm install swarm oci://ghcr.io/desplega-ai/charts/agent-swarm \
-  --version 0.1.0 \
   --set auth.existingSecret=agent-swarm-secrets
 ```
 
-That's a minimal install: API + lead + 1 coder pool, no agent-fs, no litestream. Override `pools` in your own values to size the swarm.
+Omit `--version` for latest, or pin the release you want.
+
+This installs the API and the CLI's **Full Swarm**: one lead plus one each of coder, content-reviewer, content-strategist, content-writer, discoverability-optimizer, forward-deployed-engineer, researcher, reviewer, tester, and ux-principles. agent-fs and litestream are opt-in.
+
+For a smaller install, use [examples/values-minimal.yaml](examples/values-minimal.yaml) with the Secret created above. From the repository root:
+
+```bash
+helm install swarm ./charts/agent-swarm \
+  -f charts/agent-swarm/examples/values-minimal.yaml \
+  --set auth.existingSecret=agent-swarm-secrets
+```
+
+The minimal example deploys only lead + coder. Helm merges `pools` maps, so it explicitly sets the other default pools to `null` to remove them.
+
+### Resource sizing
+
+| Pool | CPU request | Memory request | Memory limit |
+|---|---|---|---|
+| Lead (one) | 500m | 1Gi | 4Gi |
+| Each worker (ten) | 250m | 512Mi | 4Gi |
+| All default pools | **3 CPU** | **6Gi** | **44Gi** |
+
+These requests reserve a baseline for agents polling for tasks; harness processes start when work arrives. For example, three nodes with 4 CPU each can place lead + two workers on one node and four workers on each remaining node, requesting **1 CPU / 2Gi per node**. Leave additional allocatable capacity for the API, system pods, and active tasks. The API has no resource requests by default. The default persistent storage requirement is **230Gi** (eleven 20Gi personal PVCs plus the API's 10Gi PVC), using the cluster's default StorageClass.
+
+Workers inherit `poolDefaults.resources`; a nonempty `pools.<name>.resources` replaces the entire resource map. The lead has its own larger allocation. CPU has no limit so tasks can use spare capacity; memory may grow to the per-pod limit. These are starting requests, not a benchmark or a capacity guarantee for simultaneous builds or browsers. Increase requests and cluster capacity for sustained workloads. The minimal example requests **750m CPU / 1.5Gi** across its two pools, with **50Gi** of PVC storage.
+
+## Connect the dashboard
+
+Follow the [Kubernetes and Helm guide](https://docs.agent-swarm.dev/docs/guides/kubernetes) to enable API ingress, configure DNS and TLS, and connect the hosted or self-hosted dashboard. API ingress defaults to disabled; configure `enabled`, `className`, `host`, `annotations`, and `tls` under `ingress` for your controller. The dashboard calls the API directly from your browser. The API already handles CORS; see the guide’s [CORS diagnostics](https://docs.agent-swarm.dev/docs/guides/kubernetes#cors) before adding proxy CORS settings.
 
 ## What this chart deploys
 
@@ -53,7 +80,7 @@ pools:
     templateId: official/lead
   coder:
     replicas: 4
-    # role omitted → defaults to "worker"
+    role: coder
     templateId: official/coder
 ```
 
@@ -78,7 +105,7 @@ Deploys the [agent-fs](https://github.com/desplega-ai/agent-fs) HTTP service alo
 agentFs:
   enabled: true
   image:
-    tag: 0.13.1
+    tag: 0.15.1
   bucket: my-agent-fs-bucket
   # Optional. When blank, the API boot seeder registers a service user with
   # agent-fs and stores the generated bootstrap key in encrypted swarm_config.
@@ -91,6 +118,16 @@ agentFs:
     provider: local                         # Or openai/gemini + apiKey
 ```
 
+Local-disk variant (no bucket; objects live on the agent-fs PVC, so keep that PVC backed up):
+
+```yaml
+agentFs:
+  enabled: true
+  storageProvider: local
+  storage:
+    size: 50Gi
+```
+
 ### Option 2 — RWX shared volume
 
 If your cluster has a `ReadWriteMany`-capable storage class (NFS, EFS, Filestore, Azure Files, or any CSI driver advertising RWX), pre-create a PVC and point the chart at it:
@@ -101,6 +138,38 @@ sharedVolume:
 ```
 
 Every pool pod mounts that claim at `/workspace/shared`. Simpler than agent-fs but lacks search, comments, and conflict primitives — and the upstream agents won't automatically know about the shared mount unless you configure them to.
+
+## HTTPS
+
+The hosted dashboard at app.agent-swarm.dev is served over HTTPS, so browsers refuse a plain-HTTP API (mixed content). OAuth callbacks, webhooks, and page links also need a public HTTPS origin. Pick one path:
+
+**cert-manager (recommended).** Install [cert-manager](https://cert-manager.io/docs/installation/), create a ClusterIssuer, then name it in the chart. The chart adds the annotation, requests the certificate, and derives `PUBLIC_MCP_BASE_URL=https://<host>`:
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  host: swarm-api.example.com
+  certManager:
+    clusterIssuer: letsencrypt-prod
+agentFs:
+  ingress:
+    enabled: true
+    className: nginx
+    host: files.example.com
+    certManager:
+      clusterIssuer: letsencrypt-prod
+```
+
+**Ingress controller with built-in ACME (Traefik, Caddy ingress controller).** Set the controller's annotations under `ingress.annotations` and set `config.publicMcpBaseUrl: https://<host>` explicitly. An empty `ingress.tls` otherwise derives an `http://` public URL.
+
+**TLS terminated outside the cluster (Caddy or a cloud load balancer in front).** Keep `ingress.tls` empty and set `config.publicMcpBaseUrl: https://<host>` explicitly.
+
+Verify with `curl -fsS https://<host>/health` and check `PUBLIC_MCP_BASE_URL` in the API ConfigMap.
+
+### Load balancer health checks
+
+The API answers `401` on `/` (unknown paths are fail-closed), so a load balancer that probes `/` marks every target unhealthy and the ingress never forwards traffic. Probe the unauthenticated `/health` instead. With `ingress.className: alb` the chart sets `alb.ingress.kubernetes.io/healthcheck-path: /health` for you (same for the agent-fs ingress; agent-fs also serves `/health`). Other controllers that probe a path need the equivalent under `ingress.annotations`, for example GKE via a `BackendConfig` with `healthCheck.requestPath: /health`. ingress-nginx and Traefik do not probe a path and need nothing.
 
 ## Authentication
 
@@ -151,6 +220,24 @@ litestream:
 ```
 
 Restore procedure: see the [litestream docs](https://litestream.io/guides/restore/).
+
+## Sandboxed-script pids containment
+
+The API pod (not a pool pod — see "What this chart deploys") spawns a subprocess sandbox for every script/workflow run (`src/utils/sandboxed-process.ts`). That sandbox's own `ulimit -u` (`JAVASCRIPT_RUNTIME_SANDBOX_MAX_PROCS`, 4096) is a per-real-UID limit shared by the API process itself *and* every concurrently running sandboxed script in that pod — it is headroom for an interpreter's own thread-pool startup, not independent containment against a runaway or malicious script exhausting that shared budget ([issue #1332](https://github.com/desplega-ai/agent-swarm/issues/1332)).
+
+Kubernetes' native pod spec has no per-pod pids field — `resources.limits` only supports `cpu`/`memory`/`ephemeral-storage`. The [RuntimeClass API](https://kubernetes.io/docs/concepts/containers/runtime-class/) doesn't fill that gap either: a `RuntimeClass` object only selects a CRI runtime handler by name and optionally sets `overhead`/`scheduling` — it has no field for OCI PID resources, so pointing a pod at *any* RuntimeClass (an ordinary `runc` one included, and gVisor/Kata by default) applies no `pids.max` on its own. Two ways to add independent containment, neither of which this chart can fully own:
+
+1. **Cluster-wide (works today, no chart change needed):** set the kubelet flag `--pod-max-pids` on the nodes that run the API pod (GA since Kubernetes 1.20, feature gate `SupportPodPidsLimit`). This caps every pod on that node, not just the API pod — coordinate with whoever owns your node pools/kubelet config, since it's out of this chart's control. This is the mechanism to reach for; it demonstrably works with no further provisioning.
+2. **Per-pod, via `api.runtimeClassName`:** this field only wires the pod spec to reference a RuntimeClass by name — it does not, by itself, apply any pids ceiling. It's a containment mechanism only if the cluster administrator provisions a **specifically customized runtime handler that demonstrably injects `pids.max`** — e.g. a `runc` handler whose `config.toml` sets `[runtimes.<name>.options] SystemdCgroup` resources with a `pids.max`, or an equivalently configured gVisor/Kata handler — and confirms it (`cat /sys/fs/cgroup/.../pids.max` inside a pod using that handler). A stock/default handler under any of these runtimes gives you none of this:
+
+   ```yaml
+   api:
+     runtimeClassName: swarm-api-pids-limited
+   ```
+
+   Empty (the default) sets no `runtimeClassName` — zero behavior change from before this field existed.
+
+Docker Compose deployments get `pids_limit` directly on the `api` service — see the sizing arithmetic in `docker-compose.example.yml`'s `api.pids_limit` comment. That number was derived from process/thread measurements in a container, not validated against a live compose stack under real load; treat it as a documented starting point and tune it against your own traffic.
 
 ## Configuration
 

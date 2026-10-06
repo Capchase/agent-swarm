@@ -7,7 +7,7 @@
  *              memory, communication, secrets) from session-templates.ts
  *   E          outputs (gated on AGENT_FS_API_URL and the pages capability)
  *   H          deployment-gated notes: slack, steering
- *   I          tools and skills (deferred-tools line, skills, MCP server names)
+ *   I          tools and skills (harness tool discovery, skills, MCP server names)
  *   J          agent notes: CLAUDE.md for codex, opencode, pi, only when edited
  *   K          repository (per task)
  *
@@ -16,6 +16,7 @@
  */
 
 import type { ProviderTraits } from "../providers/types";
+import { getSlackConfiguration } from "../slack/config";
 import type { ProviderName } from "../types";
 import { isSteeringEnabled } from "../utils/steering-enabled";
 import { matchesDefaultClaudeMd, matchesDefaultIdentityMd } from "./defaults";
@@ -54,11 +55,18 @@ const CLAUDE_MD_INJECT_PROVIDERS: ReadonlySet<string> = new Set(["codex", "openc
 /** Providers that get the repo CLAUDE.md inlined until native loading is verified. */
 const REPO_CLAUDE_MD_INLINE_PROVIDERS: ReadonlySet<string> = new Set(["opencode"]);
 
-export function areSlackPromptToolsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const slackDisable = env.SLACK_DISABLE;
-  if (slackDisable === "true" || slackDisable === "1") return false;
+export function areSlackPromptToolsEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+  serverCapabilities?: string[],
+): boolean {
+  const config = getSlackConfiguration(env);
+  if (config.disabled || !config.mode) return false;
 
-  return Boolean(env.SLACK_BOT_TOKEN && env.SLACK_APP_TOKEN);
+  // Preserve the socket credential gate. For the HTTP contract, workers use
+  // the server tool capability without needing the API-owned signing secret.
+  if (serverCapabilities && !serverCapabilities.includes("slack")) return false;
+  if (config.mode === "http" && serverCapabilities) return true;
+  return config.missingCredentials.length === 0;
 }
 
 export type BasePromptArgs = {
@@ -111,6 +119,7 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
   const { role, agentId, traits } = args;
   const {
     hasMcp = true,
+    hasToolSearch = false,
     hasLocalEnvironment: hasLocalEnv = true,
     nativeSkillDiscovery = true,
   } = traits ?? {};
@@ -185,8 +194,8 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
 
   // H. Slack. One block for both roles; the scripts-only variant covers Slack
   // via ctx.swarm.slack_* for Slack-originated tasks.
-  const slackPromptToolsEnabled = areSlackPromptToolsEnabled();
-  if (hasMcp && slackPromptToolsEnabled && !scriptsOnlyMode && serverHasCapability("slack", true)) {
+  const slackPromptToolsEnabled = areSlackPromptToolsEnabled(process.env, args.serverCapabilities);
+  if (hasMcp && slackPromptToolsEnabled && !scriptsOnlyMode) {
     const slackResult = await resolveTemplateAsync("system.agent.slack", {});
     prompt += slackResult.text;
   }
@@ -213,12 +222,22 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
 
   // I. Tools and skills. Skipped without MCP: the discovery tools are MCP tools.
   if (hasMcp) {
+    // Amp's MCP tools sit behind its own `tool_search` + `code_exec` with
+    // underscored names, so the generic "load with your tool search" line is not enough.
+    const discoveryEvent =
+      provider === "amp"
+        ? "system.agent.tool_discovery.amp"
+        : hasToolSearch
+          ? "system.agent.tool_discovery.search"
+          : "system.agent.tool_discovery.direct";
+    const discoveryResult = await resolveTemplateAsync(discoveryEvent, {});
     const toolsResult = await resolveTemplateAsync(
       "system.agent.tools_skills",
       renderToolsAndSkillsVars({
         skillsSummary: args.skillsSummary,
         mcpServers: args.mcpServers,
         nativeSkillDiscovery,
+        toolDiscovery: discoveryResult.text,
         hasLocalEnv,
       }),
     );
@@ -257,14 +276,15 @@ export const getBasePrompt = async (args: BasePromptArgs): Promise<string> => {
 /**
  * Dynamic lines for `system.agent.tools_skills`. The static text lives in the
  * template so operators can override or skip the section; only the lists that
- * depend on the installed skills and MCP servers are built here.
+ * depend on the installed skills, MCP servers, and harness are built here.
  */
 function renderToolsAndSkillsVars(input: {
   skillsSummary?: { name: string; description: string }[];
   mcpServers?: string[];
   nativeSkillDiscovery: boolean;
   hasLocalEnv: boolean;
-}): { skills: string; mcp_servers: string } {
+  toolDiscovery: string;
+}): { skills: string; mcp_servers: string; tool_discovery: string } {
   let section = "";
 
   const skills = input.skillsSummary ?? [];
@@ -299,7 +319,11 @@ function renderToolsAndSkillsVars(input: {
       ? `Connected MCP servers: ${servers.join(", ")}. Their tools are in your tool list.\n`
       : "";
 
-  return { skills: section, mcp_servers: mcpLine };
+  return {
+    skills: section,
+    mcp_servers: mcpLine,
+    tool_discovery: input.toolDiscovery,
+  };
 }
 
 /**

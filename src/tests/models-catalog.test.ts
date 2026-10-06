@@ -2,7 +2,7 @@
  * Unit tests for the live model catalog (`src/be/models-catalog.ts`).
  *
  * Verifies:
- *  - `buildModelsCatalog` keeps only the picker-reachable providers and slims
+ *  - `buildModelsCatalog` keeps only the harness/ACP-picker providers and slims
  *    each model down to the fields the UI reads.
  *  - `getModelsCatalog` falls back to the vendored snapshot before the first
  *    live update and prefers live data after one.
@@ -58,7 +58,7 @@ describe("buildModelsCatalog", () => {
     expect(model).toEqual({
       id: "test-vendor/test-model-live-only",
       name: "Test Model (live only)",
-      cost: { input: 0.5, output: 1.5 },
+      cost: { input: 0.5, output: 1.5, cache_read: 0.1 },
       limit: { context: 256_000 },
       reasoning: true,
       reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
@@ -81,6 +81,7 @@ describe("getModelsCatalog", () => {
     // The vendored snapshot always carries the picker providers.
     expect(Object.keys(result.providers.openrouter?.models ?? {}).length).toBeGreaterThan(0);
     expect(Object.keys(result.providers.anthropic?.models ?? {}).length).toBeGreaterThan(0);
+    expect(Object.keys(result.providers.opencode?.models ?? {}).length).toBeGreaterThan(0);
   });
 
   test("prefers live data after an update", () => {

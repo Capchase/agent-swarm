@@ -19,6 +19,8 @@ import { join } from "node:path";
 import {
   closeDb,
   createAgent,
+  createScheduledTask,
+  createWorkflow,
   getDbClient,
   getInstanceActivity,
   getLiveAgentCounts,
@@ -29,13 +31,16 @@ import {
   updateAgentCredStatus,
 } from "../be/db";
 import { storeOAuthTokens, upsertOAuthApp } from "../be/db-queries/oauth";
+import { resetEmbeddingProvider } from "../be/memory";
 import { validateProviderCredentials } from "../commands/provider-credentials";
 import {
   _resetTestConnectionCache,
   buildStatusPayload,
   computeHealth,
+  rollupCredStatusForProvider,
   type SetupMilestone,
 } from "../http/status";
+import { setSlackConnectionState } from "../slack/connection-state";
 import type { AgentCredStatus } from "../types";
 
 // Helper for tests: stamp an agent row with a cred_status snapshot so the
@@ -86,18 +91,32 @@ const ENV_KEYS_TO_RESET = [
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "OPENAI_API_KEY",
+  "EMBEDDING_API_KEY",
   "OPENROUTER_API_KEY",
   "CODEX_OAUTH",
   "DEVIN_API_KEY",
   "DEVIN_ORG_ID",
   "SLACK_BOT_TOKEN",
   "SLACK_APP_TOKEN",
+  "SLACK_SIGNING_SECRET",
+  "SLACK_MODE",
   "SLACK_DISABLE",
   "GITHUB_WEBHOOK_SECRET",
   "GITHUB_APP_ID",
   "GITHUB_APP_PRIVATE_KEY",
   "AGENT_FS_API_URL",
+  "API_AGENT_FS_API_KEY",
+  "AGENT_FS_API_KEY",
+  "AGENT_FS_DEFAULT_ORG_ID",
+  "AGENT_FS_SHARED_ORG_ID",
+  "AGENT_FS_DEFAULT_DRIVE_ID",
+  "GSC_SERVICE_ACCOUNT_BASE64",
+  "GSC_SERVICE_ACCOUNT_JSON",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "AGENTMAIL_API_KEY",
+  "AGENTMAIL_DISABLE",
   "SWARM_VERIFY_TTL_MS",
+  "ANONYMIZED_TELEMETRY",
 ];
 
 const savedEnv = new Map<string, string | undefined>();
@@ -110,6 +129,11 @@ function clearEnv() {
   for (const k of ENV_KEYS_TO_RESET) {
     delete process.env[k];
   }
+  // The embedding provider memoizes its API key at construction (see
+  // OpenAIEmbeddingProvider); reset the singleton so embeddingsMilestone()
+  // (which now reads the live provider, not process.env directly) reflects
+  // whatever this test just set/cleared instead of a stale prior test's key.
+  resetEmbeddingProvider();
 }
 
 function restoreEnv() {
@@ -122,6 +146,10 @@ function restoreEnv() {
 
 async function clearTables() {
   const client = getDbClient();
+  await client.run("DELETE FROM workflow_run_steps");
+  await client.run("DELETE FROM workflow_runs");
+  await client.run("DELETE FROM workflows");
+  await client.run("DELETE FROM scheduled_tasks");
   await client.run("DELETE FROM agent_tasks");
   await client.run("DELETE FROM agents");
   await client.run("DELETE FROM oauth_authorizations");
@@ -144,6 +172,7 @@ beforeEach(async () => {
   clearEnv();
   await clearTables();
   _resetTestConnectionCache();
+  setSlackConnectionState("disconnected");
 });
 
 afterEach(() => {
@@ -194,6 +223,34 @@ describe("buildStatusPayload — identity", () => {
   });
 });
 
+// ─── Telemetry opt-out state ─────────────────────────────────────────────────
+
+describe("buildStatusPayload — telemetry", () => {
+  test("reports enabled by default (opt-out model)", async () => {
+    const payload = await buildStatusPayload();
+    expect(payload.telemetry).toEqual({ enabled: true });
+  });
+
+  test.each(["false", "0"])("reports disabled when ANONYMIZED_TELEMETRY=%s", async (value) => {
+    process.env.ANONYMIZED_TELEMETRY = value;
+    const payload = await buildStatusPayload();
+    expect(payload.telemetry).toEqual({ enabled: false });
+  });
+
+  test("reports enabled when ANONYMIZED_TELEMETRY=true", async () => {
+    process.env.ANONYMIZED_TELEMETRY = "true";
+    const payload = await buildStatusPayload();
+    expect(payload.telemetry).toEqual({ enabled: true });
+  });
+
+  test("follows the env at call time, matching the flag track() reads", async () => {
+    process.env.ANONYMIZED_TELEMETRY = "false";
+    expect((await buildStatusPayload()).telemetry?.enabled).toBe(false);
+    process.env.ANONYMIZED_TELEMETRY = "true";
+    expect((await buildStatusPayload()).telemetry?.enabled).toBe(true);
+  });
+});
+
 // ─── Setup state machine ─────────────────────────────────────────────────────
 
 function getMilestone(payload: Awaited<ReturnType<typeof buildStatusPayload>>, id: string) {
@@ -205,7 +262,7 @@ function getMilestone(payload: Awaited<ReturnType<typeof buildStatusPayload>>, i
 describe("setup milestones", () => {
   test("all unverified on a clean swarm", async () => {
     const payload = await buildStatusPayload();
-    expect(payload.setup).toHaveLength(7);
+    expect(payload.setup).toHaveLength(11);
     for (const m of payload.setup) {
       expect(m.state).toBe("unverified");
     }
@@ -219,6 +276,32 @@ describe("setup milestones", () => {
     expect(getMilestone(payload, "harness").state).toBe("configured");
   });
 
+  test("embeddings: configured with either supported key and otherwise shows a non-blocking hint", async () => {
+    const missing = getMilestone(await buildStatusPayload(), "embeddings");
+    expect(missing).toEqual({
+      id: "embeddings",
+      label: "Memory search",
+      state: "unverified",
+      hint: "Memory search is off. Set OPENAI_API_KEY (or EMBEDDING_API_KEY) on the API server to enable it; it is cheap.",
+    });
+
+    // The provider memoizes its API key at construction; in production a
+    // config reload resets it (see resetEmbeddingProvider in src/http/core.ts).
+    // Mirror that here after each direct env mutation.
+    process.env.OPENAI_API_KEY = "example-openai-embedding-key";
+    resetEmbeddingProvider();
+    expect(getMilestone(await buildStatusPayload(), "embeddings").state).toBe("configured");
+
+    process.env.EMBEDDING_API_KEY = "";
+    resetEmbeddingProvider();
+    expect(getMilestone(await buildStatusPayload(), "embeddings").state).toBe("unverified");
+
+    process.env.EMBEDDING_API_KEY = "example-dedicated-embedding-key";
+    delete process.env.OPENAI_API_KEY;
+    resetEmbeddingProvider();
+    expect(getMilestone(await buildStatusPayload(), "embeddings").state).toBe("configured");
+  });
+
   test("harness flips to `verified` when a worker's recent live test passed", async () => {
     const a = await createAgent({ name: "w-vfd", isLead: false, status: "idle", capabilities: [] });
     await seedCredStatus(a.id, "claude", {
@@ -229,6 +312,41 @@ describe("setup milestones", () => {
 
     const payload = await buildStatusPayload();
     expect(getMilestone(payload, "harness").state).toBe("verified");
+  });
+
+  test("provider rollup counts every agent with a fresh passing report in verifiedWorkers", async () => {
+    const verified = await createAgent({
+      name: "w-verified",
+      isLead: false,
+      status: "idle",
+      capabilities: [],
+    });
+    const configured = await createAgent({
+      name: "w-configured",
+      isLead: false,
+      status: "idle",
+      capabilities: [],
+    });
+    const lead = await createAgent({
+      name: "lead-verified",
+      isLead: true,
+      status: "idle",
+      capabilities: [],
+    });
+    await seedCredStatus(verified.id, "claude", {
+      liveTest: { ok: true, error: null, latency_ms: 10, testedAt: Date.now() },
+    });
+    await seedCredStatus(configured.id, "claude", { liveTest: null });
+    await seedCredStatus(lead.id, "claude", {
+      liveTest: { ok: true, error: null, latency_ms: 10, testedAt: Date.now() },
+    });
+
+    expect(await rollupCredStatusForProvider("claude")).toMatchObject({
+      state: "verified",
+      workers: 3,
+      verifiedWorkers: 2,
+      reports: 3,
+    });
   });
 
   test("harness stays `unverified` on an empty fleet (no agents registered)", async () => {
@@ -360,18 +478,56 @@ describe("setup milestones", () => {
     });
   });
 
-  test("slack: needs both bot+app tokens AND not disabled", async () => {
+  test("slack: reports mode-aware credentials as configured, not live-verified", async () => {
     process.env.SLACK_BOT_TOKEN = "xoxb-test";
     const a = await buildStatusPayload();
     expect(getMilestone(a, "slack").state).toBe("unverified");
 
     process.env.SLACK_APP_TOKEN = "xapp-test";
     const b = await buildStatusPayload();
-    expect(getMilestone(b, "slack").state).toBe("verified");
+    expect(getMilestone(b, "slack").state).toBe("configured");
+    expect(getMilestone(b, "slack").hint).toContain("not connected");
+
+    process.env.SLACK_MODE = "http";
+    delete process.env.SLACK_APP_TOKEN;
+    process.env.SLACK_SIGNING_SECRET = "synthetic-signing-secret";
+    const http = await buildStatusPayload();
+    expect(getMilestone(http, "slack").state).toBe("unverified");
+    expect(getMilestone(http, "slack").hint).toContain("unavailable");
 
     process.env.SLACK_DISABLE = "true";
     const c = await buildStatusPayload();
     expect(getMilestone(c, "slack").state).toBe("unverified");
+  });
+
+  test("slack: a live Socket Mode connection reports verified; a dropped one does not", async () => {
+    process.env.SLACK_BOT_TOKEN = "xoxb-test";
+    process.env.SLACK_APP_TOKEN = "xapp-test";
+
+    setSlackConnectionState("connected");
+    const live = getMilestone(await buildStatusPayload(), "slack");
+    expect(live.state).toBe("verified");
+    expect(live.hint).toBeUndefined();
+
+    setSlackConnectionState("connecting");
+    const reconnecting = getMilestone(await buildStatusPayload(), "slack");
+    expect(reconnecting.state).toBe("configured");
+    expect(reconnecting.hint).toContain("not connected");
+
+    // A stale "connected" never verifies credentials that are now missing.
+    setSlackConnectionState("connected");
+    delete process.env.SLACK_APP_TOKEN;
+    expect(getMilestone(await buildStatusPayload(), "slack").state).toBe("unverified");
+  });
+
+  test("slack: invalid mode fails closed with a specific hint", async () => {
+    process.env.SLACK_MODE = "webhook";
+    process.env.SLACK_BOT_TOKEN = "xoxb-test";
+    process.env.SLACK_APP_TOKEN = "xapp-test";
+
+    const milestone = getMilestone(await buildStatusPayload(), "slack");
+    expect(milestone.state).toBe("unverified");
+    expect(milestone.hint).toContain("Invalid SLACK_MODE");
   });
 
   test("github: needs webhook secret + app id + private key", async () => {
@@ -380,9 +536,31 @@ describe("setup milestones", () => {
     const a = await buildStatusPayload();
     expect(getMilestone(a, "github").state).toBe("unverified");
 
-    process.env.GITHUB_APP_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\n...";
+    process.env.GITHUB_APP_PRIVATE_KEY = "[REDACTED:github_app_private_key]";
     const b = await buildStatusPayload();
     expect(getMilestone(b, "github").state).toBe("verified");
+  });
+
+  test("gsc, agentmail, and agentfs reflect their required configuration", async () => {
+    const empty = await buildStatusPayload();
+    expect(getMilestone(empty, "gsc").state).toBe("unverified");
+    expect(getMilestone(empty, "agentmail").state).toBe("unverified");
+    expect(getMilestone(empty, "agentfs").state).toBe("unverified");
+    expect(getMilestone(empty, "gsc").action_url).toBe("/settings/integrations/gsc");
+    expect(getMilestone(empty, "agentmail").action_url).toBe("/settings/integrations/agentmail");
+    expect(getMilestone(empty, "agentfs").action_url).toBe("/settings/integrations/agentfs");
+
+    process.env.GSC_SERVICE_ACCOUNT_BASE64 = "encoded-service-account";
+    process.env.AGENTMAIL_API_KEY = "am_test";
+    process.env.AGENT_FS_API_URL = "https://agent-fs.example.test";
+    process.env.API_AGENT_FS_API_KEY = "af_test";
+    process.env.AGENT_FS_DEFAULT_ORG_ID = "org-1";
+    process.env.AGENT_FS_DEFAULT_DRIVE_ID = "drive-1";
+
+    const configured = await buildStatusPayload();
+    expect(getMilestone(configured, "gsc").state).toBe("verified");
+    expect(getMilestone(configured, "agentmail").state).toBe("verified");
+    expect(getMilestone(configured, "agentfs").state).toBe("verified");
   });
 
   test("linear: authorization row flips to verified", async () => {
@@ -397,7 +575,7 @@ describe("setup milestones", () => {
       scopes: "read",
     });
     await storeOAuthTokens("linear", {
-      accessToken: "lin-tok-xyz",
+      accessToken: "example-lin-tok-xyz",
       refreshToken: "ref",
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
       scope: "read",
@@ -416,7 +594,7 @@ describe("setup milestones", () => {
       // metadata intentionally omitted on first upsert
     });
     await storeOAuthTokens("jira", {
-      accessToken: "jira-tok",
+      accessToken: "example-jira-tok",
       refreshToken: null,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
       scope: null,
@@ -472,6 +650,52 @@ describe("setup milestones", () => {
       ["task-completed-1", "first task"],
     );
     expect(getMilestone(await buildStatusPayload(), "first_task").state).toBe("verified");
+  });
+});
+
+describe("automation setup status", () => {
+  test("uses runtime preflight for deterministic missing items and fix URLs", async () => {
+    const schedule = await createScheduledTask({
+      name: "Weekly Dependency Triage",
+      intervalMs: 86_400_000,
+      taskTemplate: "Inspect {{REPO_URL}}",
+      params: {},
+      requiredParams: ["REPO_URL"],
+      requires: ["github"],
+    });
+    const workflow = await createWorkflow({
+      name: "Daily Workflow Health",
+      definition: { nodes: [{ id: "start", type: "echo", config: {} }] },
+    });
+    await getDbClient().run("UPDATE workflows SET definition = ? WHERE id = ?", [
+      "malformed-definition-that-status-must-not-load",
+      workflow.id,
+    ]);
+
+    const payload = await buildStatusPayload();
+    expect(payload.automations).toEqual([
+      {
+        id: workflow.id,
+        name: "Daily Workflow Health",
+        kind: "workflow",
+        state: "running",
+        missing: { params: [], integrations: [] },
+        fixes: [],
+        fixUrl: `/workflows/${workflow.id}`,
+      },
+      {
+        id: schedule.id,
+        name: "Weekly Dependency Triage",
+        kind: "schedule",
+        state: "needs_setup",
+        missing: { params: ["REPO_URL"], integrations: ["github"] },
+        fixes: [
+          { type: "param", key: "REPO_URL", url: `/schedules/${schedule.id}?param=REPO_URL` },
+          { type: "integration", key: "github", url: "/settings/integrations/github" },
+        ],
+        fixUrl: `/schedules/${schedule.id}?param=REPO_URL`,
+      },
+    ]);
   });
 });
 
@@ -663,6 +887,32 @@ describe("validateProviderCredentials — error scrubbing", () => {
     expect(fetchCalled).toBe(false);
   });
 
+  test("codex with a codex_oauth_<N> pool slot passes via presence check (no upstream call)", async () => {
+    // The dashboard device login stores slots, not CODEX_OAUTH. The presence
+    // check (`checkCodexCredentials`) already accepts them; the live test must
+    // too, or the provider stays `configured` and onboarding never verifies.
+    delete process.env.CODEX_OAUTH;
+    delete process.env.OPENAI_API_KEY;
+    process.env.codex_oauth_0 = JSON.stringify({
+      access: "oai-access-token-from-device-login",
+      refresh: "oai-refresh",
+      expires: Date.now() + 3600_000,
+      accountId: "acct_123",
+    });
+    let fetchCalled = false;
+    globalThis.fetch = (async () => {
+      fetchCalled = true;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const result = await validateProviderCredentials("codex");
+      expect(result.ok).toBe(true);
+      expect(fetchCalled).toBe(false);
+    } finally {
+      delete process.env.codex_oauth_0;
+    }
+  });
+
   test("codex with ~/.codex/auth.json on disk passes via presence check (no env creds)", async () => {
     // Reproduces the prod scenario: agent boots from a credential pool that
     // pre-materialised auth.json (or ran `codex login` in a prior boot), so
@@ -726,7 +976,7 @@ describe("validateProviderCredentials — error scrubbing", () => {
   });
 
   test("devin hits v3/self (not the deprecated v1 endpoint) and passes on 2xx", async () => {
-    process.env.DEVIN_API_KEY = "cog_fake-devin-key-1234";
+    process.env.DEVIN_API_KEY = "example-cog_fake-devin-key-1234";
     let capturedUrl = "";
     globalThis.fetch = (async (url) => {
       capturedUrl = String(url);
@@ -746,7 +996,7 @@ describe("validateProviderCredentials — error scrubbing", () => {
   });
 
   test("scrubs api key from error message on 401 response", async () => {
-    const fakeKey = "sk-ant-fakekey-DO-NOT-LEAK-1234567890abcdef";
+    const fakeKey = "example-anthropic-key-do-not-leak";
     process.env.ANTHROPIC_API_KEY = fakeKey;
     globalThis.fetch = (async () =>
       new Response(`Unauthorized: invalid key ${fakeKey}`, {
@@ -865,6 +1115,19 @@ describe("computeHealth (Phase 2)", () => {
     expect(computeHealth(synthetic)).toBe("degraded");
   });
 
+  test("`ok` when a connected Slack reports `verified` next to other connected integrations", () => {
+    const synthetic: SetupMilestone[] = [
+      { id: "harness", label: "Harness", state: "verified" },
+      { id: "slack", label: "Slack", state: "verified" },
+      { id: "github", label: "GitHub", state: "verified" },
+      { id: "linear", label: "Linear", state: "verified" },
+      { id: "jira", label: "Jira", state: "unverified" },
+      { id: "workers", label: "Workers", state: "verified" },
+      { id: "first_task", label: "First task", state: "verified" },
+    ];
+    expect(computeHealth(synthetic)).toBe("ok");
+  });
+
   test("integrations in `unverified` alone do NOT degrade health", () => {
     // No integrations are connected — that's the common shape, not a
     // problem. Health should be `ok` as long as harness + workers verified.
@@ -876,6 +1139,15 @@ describe("computeHealth (Phase 2)", () => {
       { id: "jira", label: "Jira", state: "unverified" },
       { id: "workers", label: "Workers", state: "verified" },
       { id: "first_task", label: "First task", state: "unverified" },
+    ];
+    expect(computeHealth(synthetic)).toBe("ok");
+  });
+
+  test("an unverified embedding key never blocks boot or degrades health", () => {
+    const synthetic: SetupMilestone[] = [
+      { id: "harness", label: "Harness", state: "verified" },
+      { id: "embeddings", label: "Memory search", state: "unverified" },
+      { id: "workers", label: "Workers", state: "verified" },
     ];
     expect(computeHealth(synthetic)).toBe("ok");
   });

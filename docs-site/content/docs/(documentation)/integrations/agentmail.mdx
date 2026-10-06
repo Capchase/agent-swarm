@@ -1,0 +1,91 @@
+---
+title: AgentMail Integration
+description: Set up AgentMail to give each agent its own email inbox for receiving newsletters, notifications, and external messages
+---
+
+Give your agents email addresses via [AgentMail](https://agentmail.to). Emails are routed to agents as tasks or inbox messages.
+
+<Callout type="warn">
+The `register-agentmail-inbox` MCP tool requires the `agentmail` capability, which is **disabled by default**. Enable it by setting `CAPABILITIES` on the API server to the full default list plus `agentmail` — the variable replaces the defaults, it is not additive. See the [environment variables reference](/docs/reference/environment-variables). The webhook endpoint itself is not gated by this flag.
+</Callout>
+
+## Setup
+
+1. Create an account at [AgentMail](https://agentmail.to)
+2. Set up a webhook pointing to your server
+
+**Webhook URL:** `https://your-server.com/api/agentmail/webhook`
+
+## Configuration
+
+```bash
+AGENTMAIL_WEBHOOK_SECRET=your-svix-secret
+
+# Optional: filter incoming webhooks by domain
+AGENTMAIL_INBOX_DOMAIN_FILTER=yourdomain.com
+AGENTMAIL_SENDER_DOMAIN_FILTER=gmail.com,company.com
+```
+
+### Domain Filtering
+
+You can restrict which emails are processed using domain filters:
+
+- **`AGENTMAIL_INBOX_DOMAIN_FILTER`** — Only process webhooks for inboxes on the specified domains. Emails to inboxes on other domains are excluded from task routing.
+- **`AGENTMAIL_SENDER_DOMAIN_FILTER`** — Only process emails from senders on the specified domains. Emails from other sender domains are excluded from task routing.
+
+Both accept comma-separated domain lists and are optional. When not set, all domains are allowed.
+
+## How It Works
+
+### Inbound Archive
+
+After verifying the webhook signature, the server durably archives inbound `message.received`, `message.received.unauthenticated`, `message.received.blocked`, and `message.received.spam` events before acknowledging them. Archive failures or missing inbox, message, or thread IDs return HTTP 503 so the provider can retry.
+
+Capture happens before domain filters. Filtered messages remain available in the `agentmail-inbound` KV namespace; blocked and spam events are archived without creating tasks. A valid webhook signature verifies the delivery, not the sender's identity.
+
+The archive retains minimized, secret-scrubbed content and attachment metadata for 30 days from capture. It does not download attachments. Retries preserve the first entry and its expiry; a replay after expiry starts a new retention window. Expired entries are hidden on reads and removed on access or subsequent inbound capture.
+
+Coverage is limited to successfully delivered events within retention. It does not recover historical or never-delivered mail. Subscribe to each event category you want to capture. See the [contact inbox triage runbook](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/contact-inbox-triage.md) for rollout, replay, and provider-specific enrichment approval.
+
+### Email Routing
+
+Agents self-register which inboxes they receive mail from using the `register-agentmail-inbox` MCP tool.
+
+- **Emails to a worker's inbox** become tasks
+- **Emails to a lead's inbox** become inbox messages for triage
+- **Follow-up emails in the same thread** are automatically routed to the same agent
+
+### Registering an Inbox
+
+```
+register-agentmail-inbox(
+  action: "register",
+  inboxId: "inb_xxx",
+  inboxEmail: "worker@yourdomain.com"
+)
+```
+
+### Managing Inboxes
+
+```
+# List your registered inboxes
+register-agentmail-inbox(action: "list")
+
+# Unregister an inbox
+register-agentmail-inbox(action: "unregister", inboxId: "inb_xxx")
+```
+
+### Sending Email
+
+Agents can send emails using AgentMail MCP tools:
+
+- `send_message` — Send a new email
+- `reply_to_message` — Reply to an existing thread
+- `forward_message` — Forward an email
+- `list_threads` — List email threads in an inbox
+
+## Related
+
+- [Environment Variables](/docs/reference/environment-variables) — AgentMail configuration (`AGENTMAIL_WEBHOOK_SECRET`, domain filters)
+- [Task Lifecycle](/docs/concepts/task-lifecycle) — How emails become tasks
+- [Slack Integration](/docs/integrations/slack) — Another external task source

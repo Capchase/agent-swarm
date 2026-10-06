@@ -131,6 +131,42 @@ CREATE TABLE IF NOT EXISTS artifacts (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Last good models.dev payload (single row, id = 1). See src/cost/catalog.ts.
+CREATE TABLE IF NOT EXISTS model_catalog_cache (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  fetched_at TEXT NOT NULL,
+  etag TEXT,
+  payload TEXT NOT NULL
+);
+
+-- Alias configs pinned to a concrete model once per run, at creation. See
+-- src/runner/run-configs.ts.
+CREATE TABLE IF NOT EXISTS eval_run_configs (
+  run_id TEXT NOT NULL REFERENCES eval_runs(id),
+  config_id TEXT NOT NULL,
+  model_alias TEXT NOT NULL,
+  resolved_model TEXT NOT NULL,
+  catalog_fetched_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (run_id, config_id)
+);
+
+-- Harness configs: configs/index.ts seeds (source='seed') plus configs made or
+-- edited through the API (source='user'). See src/db/harness-configs.ts.
+CREATE TABLE IF NOT EXISTS harness_configs (
+  id TEXT PRIMARY KEY,
+  label TEXT,
+  provider TEXT NOT NULL,
+  model TEXT,
+  model_alias TEXT,
+  model_tier TEXT,
+  env_json TEXT,
+  source TEXT NOT NULL DEFAULT 'seed' CHECK (source IN ('seed', 'user')),
+  archived INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_attempts_run ON attempts(run_id);
 CREATE INDEX IF NOT EXISTS idx_judgments_attempt ON judgments(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_attempt ON artifacts(attempt_id);
@@ -187,4 +223,27 @@ const COLUMN_MIGRATIONS = [
   // gate rows and all pre-v2 rows read back NULL on both.
   "ALTER TABLE judgments ADD COLUMN dimension TEXT",
   "ALTER TABLE judgments ADD COLUMN weight REAL",
+  // Concrete model an attempt ran on (harness-reported, else the run's pin).
+  "ALTER TABLE attempts ADD COLUMN resolved_model TEXT",
+  // Reasoning effort (REASONING_EFFORT_OVERRIDE for the worker under test).
+  // A config's default effort; NULL = the harness default.
+  "ALTER TABLE harness_configs ADD COLUMN reasoning_effort TEXT",
+  // The run's effective effort per config id, snapshotted at creation
+  // ({"claude-opus":"high"}); NULL on runs created before efforts existed.
+  "ALTER TABLE eval_runs ADD COLUMN efforts_json TEXT",
+  // Effort the attempt's worker was launched with, and the one its harness
+  // reported applying (agent latestModel). NULL = harness default / none reported.
+  "ALTER TABLE attempts ADD COLUMN reasoning_effort TEXT",
+  "ALTER TABLE attempts ADD COLUMN applied_reasoning_effort TEXT",
+  // Phase 3 suite freeze: the scenario version an attempt ran at, and the suite
+  // version ("1.0") when that scenario version belongs to the suite manifest.
+  // NULL on pre-versioning rows and on off-suite runs.
+  "ALTER TABLE attempts ADD COLUMN scenario_version INTEGER",
+  "ALTER TABLE attempts ADD COLUMN suite_version TEXT",
+  // Phase 3 status hygiene: why an `error` attempt is excluded from scores
+  // ('cancelled' | 'harness-error'). The status CHECK on attempts cannot take a
+  // 'cancelled' value additively, so the reason lives here and status stays 'error'.
+  "ALTER TABLE attempts ADD COLUMN exclusion TEXT",
+  // Phase 3 hard cost cap: the run's metered spend ceiling in USD; NULL = uncapped.
+  "ALTER TABLE eval_runs ADD COLUMN max_metered_usd REAL",
 ];

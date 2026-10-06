@@ -1,5 +1,7 @@
 # Daily Blocker Digest
 
+Delivery uses configured admin channels with an in-app fallback.
+
 Ask the lead to summarize stuck work, failing checks, and owner decisions every weekday.
 
 ## Schedule
@@ -27,11 +29,11 @@ You are Lead. Produce one concise daily digest of blockers, stale claims, open P
 
 Run these read-only global scripts first. Use their outputs as evidence, then apply judgment:
 
-1. `script-run` global script `Heartbeat Audit` with args `{ "heartbeatMarkdown": "<current /workspace/HEARTBEAT.md text>" }`
-2. `script-run` global script `schedule-health` with args `{ "days": 7, "publishPage": true }`
-3. `script-run` global script `task-failure-audit` with args `{ "days": 7, "groupBy": "reason", "publishPage": true }`
+1. `script-run` global script `schedule-health` with args `{ "days": 7, "publishPage": true }`
+2. `script-run` global script `task-failure-audit` with args `{ "days": 7, "groupBy": "reason", "publishPage": true }`
+3. Read `GET /status`. If the `embeddings` milestone is `unverified`, append this line to the digest: "Memory search is off: set OPENAI_API_KEY on the API server to enable it."
 
-Do not script-ify judgment or notification copy. Use the script outputs to identify stale blocker claims, schedule risks, provider failure clusters, and digest-run health.
+Do not script-ify judgment or notification copy. Use the script outputs to identify schedule risks and provider failure clusters.
 
 ## Phase 1: Gather Blockers
 
@@ -93,7 +95,7 @@ Do not trust stale notes. If verification shows the item is resolved, mark it `R
 
 ## Phase 3: Post One Digest
 
-Post one message to your team's chosen channel. Replace `<OWNER_OR_TEAM_MENTION>` and `<CHANNEL_ID>` before enabling this schedule.
+Post one message through configured admin delivery channels, using the in-app fallback when no external channel is configured. Replace `<OWNER_OR_TEAM_MENTION>` before enabling this schedule.
 
 Template:
 

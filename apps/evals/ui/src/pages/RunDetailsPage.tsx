@@ -18,10 +18,12 @@ import {
   getRun,
   resumeRun,
 } from "../api.ts";
+import { AttemptOutcome } from "../components/AttemptOutcome.tsx";
 import { ConfigChip } from "../components/ConfigChip.tsx";
 import { useConfirm } from "../components/ConfirmDialog.tsx";
 import { CrownIcon } from "../components/CrownIcon.tsx";
 import { type Column, DataTable } from "../components/DataTable.tsx";
+import { EffortChip } from "../components/EffortChip.tsx";
 import { EntityLink } from "../components/EntityLink.tsx";
 import {
   fmtAgo,
@@ -47,7 +49,7 @@ import {
 } from "../components/StatusBadge.tsx";
 import { InfoTip, Tooltip } from "../components/Tooltip.tsx";
 import { type ConfigLookup, navigate, useConfigs, usePoll } from "../hooks.ts";
-import { explainCheck, observedText } from "../lib/check-descriptions.ts";
+import { explainCheck, isScoredJudgment, observedText } from "../lib/check-descriptions.ts";
 import {
   memberLabel,
   type NormalizedSandboxInfo,
@@ -195,16 +197,20 @@ function checksTabInfo(
   judgments: JudgmentJson[],
   judging: boolean,
 ): { node: ReactNode; title: string } {
-  const checks = judgments.filter((j) => j.kind === "deterministic");
+  // Scored checks (graded, feeding a dimension) show their number in the table
+  // and stay out of the pass/fail count: only gates are pass/fail.
+  const gates = judgments.filter((j) => !isScoredJudgment(j));
+  const scoredCount = judgments.length - gates.length;
+  const checks = gates.filter((j) => j.kind === "deterministic");
   const judges = judgments.filter((j) => j.kind !== "deterministic");
   const passed = checks.filter((j) => j.pass).length;
   const label = checks.length > 0 ? `Checks ${passed}/${checks.length}` : "Checks";
-  // Tri-state derived from ALL checks (deterministic + judge + agentic), not just
-  // judges: ✓ all passed, ✗ any failed, ! mixed/pending (incl. while judging).
+  // Tri-state derived from the gates (deterministic + judge + agentic):
+  // ✓ all passed, ✗ any failed, ! mixed/pending (incl. while judging).
   let stateIcon: ReactNode = null;
-  if (judgments.length > 0 || judging) {
-    const anyFail = judgments.some((j) => !j.pass);
-    const allPass = judgments.length > 0 && judgments.every((j) => j.pass);
+  if (gates.length > 0 || judging) {
+    const anyFail = gates.some((j) => !j.pass);
+    const allPass = gates.length > 0 && gates.every((j) => j.pass);
     const [glyph, tone, word] = anyFail
       ? ["✗", "tone-red", "failed"]
       : allPass && !judging
@@ -218,10 +224,11 @@ function checksTabInfo(
   }
   const titleParts: string[] = [
     checks.length > 0
-      ? `${passed} of ${checks.length} checks passed`
+      ? `${passed} of ${checks.length} gate checks passed`
       : judgments.length === 0 && !judging
         ? "Deterministic checks & judge verdicts"
-        : "No deterministic checks",
+        : "No deterministic gate checks",
+    ...(scoredCount > 0 ? [`${scoredCount} scored checks shown as numbers`] : []),
   ];
   let suffix: ReactNode = null;
   if (judging) {
@@ -232,7 +239,7 @@ function checksTabInfo(
     suffix = judges.map((j) => (
       <span
         key={j.id}
-        className={j.pass ? "tone-green" : "tone-red"}
+        className={isScoredJudgment(j) ? "tone-neutral" : j.pass ? "tone-green" : "tone-red"}
         role="img"
         aria-label={j.name}
       >
@@ -241,7 +248,11 @@ function checksTabInfo(
     ));
     for (const j of judges) {
       const score = j.score !== null ? ` (${fmtScore(j.score)})` : "";
-      titleParts.push(`${j.name} — ${j.pass ? "Passed" : "Failed"}${score}`);
+      titleParts.push(
+        isScoredJudgment(j)
+          ? `${j.name} — score ${fmtScore(j.score as number)}`
+          : `${j.name} — ${j.pass ? "Passed" : "Failed"}${score}`,
+      );
     }
   }
   return {
@@ -578,6 +589,7 @@ export default function RunDetailsPage(props: {
                 configIds={r.configIds}
                 cells={run.cells}
                 attempts={attempts}
+                efforts={r.efforts}
                 cellHref={(scenarioId, configId) =>
                   `#/runs/${runId}/attempts/${runId}_${scenarioId}_${configId}_0`
                 }
@@ -598,7 +610,10 @@ export default function RunDetailsPage(props: {
                       title={`Attempt #${a.attemptIndex} · ${info.label}`}
                       onClick={() => navigate(`#/runs/${runId}/attempts/${a.id}`)}
                     >
-                      <span className={`rd-dot ${info.tone}`} />#{a.attemptIndex}
+                      <span
+                        className={a.status === "error" ? "rd-dot red err" : `rd-dot ${info.tone}`}
+                      />
+                      #{a.attemptIndex}
                     </button>
                   );
                 })}
@@ -606,6 +621,9 @@ export default function RunDetailsPage(props: {
             ) : null}
           </div>
 
+          {attempt !== null ? (
+            <AttemptOutcome status={attempt.status} score={attempt.score} judgments={judgments} />
+          ) : null}
           <AttemptSummary
             attempt={attempt}
             selId={selId}
@@ -1008,6 +1026,16 @@ function AttemptSummary(props: {
         <Meta label="Model">
           <ModelChip model={attempt.tokens?.model ?? config?.model ?? null} />
         </Meta>
+        <Meta label="Effort">
+          {attempt.reasoningEffort ? (
+            <EffortChip
+              effort={attempt.reasoningEffort}
+              applied={attempt.appliedReasoningEffort ?? null}
+            />
+          ) : (
+            <span className="dim">Harness default</span>
+          )}
+        </Meta>
         <Meta label="Tokens">
           <TokensValue tokens={attempt.tokens} />
         </Meta>
@@ -1015,7 +1043,7 @@ function AttemptSummary(props: {
           <EntityLink kind="scenario" id={attempt.scenarioId} />
         </Meta>
         <Meta label="Config">
-          <ConfigChip configId={attempt.configId} link />
+          <ConfigChip configId={attempt.configId} link effort={null} />
         </Meta>
       </div>
       {props.tasks !== null ? (
@@ -1563,8 +1591,12 @@ function MemberSection(props: {
         <div className="pv-rows">
           <SbRow label="Config">
             <span className="rd-member-config">
-              <ConfigChip configId={effConfigId} link />
+              <ConfigChip configId={effConfigId} link effort={null} />
               <ModelChip model={effModel} />
+              <EffortChip
+                effort={e.reasoningEffort}
+                applied={e.reasoningEffort ? (e.appliedReasoningEffort ?? null) : undefined}
+              />
               {overridden ? (
                 <Tooltip
                   text={`Overrides the cell config (${props.cellConfigId})${
@@ -1883,7 +1915,16 @@ const JUDGMENT_COLUMNS: Column<JudgmentJson>[] = [
     header: "Verdict",
     width: "84px",
     sortValue: (j) => j.score ?? (j.pass ? 1 : 0),
-    render: (j) => <StatusScore status={j.pass ? "pass" : "fail"} score={j.score} />,
+    render: (j) =>
+      isScoredJudgment(j) ? (
+        <Tooltip text={`Scored check · ${fmtScore(j.score as number)} of 1 toward ${j.dimension}`}>
+          <span className="status-score tone-neutral" data-testid="scored-verdict">
+            <span className="status-score-num">{fmtScore(j.score as number)}</span>
+          </span>
+        </Tooltip>
+      ) : (
+        <StatusScore status={j.pass ? "pass" : "fail"} score={j.score} />
+      ),
   },
   {
     key: "duration",
@@ -2091,7 +2132,7 @@ function JudgmentDetail(props: { judgment: JudgmentJson }): ReactNode {
           </div>
           <div>
             <span className="meta-label">Observed</span>
-            <div>{observedText(j.reasoning, j.pass, j.score)}</div>
+            <div>{observedText(j.reasoning, j.pass, j.score, isScoredJudgment(j))}</div>
           </div>
           <div>
             <span className="meta-label">Raw check</span>

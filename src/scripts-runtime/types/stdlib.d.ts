@@ -28,6 +28,45 @@ declare module "swarm-sdk" {
   export type ScriptFsMode = "none" | "workspace-rw";
   export type ScriptApiRawOptions = { raw: true };
   export type ScriptApiDefaultOptions = { raw?: false };
+  export type RoutingReason =
+    | "skill"
+    | "continuity"
+    | "overflow"
+    | "human_pinned"
+    | "reroute_fault";
+  export type TaskSendArgs = Record<string, unknown> & {
+    task: string;
+  } & (
+      | {
+          agentId: string;
+          routingReason: RoutingReason;
+          /** At least 10 characters after trim; maximum 200. */
+          routingNote: string;
+        }
+      | { agentId?: never; routingReason?: never; routingNote?: string }
+    );
+  export type AgentTaskStepConfig = {
+    template?: string;
+    task?: string;
+    agentId?: string;
+    routingReason?: RoutingReason;
+    routingNote?: string;
+    tags?: string[];
+    priority?: number;
+    offerMode?: boolean;
+    dir?: string;
+    vcsRepo?: string;
+    model?: string;
+    parentTaskId?: string;
+    requestedByUserId?: string;
+    outputSchema?: Record<string, unknown>;
+    /** Wait for the dispatched task to reach a terminal status before resolving. Default: true. */
+    waitForCompletion?: boolean;
+    /** Max ms to wait for a terminal status before throwing. Default: 2h. Only used when waitForCompletion is true. */
+    timeoutMs?: number;
+    /** Throw when the task ends failed/cancelled/superseded (default), or resolve with {taskId,status,error} when false. */
+    failOnTaskFailure?: boolean;
+  };
 
   export interface ScriptApiRawResult {
     ok: boolean;
@@ -98,6 +137,36 @@ declare module "swarm-sdk" {
     namespace: string;
   }
 
+  export type RoomOperation =
+    | { type: "set"; path: Array<string | number>; value: JsonValue }
+    | { type: "delete"; path: Array<string | number> }
+    | { type: "insert"; path: Array<string | number>; index: number; values: JsonValue[] }
+    | { type: "increment"; path: Array<string | number>; by: number }
+    | {
+        type: "text";
+        path: Array<string | number>;
+        index: number;
+        deleteCount?: number;
+        insert?: string;
+      };
+
+  export interface RoomView {
+    namespace: string;
+    name: string;
+    schemaVersion: number;
+    generation: string;
+    stale: boolean;
+    state: unknown;
+    snapshot: string;
+    bytes: number;
+  }
+
+  export interface RoomDecoded {
+    schemaVersion: number;
+    generation: string;
+    state: unknown;
+  }
+
   export interface SwarmSdk {
     // --- memory ---
     memory_search(args: {
@@ -106,6 +175,7 @@ declare module "swarm-sdk" {
       scope?: "all" | "agent" | "swarm";
       limit?: number;
       source?: string;
+      keyPrefix?: string;
     }): Promise<unknown>;
     memory_get(args: { memoryId: string; intent: string }): Promise<unknown>;
     memory_rate(args: { id: string; useful: boolean; note?: string }): Promise<unknown>;
@@ -113,6 +183,15 @@ declare module "swarm-sdk" {
     task_list(args?: Record<string, unknown>): Promise<unknown>;
     task_get(args: { taskId: string }): Promise<unknown>;
     task_storeProgress(args: Record<string, unknown>): Promise<unknown>;
+    task_defer(args: {
+      taskId: string;
+      delayMs?: number;
+      runAt?: string;
+      wakeOn?: { event: "task.completed" | "task.failed" | "settled"; taskId: string };
+      summary: string;
+      note: string;
+      checks?: string[];
+    }): Promise<unknown>;
     task_poll(args?: Record<string, unknown>): Promise<unknown>;
     // --- kv ---
     kv_get<T = unknown>(args: {
@@ -145,6 +224,41 @@ declare module "swarm-sdk" {
       limit?: number;
       offset?: number;
     }): Promise<KvSdkResponse<KvListData<T>>>;
+    // --- realtime rooms ---
+    room: {
+      get(args?: { name?: string; namespace?: string; schemaVersion?: number }): Promise<RoomView>;
+      change(args: {
+        name?: string;
+        namespace?: string;
+        schemaVersion?: number;
+        operations: RoomOperation[];
+      }): Promise<RoomView>;
+      reset(args?: {
+        name?: string;
+        namespace?: string;
+        schemaVersion?: number;
+        state?: Record<string, JsonValue>;
+      }): Promise<RoomView>;
+      decode(args: { value: unknown }): Promise<RoomDecoded>;
+    };
+    room_get(args?: {
+      name?: string;
+      namespace?: string;
+      schemaVersion?: number;
+    }): Promise<unknown>;
+    room_change(args: {
+      name?: string;
+      namespace?: string;
+      schemaVersion?: number;
+      operations: RoomOperation[];
+    }): Promise<unknown>;
+    room_reset(args?: {
+      name?: string;
+      namespace?: string;
+      schemaVersion?: number;
+      state?: unknown;
+    }): Promise<unknown>;
+    room_decode(args: { value: unknown }): Promise<unknown>;
     // --- repos ---
     repo_list(args?: Record<string, unknown>): Promise<unknown>;
     // --- schedules ---
@@ -279,6 +393,7 @@ declare module "swarm-sdk" {
       tags?: string[];
       taskId?: string;
       intent?: string;
+      key?: string;
     }): Promise<unknown>;
     memory_edit(args: {
       memoryId?: string;
@@ -290,6 +405,7 @@ declare module "swarm-sdk" {
       newString?: string;
       intent: string;
       expectedVersion?: number;
+      newKey?: string;
     }): Promise<unknown>;
     inject_learning(args: {
       content: string;
@@ -300,7 +416,7 @@ declare module "swarm-sdk" {
     }): Promise<unknown>;
 
     // --- write: tasks ---
-    task_send(args: Record<string, unknown>): Promise<unknown>;
+    task_send(args: TaskSendArgs): Promise<unknown>;
     task_cancel(args: { taskId: string }): Promise<unknown>;
     task_steer(args: {
       taskId: string;
@@ -319,6 +435,21 @@ declare module "swarm-sdk" {
       isSecret?: boolean;
     }): Promise<unknown>;
     config_delete(args: { id: string }): Promise<unknown>;
+
+    // --- write: model catalog ---
+    modelCatalog_refresh(args?: { force?: boolean }): Promise<unknown>;
+    modelCatalog_overlayUpsert(args: {
+      provider: string;
+      modelId: string;
+      name?: string;
+      releaseDate?: string;
+      contextWindow?: number;
+      maxOutput?: number;
+      reasoningOptions?: Array<{ type: string; values?: string[] }>;
+      pricing?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
+      reason: string;
+      verifiedBy?: string;
+    }): Promise<unknown>;
 
     // --- write: slack ---
     slack_post(args: { channelId: string; message: string; blocks?: unknown }): Promise<unknown>;
@@ -404,6 +535,24 @@ declare module "swarm-sdk" {
       offset?: number;
     }): Promise<unknown>;
 
+    // --- write: extensions ---
+    extension_catalog(args?: Record<string, never>): Promise<unknown>;
+    extension_install(
+      args:
+        | { template: string; priority?: number; config?: Record<string, unknown> }
+        | {
+            manifest: Record<string, unknown>;
+            files: Record<string, string>;
+            priority?: number;
+            config?: Record<string, unknown>;
+          },
+    ): Promise<unknown>;
+    extension_list(args?: { enabledOnly?: boolean }): Promise<unknown>;
+    extension_delete(args: { id: string }): Promise<unknown>;
+    extension_enable(args: { id: string }): Promise<unknown>;
+    extension_disable(args: { id: string }): Promise<unknown>;
+    extension_activate_version(args: { id: string; version: number }): Promise<unknown>;
+
     // --- write: repos ---
     repo_update(args: Record<string, unknown>): Promise<unknown>;
 
@@ -482,6 +631,7 @@ declare module "swarm-sdk" {
 
     // --- human input ---
     request_humanInput(args: Record<string, unknown>): Promise<unknown>;
+    approval_cancel(args: { requestId: string; reason?: string }): Promise<unknown>;
   }
 
   export interface ScriptStdlib {
@@ -506,29 +656,7 @@ declare module "swarm-sdk" {
       label: string,
       config: { prompt: string; model?: string; schema?: Record<string, unknown> },
     ): Promise<unknown>;
-    agentTask(
-      label: string,
-      config: {
-        template?: string;
-        task?: string;
-        agentId?: string;
-        tags?: string[];
-        priority?: number;
-        offerMode?: boolean;
-        dir?: string;
-        vcsRepo?: string;
-        model?: string;
-        parentTaskId?: string;
-        requestedByUserId?: string;
-        outputSchema?: Record<string, unknown>;
-        /** Wait for the dispatched task to reach a terminal status before resolving. Default: true. */
-        waitForCompletion?: boolean;
-        /** Max ms to wait for a terminal status before throwing. Default: 2h. Only used when waitForCompletion is true. */
-        timeoutMs?: number;
-        /** Throw when the task ends failed/cancelled/superseded (default), or resolve with {taskId,status,error} when false. */
-        failOnTaskFailure?: boolean;
-      },
-    ): Promise<unknown>;
+    agentTask(label: string, config: AgentTaskStepConfig): Promise<unknown>;
     swarmScript(
       label: string,
       config: {

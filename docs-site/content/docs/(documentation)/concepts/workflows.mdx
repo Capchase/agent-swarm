@@ -5,6 +5,8 @@ description: Run multi-step AI agent pipelines automatically — trigger workflo
 
 Agent Swarm includes a **workflow automation engine** that lets you define multi-step processes as directed acyclic graphs (DAGs). Workflows connect triggers, conditions, and actions into pipelines that execute automatically.
 
+Bundled workflows declare the parameters and integrations they require. If one is enabled before setup is complete, it reports `needs_setup` with exactly what is missing in the dashboard and refuses to trigger until setup is complete. Operator-created workflows remain unaffected unless they opt into the same `params`, `requiredParams`, and `requires` metadata.
+
 ## Core Concepts
 
 A workflow consists of:
@@ -17,7 +19,7 @@ A workflow consists of:
 
 ### Executor Types
 
-The engine includes 12 built-in executor types:
+The engine includes 13 built-in executor types:
 
 | Executor | Description |
 |----------|-------------|
@@ -26,6 +28,7 @@ The engine includes 12 built-in executor types:
 | `agent-task` | Create and delegate a task to a swarm agent |
 | `foreach` | Fan out one agent task per array item, wait for every child, and emit one aggregate result |
 | `raw-llm` | Call an LLM directly with a prompt template |
+| `system-one-decision` | Make typed decisions (probability, choice, score) over supplied state, with Jev by default. Can send uncertain answers to a person |
 | `vcs` | Version control operations (create PR, merge, etc.) |
 | `property-match` | Route based on matching properties in step input |
 | `code-match` | Route based on a custom JavaScript expression in a sandbox |
@@ -39,6 +42,157 @@ Each executor has typed config and output schemas available via `GET /api/execut
 `swarm-script` is the durable, reusable counterpart to inline `script` nodes. In workflow definitions it accepts `scriptName`, optional `scope` (`agent` or `global`), optional `pinHash`, JSON `args`, and `timeoutMs`. The timeout defaults to `30000` ms, accepts integers from `1000` through `300000` (5 minutes), and raises the script runtime's wall-clock budget for I/O-bound work while still respecting the separate 60-second CPU-time ceiling.
 
 For `config.args`, values written as an **exact single token** such as `{{input.payload}}` preserve the resolved JSON type, so objects, arrays, numbers, and booleans reach the script as native values. If you wrap a token with surrounding text, such as `"prefix-{{input.id}}"`, interpolation falls back to string output. Raw-token resolution is scoped to the node's local interpolation context, including any explicit `inputs` mapping on that node.
+
+### Choosing a decider
+
+When a node has to decide, use the cheapest node that can decide. Agents authoring workflows apply this rule by default, so you do not need to ask for `system-one-decision`.
+
+| The decision is | Use |
+|---|---|
+| A fact: a count, PR state, flag, date, lookup, regex, or schema check | `script`, `property-match`, or `code-match` |
+| A bounded judgment: pass/fail, pick one of N, a score on a rubric, or the probability that a claim is true | `system-one-decision` |
+| Free-form generation, or findings a later node reads | `raw-llm` or `agent-task` |
+
+Jev is weak at counting. For a hybrid, count in a `script` and pass the number to `system-one-decision` as part of `state`.
+
+### SystemOne Decision
+
+A `system-one-decision` node (display name "SystemOne Decision") sends one `state` and a map of questions to a typed-decisions model and returns one validated answer per question. The model is Jev today (`model` defaults to it); the node name is not model-specific. It reaches the model through a `provider`: `typesafe` (the default), `openrouter`, or `laya`. Each provider needs its own global secret, `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, or `LAYA_API_KEY`; `laya` also needs `LAYA_URL`, its server's base URL, as a global config value. The key is read on the server and never appears in a definition, a step output, or an error.
+
+```json
+{
+  "id": "qualify",
+  "type": "system-one-decision",
+  "inputs": { "lead": "trigger.lead" },
+  "config": {
+    "provider": "typesafe",
+    "model": "jev-1.13.0",
+    "state": "{{lead}}",
+    "questions": {
+      "fit": {
+        "type": "noul",
+        "instructions": "Is this a real engineering team seeking agent workflow automation?",
+        "criteria": { "true": "A matching team with a concrete use case", "false": "Spam or no matching team" }
+      },
+      "authority": {
+        "type": "choice",
+        "instructions": "What purchasing authority does the message support?",
+        "criteria": { "buyer": "Can approve the purchase", "champion": "Influences the decision", "unknown": "Not established" }
+      }
+    },
+    "returns": { "fit": { "type": "noul" }, "authority": { "type": "choice" } }
+  },
+  "next": "gate"
+}
+```
+
+- `provider` is `typesafe` (default), `openrouter`, or `laya`, and must be a literal. `model` is that provider's own id (`jev-1.13.0` on `typesafe`, `typesafe/jev-1.13` on `openrouter`); unset means the provider's default. `laya` has no default and sends no `model`, because it silently ignores one it does not know. All three take the same request and return the same answers, so everything below holds on each, except that `laya`'s confidence is its `answer_confidence`, the top probability. There is no fallback: a node that names no provider does not switch to another when the TypeSafe key is missing.
+- Question types are `noul` (probability that a claim is true), `choice` (2 to 255 named options), and `score` (2 to 10 ordered levels). `returns` repeats each question id and type, and a mismatch is rejected when the workflow is saved.
+- The output is `{ model, answers, usage }`, plus `routing: { model }` on `laya` (the checkpoint that answered). A downstream node reads `<alias>.answers.<question>.<field>` through an `inputs` mapping. A `noul` answer is `{ type, noul }` with no confidence. `choice` and `score` answers carry `probabilities` and `confidence`.
+- A low-confidence answer is still a success. To have a person review the uncertain ones, set `humanReview` (below). To route on a threshold yourself, put it in the next node, such as `property-match` or `code-match`, and route the uncertain band to `human-in-the-loop`.
+- The node retries connection errors, 408, 429, and 5xx itself, up to `maxRetries` (0 to 3, default 2) within `timeoutMs` (default 30000). It never retries a 401, a 422, or an answer that fails validation. Do not set `retry` or `validation.retry` on a `system-one-decision` node.
+- An unresolved `{{token}}` fails the step before the request is sent.
+
+#### Human review
+
+Set `humanReview` to define a confidence band in the same node. An answer whose confidence is inside the band goes to a person instead of passing straight through.
+
+```json
+"humanReview": {
+  "band": { "min": 0.5, "max": 0.8 },
+  "approvers": { "users": ["head-of-sales"], "policy": "any" },
+  "timeout": { "seconds": 86400, "action": "reject" }
+},
+"next": { "approved": "route", "rejected": "discard", "timeout": "escalate" }
+```
+
+- `band` is `min` and `max`, each 0 to 1, and both ends count as inside. `choice` and `score` answers are tested on the `confidence` they report. A `noul` answer reports none, so it is tested on `max(noul, 1 - noul)`. The number is the provider's own, so a band tuned on one model does not carry to another. On `laya` it is `answer_confidence`, the top probability.
+- `approvers`, `timeout`, and `notifications` are the `human-in-the-loop` settings. The node raises the request through that executor: same approvers, `waiting` run state, Slack notification, and approval card. Nothing is built twice.
+- If any answer is in the band, the run waits. The card asks the person to accept or reject the decision, and asks one question for each answer in the band. Leave it empty to confirm what the model said, or pick another option to replace it. Answers outside the band stay the model's.
+- The output is the same `{ model, answers, usage }`, plus `review`. `review.status` is `not_required`, `approved`, `rejected`, or `timeout`. `review.questions.<id>` records the confidence tested, whether it was in the band, and `decidedBy` (`model` or `human`). When a person decided, `modelAnswer` keeps what the model said. Rejected and timed-out decisions leave `answers` as the model's.
+- `next` must be a port map with `approved` (every accepted answer, whether the model's or a person's) and optionally `rejected` and `timeout`. A string or list `next` is refused, because it would run the same nodes after a rejection.
+
+#### Keys and preflight
+
+The swarm checks a `system-one-decision` node's key before first use. Set `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, or `LAYA_API_KEY` as a global secret on the Secrets page (Settings > Secrets). For `laya`, also set `LAYA_URL` as a global config value (`set-config`, scope `global`). Every message names the key or config value for the node's provider.
+
+- **Saving a workflow** with a `system-one-decision` node whose key is missing succeeds and returns a warning: in the tool result message and `data.warnings` over MCP, and as `warnings` on the workflow body over HTTP. A save is not rejected, because definitions are also saved before a human has supplied the key and the key can change later.
+- **Starting a run** fails before any node executes when the key is missing. The run is recorded as `failed` with no steps and no request sent. Retrying a failed run is refused, and the run stays failed, while a node still to run needs a missing key.
+- **A key the provider refuses** (HTTP 401 or 403) fails the step with `<KEY> was rejected by <provider>` and is not retried.
+
+#### Example: a laya decision end to end
+
+This workflow classifies a text with `provider: laya`, sends borderline answers to a person, and branches on the result. It is the definition of the `system-one-decision-demo` workflow that was run live against laya.
+
+1. **Run your own laya server.** Calls do not go through any desplega API: your swarm's API server calls your laya server directly, so it must be able to reach it. laya is `@desplega.ai/laya-server` from [laya-js](https://github.com/desplega-ai/laya-js), on npm or built from its Dockerfile (no image is published). The [deploy guide](https://github.com/desplega-ai/laya-js/tree/main/docs/deploy) covers Docker, Kubernetes, and hosted platforms. It runs on CPU; plan for about 8 GB of RAM for now, since the Docker image has been measured peaking at 7 GB under load. Give the server a `LAYA_API_KEY` and wait for `GET /health` to return `status: "ok"`. Without a laya server, use the default `typesafe` provider instead.
+2. **Point the swarm at it.** Set `LAYA_URL` to the server's base URL as a global config value (`set-config`, scope `global`, not secret). Set `LAYA_API_KEY` to the same token you gave the server as a global secret on the Secrets page (Settings > Secrets). The URL must be `https`; plain `http` is accepted for `localhost` only.
+3. **Create the workflow** with a manual trigger:
+
+```json
+{
+  "name": "system-one-decision-demo",
+  "triggerSchema": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } } },
+  "definition": {
+    "onNodeFailure": "fail",
+    "nodes": [
+      {
+        "id": "decide",
+        "type": "system-one-decision",
+        "inputs": { "text": "trigger.text" },
+        "config": {
+          "provider": "laya",
+          "state": "{{text}}",
+          "questions": {
+            "sentiment": {
+              "type": "choice",
+              "instructions": "What is the sentiment of this customer review?",
+              "criteria": { "positive": "satisfied", "negative": "unhappy", "mixed": "both good and bad" }
+            }
+          },
+          "returns": { "sentiment": { "type": "choice" } },
+          "timeoutMs": 30000,
+          "maxRetries": 1,
+          "humanReview": {
+            "band": { "min": 0.5, "max": 0.8 },
+            "approvers": { "roles": ["lead"], "policy": "any" },
+            "title": "Borderline laya answer",
+            "timeout": { "seconds": 900, "action": "reject" }
+          }
+        },
+        "next": { "approved": "gate", "rejected": "rejected-end", "timeout": "timeout-end" }
+      },
+      {
+        "id": "gate",
+        "type": "property-match",
+        "inputs": { "s": "decide.answers.sentiment.choice" },
+        "config": { "conditions": [{ "field": "s", "op": "eq", "value": "positive" }], "mode": "all" },
+        "next": { "true": "pass-end", "false": "fail-end" }
+      },
+      { "id": "pass-end", "type": "script", "config": { "runtime": "bash", "script": "echo pass" } },
+      { "id": "fail-end", "type": "script", "config": { "runtime": "bash", "script": "echo fail" } },
+      { "id": "rejected-end", "type": "script", "config": { "runtime": "bash", "script": "echo rejected" } },
+      { "id": "timeout-end", "type": "script", "config": { "runtime": "bash", "script": "echo timeout" } }
+    ]
+  }
+}
+```
+
+Set `approvers` to whoever reviews the borderline answers. Replace the `script` end nodes with the real work for each branch.
+
+4. **Trigger it** with `trigger-workflow` (`triggerData: { "text": "..." }`), the dashboard, or `POST /api/workflows/<id>/trigger` with the body `{ "text": "..." }`.
+5. **Read the result** on the `decide` step. `answers.sentiment.choice` is the label, `answers.sentiment.confidence` is laya's top probability, and `routing.model` is the checkpoint that answered (`english` for English text; laya picks it from the text because the node sends no `model`). When the confidence falls in the band, the run waits on an approval; after it resolves, `review.status` says how and `review.questions.sentiment.decidedBy` says whether the model or a person produced the answer.
+
+The live runs of this definition:
+
+| Input | Answer | Confidence | Path |
+|---|---|---|---|
+| Clearly positive review | `positive` | 0.94 | `approved` → `gate` → `pass-end` |
+| Clearly negative review | `negative` | 0.98 | `approved` → `gate` → `fail-end` |
+| Mixed review | `mixed` | 0.71 | in the band: waited, a person approved, then `gate` → `fail-end` |
+
+Each laya call took under 0.7 s.
+
+Prefer `choice` questions on laya for now. On laya-server 0.1.0, a `noul` question asking whether the review was positive returned close to 0 for every input, including clearly positive ones, while the same judgment as a `choice` answered correctly. Check a `noul` question against a few known inputs before you rely on it.
 
 ### Foreach fan-out
 
@@ -86,15 +240,20 @@ The `next` field supports three formats:
         "id": "check-type",
         "type": "property-match",
         "label": "Check Event Type",
-        "config": { "property": "event", "match": "pull_request.opened" },
-        "next": { "match": "create-review", "no_match": null }
+        "inputs": { "event": "trigger.event" },
+        "config": {
+          "conditions": [{ "field": "event", "op": "eq", "value": "pull_request.opened" }],
+          "mode": "all"
+        },
+        "next": { "true": "create-review" }
       },
       {
         "id": "create-review",
         "type": "agent-task",
         "label": "Create Review Task",
+        "inputs": { "pr": "trigger.pull_request" },
         "config": {
-          "taskTemplate": "Review PR #{{input.number}}: {{input.title}}",
+          "template": "Review PR #{{pr.number}}: {{pr.title}}",
           "tags": ["review", "automated"],
           "priority": 60
         }
@@ -104,6 +263,8 @@ The `next` field supports three formats:
 }
 ```
 
+The webhook payload supplies `event` and `pull_request`. A nonmatching event ends the branch because no `false` target is declared.
+
 ### Triggers
 
 | Type | Description |
@@ -111,6 +272,9 @@ The `next` field supports three formats:
 | `webhook` | HTTP POST to `/api/workflows/:id/trigger` with optional verification |
 | `schedule` | References a schedule by ID — the schedule creates workflow runs at configured times |
 | `manual` | Triggered via the `trigger-workflow` MCP tool or dashboard UI |
+| `event` | Starts from a named internal event; `slack.message` is currently supported |
+
+An event trigger uses `{ "type": "event", "eventName": "slack.message" }`. The Slack message payload becomes the workflow's `triggerData` and contains `channel`, `text`, `user`, `ts`, and `threadTs`; any configured `triggerSchema` is applied before a run starts.
 
 Workflow runs preserve the human who actually triggered them in `createdBy`. Authenticated HTTP and MCP triggers use the trusted caller context, schedules use their creator when present, and Kapso routing uses its resolved sender. Generic ownerless webhooks and creatorless schedules remain unattributed rather than inheriting the workflow author's identity. Retry, resume, and recovery paths rehydrate this requester from the run so agent tasks created later keep the same attribution.
 
@@ -166,6 +330,24 @@ Use `token-equality` for shared-token providers such as GitLab. The configured `
   "verification": {
     "format": "token-equality",
     "header": "X-Gitlab-Token"
+  }
+}
+```
+
+Use `standard-webhooks` for any sender that follows the [Standard Webhooks](https://www.standardwebhooks.com/) specification (for example Granola, or services built on Svix-compatible signing). The headers are fixed by the spec, so there is no `header` field:
+
+- `webhook-id`, `webhook-timestamp` (unix seconds), and `webhook-signature` must all be present.
+- The signed content is `<webhook-id>.<webhook-timestamp>.<raw body>`, HMAC-SHA256 keyed with the base64-decoded secret. Store the sender's signing secret as-is in `hmacSecret`; a `whsec_` prefix is stripped automatically.
+- `webhook-signature` is a space-delimited list of `v1,<base64>` entries. Any matching `v1` entry is accepted, so senders can rotate secrets without downtime. Other versions (such as asymmetric `v1a`) are ignored.
+- Timestamps more than `toleranceSeconds` (default `300`) in the past or future are rejected.
+
+```json
+{
+  "type": "webhook",
+  "hmacSecret": "secret.GRANOLA_WEBHOOK_SECRET",
+  "verification": {
+    "format": "standard-webhooks",
+    "toleranceSeconds": 300
   }
 }
 ```
@@ -253,19 +435,22 @@ This is useful for fan-out patterns where some branches may fail but you still w
 
 ### Per-Step Retry
 
-Each node can define a `retryPolicy`:
+Each node can define a `retry` policy on the node itself (not inside `config`):
 
 ```json
 {
-  "retryPolicy": {
+  "retry": {
     "maxRetries": 3,
-    "backoff": "exponential",
-    "initialDelayMs": 1000
+    "strategy": "exponential",
+    "baseDelayMs": 1000,
+    "maxDelayMs": 60000
   }
 }
 ```
 
 Backoff strategies: `exponential`, `linear`, `static`. The poller detects failed steps and re-executes them according to the policy.
+
+For an `agent-task` node, `retry` also covers a task that fails after dispatch, for example one the heartbeat fails with `superseded_workflow_task` after a worker restart. The engine detaches the failed task and the poller dispatches a fresh task for the same step. `onNodeFailure` applies only once `maxRetries` is spent. A cancelled task is never retried, and a node without `retry` behaves as before. Before a retry, the engine restores completed upstream outputs from step checkpoints, so declared inputs resolve to the same values as the original execution. Retrying a failed run also reconstructs the branch selected by each completed step and never revives a branch that was not taken.
 
 ### Per-Node Timeout
 
@@ -443,9 +628,11 @@ The `human-in-the-loop` executor pauses a workflow until a human responds via th
 
 Question types supported: `approval` (yes/no), `text`, `single-select`, `multi-select`, and `boolean`.
 
-When the node executes, it creates an approval request accessible at `/approval-requests/{id}` in the dashboard. The workflow run pauses until a human responds. Upon resolution, a follow-up task is created for the requesting agent and the workflow resumes via the appropriate `next` port.
+When the node executes, it creates an approval request accessible at `/approval-requests/{id}` in the dashboard. The workflow run pauses until a human responds. Upon resolution, a follow-up task is created for the requesting agent and the workflow resumes via the appropriate `next` port. Cancelling the run or its human-in-the-loop step marks the pending request as cancelled, rejects later responses, and updates any linked Slack approval thread so reviewers do not act on a stale gate.
 
 The dashboard validates every required response before submission. Missing or invalid approval, text, select, and boolean answers are marked inline and keep **Submit Response** disabled; if the server rejects a response, its error is shown directly so the user can correct it.
+
+`questions` can also be built at run time: set it to one exact token such as `"{{plan.questions}}"` (with a matching `inputs` mapping) and the upstream array becomes the card's questions, for example one `single-select` per item. The array is validated when the node runs; a missing, empty, or malformed value (or more than 100 questions) fails the node without creating a card.
 
 ## Loop Support
 
@@ -458,6 +645,12 @@ The engine uses **iteration-aware idempotency keys** to distinguish between loop
   "definition": {
     "nodes": [
       {
+        "id": "start",
+        "type": "agent-task",
+        "config": { "template": "Prepare the draft requirements" },
+        "next": "generate"
+      },
+      {
         "id": "generate",
         "type": "agent-task",
         "config": { "template": "Generate a draft" },
@@ -466,7 +659,12 @@ The engine uses **iteration-aware idempotency keys** to distinguish between loop
       {
         "id": "validate",
         "type": "validate",
-        "next": { "pass": "publish", "retry": "generate" }
+        "inputs": { "draft": "generate" },
+        "config": {
+          "targetNodeId": "draft",
+          "prompt": "Does the draft in taskOutput meet the requirements and read clearly?"
+        },
+        "next": { "pass": "publish", "fail": "generate" }
       },
       {
         "id": "publish",
@@ -478,7 +676,7 @@ The engine uses **iteration-aware idempotency keys** to distinguish between loop
 }
 ```
 
-In this example, the `validate` node routes back to `generate` on failure, creating a loop that continues until validation passes.
+The `start` node provides an entry outside the cycle. The `draft` input maps the generator output into the validator context. In this example, the `validate` node routes back to `generate` on failure, creating a loop that continues until validation passes.
 
 ## Related
 

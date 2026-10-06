@@ -4,6 +4,7 @@ This guide covers all deployment options for Agent Swarm.
 
 ## Table of Contents
 
+- [Kubernetes and Helm](https://docs.agent-swarm.dev/docs/guides/kubernetes) — API ingress, dashboard access, and CORS diagnostics
 - [Docker Compose (Recommended)](#docker-compose-recommended)
 - [Docker Worker](#docker-worker)
 - [Server Deployment (systemd)](#server-deployment-systemd)
@@ -35,8 +36,8 @@ The easiest way to deploy a full swarm with API, workers, and lead agent.
 
 ### Prerequisites
 
-- Docker & Docker Compose installed
-- A Claude Code OAuth token (run `claude setup-token` to get one)
+- Docker & Docker Compose installed (rootless Podman with a Compose provider also works; see [Rootless Podman](https://docs.agent-swarm.dev/docs/guides/podman-rootless))
+- One supported harness credential from the table below
 - An API key (any secret string you choose — all services share this key)
 
 ### Quick Start
@@ -52,7 +53,9 @@ cp docker-compose.example.yml docker-compose.yml
 ```bash
 # ---- Required ----
 API_KEY=your-secret-api-key
-CLAUDE_CODE_OAUTH_TOKEN=your-oauth-token   # Run `claude setup-token` to get this
+HARNESS_PROVIDER=claude
+CLAUDE_CODE_OAUTH_TOKEN=your-oauth-token   # Or configure another provider below
+AGENT_SWARM_VERSION=1.150.0                # Pin a release. Blank tracks `:latest` — see Step 4
 
 # ---- Optional ----
 GITHUB_TOKEN=your-github-token             # For git operations inside agents
@@ -61,26 +64,54 @@ GITHUB_NAME=Your Name
 SWARM_URL=localhost                         # Base domain for service discovery
 ```
 
-> **Tip:** You can pass multiple OAuth tokens for load balancing: `CLAUDE_CODE_OAUTH_TOKEN=token1,token2,token3`
+Choose one provider for the whole example fleet:
 
-**Step 3:** Generate stable UUIDs for each agent. The example compose file has placeholder UUIDs — replace them with your own so that agent identity persists across restarts.
+| Provider | `HARNESS_PROVIDER` | Credential/configuration |
+| --- | --- | --- |
+| Claude Code | `claude` | `CLAUDE_CODE_OAUTH_TOKEN` (run `claude setup-token`) or `ANTHROPIC_API_KEY` |
+| OpenAI | `codex` | `OPENAI_API_KEY` |
+| OpenRouter | `pi` | `OPENROUTER_API_KEY` and a `MODEL_OVERRIDE` such as `openrouter/anthropic/claude-sonnet-4-5` |
+| AWS Bedrock (alpha) | `pi` | `AWS_REGION`, `MODEL_OVERRIDE=amazon-bedrock/<model-id>`, and AWS access keys or `AWS_PROFILE` |
+
+Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock. See [model providers and gateways](https://docs.agent-swarm.dev/docs/guides/provider-auth/model-gateways) and [what each provider supports](https://docs.agent-swarm.dev/docs/guides/harness-configuration#supported-providers).
+
+> **Tip:** Claude users can pass multiple OAuth tokens for load balancing: `CLAUDE_CODE_OAUTH_TOKEN=token1,token2,token3`.
+
+**Step 3:** Optionally set agent ID overrides in `.env`.
+
+Leave the Docker Compose agent ID variables blank to generate a UUID on first boot and reuse it across restarts. Each service stores its ID in `/workspace/personal/.agent-id` on its own volume.
+
+To retain an existing identity, set the service's override in `.env` (for example, `LEAD_AGENT_ID` or `WORKER_1_AGENT_ID`). An explicit override takes precedence over the saved ID and is persisted to the same file. See `.env.docker.example` for all override variables.
+
+Removing personal volumes also removes generated IDs.
+
+**Step 4:** Pin the image version.
+
+`AGENT_SWARM_VERSION` in `.env` drives the tag for the API and every agent service. Leaving it blank resolves to `:latest`, which is rebuilt and moved on **every commit to `main`** — it is not a release. A version tag is published only when the release version changes. Because the example sets `pull_policy: always`, an unpinned deployment can move to a newer build on any `up -d` or container restart, which lets the API and the agents drift onto different code.
+
+Pin a version from [releases](https://github.com/desplega-ai/agent-swarm/releases) and confirm every service resolved the same tag:
 
 ```bash
-# Generate UUIDs (run once per agent)
-uuidgen  # lead
-uuidgen  # worker-1
-uuidgen  # worker-2
+docker compose config | grep -E 'image: .*(agent-swarm|agent-swarm-worker):'
 ```
 
-Edit `docker-compose.yml` and replace the `AGENT_ID` values for each service with your generated UUIDs.
+Changing this value later is an upgrade, not a restart. Migrations are forward-only, so re-pinning to an older tag does **not** roll back a schema change — only a database backup taken before the upgrade does. Back it up (see [Volumes & Persistence](#volumes--persistence)), then:
 
-**Step 4:** Start the swarm.
+```bash
+docker compose pull      # explicit: a moved tag is not re-pulled unless pull_policy is always
+docker compose up -d
+docker compose images    # confirm what is actually running
+```
+
+Verify with `/health` **and** a completed task, not `/health` alone. On Kubernetes the chart pins images through its `appVersion`; pass `--version` to `helm upgrade` or it moves to the newest published chart.
+
+**Step 5:** Start the swarm.
 
 ```bash
 docker compose up -d
 ```
 
-**Step 5:** Verify everything is running.
+**Step 6:** Verify everything is running.
 
 ```bash
 # Check all services are up
@@ -102,9 +133,10 @@ All services in the docker-compose files include `platform: linux/amd64` to avoi
 The example `docker-compose.yml` sets up:
 
 - **API service** (port 3013) — MCP HTTP server with SQLite database
-- **1 Lead agent** — Coordinator that delegates tasks to workers
-- **2 Worker agents** — Claude-powered agents that execute tasks
-- **3 Content agents** (optional) — Specialized workers for content writing, reviewing, and strategy, each bootstrapped from a template via `TEMPLATE_ID`
+- **12 agent services: 1 lead and 11 workers covering all 11 official templates**, each bootstrapped via `TEMPLATE_ID`:
+  - **1 lead** — Coordinator that delegates tasks to workers
+  - **2 coders** — Worker replicas that execute coding tasks
+  - **9 specialized workers** — `content-writer`, `content-reviewer`, `content-strategist`, `researcher`, `reviewer`, `tester`, `forward-deployed-engineer`, `ux-principles`, and `discoverability-optimizer`
 
 ### Volumes & Persistence
 
@@ -113,7 +145,7 @@ The swarm uses Docker named volumes to persist data across restarts and upgrades
 ```
 Docker Volume            → Container Path        → What It Stores
 ─────────────────────────────────────────────────────────────────────
-swarm_api                → /app                  → SQLite DB (agent-swarm-db.sqlite)
+swarm_api_data           → /app/data             → SQLite DB (agent-swarm-db.sqlite)
 swarm_logs               → /logs                 → Session logs (all agents share this)
 swarm_shared             → /workspace/shared     → Shared workspace (all agents read/write)
 swarm_lead               → /workspace/personal   → Lead agent's private workspace
@@ -126,7 +158,34 @@ swarm_content_strategist → /workspace/personal   → Content strategist's priv
 
 **How it works:**
 
-- **`swarm_api`** — The most critical volume. Contains the SQLite database with all tasks, agents, schedules, and configuration, plus auto-generated secrets such as `.page-session-secret`. **Back this up regularly.** Losing this volume means losing swarm state and invalidates existing authenticated page sessions.
+- **`swarm_api_data`** — The most critical volume. Contains the SQLite database with all tasks, agents, schedules, and configuration, plus auto-generated secrets such as `.page-session-secret`. **Back this up regularly.** Losing this volume means losing swarm state and invalidates existing authenticated page sessions.
+
+#### Migrating from the `/app` mount
+
+Installs created before this change mount `swarm_api` at `/app` instead of `swarm_api_data` at `/app/data`. **Fix this — it silently breaks upgrades.**
+
+A Docker named volume copies image content only on *first* population, then shadows that path forever. Mounting `/app` therefore freezes everything the image ships there — `migrations/`, `package.json`, `extensions/`, `scripts-runtime/`, `script-types/`, `typescript-lib/`, `vendored-openapi/` — at install time. The compiled binary lives outside `/app` (`/usr/local/bin/agent-swarm-api`), so **the code upgrades while its migrations do not**. The API then queries columns and tables that no migration in its frozen directory ever created, and every affected write fails with `SQLiteError: table … has no column named …`.
+
+It is undetectable from the outside: `/health` reads the stale `/app/package.json`, so it reports the *old* version and stays green while newer code runs.
+
+Detect it by comparing the running container against its own image:
+
+```bash
+docker compose exec api sh -c 'ls /app/migrations | wc -l; grep \"version\" /app/package.json'
+docker run --rm --entrypoint sh ghcr.io/desplega-ai/agent-swarm:<your tag> \
+  -c 'ls /app/migrations | wc -l; grep \"version\" /app/package.json'
+```
+
+Differing counts or versions confirm the shadowing. Migrate with a one-time copy — only `/app/data` needs to persist:
+
+```bash
+docker compose down
+docker run --rm -v swarm_api:/old -v swarm_api_data:/new alpine \
+  sh -c 'cp -a /old/data/. /new/ && ls -la /new'   # expect agent-swarm-db.sqlite
+docker compose up -d
+```
+
+Keep the old `swarm_api` volume until the upgraded install is verified, then delete it. Worker volumes are unaffected — they mount `/workspace/*` and `/logs`, which is intended agent state.
 - **`swarm_logs`** — Shared by all agent containers. Each agent writes session logs here. Useful for debugging but not critical — can be recreated.
 - **`swarm_shared`** — A workspace visible to all agents. Each agent creates subdirectories under `/workspace/shared/{thoughts,memory,downloads,misc}/$AGENT_ID`. Agents can read each other's files but conventionally only write to their own subdirectory.
 - **`swarm_<agent>`** (personal volumes) — Each agent gets an isolated workspace at `/workspace/personal` for its own files. Not visible to other agents.
@@ -134,10 +193,18 @@ swarm_content_strategist → /workspace/personal   → Content strategist's priv
 **Backup:**
 
 ```bash
-# Back up the API database and persisted page-session secret
-docker run --rm -v swarm_api:/app -v $(pwd):/backup alpine \
-  sh -c 'cp /app/agent-swarm-db.sqlite /backup/agent-swarm-db-backup.sqlite && if [ -f /app/.page-session-secret ]; then cp /app/.page-session-secret /backup/page-session-secret.backup; fi'
+# Back up the API database, its WAL sidecars, and the persisted page-session secret
+docker run --rm -v swarm_api_data:/data -v $(pwd):/backup alpine \
+  sh -c 'cp -a /data/. /backup/swarm-api-data-backup/'
 ```
+
+> **Note:** The API volume is `swarm_api_data`, mounted at `/app/data`. Installs created before that change mount `swarm_api` at `/app` — substitute that name and use `-v swarm_api:/old` with `cp -a /old/data/.`. See [Migrating from the `/app` mount](#migrating-from-the-app-mount).
+
+### Database retention
+
+`SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, and `CONTEXT_VERSIONS_KEEP_LATEST` are disabled until you set them. Each `*_RETENTION_DAYS` value permanently deletes rows older than its window. `CONTEXT_VERSIONS_KEEP_LATEST` is a count, not a window: it keeps that many newest `context_versions` rows per agent and field and deletes older profile history, never the newest version. Start with `DB_RETENTION_DRY_RUN=true`, confirm the exact would-delete count through the `agentswarm.db.retention.backlog` metric and `GET /api/metrics`, then enable one table at a time.
+
+The sweep reads three tuning values on every tick: `DB_RETENTION_TICK_BUDGET_MS` (default `30000`, range `1000`–`300000`), `DB_RETENTION_CATCHUP_INTERVAL_MS` (default `60000`, range `5000`–`3600000`), and `DB_RETENTION_MAX_STATEMENT_MS` (default `250`, range `25`–`5000`). See [runbooks/db-retention.md](./runbooks/db-retention.md) before activation.
 
 ### Adding More Workers
 
@@ -170,7 +237,8 @@ Run individual Claude workers in containers.
 ### Pull from Registry
 
 ```bash
-docker pull ghcr.io/desplega-ai/agent-swarm-worker:latest
+# Pin a release. `:latest` is rebuilt on every commit to `main` and is not a release.
+docker pull ghcr.io/desplega-ai/agent-swarm-worker:1.150.0
 
 # Slim variant for CI/E2E (all four harnesses, no playwright/postgres/redis/glab
 # or dev toolchain — see docs-site "Published Artifacts" for the full matrix)
@@ -189,23 +257,25 @@ bun run docker:build:worker
 # Slim variant (CI/E2E)
 bun run docker:build:worker:slim
 
-# Override the pinned Claude Code version (default: 2.1.235)
+# Override the pinned Claude Code version (default: 2.1.246)
 docker build -f Dockerfile.worker --build-arg CLAUDE_CODE_VERSION=2.2.0 -t agent-swarm-worker .
 ```
 
 Current worker-image defaults in `Dockerfile.worker`:
 
-- `CLAUDE_CODE_VERSION=2.1.235`
-- `PI_CODING_AGENT_VERSION=0.84.2`
-- `CODEX_VERSION=0.148.0`
-- `OPENCODE_VERSION=1.18.18`
-- `OPENCODE_SDK_VERSION=1.18.18`
+- `CLAUDE_CODE_VERSION=2.1.246`
+- `PI_CODING_AGENT_VERSION=0.84.3`
+- `CODEX_VERSION=0.149.1`
+- `OPENCODE_VERSION=1.18.23`
+- `OPENCODE_SDK_VERSION=1.18.23`
 
 The image also sets `DISABLE_AUTOUPDATER=1` so Claude Code stays on the pinned version instead of self-updating at runtime.
 
 The worker image now also ships PostgreSQL 16 server binaries (`initdb`, `pg_ctl`, `psql`, `pg_stat_statements`) for local backend or integration-style test setups. They stay dormant unless you opt in with `SWARM_DEP_POSTGRES_ENABLED=true`, which runs [`scripts/init-local-postgres.sh`](./scripts/init-local-postgres.sh) from the entrypoint. The helper defaults to `localhost:5433` and can be tuned with `LOCAL_POSTGRES_DATA_DIR`, `LOCAL_POSTGRES_PORT`, `LOCAL_POSTGRES_USER`, `LOCAL_POSTGRES_PASSWORD`, and `LOCAL_POSTGRES_DB`.
 
-The worker image also now bundles the Ubuntu runtime libraries Playwright's Chromium binary needs at launch time, so `qa-use` / browser-automation tasks no longer need an extra per-agent `apt` bootstrap just to start the bundled browser.
+Set a non-empty `LOCAL_POSTGRES_PASSWORD` in the worker environment before enabling PostgreSQL. The helper has no password default and reapplies the supplied value to existing clusters on every invocation. Configure password-using clients with that value; loopback binding and local trust authentication are unchanged.
+
+The worker image also now bundles the Ubuntu runtime libraries Playwright's Chromium binary needs at launch time, so `agent-browser` / browser-automation tasks no longer need an extra per-agent `apt` bootstrap just to start the bundled browser.
 
 Both `Dockerfile` and `Dockerfile.worker` now copy the repository `templates/` directory into the image, so system-default skills and templates are available inside compiled deployments without an extra post-build sync step.
 
@@ -269,7 +339,7 @@ The Docker worker image uses a multi-stage build with two publishable targets:
 
 1. **Builder stage**: Compiles `src/cli.tsx` into a standalone binary
 2. **`worker-slim` target** (`:slim` tag): Ubuntu 24.04 with all four harness CLIs and the core agent tooling — for CI and E2E
-3. **`worker-full` target** (default, `:latest` tag): adds the full development environment below (build toolchain, Playwright/qa-use, postgres/redis servers, glab)
+3. **`worker-full` target** (default, `:latest` tag): adds the full development environment below (build toolchain, Playwright Chromium + `agent-browser`, postgres/redis servers, glab)
 
 **Pre-installed tools** (full image; `:slim` drops build tools, `glab`, `vim`, `fuse3`, Playwright, and the postgres/redis servers):
 
@@ -429,6 +499,21 @@ When a worker starts, it:
    - Previous progress (if any was saved)
    - Notification that this is a resumed task
 
+### API drain
+
+Off by default. Set `API_DRAIN_MAX_MS` (for example `30000`) to turn it on. With it on, the API does not close the moment it gets SIGTERM. It first drains:
+
+1. It keeps serving, but dispatches no new work: HTTP `/api/poll`, MCP `poll-task`, and `task-action` claim and accept all refuse. Creating tasks still works.
+2. It adds `X-Swarm-Draining: 1` to every response.
+3. A worker that sees the header supersedes each in-flight task right away (reason `graceful_shutdown`, the same resume follow-up as the worker's SIGTERM handoff) and takes no new work. It still exits on its own SIGTERM.
+4. The API closes when every task it saw in flight on a live worker has left `in_progress`, or after `API_DRAIN_MAX_MS` (default `0`, which means no drain; max `120000`). With nothing in flight it closes at once.
+
+Orchestrators such as Docker Compose stop the API and the workers together, so a worker's SIGTERM handoff can run after the API is gone and the task falls through to the heartbeat sweep. The drain makes the handoff happen while the API is still up.
+
+Enable it where the API and the workers are stopped together. It also applies to an API-only restart: while it is on, every live worker supersedes its in-flight tasks when the API gets SIGTERM, tasks that would otherwise have kept running. Leave it off for local dev and for API-only rolls.
+
+Keep the API's `stop_grace_period` above `API_DRAIN_MAX_MS` plus the time the API needs to close (a few seconds). Workers older than this feature do not hand off on the header, so the API waits the full cap when they hold tasks.
+
 ### Best Practices
 
 - **Use stable Agent IDs** - Set explicit `AGENT_ID` for each worker to enable resume after restarts
@@ -436,6 +521,12 @@ When a worker starts, it:
 - **Test deployments** - Verify tasks resume correctly in staging before production
 
 ---
+
+## Memory defaults
+
+API retrieval defaults enable hybrid search and graph expansion, with `MEMORY_DEMOTION_FLOOR=1.0` disabling rating-based demotion. On the API and workers, unset `MEMORY_RATERS` enables `implicit-citation,explicit-self`; set it explicitly empty to disable all raters. The `llm` rater remains opt-in. Without embedding credentials, search falls back to full-text search, then recency when full-text search is unavailable.
+
+The bundled agent-fs service uses version 0.15.1. Provisioning seeds agent display names for readable file ownership.
 
 ## Environment Variables
 
@@ -445,14 +536,19 @@ When a worker starts, it:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Yes | OAuth token for Claude CLI (run `claude setup-token`). Supports comma-separated values for [multi-credential load balancing](./docs/ENVS.md#multi-credential-support). |
+| `HARNESS_PROVIDER` | No | Fleet harness: `claude` (default), `codex` for OpenAI, or `pi` for OpenRouter and AWS Bedrock (alpha). |
+| `CLAUDE_CODE_OAUTH_TOKEN` | One of four | Claude Code OAuth token (run `claude setup-token`). Supports comma-separated values for [multi-credential load balancing](./docs/ENVS.md#multi-credential-support). `ANTHROPIC_API_KEY` is also accepted for Claude. |
+| `OPENAI_API_KEY` | One of four | OpenAI credential for the `codex` harness. Also enables workflow LLM nodes and optional memory embeddings. |
+| `OPENROUTER_API_KEY` | One of four | OpenRouter credential for the `pi` harness and workflow LLM nodes. Use `OPENROUTER_BASE_URL` for a compatible gateway. |
+| `AWS_REGION` | One of four | Region for AWS Bedrock (alpha). Also set `MODEL_OVERRIDE=amazon-bedrock/<model-id>` and provide the standard AWS credential chain. Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock. |
+| `MODEL_OVERRIDE` | Provider-specific | OpenRouter model slug or `amazon-bedrock/<model-id>` for Bedrock. Leave empty for provider defaults. |
 | `API_KEY` | Yes | API key for MCP server |
 | `AGENT_ID` | No | Agent UUID (assigned on join if not set). **Keep stable for task resume.** |
 | `AGENT_ROLE` | No | Role: `worker` (default) or `lead` |
 | `AGENT_NAME` | No | Display name for the agent (auto-generated if not set) |
 | `MCP_BASE_URL` | No | MCP server URL (default: `http://host.docker.internal:3013`) |
 | `WORKER_API_READY_TIMEOUT_SECONDS` | No | Positive-integer deadline for the entrypoint to reach `${MCP_BASE_URL}/health` before provider setup (default: `90`). This bootstrap-only setting must be present in the container environment. |
-| `MULTI_RUNTIME_ENABLED` | No | Allow multiple worker processes to serve one logical `AGENT_ID` (default: `false`). Set consistently on the API server and every worker; shared-agent runtimes need compatible workspace state. |
+| `MULTI_RUNTIME_ENABLED` | No | Allow multiple worker processes to serve one logical `AGENT_ID` (default: `true`). Set consistently on the API server and every worker; shared-agent runtimes need compatible workspace state. |
 | `SESSION_ID` | No | Log folder name (auto-generated if not provided) |
 | `YOLO` | No | Continue on errors (default: `false`) |
 | `SYSTEM_PROMPT` | No | Custom system prompt text |
@@ -483,9 +579,11 @@ When a worker starts, it:
 | `APP_URL` | Dashboard URL for Slack message links | - |
 | `ENV` | Environment mode (`development` adds prefix to Slack agent names) | - |
 | `SCHEDULER_INTERVAL_MS` | Polling interval for scheduled tasks | `10000` |
-| `MULTI_RUNTIME_ENABLED` | Track multiple worker runtime instances independently for one logical agent. Set consistently on the API server and every worker. | `false` |
+| `API_DRAIN_MAX_MS` | Max wait (ms) for workers to hand off in-flight tasks when the API stops. Off by default; set it (e.g. `30000`, max `120000`) to turn the drain on. See [API drain](#api-drain) | `0` |
+| `MULTI_RUNTIME_ENABLED` | Track multiple worker runtime instances independently for one logical agent. Set consistently on the API server and every worker. | `true` |
 | `RUNTIME_STALE_THRESHOLD_MIN` | Minutes without runtime traffic before an active runtime stops counting and the heartbeat sweep retires it. | `5` |
 | `DATABASE_PATH` | SQLite database file path | `./agent-swarm-db.sqlite` |
+| `MIGRATIONS_DIR` | Directory for packaged `.sql` migrations in compiled-binary deployments. Bun virtual-filesystem paths select this directory explicitly; a missing or empty directory stops a fresh database from booting without its baseline schema. Docker sets it to `/app/migrations`. | - |
 | `PAGE_SESSION_SECRET` | HMAC secret for authenticated page-session cookies; never falls back to `API_KEY` | Persisted in `<data-dir>/.page-session-secret` when unset |
 | `PAGE_SESSION_SECRET_FILE` | Absolute path to a file containing the page-session secret (Docker/k8s secret mount) | - |
 | `OPENAI_API_KEY` | OpenAI key for memory embeddings (optional) | - |
@@ -522,27 +620,26 @@ Worker requirements for this path:
 
 Your laptop can use a public API URL while containers use an internal one, as long as both point to the same swarm API and database.
 
-#### Managed Codex steering hooks
+#### Codex app-server steering
 
-Queued steering for Codex depends on lifecycle hooks installed at image build
-time. The official worker image writes a root-owned
-`/etc/codex/requirements.toml` that enables hooks and registers
-`agent-swarm codex-hook` for `SessionStart`, `PostToolUse`, and `Stop`.
-Requirements-managed hooks are trusted by policy, which avoids an interactive
-hook-trust prompt in headless workers. `PreToolUse` is deliberately omitted
-because Codex does not apply its `additionalContext`.
+Each task starts a fresh `codex app-server` inside its isolated task runner.
+The official worker image sets `CODEX_PATH_OVERRIDE=/usr/bin/codex` to select
+the installed CLI. Custom images must provide a CLI with app-server support.
 
-The hook requires the same `API_KEY`, `MCP_BASE_URL`, and stable `AGENT_ID` as
-the worker, and it is active only when `STEERING_ENABLED=true` (or `1`). It
-polls pending messages, marks each one delivered before injecting it, and
-silently leaves messages pending for a later lifecycle event if the API cannot
-be reached.
+With `STEERING_ENABLED=true` (or `1`), `steer` sends native `turn/steer` input
+to the active turn. `queue` holds input until the current turn ends and marks
+it delivered only when Codex accepts the next turn. Messages left pending when
+the session ends remain eligible for promotion to follow-up tasks. Cancellation
+uses the native turn interrupt request, with process-group termination if the
+request cannot finish within the grace period.
 
-If you build your own worker image, rebuild it from the current
-`Dockerfile.worker` or reproduce this managed requirements file. Restarting an
-older container alone does not add the build-time hook configuration; without
-it, Codex queue messages remain pending until the terminal sweep promotes them
-to follow-up tasks.
+The image still registers `agent-swarm codex-hook` for `SessionStart`,
+`PostToolUse`, and `Stop` in `/etc/codex/requirements.toml` for legacy
+`codex exec` sessions. App-server sessions disable steering delivery in the
+hook to avoid duplicates. The image also registers it for `PreToolUse` (Bash
+calls only), in every session mode, to block `gh pr create|edit` when the PR body for a public repo
+carries internal identifiers. No shared app-server daemon is required; task continuity
+uses the swarm context preamble.
 
 ---
 
@@ -550,20 +647,28 @@ to follow-up tasks.
 
 Enable Slack for task creation and agent communication via direct messages.
 
+Files shared with the bot, and files fetched by task-scoped `slack-read` or `slack-download-file` calls, are stored through the file provider as task attachments. Workers fetch them with the returned command and need no disk shared with the API. Without a task, downloads remain on the API server: mount the shared volume at the fallback path if workers need to read those files (see the volume comments in `docker-compose.example.yml`).
+
 ### Setup
 
 1. Create a Slack App at https://api.slack.com/apps (or import `slack-manifest.json` from the repo root)
 2. Enable Socket Mode (for real-time events without public webhooks)
-3. Enable Interactivity and Assistant View
+3. Enable Interactivity and Agent View
 4. Add required scopes: `app_mentions:read`, `assistant:write`, `channels:history`, `channels:manage`, `channels:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `groups:write`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `mpim:write`, `reactions:write`, `users:read`
-   After changing scopes in `slack-manifest.json`, apply the updated manifest to the Slack app and reinstall the app to the workspace for the changes to take effect.
-5. Subscribe to bot events: `app_mention`, `assistant_thread_started`, `assistant_thread_context_changed`, `message.channels`, `message.groups`, `message.im`, `message.mpim`
+   After changing scopes or event subscriptions in `slack-manifest.json`, apply the updated manifest to the Slack app and reinstall the app to the workspace for the changes to take effect.
+5. Subscribe to bot events: `app_mention`, `assistant_thread_started`, `assistant_thread_context_changed`, `entity_details_requested`, `message.channels`, `message.groups`, `message.im`, `message.mpim`
 6. Install to workspace and copy tokens
 
 ### Configuration
 
+Keep `SLACK_MODE=socket` for working Slack ingress. The `http` value validates
+`SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`, but the HTTP receiver is not yet
+available: no listener or Socket Mode fallback is started. Invalid mode values
+also leave Slack unavailable.
+
 ```bash
-# Required for Slack
+# Socket Mode (default and currently available)
+SLACK_MODE=socket
 SLACK_BOT_TOKEN=xoxb-...      # Bot User OAuth Token
 SLACK_APP_TOKEN=xapp-...      # App-Level Token (Socket Mode)
 SLACK_SIGNING_SECRET=...      # Signing Secret (optional for Socket Mode)
@@ -571,8 +676,11 @@ SLACK_SIGNING_SECRET=...      # Signing Secret (optional for Socket Mode)
 # Disable Slack (if not using)
 SLACK_DISABLE=true
 
-# Optional: one persistent task tree plus streamed outcome cards (default: false)
+# One persistent task tree plus streamed outcome cards (default: true)
 # SLACK_RENDER_V2=true
+
+# Optional: Populate Work Object flexpanes (default: false)
+# SLACK_WORK_OBJECTS_ENABLED=true
 
 # Optional: Filter allowed users
 SLACK_ALLOWED_EMAIL_DOMAINS=company.com,partner.com  # Comma-separated email domains
@@ -586,8 +694,8 @@ SLACK_ALLOWED_USER_IDS=U12345678,U87654321           # Comma-separated user IDs 
 # By default, replies to swarm-started thread roots also auto-route as follow-ups.
 # SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION=true
 
-# Optional: steer an in-progress task from buffered Slack thread replies.
-# Values: lead | all. Unset/off preserves normal follow-up task routing.
+# Steer an in-progress task from Slack thread replies (default: lead).
+# Values: off | lead | all. Explicit off preserves normal follow-up task routing.
 # SLACK_THREAD_STEERING=lead
 # SLACK_THREAD_STEERING_MODE=queue  # queue (default) | steer
 
@@ -595,11 +703,36 @@ SLACK_ALLOWED_USER_IDS=U12345678,U87654321           # Comma-separated user IDs 
 # 0/false/off/no keeps `-p`; 1/true/on/yes forces stream-json input.
 # CLAUDE_QUEUE_STEERING=off
 
-# Task steering is disabled by default. Set `true`/`1` (API + worker containers)
-# to enable steering MCP/UI surfaces and worker delivery. History reads, in-flight
+# Task steering is enabled by default. Set `false`/`0` (API + worker containers)
+# to disable steering MCP/UI surfaces and worker delivery. History reads, in-flight
 # worker callbacks, and terminal promotion work regardless.
 # STEERING_ENABLED=true
 ```
+
+### Work Object flexpanes (opt-in)
+
+Set `SLACK_WORK_OBJECTS_ENABLED=true` on the API to handle `entity_details_requested` with `entity.presentDetails`. The default is off. Apply the updated `slack-manifest.json` and reinstall the Slack app as described above, and enable Work Object Previews in the Slack app settings.
+
+The supported reference is `external_ref: { "type": "task", "id": "<full task UUID>" }` with `entity_type: "slack#/entities/task"` and `url: "<APP_URL>/tasks/<full task UUID>"`. The pane reads the task's current title, description, status, assignee, timestamps, and result/failure/progress. It respects the Slack user filters below and only serves tasks whose `slackChannelId` matches the requesting event's channel. Forwarded cards in other channels and tasks without Slack context receive a restricted view. Unknown references (including file, item, and content_item references), missing tasks, and lookup failures receive explicit error views.
+
+This flag enables the details handler; task notifications continue to use their existing rendering. To test manually after applying the manifest, reinstalling, and enabling the flag:
+
+1. Choose an existing Slack task and its original channel. Using the app's bot token, post a test card with `chat.postMessage` in that channel, with `text` and this `metadata` (replace the placeholders):
+
+   ```json
+   {
+     "entities": [{
+       "entity_type": "slack#/entities/task",
+       "external_ref": { "type": "task", "id": "<task UUID>" },
+       "url": "<APP_URL>/tasks/<task UUID>",
+       "entity_payload": { "attributes": { "title": { "text": "Task flexpane test" } } }
+     }]
+   }
+   ```
+
+2. Click the card and confirm the pane shows the task's current data. Refresh after the task changes and confirm it updates. If no `entity_details_requested` event arrives, record that outcome: Slack's [implementation guide](https://docs.slack.dev/messaging/work-objects-implementation/#flexpane-implementation) documents the flexpane through unfurls and does not explicitly guarantee event delivery for postMessage-only cards. Adding link unfurls requires a separate decision and implementation.
+3. Post a card with an unknown reference, then click it and confirm an error view replaces the spinner. A task from another channel must show a restricted view.
+4. Unset the flag (and reload the API configuration or restart) to disable details handling.
 
 ### User Filtering
 
@@ -653,7 +786,7 @@ GITHUB_APP_PRIVATE_KEY=base64-encoded-key
 
 ### Bot Reactions
 
-If GitHub App credentials are provided, the bot can react to comments/issues to acknowledge receipt. Additionally, a 👀 reaction is automatically added to the originating GitHub entity (comment, issue, PR, or review) when an agent picks up a GitHub-sourced task.
+If GitHub App credentials are provided, the bot reacts with 👀 to the comment, issue, PR, or review that pinged it. Without an App, it uses `GITHUB_TOKEN` (a PAT with write access to issues and pull requests) and the reaction appears as that user. Additionally, a 👀 reaction is automatically added to the originating GitHub entity (comment, issue, PR, or review) when an agent picks up a GitHub-sourced task.
 
 ---
 
@@ -799,3 +932,14 @@ bun deploy/docker-push.ts
 ```
 
 This builds, tags with version from package.json + `latest`, and pushes to GHCR.
+
+
+## Built-in API CORS
+
+**Breaking change:** unset or blank `CORS_ALLOWED_ORIGINS` now uses a restrictive hosted/dev allowlist. Custom dashboards must set `CORS_ALLOWED_ORIGINS=https://dashboard.example.com` on the API (use the actual SPA origin). A nonblank custom list replaces the defaults.
+
+Defaults: `https://*.agent-swarm.dev,https://*.agent-swarm.cloud,http://localhost:5274,http://127.0.0.1:5274,http://[::1]:5274,https://ui.swarm.localhost:1355`.
+
+For intentional compatibility only, `CORS_ALLOW_ANY_ORIGIN=true` allows any origin for non-credentialed requests only. Bearer-token clients from unlisted origins must use `credentials: "omit"`. Cookie-authenticated responses, including page JSON and `/@swarm/api/*`, always require an allowlisted origin for credentialed CORS. The API warns once per process when enabled, at startup or first request. Denied-origin logs name the rejected origin and the allowlist setting. Only CORS_ALLOWED_ORIGINS is reloadable through Settings → Configuration. CORS_ALLOW_ANY_ORIGIN is deployment-only: set it in the API environment and restart. Runtime config writes reject it, and legacy stored values are ignored at startup and reload.
+
+See the [Kubernetes CORS guide](https://docs.agent-swarm.dev/docs/guides/kubernetes#cors) for ingress and preflight diagnostics. CORS limits browser response access; authentication and CSRF protections remain necessary.

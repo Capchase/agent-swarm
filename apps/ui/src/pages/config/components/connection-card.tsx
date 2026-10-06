@@ -1,5 +1,6 @@
-import { CheckCircle2, Loader2, Pencil, Signal, Trash2, XCircle } from "lucide-react";
+import { CheckCircle2, Pencil, Signal, Trash2, XCircle } from "lucide-react";
 import { useState } from "react";
+import { Spinner } from "@/components/kibo-ui/spinner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -8,12 +9,14 @@ import type { Connection } from "@/lib/config";
 export function ConnectionCard({
   connection,
   isActive,
+  readOnly = false,
   onActivate,
   onEdit,
   onDelete,
 }: {
   connection: Connection;
   isActive: boolean;
+  readOnly?: boolean;
   onActivate: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -61,7 +64,7 @@ export function ConnectionCard({
             disabled={testStatus === "loading"}
           >
             {testStatus === "loading" ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <Spinner className="size-3.5" />
             ) : testStatus === "success" ? (
               <CheckCircle2 className="h-3.5 w-3.5 text-status-success-strong" />
             ) : testStatus === "error" ? (
@@ -72,18 +75,29 @@ export function ConnectionCard({
             {isActive ? "Test" : "Connect"}
           </Button>
 
-          <Button
-            size="icon"
-            variant="outline"
-            className="h-8 w-8 border-border/60"
-            onClick={onEdit}
-          >
-            <Pencil className="h-3.5 w-3.5" />
-          </Button>
+          {!readOnly ? (
+            <>
+              <Button
+                size="icon"
+                variant="outline"
+                className="h-8 w-8 border-border/60"
+                onClick={onEdit}
+                aria-label={`Edit connection ${connection.name}`}
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </Button>
 
-          <Button size="icon" variant="destructive-outline" className="h-8 w-8" onClick={onDelete}>
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
+              <Button
+                size="icon"
+                variant="destructive-outline"
+                className="h-8 w-8"
+                onClick={onDelete}
+                aria-label={`Delete connection ${connection.name}`}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </>
+          ) : null}
         </div>
       </CardContent>
     </Card>

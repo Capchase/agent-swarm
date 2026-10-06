@@ -1,6 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
-import { createMcpServer, getAgentById, installMcpServer } from "@/be/db";
+import {
+  createMcpServer,
+  emitMcpServerConnectedTelemetry,
+  getAgentById,
+  installMcpServer,
+} from "@/be/db";
 import { can } from "@/rbac";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 
@@ -11,7 +16,7 @@ export const registerMcpServerCreateTool = (server: McpServer) => {
       title: "Create MCP Server",
       annotations: { destructiveHint: false },
       description:
-        "Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope requires lead.",
+        "Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope and stdio servers require lead.",
       inputSchema: z.object({
         name: z.string().describe("Server name"),
         description: z.string().optional().describe("Server description"),
@@ -88,6 +93,28 @@ export const registerMcpServerCreateTool = (server: McpServer) => {
           }
         }
 
+        // A stdio server runs a command of the caller's choosing on the worker, so an
+        // agent-scope one needs the same authorization as a swarm-scope one. Remote
+        // http/sse servers at agent scope stay open to every agent.
+        if (scope === "agent" && args.transport === "stdio") {
+          const agent = await getAgentById(requestInfo.agentId);
+          const decision = can({
+            principal: {
+              kind: "agent",
+              agentId: requestInfo.agentId,
+              isLead: agent?.isLead ?? false,
+            },
+            verb: "mcp-server.stdio.write",
+            resource: { kind: "none" },
+            source: "mcp",
+          });
+          if (!decision.allow) {
+            return toolErr("Only lead agents can create or change stdio MCP servers.", {
+              data: { yourAgentId: requestInfo.agentId },
+            });
+          }
+        }
+
         const created = await createMcpServer({
           name: args.name,
           description: args.description,
@@ -102,6 +129,7 @@ export const registerMcpServerCreateTool = (server: McpServer) => {
           headerConfigKeys: args.headerConfigKeys,
           extraAuthorizeParams: args.extraAuthorizeParams,
         });
+        await emitMcpServerConnectedTelemetry();
 
         // Auto-install for the creating agent
         await installMcpServer(requestInfo.agentId, created.id);

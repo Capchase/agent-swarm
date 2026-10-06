@@ -145,8 +145,10 @@
   user-select: none;
 }
 
-.cms-row:hover {
-  background: var(--panel-2);
+@media (hover: hover) {
+  .cms-row:hover {
+    background: var(--panel-2);
+  }
 }
 
 .cms-row:has(input:checked) {
@@ -266,4 +268,11 @@
   display: flex;
   flex-wrap: wrap;
   gap: 4px 10px;
+}
+
+/* Per-run reasoning effort select on a selected config chip. */
+.cms-effort {
+  max-width: 190px;
+  padding: 1px 4px;
+  font-size: 11px;
 }

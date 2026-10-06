@@ -51,6 +51,44 @@ create-schedule(
 )
 ```
 
+## Deferring until another task finishes
+
+Use `defer-task` when your current task needs to resume after other work finishes:
+
+```json
+{
+  "taskId": "<current-task-id>",
+  "delayMs": 1800000,
+  "wakeOn": { "event": "settled", "taskId": "<build-task-id>" },
+  "summary": "Submitted the build; validation is pending.",
+  "note": "Read the build result, then verify the deployment."
+}
+```
+
+The call completes the current task and schedules one continuation for the same agent. `settled` wakes on completion, failure, or cancellation; use `task.completed` or `task.failed` to watch only that outcome. Cancellation does not match either named event. The required delay or `runAt` is the latest scheduled wake-up time if the event does not arrive.
+
+To wait for several tasks, replace `taskId` inside `wakeOn` with `taskIds`:
+
+```json
+"wakeOn": {
+  "event": "settled",
+  "taskIds": ["<build-task-id>", "<test-task-id>"],
+  "mode": "all"
+}
+```
+
+`mode` defaults to `all`: every member must match the requested event. Set `mode: "any"` to wake on the first matching member. For example, `all` with `settled` accepts a mix of successes, failures, and cancellations; `all` with `task.completed` cannot wake early if one member fails or is cancelled. The single deadline bounds the whole set.
+
+A worker task normally creates a lead follow-up when it finishes. When its settlement is the one that wakes the wait, and the wake-up task goes to the agent the follow-up would target, the engine skips that follow-up: the wake-up task reviews the result. The task log of the settled task records a `task_follow_up_suppressed` event naming the woken waiter. The follow-up is kept when no wait is woken, including an `all` wait whose other members are still pending, a wait already woken or cancelled, or a wait owned by a different agent. It is also kept when the task's `followUpConfig` sets `onCompleted` or `onFailed` for that outcome, because the wake-up task does not carry those instructions.
+
+Provide exactly one of `taskId` or a nonempty, unique `taskIds` array. Every watched task must exist, be nonterminal, and differ from the current task. If any member is already terminal, the whole request is rejected before completing the current task or creating a schedule. Read those results and submit only unfinished IDs; terminal IDs are never silently counted as satisfied.
+
+When a member defers, its completion does not count as a match. That member follows its resume task across further deferrals without changing the set's deadline. Disabling or deleting its successor schedule before it runs makes the parent's completion eligible on reconciliation.
+
+When a member is superseded, the wait follows its `resume` child without waking or changing the deadline. This works whether the child is created before or after supersession, including across API restarts. If no resume child exists, the wait holds to its original deadline. Supersession itself never matches an event.
+
+The event and deadline compete for the same durable wait. Only one creates the continuation, including after an API restart. Tasks with an `outputSchema` must also supply schema-valid JSON in `output`; summary and deferral details are stored separately in the task log.
+
 ## Schedule Properties
 
 | Property | Description |
@@ -74,6 +112,14 @@ create-schedule(
 | `model` | Concrete model override for created agent tasks |
 | `modelTier` | Portable model intent for created agent tasks: `smol`, `regular`, `smart`, or `ultra` |
 | `enabled` | Whether the schedule is active (default: true) |
+
+## Automation setup checks
+
+Bundled schedules can declare `requiredParams` and `requires` metadata. `requiredParams` names values that must be present in the schedule's `params` object. `requires` names integrations, such as Slack or GitHub, that must be configured before the automation can run.
+
+The scheduler checks these requirements immediately before dispatch. An incomplete automation reports `needs_setup` with its missing parameters, missing integrations, and a dashboard fix URL; it does not create a task, start a workflow, or run a script. The schedules dashboard exposes the same status and lets operators supply the missing values, so the UI and dispatcher use one preflight result.
+
+When Slack is available and `SLACK_ALERTS_CHANNEL` is configured, a newly recorded setup refusal sends an alert naming the automation, missing values, and dashboard fix URL. Repeated identical schedule refusals are suppressed within a UTC day; a changed failure can alert again. Workflow refusals alert at most once per workflow per UTC day. The blocked fire is skipped without being retried or queued; fixing setup allows later fires to proceed. Without Slack alerts, the refusal remains visible in the dashboard and logs.
 
 ## Choosing `targetType`
 
@@ -148,6 +194,8 @@ For `agent-task` schedules:
 4. If `model` or `modelTier` is set, the task inherits that runtime selection
 5. The schedule's `lastRunAt` is updated
 6. **One-time schedules** are automatically disabled after execution
+
+A `defer-task` wake-up schedule (`deferred-*`) is deleted 30 days after it fires, whether the deadline or a watched task woke it. The wake-up task keeps its `scheduleId`. A deferral schedule that never fired is kept.
 
 ### Direct Workflow and Script Targets
 

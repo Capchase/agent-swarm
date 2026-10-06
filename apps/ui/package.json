@@ -11,9 +11,14 @@
     "format": "biome format --write .",
     "check:tokens": "bash scripts/check-design-tokens.sh",
     "generate:catalog-schema": "bun run scripts/generate-catalog-schema.ts",
+    "og:render": "bun run og/render.tsx",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@desplega/model-catalog": "workspace:*",
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@json-render/core": "^0.19.0",
     "@json-render/react": "^0.19.0",
     "@monaco-editor/react": "^4.7.0",
@@ -33,7 +38,10 @@
     "cmdk": "^1.1.1",
     "cronstrue": "^3.14.0",
     "dagre": "^0.8.5",
+    "date-fns": "^4.1.0",
+    "jotai": "^3.0.0",
     "lucide-react": "^0.575.0",
+    "modern-screenshot": "^4.7.0",
     "motion": "^13.0.0",
     "prism-react-renderer": "^2.4.1",
     "radix-ui": "^1.4.3",
@@ -45,16 +53,20 @@
     "streamdown": "^2.5.0",
     "tailwind-merge": "^3.5.0",
     "tailwindcss": "^4.2.1",
+    "tunnel-rat": "^0.1.2",
     "tw-animate-css": "^1.4.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.5",
+    "@happy-dom/global-registrator": "^20.14.5",
+    "@resvg/resvg-js": "^2.6.2",
     "@types/dagre": "^0.7.54",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
+    "satori": "^0.33.5",
     "typescript": "~5.9.3",
     "vite": "^7.3.5"
   }

@@ -9,6 +9,8 @@ export interface EmbeddingProvider {
   readonly dimensions: number;
   embed(text: string): Promise<Float32Array | null>;
   embedBatch(texts: string[]): Promise<(Float32Array | null)[]>;
+  /** True when the provider has a usable API key — no network call. */
+  isConfigured(): boolean;
 }
 
 // ============================================================================
@@ -28,7 +30,8 @@ export interface MemoryStore {
   edit(input: MemoryEditInput): Promise<MemoryEditResult>;
   list(agentId: string, options: MemoryListOptions): Promise<AgentMemory[]>;
   count(agentId: string, options: MemoryListOptions): Promise<number>;
-  isSourceProtected(source: AgentMemorySource): boolean;
+  /** True when automated cleanup must skip the memory: a protected source, or any /longterm key. */
+  isSourceProtected(source: AgentMemorySource, key?: string | null): boolean;
   listForCuration(
     agentId?: string,
   ): Promise<{ id: string; source: string; name: string; createdAt: string }[]>;
@@ -70,6 +73,8 @@ export interface MemoryCandidate extends AgentMemory {
   compositeScore?: number;
   /** Search arm that surfaced the candidate. Memory `source` remains manual/file_index/etc. */
   retrievalSource?: MemoryRetrievalSource;
+  /** Graph candidates only: the candidate whose link surfaced this one. rerank() never ranks it above that parent. */
+  graphParentId?: string;
   /** True when `similarity` already includes source-aware recency decay. */
   recencyDecayApplied?: boolean;
   accessCount: number;
@@ -89,6 +94,8 @@ export interface MemorySearchOptions {
   isLead?: boolean;
   includeExpired?: boolean;
   queryText?: string;
+  /** Keep only memories whose `key` starts with this string. Applied inside each SQL arm, before top-K. */
+  keyPrefix?: string;
 }
 
 /**
@@ -117,6 +124,12 @@ export interface MemoryEditInput {
   intent: string;
   expectedVersion?: number;
   changedByAgentId?: string | null;
+  /**
+   * Move the document to this key, on every chunk, in the same transaction.
+   * Without content fields it is a pure move. Id, posteriors, access counters
+   * and author are untouched.
+   */
+  newKey?: string;
 }
 
 export interface MemoryEditResult {
@@ -135,6 +148,8 @@ export interface MemoryListOptions {
   ownerAgentId?: string;
   source?: AgentMemorySource;
   sourcePath?: string;
+  /** Keep only memories whose `key` starts with this string. */
+  keyPrefix?: string;
 }
 
 export interface MemoryStats {

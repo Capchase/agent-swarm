@@ -30,7 +30,9 @@
  * nothing (empty aggregates, never an error).
  */
 
+import { REASONING_EFFORT_LEVELS } from "@desplega/model-catalog";
 import { resolveClaudeAlias } from "../cost/model-alias.ts";
+import { legacyAliasModel } from "../cost/resolve-alias.ts";
 import type { Registry } from "../runner/index.ts";
 import { cleanVersion } from "../swarm/version.ts";
 import type {
@@ -54,11 +56,27 @@ export interface AnalyticsSourceRow {
   configId: string;
   /** AttemptStatus as stored; any status counts toward `attempts`. */
   status: string;
+  /**
+   * attempts.exclusion. A `cancelled` row (dead run, cost cap) is dropped before
+   * any count; a `harness-error` row stays visible in `errors` and is never graded.
+   */
+  exclusion?: string | null;
   score: number | null;
   costUsd: number | null;
   costSource: string | null;
   judgeCostUsd: number | null;
   durationMs: number | null;
+  /**
+   * json_extract(timings_json, '$.tasksMs'): time the agent worked, boot and
+   * seeding excluded. Null on rows without timings. `durationMs` stays the total.
+   */
+  agentMs?: number | null;
+  /** attempts.resolved_model — the concrete model the attempt ran on (null on old rows). */
+  resolvedModel?: string | null;
+  /** eval_run_configs.resolved_model — the run's pin for an alias config. */
+  pinnedModel?: string | null;
+  /** attempts.reasoning_effort — the effort the worker was launched with (null = harness default / old rows). */
+  reasoningEffort?: string | null;
   /** json_extract(tokens_json, '$.model') — dominant observed model id. */
   tokenModel: string | null;
   /** json_extract(tokens_json, '$.inputTokens') — null on rows without token capture (v7 §6.1). */
@@ -66,6 +84,8 @@ export interface AnalyticsSourceRow {
   tokenOutput: number | null;
   tokenCacheRead: number | null;
   tokenCacheWrite: number | null;
+  /** attempts.suite_version — the suite this attempt belongs to; null off-suite and on old rows. */
+  suiteVersion?: string | null;
   /** Raw stored sandbox versions — may carry ANSI dirt; cleaned on read. */
   apiVersion: string | null;
   workerVersion: string | null;
@@ -81,6 +101,15 @@ function sum(values: number[]): number {
 function mean(values: number[]): number | null {
   if (values.length === 0) return null;
   const v = sum(values) / values.length;
+  return Number.isFinite(v) ? v : null;
+}
+
+/** Median over the given values; null when empty (never NaN). */
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const v = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
   return Number.isFinite(v) ? v : null;
 }
 
@@ -113,26 +142,52 @@ function tokenValue(v: number | null): number {
 }
 
 /**
- * Model key precedence (§1.2, unchanged): tokens.model → registry config.model
- * → "(configId)". v7 §7.1/§8: bare claude aliases in the resolved key
+ * Model key precedence: attempts.resolved_model → the run's alias pin →
+ * tokens.model → registry config.model → the bare family of a
+ * `latest:anthropic/<family>` alias → "(configId)". v7 §7.1/§8: bare claude aliases in the resolved key
  * ("fable" from historical token models, "haiku" from config fallbacks) map to
  * the latest concrete family id so old and new rows group together; concrete
  * ids and the parenthesized fallback pass through untouched.
  */
-function modelKey(
+export function modelKey(
   row: AnalyticsSourceRow,
   registry: Registry,
   aliasMap: Record<string, string>,
 ): string {
   let key: string | null = null;
-  if (row.tokenModel && row.tokenModel.trim().length > 0) {
-    key = row.tokenModel;
-  } else {
-    const configModel = registry.configs.get(row.configId)?.model;
+  for (const candidate of [row.resolvedModel, row.pinnedModel, row.tokenModel]) {
+    if (candidate && candidate.trim().length > 0) {
+      key = candidate;
+      break;
+    }
+  }
+  if (key === null) {
+    const config = registry.configs.get(row.configId);
+    const configModel =
+      config?.model ?? (config?.modelAlias ? legacyAliasModel(config.modelAlias) : null);
     if (configModel && configModel.length > 0) key = configModel;
   }
   if (key === null) return `(${row.configId})`;
   return resolveClaudeAlias(key, aliasMap) ?? key;
+}
+
+/** Effort key of attempts that ran at the harness default (no effort set). */
+export const ANALYTICS_NO_EFFORT = "default";
+
+/** The effort an attempt ran at, or the default key. */
+export function effortKey(row: AnalyticsSourceRow): string {
+  return row.reasoningEffort || ANALYTICS_NO_EFFORT;
+}
+
+/** Effort keys low → high (canonical enum order), unknown values after them, the default key last. */
+function sortEffortKeys(keys: Iterable<string>): string[] {
+  const order: readonly string[] = REASONING_EFFORT_LEVELS;
+  const rank = (key: string): number => {
+    if (key === ANALYTICS_NO_EFFORT) return order.length + 1;
+    const i = order.indexOf(key);
+    return i === -1 ? order.length : i;
+  };
+  return [...keys].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
 }
 
 /**
@@ -140,7 +195,7 @@ function modelKey(
  * configId; when the config left the catalog, the configId prefix before the
  * first "-" ("claude-fable" → "claude"); final fallback "(unknown)".
  */
-function harnessKey(configId: string, registry: Registry): string {
+export function harnessKey(configId: string, registry: Registry): string {
   const provider = registry.configs.get(configId)?.provider;
   if (provider) return provider;
   const prefix = configId.split("-")[0] ?? "";
@@ -182,6 +237,8 @@ interface MetricAcc {
   costs: number[];
   judgeCosts: number[];
   durations: number[];
+  /** Agent time per attempt (timings.tasksMs); see AnalyticsSourceRow.agentMs. */
+  agentTimes: number[];
   scores: number[];
   /** Token sums over token-bearing attempts (v7 §11). */
   tokenAttempts: number;
@@ -200,6 +257,7 @@ function newMetricAcc(): MetricAcc {
     costs: [],
     judgeCosts: [],
     durations: [],
+    agentTimes: [],
     scores: [],
     tokenAttempts: 0,
     tokenInput: 0,
@@ -217,6 +275,7 @@ function accumulate(acc: MetricAcc, row: AnalyticsSourceRow): void {
   if (row.costUsd !== null) acc.costs.push(row.costUsd);
   if (row.judgeCostUsd !== null) acc.judgeCosts.push(row.judgeCostUsd);
   if (row.durationMs !== null) acc.durations.push(row.durationMs);
+  if (row.agentMs !== null && row.agentMs !== undefined) acc.agentTimes.push(row.agentMs);
   if (row.score !== null) acc.scores.push(row.score);
   // v7 §6.1: an attempt is token-bearing iff any token field is > 0 — all-zero
   // tokens_json blobs (the pre-v7 harness-priced gap) contribute nothing.
@@ -258,6 +317,8 @@ interface RunAcc extends MetricAcc {
 }
 
 interface CellAcc extends MetricAcc {
+  /** Model keys the cell's attempts ran on (an alias config can span several). */
+  models: Set<string>;
   scenarioId: string;
   configId: string;
   lastRunAt: string | null;
@@ -273,6 +334,8 @@ interface ModelAcc extends MetricAcc {
   /** Contributing harness keys (v7 §7.2 scatter), first-seen order. */
   harnesses: Set<string>;
   configIds: Set<string>;
+  /** Effort keys of the model's attempts (`ANALYTICS_NO_EFFORT` = harness default). */
+  efforts: Set<string>;
   runIds: Set<string>;
   /** Runs with ≥1 priced attempt (avgCostPerRun denominator). */
   pricedRunIds: Set<string>;
@@ -332,6 +395,8 @@ function finishGroup(g: GroupAcc): AnalyticsGroupRollup {
     minCostUsd: minOrNull(g.costs),
     maxCostUsd: maxOrNull(g.costs),
     avgDurationMs: mean(g.durations),
+    avgAgentMs: mean(g.agentTimes),
+    medianAgentMs: median(g.agentTimes),
     tokens: tokenSums(g),
   };
 }
@@ -341,6 +406,29 @@ function sortGroups(groups: Map<string, GroupAcc>): AnalyticsGroupRollup[] {
   return [...groups.values()]
     .map(finishGroup)
     .sort((a, b) => b.attempts - a.attempts || a.group.localeCompare(b.group));
+}
+
+/**
+ * Rows kept by a filter: (configIds empty OR row.configId ∈ configIds) AND
+ * (harnesses empty OR harnessKey ∈ harnesses) AND (efforts empty OR effortKey ∈
+ * efforts). A null/undefined filter keeps every row.
+ */
+export function filterRows(
+  rows: AnalyticsSourceRow[],
+  registry: Registry,
+  filter?: AnalyticsFilter | null,
+): AnalyticsSourceRow[] {
+  if (filter === undefined || filter === null) return rows;
+  const harnessSet = filter.harnesses.length > 0 ? new Set(filter.harnesses) : null;
+  const configSet = filter.configIds.length > 0 ? new Set(filter.configIds) : null;
+  const effortSet = (filter.efforts?.length ?? 0) > 0 ? new Set(filter.efforts) : null;
+  if (harnessSet === null && configSet === null && effortSet === null) return rows;
+  return rows.filter(
+    (row) =>
+      (configSet === null || configSet.has(row.configId)) &&
+      (harnessSet === null || harnessSet.has(harnessKey(row.configId, registry))) &&
+      (effortSet === null || effortSet.has(effortKey(row))),
+  );
 }
 
 export function buildAnalytics(
@@ -356,33 +444,30 @@ export function buildAnalytics(
    */
   filter?: AnalyticsFilter | null,
 ): AnalyticsResponse {
+  // A cancelled attempt (dead run, cost cap) never ran to a verdict: it is not an
+  // attempt, an error or a failure, so it leaves every count and option list.
+  sourceRows = sourceRows.filter((row) => row.exclusion !== "cancelled");
   // filterOptions over ALL rows BEFORE filtering (first-seen order) — the bar
   // keeps every option visible while a filter is active.
-  const filterOptions: AnalyticsFilterOptions = { harnesses: [], configIds: [] };
+  const filterOptions: AnalyticsFilterOptions = { harnesses: [], configIds: [], efforts: [] };
   for (const row of sourceRows) {
     const harness = harnessKey(row.configId, registry);
     if (!filterOptions.harnesses.includes(harness)) filterOptions.harnesses.push(harness);
     if (!filterOptions.configIds.includes(row.configId)) filterOptions.configIds.push(row.configId);
+    const effort = effortKey(row);
+    if (!filterOptions.efforts?.includes(effort)) filterOptions.efforts?.push(effort);
   }
+  filterOptions.efforts = sortEffortKeys(filterOptions.efforts ?? []);
 
-  const harnessSet =
-    filter !== undefined && filter !== null && filter.harnesses.length > 0
-      ? new Set(filter.harnesses)
-      : null;
-  const configSet =
-    filter !== undefined && filter !== null && filter.configIds.length > 0
-      ? new Set(filter.configIds)
-      : null;
-  const rows =
-    harnessSet === null && configSet === null
-      ? sourceRows
-      : sourceRows.filter(
-          (row) =>
-            (configSet === null || configSet.has(row.configId)) &&
-            (harnessSet === null || harnessSet.has(harnessKey(row.configId, registry))),
-        );
+  const rows = filterRows(sourceRows, registry, filter);
   // appliedFilter = the filter when any axis is non-empty, else null.
-  const appliedFilter = harnessSet !== null || configSet !== null ? (filter ?? null) : null;
+  const filterActive =
+    filter !== undefined &&
+    filter !== null &&
+    (filter.harnesses.length > 0 ||
+      filter.configIds.length > 0 ||
+      (filter.efforts?.length ?? 0) > 0);
+  const appliedFilter = filterActive ? (filter ?? null) : null;
 
   const scenarioIds: string[] = [];
   const configIds: string[] = [];
@@ -390,6 +475,7 @@ export function buildAnalytics(
   const models = new Map<string, ModelAcc>();
   const harnessGroups = new Map<string, GroupAcc>();
   const vendorGroups = new Map<string, GroupAcc>();
+  const effortGroups = new Map<string, GroupAcc>();
 
   for (const row of rows) {
     if (!scenarioIds.includes(row.scenarioId)) scenarioIds.push(row.scenarioId);
@@ -405,10 +491,13 @@ export function buildAnalytics(
         configId: row.configId,
         lastRunAt: null,
         runs: new Map(),
+        models: new Set(),
       };
       cells.set(cellKey, cell);
     }
     accumulate(cell, row);
+    const model = modelKey(row, registry, aliasMap);
+    cell.models.add(model);
     if (cell.lastRunAt === null || row.runCreatedAt > cell.lastRunAt) {
       cell.lastRunAt = row.runCreatedAt;
     }
@@ -435,7 +524,6 @@ export function buildAnalytics(
     }
 
     // ---- model rollup ----
-    const model = modelKey(row, registry, aliasMap);
     const harness = harnessKey(row.configId, registry);
     let modelAcc = models.get(model);
     if (!modelAcc) {
@@ -446,6 +534,7 @@ export function buildAnalytics(
         providers: new Set(),
         harnesses: new Set(),
         configIds: new Set(),
+        efforts: new Set(),
         runIds: new Set(),
         pricedRunIds: new Set(),
         pairedCostUsd: 0,
@@ -458,6 +547,7 @@ export function buildAnalytics(
     if (config) modelAcc.providers.add(config.provider);
     modelAcc.harnesses.add(harness);
     modelAcc.configIds.add(row.configId);
+    modelAcc.efforts.add(effortKey(row));
     modelAcc.runIds.add(row.runId);
     if (row.costUsd !== null) modelAcc.pricedRunIds.add(row.runId);
     if (row.costUsd !== null && row.durationMs !== null) {
@@ -468,6 +558,7 @@ export function buildAnalytics(
     // ---- harness / vendor rollups (v7 §7) ----
     accumulateGroup(harnessGroups, harness, row, model);
     accumulateGroup(vendorGroups, modelAcc.vendor, row, model);
+    accumulateGroup(effortGroups, effortKey(row), row, model);
   }
 
   const matrix: AnalyticsCell[] = [...cells.values()].map((cell) => {
@@ -488,11 +579,14 @@ export function buildAnalytics(
       totalJudgeCostUsd,
       avgJudgeCostUsd: mean(cell.judgeCosts),
       avgDurationMs: mean(cell.durations),
+      avgAgentMs: mean(cell.agentTimes),
+      medianAgentMs: median(cell.agentTimes),
       avgScore: mean(cell.scores),
       lastRunAt: cell.lastRunAt,
       minCostUsd: minOrNull(cell.costs),
       maxCostUsd: maxOrNull(cell.costs),
       tokens: tokenSums(cell),
+      models: [...cell.models].sort(),
     };
   });
 
@@ -522,9 +616,12 @@ export function buildAnalytics(
         costPerMinute:
           m.pairedDurationMs > 0 ? ratio(m.pairedCostUsd, m.pairedDurationMs / 60_000) : null,
         avgDurationMs: mean(m.durations),
+        avgAgentMs: mean(m.agentTimes),
+        medianAgentMs: median(m.agentTimes),
         minCostUsd: minOrNull(m.costs),
         maxCostUsd: maxOrNull(m.costs),
         vendor: m.vendor,
+        efforts: sortEffortKeys(m.efforts),
         tokens,
       };
       const point: AnalyticsScatterPoint = {
@@ -537,6 +634,8 @@ export function buildAnalytics(
         avgScore: rollup.avgScore,
         avgCostUsd: avgCostPerAttempt,
         avgDurationMs: rollup.avgDurationMs,
+        avgAgentMs: rollup.avgAgentMs,
+        medianAgentMs: rollup.medianAgentMs,
         avgTotalTokens: tokens?.avgTotalTokens ?? null,
         totalTokens: tokens?.totalTokens ?? 0,
       };
@@ -572,6 +671,8 @@ export function buildAnalytics(
           avgCostUsd: totalCostUsd === null ? null : ratio(totalCostUsd, p.costs.length),
           avgJudgeCostUsd: mean(p.judgeCosts),
           avgDurationMs: mean(p.durations),
+          avgAgentMs: mean(p.agentTimes),
+          medianAgentMs: median(p.agentTimes),
           apiVersion: p.apiVersion,
           workerVersion: p.workerVersion,
           minCostUsd: minOrNull(p.costs),
@@ -620,6 +721,7 @@ export function buildAnalytics(
     series,
     harnesses: sortGroups(harnessGroups),
     vendors: sortGroups(vendorGroups),
+    efforts: sortGroups(effortGroups),
     scatter,
     filterOptions,
     appliedFilter,

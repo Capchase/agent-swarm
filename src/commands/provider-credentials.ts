@@ -10,38 +10,84 @@
  * Used by:
  * - The worker boot loop (`src/commands/credential-wait.ts`) to decide
  *   whether the worker can claim tasks yet.
- * - The worker post-task hook (`src/commands/runner.ts`) to refresh on
- *   harness_provider changes.
+ * - The worker steady-state refresh (`src/commands/credential-refresh.ts`)
+ *   to check provider changes and recover blocked credentials.
  *
  * Reports flow worker → API as JSON via the existing PATCH /agents/:id
  * endpoint (see `AgentCredStatusSchema` in `src/types.ts`). The API never
  * runs the predicate itself — it just reads the agent row.
  */
 
+import { deriveDefaultRoute, validateRoute } from "@desplega/model-routing";
+import { checkAmpCredentials, liveTestAmpCredentials } from "../providers/amp-adapter";
 import { checkClaudeCredentials } from "../providers/claude-adapter";
 import { checkClaudeManagedCredentials } from "../providers/claude-managed-adapter";
 import { checkCodexCredentials } from "../providers/codex-adapter";
+import { checkCursorCredentials } from "../providers/cursor-adapter";
 import { checkDevinCredentials } from "../providers/devin-adapter";
+import { checkDshCredentials } from "../providers/dsh-adapter";
 import { checkOpencodeCredentials } from "../providers/opencode-adapter";
 import type { CredCheckOptions, CredStatus } from "../providers/types";
-import type { AgentCredStatus, AgentLatestModel, ProviderName, ReasoningEffort } from "../types";
+import type {
+  AgentAcpStatus,
+  AgentCredStatus,
+  AgentLatestModel,
+  ProviderName,
+  ReasoningEffort,
+} from "../types";
+import { CLAUDE_CREDENTIALS_HINT } from "../utils/credentials";
 import { getOpenRouterBaseUrl } from "../utils/openrouter-base-url";
 import { scrubSecrets } from "../utils/secret-scrubber";
 
-export type SupportedProvider = "claude" | "claude-managed" | "codex" | "devin" | "opencode" | "pi";
+export type SupportedProvider =
+  | "claude"
+  | "claude-managed"
+  | "codex"
+  | "devin"
+  | "opencode"
+  | "pi"
+  | "acp"
+  | "dsh"
+  | "cursor"
+  | "amp";
 
 /**
- * True when the pi harness should use the AWS SDK Bedrock path: either an
- * explicit `BEDROCK_AUTH_MODE=sdk`, or — preserving prefix-inference semantics —
+ * True when the pi harness authenticates against Bedrock rather than a provider
+ * API key: an explicit `BEDROCK_AUTH_MODE=sdk` (AWS credential chain), an
+ * explicit `BEDROCK_AUTH_MODE=bearer` (Bedrock API key in
+ * `AWS_BEARER_TOKEN_BEDROCK`), or — preserving prefix-inference semantics —
  * `BEDROCK_AUTH_MODE` absent with a `MODEL_OVERRIDE=amazon-bedrock/*` selection.
  * Single source of truth for the gate so the live-test arm and the worker
- * reconcile loop agree with `checkPiMonoCredentials`.
+ * reconcile loop agree with `checkPiMonoCredentials`, which owns the per-mode
+ * readiness rules (what must be present, how readiness is reported).
  */
-export function isBedrockSdkMode(env: Record<string, string | undefined>): boolean {
+export function isBedrockMode(env: Record<string, string | undefined>): boolean {
   const mode = env.BEDROCK_AUTH_MODE?.toLowerCase();
   return (
     mode === "sdk" ||
+    mode === "bearer" ||
     (mode === undefined && Boolean(env.MODEL_OVERRIDE?.toLowerCase().startsWith("amazon-bedrock/")))
+  );
+}
+
+/**
+ * Scheduling decision for the runner's post-task Bedrock enumeration refresh
+ * (see the throttled branch in `runner.ts`). Kept pure so the gate can be
+ * exercised without spinning the runner: it fires for the pi harness in any
+ * Bedrock mode (`sdk`, `bearer`, or the `MODEL_OVERRIDE=amazon-bedrock/*`
+ * inference) once `intervalMs` has elapsed since the last refresh.
+ */
+export function shouldRefreshBedrockStatus(opts: {
+  harnessProvider: string | null | undefined;
+  env: Record<string, string | undefined>;
+  lastRefreshAt: number;
+  now: number;
+  intervalMs: number;
+}): boolean {
+  return (
+    opts.harnessProvider === "pi" &&
+    isBedrockMode(opts.env) &&
+    opts.now - opts.lastRefreshAt > opts.intervalMs
   );
 }
 
@@ -65,6 +111,33 @@ export const REQUIRED_CRED_VARS_BY_PROVIDER: Record<SupportedProvider, readonly 
   devin: ["DEVIN_API_KEY", "DEVIN_ORG_ID"],
   opencode: ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
   pi: ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+  // The ACP target process owns its own auth, so the swarm requires nothing.
+  acp: [],
+  dsh: ["DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"],
+  amp: ["AMP_API_KEY"],
+  cursor: ["CURSOR_API_KEY"],
+};
+
+type CredentialChecker = (
+  env: Record<string, string | undefined>,
+  opts?: CredCheckOptions,
+) => CredStatus | Promise<CredStatus>;
+
+/** The handlers used by the credential-readiness dispatcher. */
+export const CREDENTIAL_PROVIDER_CHECKERS: Record<SupportedProvider, CredentialChecker> = {
+  dsh: (env) => checkDshCredentials(env),
+  amp: (env) => checkAmpCredentials(env),
+  cursor: (env) => checkCursorCredentials(env),
+  claude: (env) => checkClaudeCredentials(env),
+  "claude-managed": (env) => checkClaudeManagedCredentials(env),
+  codex: (env, opts) => checkCodexCredentials(env, opts),
+  devin: (env) => checkDevinCredentials(env),
+  opencode: (env, opts) => checkOpencodeCredentials(env, opts),
+  pi: async (env, opts) => {
+    const { checkPiMonoCredentials } = await import("../providers/pi-mono-adapter");
+    return checkPiMonoCredentials(env, opts);
+  },
+  acp: () => ({ ready: true, missing: [], satisfiedBy: "sdk-delegated" }),
 };
 
 /**
@@ -80,26 +153,17 @@ export async function checkProviderCredentials(
   env: Record<string, string | undefined>,
   opts?: CredCheckOptions,
 ): Promise<CredStatus> {
-  switch (provider) {
-    case "claude":
-      return checkClaudeCredentials(env);
-    case "claude-managed":
-      return checkClaudeManagedCredentials(env);
-    case "codex":
-      return checkCodexCredentials(env, opts);
-    case "devin":
-      return checkDevinCredentials(env);
-    case "opencode":
-      return checkOpencodeCredentials(env, opts);
-    case "pi": {
-      const { checkPiMonoCredentials } = await import("../providers/pi-mono-adapter");
-      return checkPiMonoCredentials(env, opts);
-    }
-    default:
-      throw new Error(
-        `checkProviderCredentials: unknown provider "${provider}". Supported: claude, claude-managed, codex, devin, opencode, pi.`,
-      );
+  const checker = (CREDENTIAL_PROVIDER_CHECKERS as Record<string, CredentialChecker | undefined>)[
+    provider
+  ];
+  if (!checker) {
+    throw new Error(
+      `checkProviderCredentials: unknown provider "${provider}". Supported: ${Object.keys(
+        CREDENTIAL_PROVIDER_CHECKERS,
+      ).join(", ")}.`,
+    );
   }
+  return checker(env, opts);
 }
 
 // ─── Live "Test connection" dispatcher ───────────────────────────────────────
@@ -118,6 +182,8 @@ export interface LiveValidationResult {
   ok: boolean;
   error?: string;
   latency_ms: number;
+  /** No free live check exists for this credential (cloud routes): report presence only. */
+  skipped?: boolean;
 }
 
 async function timedFetch(
@@ -254,34 +320,45 @@ function parseCodexOAuthAccess(blob: string | undefined): string | null {
  *
  * | Harness          | Accepted credentials (in resolution order)                              | Endpoint                       |
  * |------------------|-------------------------------------------------------------------------|--------------------------------|
- * | `claude`         | `CLAUDE_CODE_OAUTH_TOKEN` (Pro/Max OAuth) → `ANTHROPIC_API_KEY`         | Anthropic `/v1/models`         |
+ * | `claude`         | default route: Foundry / Bedrock / Vertex → gateway (`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`) → `CLAUDE_CODE_OAUTH_TOKEN` → `ANTHROPIC_API_KEY` | the route's own `/v1/models`; OAuth presence-only; cloud routes skipped |
  * | `claude-managed` | `ANTHROPIC_API_KEY` (managed agents always use API key + managed envs)  | Anthropic `/v1/models`         |
  * | `codex`          | `~/.codex/auth.json` (file) → `CODEX_OAUTH` (env OAuth) → `OPENAI_API_KEY` | OpenAI `/v1/models` (api-key path only) |
  * | `opencode`       | `OPENROUTER_API_KEY` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` (pi-style) | matching provider's `/v1/models` |
  * | `pi`             | `OPENROUTER_API_KEY` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY`           | matching provider's `/v1/models` |
+ * | `acp`            | target-specific (the ACP target process owns its own auth)              | presence-only (validated by the target process) |
  * | `pi` (bedrock)   | `MODEL_OVERRIDE=amazon-bedrock/*` → AWS SDK default credential chain    | presence-only (real check is the worker-side Bedrock enumeration) |
  * | `devin`          | `DEVIN_API_KEY` (+ `DEVIN_API_BASE_URL` override)                       | `${baseUrl}/v3/self`            |
+ * | `amp`            | `AMP_API_KEY`                                                           | `amp usage` (credit balance, no inference; 5s timeout) |
  *
  * Returns `{ok: true, latency_ms}` on 2xx, `{ok: false, error, latency_ms}`
  * otherwise. Errors are scrubbed via `scrubSecrets` before being returned.
  */
-export async function validateProviderCredentials(provider: string): Promise<LiveValidationResult> {
-  const env = process.env;
+export async function validateProviderCredentials(
+  provider: string,
+  env: Record<string, string | undefined> = process.env,
+): Promise<LiveValidationResult> {
   const startedAt = Date.now();
 
   try {
     switch (provider) {
       case "claude": {
-        // OAuth (Claude Pro/Max via `claude` CLI login) wins over API key —
-        // matches `claude-adapter.ts` and the docker entrypoint precedence.
-        // OAuth tokens get a presence check only (see `presenceCheckOk`).
-        if (env.CLAUDE_CODE_OAUTH_TOKEN) return presenceCheckOk();
-        if (env.ANTHROPIC_API_KEY) return checkAnthropicApiKey(env.ANTHROPIC_API_KEY);
-        return {
-          ok: false,
-          error: "Set either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.",
-          latency_ms: Date.now() - startedAt,
-        };
+        // The default route decides where the check goes: a gateway key is
+        // checked against the gateway only (scoped fetch), never against
+        // api.anthropic.com. OAuth stays presence-only; cloud routes have no
+        // free check and report `configured` (no live test).
+        const route = deriveDefaultRoute("claude", env);
+        if (!route) {
+          return {
+            ok: false,
+            error: CLAUDE_CREDENTIALS_HINT,
+            latency_ms: Date.now() - startedAt,
+          };
+        }
+        const result = await validateRoute(route, env);
+        const latency_ms = Date.now() - startedAt;
+        if (result.status === "verified") return { ok: true, latency_ms };
+        if (result.status === "configured") return { ok: true, skipped: true, latency_ms };
+        return { ok: false, error: scrubSecrets(result.reason), latency_ms };
       }
       case "claude-managed": {
         // Managed agents always run with an API key — OAuth not supported on
@@ -300,7 +377,9 @@ export async function validateProviderCredentials(provider: string): Promise<Liv
         //      CODEX_OAUTH / OPENAI_API_KEY). This is the OAuth-equivalent path
         //      for codex — refresh logic lives in the adapter, so we only do a
         //      presence check (no upstream call).
-        //   2) `CODEX_OAUTH` env blob — same OAuth treatment.
+        //   2) `CODEX_OAUTH` env blob, or a `codex_oauth_<N>` pool slot (the
+        //      dashboard device login and `codex-login` store these; the runner
+        //      materialises auth.json per task) — same OAuth treatment.
         //   3) `OPENAI_API_KEY` env var — live-test against OpenAI `/v1/models`.
         //
         // Without (1), an agent that boots fresh from a credential pool whose
@@ -308,6 +387,13 @@ export async function validateProviderCredentials(provider: string): Promise<Liv
         // with "Set either CODEX_OAUTH or OPENAI_API_KEY" (observed in prod).
         if (codexAuthFileExists(env)) return presenceCheckOk();
         if (parseCodexOAuthAccess(env.CODEX_OAUTH)) return presenceCheckOk();
+        if (
+          Object.entries(env).some(
+            ([key, value]) => /^codex_oauth_\d+$/.test(key) && parseCodexOAuthAccess(value),
+          )
+        ) {
+          return presenceCheckOk();
+        }
         if (env.OPENAI_API_KEY) return checkOpenAiApiKey(env.OPENAI_API_KEY);
         return {
           ok: false,
@@ -318,14 +404,14 @@ export async function validateProviderCredentials(provider: string): Promise<Liv
       }
       case "pi":
       case "opencode": {
-        // For the pi Bedrock path, the real credential check is the AWS SDK
+        // For the pi Bedrock path (sdk or bearer), the real credential check is the AWS SDK
         // enumeration (`ListFoundationModels` + `ListInferenceProfiles`) that
         // `checkProviderCredentials` (the `pi` dynamic-import arm) already ran.
         // That result is already in `buildCredStatusReport` — the live-test is a
         // pass-through / no-op so we never issue a second AWS SDK call here
         // (which would drag the SDK into the wrong binary or make slow IMDS
         // calls on non-EC2 hosts).
-        if (provider === "pi" && isBedrockSdkMode(env)) {
+        if (provider === "pi" && isBedrockMode(env)) {
           return presenceCheckOk();
         }
         // Both pi-mono and opencode resolve credentials in the same order:
@@ -365,10 +451,53 @@ export async function validateProviderCredentials(provider: string): Promise<Liv
           latency_ms: r.latency_ms,
         };
       }
+      case "dsh":
+        return checkDshCredentials(env).ready
+          ? presenceCheckOk()
+          : {
+              ok: false,
+              error: "Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY for dsh.",
+              latency_ms: Date.now() - startedAt,
+            };
+      case "amp": {
+        if (!checkAmpCredentials(env).ready) {
+          return {
+            ok: false,
+            error: "AMP_API_KEY is not set.",
+            latency_ms: Date.now() - startedAt,
+          };
+        }
+        // `amp usage` reads the credit balance and runs no inference.
+        const live = await liveTestAmpCredentials(env as Record<string, string | undefined>);
+        return live.ok
+          ? { ok: true, latency_ms: Date.now() - startedAt }
+          : {
+              ok: false,
+              error: live.error ?? "amp usage failed",
+              latency_ms: Date.now() - startedAt,
+            };
+      }
+      case "cursor": {
+        const apiKey = env.CURSOR_API_KEY?.trim();
+        if (!apiKey) {
+          return {
+            ok: false,
+            error: "CURSOR_API_KEY is not set.",
+            latency_ms: Date.now() - startedAt,
+          };
+        }
+        const { liveTestCursorKey } = await import("../providers/cursor-adapter");
+        const result = await liveTestCursorKey(apiKey);
+        return result.ok
+          ? { ok: true, latency_ms: Date.now() - startedAt }
+          : { ok: false, error: result.error, latency_ms: Date.now() - startedAt };
+      }
+      case "acp":
+        return presenceCheckOk();
       default:
         return {
           ok: false,
-          error: `Unknown provider "${provider}". Supported: claude, claude-managed, codex, devin, opencode, pi.`,
+          error: `Unknown provider "${provider}". Supported: claude, claude-managed, codex, devin, opencode, pi, acp, dsh, cursor, amp.`,
           latency_ms: Date.now() - startedAt,
         };
     }
@@ -409,8 +538,8 @@ export async function buildCredStatusReport(
 ): Promise<AgentCredStatus> {
   const presence = await checkProviderCredentials(provider, env, opts);
   let liveTest: AgentCredStatus["liveTest"] = null;
-  if (presence.ready) {
-    const live = await validateProviderCredentials(provider);
+  const live = presence.ready ? await validateProviderCredentials(provider, env) : null;
+  if (live && !live.skipped) {
     liveTest = {
       ok: live.ok,
       error: live.error ?? null,
@@ -440,6 +569,7 @@ export async function buildCredStatusReport(
     reportedAt: Date.now(),
     reportKind: kind,
     bedrock,
+    acp: null,
   };
 }
 
@@ -483,29 +613,6 @@ export async function sendCredStatusReport(
   }
 }
 
-/**
- * Fire-and-forget wrapper around {@link sendCredStatusReport}. Used by the
- * post-task cache-miss path (`runner.ts`), where a stale dashboard is
- * acceptable and blocking the worker is not.
- */
-export async function reportCredStatus(
-  apiUrl: string,
-  apiKey: string,
-  agentId: string,
-  runtimeInstanceId: string | undefined,
-  credStatus: AgentCredStatus,
-): Promise<void> {
-  try {
-    await sendCredStatusReport(apiUrl, apiKey, agentId, runtimeInstanceId, {
-      ready: credStatus.ready,
-      missing: credStatus.missing,
-      credStatus,
-    });
-  } catch (err) {
-    console.warn(`[cred-status] POST failed (non-fatal): ${err}`);
-  }
-}
-
 export async function reportLatestModel(
   apiUrl: string,
   apiKey: string,
@@ -526,6 +633,27 @@ export async function reportLatestModel(
     });
   } catch (err) {
     console.warn(`[latest-model] POST failed (non-fatal): ${err}`);
+  }
+}
+
+export async function reportAcpStatus(
+  apiUrl: string,
+  apiKey: string,
+  agentId: string,
+  acp: AgentAcpStatus,
+): Promise<void> {
+  try {
+    await fetch(`${apiUrl}/api/agents/${encodeURIComponent(agentId)}/credential-status`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "X-Agent-ID": agentId,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ acp }),
+    });
+  } catch (err) {
+    console.warn(`[acp-status] POST failed (non-fatal): ${err}`);
   }
 }
 

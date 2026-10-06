@@ -85,9 +85,9 @@ afterAll(async () => {
 describe("oauth presets — pure data", () => {
   test("exposes the expected curated preset ids", () => {
     expect(listOAuthPresetIds().sort()).toEqual(
-      ["github", "google", "jira", "linear", "notion", "slack"].sort(),
+      ["github", "google", "jira", "linear", "microsoft", "notion", "slack"].sort(),
     );
-    expect(listOAuthPresets()).toHaveLength(6);
+    expect(listOAuthPresets()).toHaveLength(7);
   });
 
   test("every preset carries endpoints, setup hints, and SSRF-safe URLs", () => {
@@ -124,6 +124,18 @@ describe("oauth presets — pure data", () => {
 
     const slack = getOAuthPreset("slack");
     expect(slack?.scopeSeparator).toBe(",");
+
+    const microsoft = getOAuthPreset("microsoft");
+    expect(microsoft?.authorizeUrl).toContain("/common/oauth2/v2.0/authorize");
+    expect(microsoft?.tokenUrl).toContain("/common/oauth2/v2.0/token");
+    expect(microsoft?.scopes).toContain("offline_access");
+    expect(microsoft?.scopes).toContain("ChannelMessage.Send");
+    expect(microsoft?.scopes).toContain("Mail.Read");
+    expect(microsoft?.scopes).toContain("Mail.Send");
+    expect(microsoft?.scopeSeparator).toBe(" ");
+    expect(microsoft?.tokenAuthStyle).toBe("body");
+    expect(microsoft?.tokenBodyFormat).toBe("form");
+    expect(microsoft?.requiresRefreshTokenRotation).toBeUndefined();
   });
 
   test("hydration marks curated-prefill and lets explicit fields win", () => {
@@ -155,7 +167,11 @@ describe("oauth presets — pure data", () => {
     const created = await dispatch("/api/oauth-apps", {
       method: "POST",
       agentId: leadAgentId,
-      body: { presetId: "google", clientId: "google-client", clientSecret: "google-secret" },
+      body: {
+        presetId: "google",
+        clientId: "google-client",
+        clientSecret: "example-google-secret",
+      },
     });
     expect(created.status).toBe(200);
 
@@ -163,7 +179,7 @@ describe("oauth presets — pure data", () => {
       {
         provider: hydrated.provider,
         clientId: "google-client",
-        clientSecret: "google-secret",
+        clientSecret: "example-google-secret",
         authorizeUrl: hydrated.authorizeUrl,
         tokenUrl: hydrated.tokenUrl,
         redirectUri: "https://api.public.test/api/oauth/callback",
@@ -183,15 +199,15 @@ describe("oauth presets — pure data", () => {
 });
 
 describe("oauth presets — HTTP", () => {
-  test("GET /api/oauth-presets lists all six presets with hints", async () => {
+  test("GET /api/oauth-presets lists all seven presets with hints", async () => {
     const res = await dispatch("/api/oauth-presets");
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       presets: Array<{ id: string; authorizeUrl: string; setupHints: string[] }>;
     };
-    expect(body.presets).toHaveLength(6);
+    expect(body.presets).toHaveLength(7);
     expect(body.presets.map((p) => p.id).sort()).toEqual(
-      ["github", "google", "jira", "linear", "notion", "slack"].sort(),
+      ["github", "google", "jira", "linear", "microsoft", "notion", "slack"].sort(),
     );
     for (const preset of body.presets) {
       expect(preset.authorizeUrl.startsWith("https://")).toBe(true);
@@ -205,7 +221,11 @@ describe("oauth presets — HTTP", () => {
     const res = await dispatch("/api/oauth-apps", {
       method: "POST",
       agentId: leadAgentId,
-      body: { presetId: "google", clientId: "google-client", clientSecret: "google-secret" },
+      body: {
+        presetId: "google",
+        clientId: "google-client",
+        clientSecret: "example-google-secret",
+      },
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -216,7 +236,7 @@ describe("oauth presets — HTTP", () => {
     expect(body.redirectUri).toContain("/api/oauth/callback");
     expect(body.setupHints.length).toBeGreaterThan(0);
     expect(body.oauthApp.source).toBe("curated-prefill");
-    expect(res.text).not.toContain("google-secret");
+    expect(res.text).not.toContain("example-google-secret");
 
     const stored = await getOAuthApp("google");
     expect(stored?.source).toBe("curated-prefill");
@@ -225,7 +245,7 @@ describe("oauth presets — HTTP", () => {
     expect(stored?.scopeSeparator).toBe(" ");
     expect(stored?.revocationUrl).toBe("https://oauth2.googleapis.com/revoke");
     expect(stored?.extraParamsJson ?? "").toContain("access_type");
-    expect(stored?.clientSecret).toBe("google-secret");
+    expect(stored?.clientSecret).toBe("example-google-secret");
   });
 
   test("no presetId + missing required endpoint fields is rejected with 400", async () => {

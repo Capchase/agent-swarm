@@ -49,6 +49,18 @@ New MCP tools: when adding a tool, register it in `SDK_TOOL_NAME_MAP` (`src/scri
 
 </important>
 
+<important if="you are modifying the extension system (src/extensions/*, src/be/extensions/*, src/http/extensions.ts, src/tools/extension-*.ts) or adding a pre/post event">
+
+Dispatch pre hooks only at entry points outside transactions. `dispatchPre()` uses `isInTransaction()` as a defensive guard.
+Add an event contract in `src/extensions/contract.ts`, then run `bun run build:extension-types`.
+Add one `dispatchPre` or `dispatchPost` call at the entry point.
+Add a fixture under `src/tests/fixtures/extensions/` and add the operator guide table row.
+Extension SDK calls use `callOrigin: "extension"`. This origin bypasses tool hooks and prevents recursion.
+Run `bun run test:root -- src/tests/extensions-*.test.ts`.
+Full rules: [runbooks/extensions.md](./runbooks/extensions.md).
+
+</important>
+
 <important if="you need to run commands to build, test, lint, start the server, or generate code">
 
 ## Commands
@@ -61,6 +73,7 @@ New MCP tools: when adding a tool, register it in `SDK_TOOL_NAME_MAP` (`src/scri
 | `bun run lint:fix` | Lint & format with Biome |
 | `bun run tsc:check` | Type check |
 | `bun run test:root` | Run root unit tests (`bun run test:root -- src/tests/<file>.test.ts` for one) |
+| `bun run e2e:ui` | Playwright UI suite: builds `apps/ui`, one seeded API per worker (`-- --grep @smoke`, `-- --no-build`) |
 | `bun run pm2-{start,stop,restart,logs,status}` | All services (API 3013, UI 5274, lead 3201, worker 3202) |
 | `bun run docker:build:worker` | Build Docker worker image (full) |
 | `bun run docker:build:worker:slim` | Build slim worker image (`--target worker-slim`, for CI/E2E) |
@@ -135,13 +148,19 @@ File-based, forward-only SQL in `src/be/migrations/NNN_descriptive_name.sql`. Ru
 
 Test against a fresh DB (`rm agent-swarm-db.sqlite && bun run start:http`) **and** an existing one. Never modify an applied migration — create a new one. No `down` migrations (SQLite rollbacks flake). Keep `AgentTaskSourceSchema` in `src/types.ts` in sync with SQL CHECK constraints.
 
+Before adding a migration, check its ordinal against `main`'s tail and every other open PR that adds one. `scripts/check-migration-conflicts.sh` (CI-enforced) checks uniqueness, base-branch immutability, **and** that every migration added since the base branch sorts strictly above the base branch's tail — so a migration numbered against a stale `main` fails CI instead of silently landing behind it. A duplicate ordinal is applied once and silently skipped by the runner; a gap is harmless, but a duplicate is dangerous.
+
 </important>
 
-<important if="you are adding or editing an agent skill (templates/skills/ or src/be/seed-skills/)">
+<important if="you are adding or editing an agent skill (skills/, templates/skills/, or src/be/seed-skills/)">
 
-Full authoring guide, the three delivery paths, versioning semantics, and every enforced rule: [runbooks/skills.md](./runbooks/skills.md).
+Full authoring guide, the four delivery paths, versioning semantics, and every enforced rule: [runbooks/skills.md](./runbooks/skills.md).
 
 **The rule that matters: one skill name must not be both seeded and baked.** `templates/skills/<name>/` (DB-seeded) and an image-baked skill (such as a pinned `npx skills` install) both write `~/.claude/skills/<name>/SKILL.md`. The DB copy wins, the baked content is silently discarded, and the FS writer then prunes any bundled file with no `skill_files` row. That truncated `artifacts` / `kv-storage` / `pages` and deleted their examples in production. `plugin/skills/` is retired for skills; `plugin/commands/`, `plugin/agents/`, and `plugin/pi-skills/` remain baked.
+
+**Public operator skills use the fourth delivery path:** `skills/<name>/SKILL.md`, installed with `npx skills add desplega-ai/agent-swarm`. They guide the operator's coding agent. Never seed or bake them.
+
+Keep `skills/agent-swarm/SKILL.md` valid and `skills/` nonempty. Otherwise, the installer's fallback scan exposes internal skills. Keep maintainer skills canonical in `.claude/internal-skills/`, with symlinks in harness skill directories. Run `bun run check:operator-skill` after changing public skills or their referenced files.
 
 **Prefer `templates/skills/`** — seeded skills are live-updatable (no image rebuild), listed by the skills API, editable in the UI, per-agent toggleable, and version-tracked with user-edit preservation.
 
@@ -262,7 +281,7 @@ Quick reference:
 Operator-tunable env vars are surfaced on the dashboard **Settings → Configuration** page, driven by the catalog in `apps/ui/src/lib/configuration-catalog.ts`. When you add such a var:
 
 - Register it in the catalog: pick a group (Steering, Memory, Heartbeat, Harness, Integrations, Security, Workflows, Branding — or add a group), a `kind` (`boolean` / `enum` / `number` / `string`), `defaultValue`, description, and a `docsUrl` when a docs page covers it.
-- Values persist as **global-scope `swarm_config` rows** via PUT `/api/config`. Precedence: env wins at boot; stored values win after reload (global upserts trigger a debounced auto-reload server-side). If the var is only read at server startup, set `restartRequired: true`.
+- Values persist as **global-scope `swarm_config` rows** via PUT `/api/config`. Precedence: stored values win over the deployment env, both at boot and after reload (global upserts trigger a debounced auto-reload server-side); reserved keys stay env-only. If the var is only read at server startup, set `restartRequired: true`.
 - Constrained values should get a validator in `VALIDATED_KEYS` in `src/be/swarm-config-guard.ts`.
 - NEVER add secrets/credentials or reserved keys (`API_KEY`, `SECRETS_ENCRYPTION_KEY`) to the catalog — those belong on the Secrets/Integrations pages.
 - Update the docs page [docs-site/.../ui/configuration.mdx](./docs-site/content/docs/(documentation)/ui/configuration.mdx) in the same PR.
@@ -271,11 +290,14 @@ Operator-tunable env vars are surfaced on the dashboard **Settings → Configura
 
 <important if="you are writing or running tests, drafting a plan with verification / E2E / QA steps, or preparing a frontend PR (apps/ui/, apps/templates-ui/)">
 
-Hub: [runbooks/testing.md](./runbooks/testing.md) — routes to LOCAL_TESTING.md, qa-use, swarm-local-e2e skill, memory tests, Slack E2E.
+Read [DESIGN.md](./DESIGN.md) before UI work.
+
+Hub: [runbooks/testing.md](./runbooks/testing.md) — routes to LOCAL_TESTING.md, agent-browser UI verification, swarm-local-e2e skill, memory tests, Slack E2E.
 
 Hard rules:
 - Plan-mode verification steps MUST copy real commands from LOCAL_TESTING.md; don't paraphrase.
-- Frontend PRs (`apps/ui/`, `apps/templates-ui/`) MUST include a `qa-use` session with screenshots — enforced by merge gate.
+- The black-box runner and optional `--harness` legs are documented in `LOCAL_TESTING.md` under `Black-box E2E`. The Playwright UI suite (`bun run e2e:ui`, `packages/ui-e2e`) is under `UI E2E`; its workflow `ui-e2e.yml` is informational.
+- Frontend PRs (`apps/ui/`, `apps/templates-ui/`) MUST include screenshots of the change running locally and a recording for interaction/flow changes (navigation, form, modal, drag, animation, or multi-step flow), captured with `agent-browser` and uploaded to agent-fs (signed URLs in the PR body). Screenshots remain required for static/layout changes. Never `qa-use` unless explicitly asked. This is a reviewer convention; no CI job enforces it. Commands: the `agent-browser` skill and [LOCAL_TESTING.md § When you need to verify a UI change](./LOCAL_TESTING.md#when-you-need-to-verify-a-ui-change).
 - E2E/test agents MUST use valid UUID agent IDs (e.g. `AGENT_ID=$(uuidgen)`), never slugs like `e2e-lead` — several MCP tool *output* schemas pin `yourAgentId`/`task.agentId` to UUID, so slug-ID agents get `MCP error -32602: Output validation error` on `get-tasks`/`get-task-details`/`store-progress`/`memory-search` **after the write already landed** (retrying double-writes).
 - Tests MUST NOT hard-code ports. CI runs `bun test --parallel=4` (one worker process per file), so two files with the same literal collide. Use `src/tests/test-net.ts`: `listenOnFreePort(server)` for in-process `node:http` servers, `port: 0` + `server.port` for `Bun.serve`, `getFreePort()` + `waitForServer()` for spawned `src/http.ts` children. No global test retry: a timing-sensitive test opts in with `test(name, fn, { retry: 2 })` plus a comment.
 
@@ -301,6 +323,8 @@ bun install --frozen-lockfile
 bun run lint           # NOT lint:fix — CI runs `lint` (read-only)
 bun run tsc:check
 bun run test:root -- --parallel=4     # CI: 2 shards x --parallel=4, balanced by cached --timings
+bun run e2e                          # black-box contract suite: boots the API on a free port, no Docker, no LLM
+bun run e2e:ui                       # Playwright UI suite: seeded API per worker, headless Chromium, needs Node 22+
 bun run check:bun-version             # Dockerfile oven/bun tags == package.json packageManager
 bash scripts/check-db-boundary.sh
 bash scripts/check-test-spawn-sync.sh # tests must use runChild(), never Bun.spawnSync
@@ -314,11 +338,36 @@ Drift checks — run only if you touched the trigger files, MUST commit any rege
 - Edited `content.md` or `config.json` under `templates/skills/` in a directory with a `SKILL.md`? → `bun run build:skill-md` and commit the generated file
 - Added/edited a file under `templates/skills/*/files/`? → `bun run build:seed-skill-files` and commit `src/be/seed-skills/bundled-files.generated.json` (NEVER hand-edit that JSON)
 - Edited `src/be/scripts/typecheck.ts` or `src/scripts-runtime/sdk-allowlist.ts`? → `bun run build:script-types` and commit `src/scripts-runtime/types/*.d.ts` (NEVER edit those `.d.ts` files directly — they're generated from `typecheck.ts`)
+- Edited `apps/ui/src/logs-parser/**` or `src/utils/dsh-usage.ts`? → `bun run build:claude-mod` and commit `claude-mod/vendor/logs-parser.js` (the Claude Code mod's bundle of the parser)
 - Edited an HTTP route OR bumped `package.json` `version`? → `bun run docs:openapi` (regenerates `openapi.json` AND `docs-site/content/docs/api-reference/**`)
+- Edited `templates/extensions/` or `ExtensionManifestSchema`? → `bun run build:extension-catalog && bun run build:extension-schema` and commit both generated files
 - Touched `apps/ui/` — or root `bun.lock`/`package.json`/`bunfig.toml` (ui deps resolve from the root lock)? → `cd apps/ui && bun install --frozen-lockfile && bun run lint && bunx tsc -b` (CI uses `tsc -b`, not `--noEmit`)
 - Touched `Dockerfile` / `Dockerfile.worker` / `apps/evals/Dockerfile` / files they COPY (incl. `bunfig.toml`, member `package.json`s, `.dockerignore`)? → `docker build -f <Dockerfile> .` — CI builds all three images
 
-Frontend (`apps/ui/`, `apps/templates-ui/`) PRs additionally require a `qa-use` session with screenshots.
+Frontend (`apps/ui/`, `apps/templates-ui/`) PRs additionally require screenshots (including static/layout changes) and a recording for interaction/flow changes (navigation, form, modal, drag, animation, or multi-step flow), uploaded to agent-fs with signed URLs in the PR body. This is a reviewer convention, not a CI gate. Commands: the `agent-browser` skill and [LOCAL_TESTING.md § When you need to verify a UI change](./LOCAL_TESTING.md#when-you-need-to-verify-a-ui-change).
+
+</important>
+
+<important if="you are writing a pull request description or filing a GitHub issue on this repo">
+
+Most PRs here are written by agents, so the description must carry the intent a reviewer checks the diff against. Write for a human, in the style of the [`comms` skill](https://github.com/desplega-ai/ai-toolbox/blob/main/cc-plugin/base/skills/comms/SKILL.md) (Precise mode): short direct sentences, no filler. Each template section gives a length target. Synthesize to meet it, and go past it only when the reviewer needs the detail.
+
+PR descriptions MUST fill every required section of [.github/pull_request_template.md](./.github/pull_request_template.md). A `fix:` / `fix(scope):` title also requires Repro and Setup.
+
+- **Intent**: why this change exists, paraphrased. Link only public sources (Fixes #N, a public PR or issue). Never paste Slack or DM ids, ts or permalinks, swarm task, run or memory ids, app.agent-swarm.dev or agent-fs links or paths, customer names, or verbatim quotes from private chat. Write 'a maintainer asked for X'. Internal provenance stays in the swarm task. Do not rewrite the ask to match what you built. The **PR Body** check and a PreToolUse hook on `gh pr create|edit` reject bot PR bodies that carry these identifiers (`src/utils/pr-body-leaks.ts`).
+- **Decisions & trade-offs**: up to 3 choices the request did not specify, each with its cost. Always list every migration, new config key, and breaking change.
+- **Urgency**: copy it from the request. If the request gives none, check "nice to have". Never pick it yourself. After the check passes, "asap" requests a review from tarasyarema and posts a comment. "this week" requests a review from desplega-bot, which starts a swarm review.
+
+`gh pr create --body` skips the template, so write the description to a file, check it, then pass the file:
+
+```bash
+bun scripts/check-pr-body.ts --title "<conventional title>" --body-file /tmp/pr-body.md
+gh pr create --title "<conventional title>" --body-file /tmp/pr-body.md
+```
+
+The **PR Body** workflow (`.github/workflows/pr-body.yml`) runs the same check on every PR event. To fix a failure, edit the PR title or description; no push is needed. Dependabot PRs, `release:` PRs, and PRs labeled `skip-pr-body-check` are exempt.
+
+Issues MUST use one of the forms in `.github/ISSUE_TEMPLATE/` (bug, feature request, question). `gh issue create` skips forms, so write each form field label as a `### <label>` heading, fill the required fields, and apply the form's label.
 
 </important>
 
@@ -356,7 +405,9 @@ Full rulebook: [apps/evals/SCENARIO-AUTHORING.md](./apps/evals/SCENARIO-AUTHORIN
 
 ## Related
 
-- [runbooks/](./runbooks/) — ci, release, local-development, testing, workflows, skills, memory-system, secret-scrubbing, harness-providers, seed-scripts, heartbeat-crash-recovery
+- [runbooks/db-retention.md](./runbooks/db-retention.md) — opt-in retention for non-critical SQLite log tables
+- [runbooks/extensions.md](./runbooks/extensions.md): extension lifecycle, dispatch, identity, and failure rules
+- [runbooks/](./runbooks/) — ci, release, local-development, testing, k8s-test-cluster, workflows, skills, memory-system, secret-scrubbing, harness-providers, seed-scripts, heartbeat-crash-recovery, extensions
 - [LOCAL_TESTING.md](./LOCAL_TESTING.md) — unit / E2E / entrypoint / MCP / UI testing recipes
 - [BUSINESS_USE.md](./BUSINESS_USE.md) — flow diagrams and instrumentation
 - [MCP.md](./MCP.md) — MCP tools reference

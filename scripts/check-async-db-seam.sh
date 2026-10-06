@@ -17,13 +17,15 @@
 set -euo pipefail
 
 ALLOWLIST=(
-  src/be/db.ts                                  # seam owner + initDb boot path
+  src/be/db.ts                                  # remaining sync sites until db-12-facade-cleanup
+  src/be/db/runtime.ts                          # singleton lifecycle + async client seam owner
   src/be/db-client.ts                           # the seam implementation
   src/be/migrations/runner.ts                   # boot: SQL migrations
   src/be/oauth-encryption-backfill.ts           # boot: one-time backfill
   src/be/connection-bindings-blob-migration.ts  # boot: one-time migration
   src/be/seed-pricing.ts                        # boot: seeder
   src/be/rbac-roles.ts                          # boot: ensureRbacSeedsSynced
+  src/be/boot-seeds.ts                          # boot: once-per-handle guards around the two seeders (getDb() only identifies the handle)
   src/be/asset-key-audit.ts                     # boot: startup audit (raw handle param)
   src/be/memory/providers/sqlite-store.ts       # constructor vec/FTS bootstrap; instance is boot-warmed by startMemoryGc()'s initial tick (async init = future decision)
   src/be/script-connections.ts                  # listScriptConnections feeds default parameter expressions (must stay sync)

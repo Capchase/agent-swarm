@@ -18,6 +18,8 @@ export interface ModelsDevModel {
   name?: string;
   cost?: ModelsDevCostBlock;
   limit?: { context?: number };
+  release_date?: string;
+  status?: string;
   reasoning?: boolean;
   reasoning_options?: ModelsDevReasoningOption[];
 }
@@ -31,6 +33,15 @@ export interface ModelsDevProvider {
 export type ModelsDevCache = Record<string, ModelsDevProvider>;
 
 export const MODELSDEV_CACHE_PATH = path.join("src", "be", "modelsdev-cache.json");
+
+/**
+ * Parsed snapshots by file path, so a changed `MODELSDEV_CACHE_PATH` is honoured.
+ * The file is 8.6 MB and its `JSON.parse` blocks the event loop for ~40 ms, so a
+ * second load while the first result is still alive reuses it. References are
+ * weak: the parsed tree is ~27 MB of heap that nothing needs pinned once the
+ * seed and catalog have read it. Callers must treat the result as read-only.
+ */
+const parsedCaches = new Map<string, WeakRef<ModelsDevCache>>();
 
 /**
  * Resolve the vendored models.dev cache from source checkouts and compiled
@@ -53,8 +64,12 @@ export function loadModelsDevCache(): ModelsDevCache | null {
   ];
 
   for (const candidate of candidates) {
+    const memoized = parsedCaches.get(candidate)?.deref();
+    if (memoized) return memoized;
     try {
-      return JSON.parse(readFileSync(candidate, "utf-8")) as ModelsDevCache;
+      const parsed = JSON.parse(readFileSync(candidate, "utf-8")) as ModelsDevCache;
+      parsedCaches.set(candidate, new WeakRef(parsed));
+      return parsed;
     } catch {
       // try next candidate
     }

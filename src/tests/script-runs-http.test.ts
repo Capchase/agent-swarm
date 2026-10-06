@@ -20,7 +20,7 @@ import { getPathSegments, parseQueryParams } from "../http/utils";
 import { refreshSecretScrubberCache } from "../utils/secret-scrubber";
 
 const TEST_DB_PATH = "./test-script-runs-http.sqlite";
-const API_KEY = "test-script-runs-http-key-1234567890";
+const API_KEY = "example-test-script-runs-http-key-1234567890";
 
 let agentId: string;
 let savedEnv: NodeJS.ProcessEnv;
@@ -399,6 +399,45 @@ describe("/api/script-runs HTTP", () => {
       [contextKey],
     )) as { c: number };
     expect(stepCount.c).toBe(1);
+  });
+
+  test.each([
+    undefined,
+    "skill",
+  ] as const)("agent-task dispatch preserves author pins and routing provenance for %s", async (routingReason) => {
+    const created = await dispatch("/api/script-runs", {
+      method: "POST",
+      agentId,
+      body: createBody(),
+    });
+    const { id: runId } = (await created.json()) as { id: string };
+
+    const responsePromise = dispatch(`/api/internal/script-runs/${runId}/agent-task`, {
+      method: "POST",
+      agentId,
+      body: JSON.stringify({ stepKey: "pinned", task: "do pinned work", agentId, routingReason }),
+    });
+
+    let dispatched = await getLatestScriptRunStepTaskByContextKey(`script-run:${runId}:pinned`);
+    for (let i = 0; i < 50 && !dispatched; i++) {
+      await Bun.sleep(20);
+      dispatched = await getLatestScriptRunStepTaskByContextKey(`script-run:${runId}:pinned`);
+    }
+    expect(dispatched).not.toBeNull();
+    await completeTask(dispatched!.id, "done");
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    const { taskId } = (await response.json()) as { taskId: string };
+    expect(
+      await getDbClient().get(
+        "SELECT agentId, routing_reason, routing_source FROM agent_tasks WHERE id = ?",
+        [taskId],
+      ),
+    ).toEqual({
+      agentId,
+      routing_reason: routingReason ?? "human_pinned",
+      routing_source: routingReason ? "declared" : "engine_default",
+    });
   });
 
   test("agent-task polling returns the step output when a newer completed follow-up shares its context key", async () => {

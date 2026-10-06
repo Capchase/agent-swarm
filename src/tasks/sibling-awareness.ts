@@ -17,7 +17,10 @@ import {
   getAgentById,
   getInProgressTasksByContextKey,
 } from "../be/db";
+import { applyPreTaskCreate } from "../extensions/apply-task-create";
+import type { TaskCreateOrigin } from "../extensions/contract";
 import type { AgentTask } from "../types";
+import { TaskCreationBlockedError } from "./errors";
 import {
   pickResumeParent,
   prependSiblingBlock,
@@ -58,6 +61,7 @@ async function toSiblingTaskInfo(task: AgentTask): Promise<SiblingTaskInfo> {
     agentName: agent?.name ?? null,
     description: stripSiblingBlock(task.task),
     updatedAt: task.lastUpdatedAt,
+    createdAt: task.createdAt,
   };
 }
 
@@ -135,10 +139,42 @@ export async function withSiblingAwareness(
  * first. Use this from every ingress that has a `contextKey` so cross-ingress
  * sibling coordination is uniform without duplicating the wrapper boilerplate.
  */
+/** Final description and options after extension pre-hooks and sibling wiring. */
+export type PreparedTaskCreate = { description: string; options: CreateTaskOptions };
+
+/**
+ * Run the `pre.task.create` extension hooks and sibling-awareness wiring without
+ * inserting the task. Callers that must create the task inside a transaction call
+ * this first, outside the transaction, so extension hooks are not skipped by the
+ * dispatcher's `isInTransaction()` guard.
+ */
+export async function prepareTaskWithSiblingAwareness(
+  description: string,
+  options: CreateTaskOptions,
+  args: { origin?: TaskCreateOrigin; allowCustomModel?: boolean } = {},
+): Promise<PreparedTaskCreate> {
+  const preCreate = await applyPreTaskCreate({
+    description,
+    options,
+    // Preserve the plan's REST default for callers without an explicit ingress origin.
+    origin: args.origin ?? "rest",
+    allowCustomModel: args.allowCustomModel,
+  });
+  if (preCreate.kind === "blocked") {
+    throw new TaskCreationBlockedError(preCreate.reason, preCreate.extension);
+  }
+  return await withSiblingAwareness(preCreate.description, preCreate.options);
+}
+
 export async function createTaskWithSiblingAwareness(
   description: string,
   options: CreateTaskOptions,
+  args: { origin?: TaskCreateOrigin; allowCustomModel?: boolean } = {},
 ): Promise<AgentTask> {
-  const { description: d, options: o } = await withSiblingAwareness(description, options);
+  const { description: d, options: o } = await prepareTaskWithSiblingAwareness(
+    description,
+    options,
+    args,
+  );
   return await createTaskExtended(d, o);
 }

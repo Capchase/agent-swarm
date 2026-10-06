@@ -1,10 +1,18 @@
+import { composeCommandText, engineForCommands } from "./container-engine.ts";
 import { expandServices } from "./service-names.ts";
 import type { OnboardState } from "./types.ts";
+
+const DEFAULT_LEAD_MAX_CONCURRENT_TASKS = 2;
+const DEFAULT_WORKER_MAX_CONCURRENT_TASKS = 1;
 
 // Docker Compose env var references use ${VAR} syntax which triggers biome's
 // noTemplateCurlyInString rule. We collect them via a helper to keep the
 // suppression comments in one place.
 
+// Image tag for the API and agent images. Blank or unset resolves to `latest`,
+// which moves on every commit to main; operators pin a release in .env.
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const IMAGE_TAG_EXPRESSION = "${AGENT_SWARM_VERSION:-latest}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
 const ENV_API_KEY = "      - API_KEY=${API_KEY}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
@@ -16,9 +24,38 @@ const ENV_SLACK_BOT_TOKEN = "      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
 const ENV_SLACK_APP_TOKEN = "      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_SLACK_SIGNING_SECRET = "      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_SLACK_MODE = "      - SLACK_MODE=${SLACK_MODE:-socket}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
 const ENV_CLAUDE_OAUTH = "      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
 const ENV_ANTHROPIC_KEY = "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_HARNESS_PROVIDER = "      - HARNESS_PROVIDER=${HARNESS_PROVIDER}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_OPENAI_KEY = "      - OPENAI_API_KEY=${OPENAI_API_KEY}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_OPENROUTER_KEY = "      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_MODEL_OVERRIDE = "      - MODEL_OVERRIDE=${MODEL_OVERRIDE}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_AWS_REGION = "      - AWS_REGION=${AWS_REGION}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_AWS_ACCESS_KEY_ID = "      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_AWS_SECRET_ACCESS_KEY = "      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_AWS_SESSION_TOKEN = "      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_AWS_PROFILE = "      - AWS_PROFILE=${AWS_PROFILE}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const ENV_BEDROCK_AUTH_MODE = "      - BEDROCK_AUTH_MODE=${BEDROCK_AUTH_MODE}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const AWS_PROFILE_VOLUME = "      - ${HOME}/.aws:/home/worker/.aws:ro";
+// `z` relabels the bind mount for SELinux as shared, since every worker mounts it.
+// biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+const AWS_PROFILE_VOLUME_SELINUX = "      - ${HOME}/.aws:/home/worker/.aws:ro,z";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
 const ENV_GITHUB_TOKEN = "      - GITHUB_TOKEN=${GITHUB_TOKEN}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
@@ -34,6 +71,40 @@ const ENV_SENTRY_AUTH_TOKEN = "      - SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN}";
 // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
 const ENV_SENTRY_ORG = "      - SENTRY_ORG=${SENTRY_ORG}";
 
+function appendProviderEnvironment(lines: string[], state: OnboardState, includeHarness: boolean) {
+  if (includeHarness) lines.push(ENV_HARNESS_PROVIDER);
+  switch (state.provider) {
+    case "claude":
+      lines.push(state.credentialType === "api_key" ? ENV_ANTHROPIC_KEY : ENV_CLAUDE_OAUTH);
+      break;
+    case "openai":
+      lines.push(ENV_OPENAI_KEY);
+      break;
+    case "openrouter":
+      lines.push(ENV_OPENROUTER_KEY);
+      lines.push(ENV_MODEL_OVERRIDE);
+      break;
+    case "bedrock":
+      // Workflow LLM nodes do not support Bedrock yet, so the API does not need AWS credentials.
+      if (!includeHarness) break;
+      lines.push("      # AWS Bedrock (alpha)");
+      lines.push(
+        "      # Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock.",
+      );
+      lines.push(ENV_BEDROCK_AUTH_MODE);
+      lines.push(ENV_AWS_REGION);
+      lines.push(ENV_MODEL_OVERRIDE);
+      if (state.awsProfile) {
+        lines.push(ENV_AWS_PROFILE);
+      } else {
+        lines.push(ENV_AWS_ACCESS_KEY_ID);
+        lines.push(ENV_AWS_SECRET_ACCESS_KEY);
+        if (state.awsSessionToken) lines.push(ENV_AWS_SESSION_TOKEN);
+      }
+      break;
+  }
+}
+
 /**
  * Generate a docker-compose.yml string from onboard wizard state.
  * Builds the YAML as plain strings (no YAML library) following the pattern
@@ -44,19 +115,28 @@ export function generateCompose(state: OnboardState): string {
   const lines: string[] = [];
 
   // Header
-  lines.push("# Docker Compose for Agent Swarm");
+  const engine = engineForCommands(state.containerEngine);
+  lines.push(`# ${engine === "podman" ? "Podman" : "Docker"} Compose for Agent Swarm`);
   lines.push("# Generated by `agent-swarm onboard`");
   lines.push("#");
   lines.push("# Usage:");
-  lines.push("#   docker compose --env-file .env up -d");
+  lines.push(`#   ${composeCommandText(engine, "--env-file .env up -d")}`);
+  lines.push("#");
+  lines.push("# Image version: set AGENT_SWARM_VERSION in .env to a published release.");
+  lines.push("# Blank falls back to `latest`, which moves on every commit to main and is");
+  lines.push("# not a release. Releases: https://github.com/desplega-ai/agent-swarm/releases");
+  lines.push("# Upgrade/rollback (migrations are forward-only, so back up first):");
+  lines.push(
+    "# https://github.com/desplega-ai/agent-swarm/blob/main/skills/agent-swarm/references/upgrade.md",
+  );
   lines.push("");
   lines.push("services:");
 
   // ── API service ──
   lines.push("  swarm-api:");
-  lines.push('    image: "ghcr.io/desplega-ai/agent-swarm:latest"');
+  lines.push(`    image: "ghcr.io/desplega-ai/agent-swarm:${IMAGE_TAG_EXPRESSION}"`);
   lines.push("    container_name: swarm-api");
-  lines.push("    pull_policy: always");
+  lines.push(`    pull_policy: ${state.pullPolicy}`);
   lines.push("    stop_grace_period: 60s");
   lines.push("");
   const port = state.apiPort || 3013;
@@ -65,13 +145,23 @@ export function generateCompose(state: OnboardState): string {
   lines.push(ENV_API_KEY);
   lines.push(ENV_INSTALL_METHOD);
   lines.push(ENV_INSTALL_PRESET);
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+  lines.push("      - MEMORY_HYBRID_SEARCH=${MEMORY_HYBRID_SEARCH-1}");
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+  lines.push("      - MEMORY_GRAPH_EXPANSION=${MEMORY_GRAPH_EXPANSION-1}");
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+  lines.push("      - MEMORY_RATERS=${MEMORY_RATERS-implicit-citation,explicit-self}");
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+  lines.push("      - MEMORY_DEMOTION_FLOOR=${MEMORY_DEMOTION_FLOOR-1.0}");
+  appendProviderEnvironment(lines, state, false);
   lines.push(`      - MCP_BASE_URL=http://localhost:${port}`);
   lines.push("      - APP_URL=https://app.agent-swarm.dev");
 
   if (state.integrations.slack) {
     lines.push("      - SLACK_DISABLE=false");
+    lines.push(ENV_SLACK_MODE);
     lines.push(ENV_SLACK_BOT_TOKEN);
-    lines.push(ENV_SLACK_APP_TOKEN);
+    lines.push(state.slackMode === "http" ? ENV_SLACK_SIGNING_SECRET : ENV_SLACK_APP_TOKEN);
   }
 
   if (state.integrations.github) {
@@ -105,9 +195,9 @@ export function generateCompose(state: OnboardState): string {
 
     lines.push("");
     lines.push(`  ${svc.name}:`);
-    lines.push('    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"');
+    lines.push(`    image: "ghcr.io/desplega-ai/agent-swarm-worker:${IMAGE_TAG_EXPRESSION}"`);
     lines.push(`    container_name: ${svc.containerName}`);
-    lines.push("    pull_policy: always");
+    lines.push(`    pull_policy: ${state.pullPolicy}`);
     lines.push("    stop_grace_period: 60s");
     lines.push("");
     lines.push("    depends_on:");
@@ -115,12 +205,10 @@ export function generateCompose(state: OnboardState): string {
     lines.push("        condition: service_healthy");
     lines.push("");
     lines.push("    environment:");
-    if (state.credentialType === "api_key") {
-      lines.push(ENV_ANTHROPIC_KEY);
-    } else {
-      lines.push(ENV_CLAUDE_OAUTH);
-    }
+    appendProviderEnvironment(lines, state, true);
     lines.push(ENV_API_KEY);
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: Docker Compose env var syntax
+    lines.push("      - MEMORY_RATERS=${MEMORY_RATERS-implicit-citation,explicit-self}");
     lines.push(`      - AGENT_ID=${svc.agentId}`);
     lines.push(`      - AGENT_NAME=${agentName}`);
     lines.push(`      - AGENT_ROLE=${agentRole}`);
@@ -129,9 +217,10 @@ export function generateCompose(state: OnboardState): string {
     lines.push("      - YOLO=true");
     lines.push("      - SWARM_URL=http://swarm-api:3013");
 
-    if (svc.entry.isLead) {
-      lines.push("      - MAX_CONCURRENT_TASKS=1");
-    }
+    const maxConcurrentTasks =
+      state.maxConcurrentTasks ??
+      (svc.entry.isLead ? DEFAULT_LEAD_MAX_CONCURRENT_TASKS : DEFAULT_WORKER_MAX_CONCURRENT_TASKS);
+    lines.push(`      - MAX_CONCURRENT_TASKS=${maxConcurrentTasks}`);
 
     if (state.integrations.github) {
       lines.push(ENV_GITHUB_TOKEN);
@@ -157,6 +246,9 @@ export function generateCompose(state: OnboardState): string {
     lines.push("      - swarm_logs:/app/logs");
     lines.push("      - swarm_shared:/app/shared");
     lines.push(`      - swarm_${svc.sanitizedName}:/app/agent`);
+    if (state.provider === "bedrock" && state.awsProfile) {
+      lines.push(engine === "podman" ? AWS_PROFILE_VOLUME_SELINUX : AWS_PROFILE_VOLUME);
+    }
     lines.push("");
     lines.push("    restart: unless-stopped");
   }

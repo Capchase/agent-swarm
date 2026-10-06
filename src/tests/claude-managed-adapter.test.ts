@@ -9,8 +9,8 @@ import {
   normalizeRepoUrl,
 } from "../providers/claude-managed-adapter";
 import {
-  CLAUDE_MANAGED_MODEL_PRICING,
   computeClaudeManagedCostUsd,
+  getClaudeManagedModelPricing,
 } from "../providers/claude-managed-models";
 import type { ProviderEvent, ProviderSessionConfig } from "../providers/types";
 
@@ -242,6 +242,53 @@ describe("ClaudeManagedAdapter (Phase 3) — session lifecycle", () => {
     expect(a[0]?.text).toBe(b[0]?.text);
     // Second (per-task) block intentionally differs.
     expect(a[1]?.text).not.toBe(b[1]?.text);
+  });
+
+  test("agent.message with a redacted block keeps a visible placeholder instead of dropping it", async () => {
+    const events: Array<Record<string, unknown>> = [
+      {
+        type: "agent.message",
+        id: "evt1",
+        processed_at: "2026-01-01T00:00:01Z",
+        content: [
+          { type: "text", text: "before " },
+          { type: "redacted" },
+          { type: "text", text: " after" },
+        ],
+      },
+      {
+        type: "agent.message",
+        id: "evt2",
+        processed_at: "2026-01-01T00:00:02Z",
+        content: [{ type: "redacted" }],
+      },
+      {
+        type: "session.status_idle",
+        id: "evt3",
+        processed_at: "2026-01-01T00:00:03Z",
+        stop_reason: { type: "end_turn" },
+      },
+    ];
+    const spy = makeFakeClient({
+      streamEvents: async function* () {
+        for (const e of events) yield e;
+      },
+    });
+    const adapter = new ClaudeManagedAdapter({ client: spy.client });
+    const session = await adapter.createSession(
+      tConfig({ logFile: join(tmpLogDir, "redacted.log") }),
+    );
+    const emitted: ProviderEvent[] = [];
+    session.onEvent((e) => emitted.push(e));
+    await session.waitForCompletion();
+
+    const messages = emitted.flatMap((e) =>
+      e.type === "message" && e.role === "assistant" ? [e.content] : [],
+    );
+    expect(messages).toEqual([
+      "before [content redacted by Anthropic model policy] after",
+      "[content redacted by Anthropic model policy]",
+    ]);
   });
 
   test("happy path: agent.message → message ProviderEvent, span.model_request_end → cost + context_usage, status_idle → result", async () => {
@@ -733,7 +780,7 @@ describe("ClaudeManagedAdapter (Phase 4) — repo provisioning + cost data", () 
   });
 
   test("createSession includes resources[github_repository] when config.vcsRepo is set", async () => {
-    process.env.MANAGED_GITHUB_TOKEN = "ghp_test_pat";
+    process.env.MANAGED_GITHUB_TOKEN = "example-ghp_test_pat";
     const events: Array<Record<string, unknown>> = [
       {
         type: "session.status_idle",
@@ -764,7 +811,7 @@ describe("ClaudeManagedAdapter (Phase 4) — repo provisioning + cost data", () 
     const repo = resources![0]!;
     expect(repo.type).toBe("github_repository");
     expect(repo.url).toBe("https://github.com/desplega-ai/agent-swarm");
-    expect(repo.authorization_token).toBe("ghp_test_pat");
+    expect(repo.authorization_token).toBe("example-ghp_test_pat");
     const checkout = repo.checkout as Record<string, unknown> | undefined;
     expect(checkout?.type).toBe("branch");
     expect(checkout?.name).toBe("main");
@@ -831,10 +878,10 @@ describe("ClaudeManagedAdapter (Phase 4) — repo provisioning + cost data", () 
     expect(cost).toBeCloseTo(4.5, 10);
   });
 
-  test("computeClaudeManagedCostUsd uses sonnet-5 introductory rate through 2026-08-31", () => {
+  test("computeClaudeManagedCostUsd uses sonnet-5 standard rate before 2026-09-01", () => {
     // 1M input tokens × $2.00/Mtok = $2.00
     // 100k output tokens × $10.00/Mtok = $1.00
-    // total = $3.00. The introductory rate applies through 2026-08-31.
+    // total = $3.00.
     const cost = computeClaudeManagedCostUsd(
       "claude-sonnet-5",
       1_000_000,
@@ -846,10 +893,11 @@ describe("ClaudeManagedAdapter (Phase 4) — repo provisioning + cost data", () 
     expect(cost).toBeCloseTo(3.0, 10);
   });
 
-  test("computeClaudeManagedCostUsd uses sonnet-5 standard rate from 2026-09-01", () => {
-    // 1M input tokens × $3.00/Mtok = $3.00
-    // 100k output tokens × $15.00/Mtok = $1.50
-    // total = $4.50 from the first instant of 2026-09-01 UTC.
+  test("computeClaudeManagedCostUsd keeps sonnet-5 standard rate from 2026-09-01", () => {
+    // Anthropic cancelled the previously scheduled increase to $3/$15.
+    // 1M input tokens × $2.00/Mtok = $2.00
+    // 100k output tokens × $10.00/Mtok = $1.00
+    // total = $3.00 from the first instant of 2026-09-01 UTC.
     const cost = computeClaudeManagedCostUsd(
       "claude-sonnet-5",
       1_000_000,
@@ -858,7 +906,7 @@ describe("ClaudeManagedAdapter (Phase 4) — repo provisioning + cost data", () 
       0,
       Date.parse("2026-09-01T00:00:00.000Z"),
     );
-    expect(cost).toBeCloseTo(4.5, 10);
+    expect(cost).toBeCloseTo(3.0, 10);
   });
 
   test("computeClaudeManagedCostUsd factors cache-read and cache-write at correct rates", () => {
@@ -884,43 +932,52 @@ describe("ClaudeManagedAdapter (Phase 4) — repo provisioning + cost data", () 
     expect(cost2).toBe(0);
   });
 
-  test("CLAUDE_MANAGED_MODEL_PRICING covers sonnet, opus, haiku at minimum", () => {
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-opus-5"]).toEqual({
+  test("catalog prices managed models: covers sonnet, opus, haiku at minimum", () => {
+    expect(getClaudeManagedModelPricing("claude-fable-5-1")).toEqual({
+      inputPerMillion: 10.0,
+      outputPerMillion: 50.0,
+      cacheReadPerMillion: 0.25,
+      cacheWritePerMillion: 12.5,
+    });
+    expect(getClaudeManagedModelPricing("claude-opus-5-5")).toEqual({
+      inputPerMillion: 4.0,
+      outputPerMillion: 20.0,
+      cacheReadPerMillion: 0.2,
+      cacheWritePerMillion: 5.0,
+    });
+    expect(getClaudeManagedModelPricing("claude-opus-5")).toEqual({
       inputPerMillion: 5.0,
       outputPerMillion: 25.0,
       cacheReadPerMillion: 0.5,
       cacheWritePerMillion: 6.25,
     });
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-fable-5"]).toEqual({
+    expect(getClaudeManagedModelPricing("claude-fable-5")).toEqual({
       inputPerMillion: 10.0,
       outputPerMillion: 50.0,
       cacheReadPerMillion: 1.0,
       cacheWritePerMillion: 12.5,
     });
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-mythos-5"]).toEqual({
+    expect(getClaudeManagedModelPricing("claude-mythos-5")).toEqual({
       inputPerMillion: 10.0,
       outputPerMillion: 50.0,
       cacheReadPerMillion: 1.0,
       cacheWritePerMillion: 12.5,
     });
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-sonnet-5"]).toEqual({
+    expect(getClaudeManagedModelPricing("claude-sonnet-5-5")).toEqual({
       inputPerMillion: 2.0,
       outputPerMillion: 10.0,
       cacheReadPerMillion: 0.2,
       cacheWritePerMillion: 2.5,
-      scheduledChange: {
-        effectiveAt: "2026-09-01T00:00:00.000Z",
-        pricing: {
-          inputPerMillion: 3.0,
-          outputPerMillion: 15.0,
-          cacheReadPerMillion: 0.3,
-          cacheWritePerMillion: 3.75,
-        },
-      },
     });
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-sonnet-4-6"]).toBeDefined();
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-opus-4-7"]).toBeDefined();
-    expect(CLAUDE_MANAGED_MODEL_PRICING["claude-haiku-4-5"]).toBeDefined();
+    expect(getClaudeManagedModelPricing("claude-sonnet-5")).toEqual({
+      inputPerMillion: 2.0,
+      outputPerMillion: 10.0,
+      cacheReadPerMillion: 0.2,
+      cacheWritePerMillion: 2.5,
+    });
+    expect(getClaudeManagedModelPricing("claude-sonnet-4-6")).toBeDefined();
+    expect(getClaudeManagedModelPricing("claude-opus-4-7")).toBeDefined();
+    expect(getClaudeManagedModelPricing("claude-haiku-4-5")).toBeDefined();
   });
 
   test("session totalCostUsd = token cost + (durationMs/3.6e6) × $0.08 runtime fee", async () => {
@@ -1122,7 +1179,7 @@ describe("ClaudeManagedAdapter (Phase 5) — cancellation + tool-loop detection"
         logFile: join(tmpLogDir, "cancel-poll.log"),
         // Provide the API context so the swarm-event handler attaches.
         apiUrl: "http://test-api",
-        apiKey: "test-key",
+        apiKey: "example-test-key",
         taskId,
       }),
     );
@@ -1220,7 +1277,7 @@ describe("ClaudeManagedAdapter (Phase 5) — cancellation + tool-loop detection"
         tConfig({
           logFile: join(tmpLogDir, "tool-loop.log"),
           apiUrl: "http://test-api",
-          apiKey: "test-key",
+          apiKey: "example-test-key",
           taskId,
         }),
       );

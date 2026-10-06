@@ -9,7 +9,6 @@ import {
   File,
   FileText,
   Image as ImageIcon,
-  Loader2,
   Paperclip,
   Star,
   Trash2,
@@ -17,8 +16,14 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchTaskAttachmentBlob, useDeleteAttachment, useTaskAttachments } from "@/api/fs";
 import type { TaskAttachment, TaskAttachmentKind } from "@/api/types";
+import { Spinner } from "@/components/kibo-ui/spinner";
 import { CollapsibleSection } from "@/components/shared/collapsible-section";
-import { AttachmentName, buildAgentFsLiveUrl } from "@/components/shared/task-attachment-link";
+import { InAppOrExternalLink } from "@/components/shared/in-app-or-external-link";
+import {
+  type AgentFsLinkContext,
+  AttachmentName,
+  agentFsAttachmentLinks,
+} from "@/components/shared/task-attachment-link";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,36 +33,36 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { MiddleTruncation } from "@/components/ui/middle-truncation";
+import { useOptionalAgentFs } from "@/contexts/agent-fs-context";
+import { formatBytes } from "@/lib/format-bytes";
+import { scrubSecretText } from "@/lib/scrub-secrets";
 import { cn } from "@/lib/utils";
 
 /**
  * Per-row resolution mirrors `resolveAttachmentDisplay` in `src/slack/blocks.ts`.
- * For `agent-fs` we build a public live-URL when the row carries `orgId` and
- * `driveId` on that same row; otherwise the row stays non-clickable and we
- * surface the raw path so users can copy it manually.
+ * For `agent-fs` we build a public live-URL from the row's `orgId` and
+ * `driveId` (or, while Comb is on, the swarm drive when the row has neither);
+ * otherwise the row stays non-clickable and we surface the raw path so users
+ * can copy it manually. `combTo` opens an agent-fs file in Comb (same tab)
+ * while Comb is connected; `href` then stays the "Open in agent-fs" action.
  */
-function resolveHref(a: TaskAttachment): string | null {
+function resolveLinks(
+  a: TaskAttachment,
+  agentFs: AgentFsLinkContext | null,
+): { href: string | null; combTo: string | null } {
   switch (a.kind) {
     case "url":
-      return a.url ?? null;
+      return { href: a.url ?? null, combTo: null };
     case "page":
       // SPA-relative — react-router handles `/pages/:id`. We still render as
       // an anchor with target="_blank" so the link survives copy/paste.
-      return a.pageId ? `/pages/${a.pageId}` : null;
+      return { href: a.pageId ? `/pages/${a.pageId}` : null, combTo: null };
     case "agent-fs":
-      return buildAgentFsLiveUrl({ path: a.path, orgId: a.orgId, driveId: a.driveId });
+      return agentFsAttachmentLinks(a, agentFs);
     case "shared-fs":
-      return null;
+      return { href: null, combTo: null };
   }
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const kb = bytes / 1024;
-  if (kb < 1024) return `${kb.toFixed(1)} KB`;
-  const mb = kb / 1024;
-  if (mb < 1024) return `${mb.toFixed(1)} MB`;
-  return `${(mb / 1024).toFixed(2)} GB`;
 }
 
 function KindBadge({ kind }: { kind: TaskAttachmentKind }) {
@@ -189,13 +194,6 @@ function PreviewIcon({ kind }: { kind: PreviewKind | null }) {
   return <File className="h-4 w-4 text-muted-foreground" />;
 }
 
-function scrubPreviewText(text: string): string {
-  return text
-    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}/g, "$1[REDACTED]")
-    .replace(/\b([A-Z0-9_]*(?:API|TOKEN|SECRET|KEY)[A-Z0-9_]*\s*=\s*)[^\s"'`]+/gi, "$1[REDACTED]")
-    .replace(/\b(aswt_|sk-|af_)[A-Za-z0-9._-]{12,}/g, "$1[REDACTED]");
-}
-
 function AttachmentRow({
   attachment,
   onDownload,
@@ -211,7 +209,8 @@ function AttachmentRow({
   taskId: string;
   variant?: "card" | "prompt";
 }) {
-  const href = resolveHref(attachment);
+  const agentFs = useOptionalAgentFs();
+  const { href, combTo } = resolveLinks(attachment, agentFs);
   const descriptor = attachment.intent || attachment.description;
   const previewKind = getPreviewKind(attachment);
   const [expanded, setExpanded] = useState(false);
@@ -265,7 +264,7 @@ function AttachmentRow({
             });
             return;
           }
-          const text = scrubPreviewText(await blob.text());
+          const text = scrubSecretText(await blob.text());
           previewStateRef.current = "text";
           setPreview({
             kind: "text",
@@ -334,7 +333,7 @@ function AttachmentRow({
             ) : (
               <span className="flex h-full w-full items-center justify-center text-muted-foreground">
                 {preview.kind === "loading" ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <Spinner className="size-4" />
                 ) : (
                   <ImageIcon className="h-5 w-5" />
                 )}
@@ -342,19 +341,21 @@ function AttachmentRow({
             )}
             <span className="absolute inset-x-0 bottom-0 flex items-center gap-1 bg-background/80 px-2 py-1 text-[10px] text-foreground opacity-0 backdrop-blur-sm transition group-hover:opacity-100">
               <ImageIcon className="h-3 w-3 shrink-0" />
-              <span className="truncate">{attachment.name}</span>
+              <MiddleTruncation>{attachment.name}</MiddleTruncation>
             </span>
           </button>
 
           <Dialog open={lightboxOpen} onOpenChange={setLightboxOpen}>
             <DialogContent className="max-h-[92vh] overflow-hidden p-4 sm:max-w-4xl">
               <DialogHeader className="pr-8">
-                <DialogTitle className="truncate text-base">{attachment.name}</DialogTitle>
+                <DialogTitle className="text-base">
+                  <MiddleTruncation>{attachment.name}</MiddleTruncation>
+                </DialogTitle>
                 <DialogDescription>{previewKindLabel(previewKind)}</DialogDescription>
               </DialogHeader>
               {preview.kind === "loading" ? (
                 <div className="flex h-48 items-center justify-center gap-2 rounded-md border border-dashed border-border bg-muted/20 text-sm text-muted-foreground">
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <Spinner className="size-4" />
                   Loading preview
                 </div>
               ) : preview.kind === "error" ? (
@@ -379,6 +380,76 @@ function AttachmentRow({
             ? "Text"
             : attachment.mimeType?.split("/")[1]?.toUpperCase() || attachment.kind;
 
+    if (href) {
+      const metadata = [
+        attachment.kind === "agent-fs" ? "Agent FS" : null,
+        label !== attachment.kind ? label : null,
+        attachment.sizeBytes != null ? formatBytes(attachment.sizeBytes) : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const filename = attachment.path?.split("/").filter(Boolean).at(-1);
+
+      return (
+        <div className="inline-flex w-[24rem] max-w-full items-center rounded-xl border border-border bg-background shadow-sm">
+          <InAppOrExternalLink
+            to={combTo}
+            href={href}
+            className="group flex min-w-0 flex-1 items-center gap-3 rounded-l-xl px-3 py-2.5 text-left hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+            aria-label={combTo ? `Open ${attachment.name}` : `Open ${attachment.name} in a new tab`}
+            title={attachment.path || attachment.name}
+          >
+            <span className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted sm:flex">
+              <PreviewIcon kind={previewKind} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="line-clamp-2 break-words text-sm font-medium text-foreground group-hover:text-primary">
+                {attachment.name}
+              </span>
+              {metadata && <span className="block text-xs text-muted-foreground">{metadata}</span>}
+              {!attachment.mimeType && filename && filename !== attachment.name && (
+                <MiddleTruncation className="hidden font-mono text-xs text-muted-foreground sm:block">
+                  {filename}
+                </MiddleTruncation>
+              )}
+            </span>
+            {!combTo && (
+              <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground group-hover:text-primary" />
+            )}
+          </InAppOrExternalLink>
+          {combTo && (
+            <Button
+              asChild
+              variant="ghost"
+              size="icon-sm"
+              className="shrink-0 border-l border-border-subtle rounded-none text-muted-foreground"
+            >
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={`Open ${attachment.name} in agent-fs`}
+                title="Open in agent-fs"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            className="mr-1 shrink-0 border-l border-border-subtle rounded-l-none text-muted-foreground"
+            onClick={() => onDownload(attachment)}
+            aria-label={`Download ${attachment.name}`}
+            title={`Download ${attachment.name}`}
+          >
+            <Download className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      );
+    }
+
     return (
       <>
         <button
@@ -398,10 +469,12 @@ function AttachmentRow({
             <PreviewIcon kind={previewKind} />
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block truncate font-medium text-foreground">{attachment.name}</span>
+            <MiddleTruncation className="font-medium text-foreground">
+              {attachment.name}
+            </MiddleTruncation>
             <span className="block truncate font-mono text-[10px] uppercase text-muted-foreground">
               {label}
-              {attachment.sizeBytes != null ? ` · ${formatSize(attachment.sizeBytes)}` : ""}
+              {attachment.sizeBytes != null ? ` · ${formatBytes(attachment.sizeBytes)}` : ""}
             </span>
           </span>
           {previewKind ? (
@@ -414,14 +487,16 @@ function AttachmentRow({
         <Dialog open={lightboxOpen} onOpenChange={setLightboxOpen}>
           <DialogContent className="max-h-[92vh] overflow-hidden p-4 sm:max-w-4xl">
             <DialogHeader className="pr-8">
-              <DialogTitle className="truncate text-base">{attachment.name}</DialogTitle>
+              <DialogTitle className="text-base">
+                <MiddleTruncation>{attachment.name}</MiddleTruncation>
+              </DialogTitle>
               <DialogDescription>
                 {previewKind ? previewKindLabel(previewKind) : ""}
               </DialogDescription>
             </DialogHeader>
             {preview.kind === "loading" ? (
               <div className="flex h-48 items-center justify-center gap-2 rounded-md border border-dashed border-border bg-muted/20 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Spinner className="size-4" />
                 Loading preview
               </div>
             ) : preview.kind === "error" ? (
@@ -470,7 +545,7 @@ function AttachmentRow({
                 aria-label="Primary attachment"
               />
             )}
-            <AttachmentName href={href} name={attachment.name} />
+            <AttachmentName href={href} to={combTo} name={attachment.name} />
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             <KindBadge kind={attachment.kind} />
@@ -490,8 +565,9 @@ function AttachmentRow({
           )}
           {pathDisplay && (
             <div className="flex items-center gap-1.5">
-              <code className="truncate rounded bg-muted/40 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
-                {pathDisplay}
+              {/* flex-1: a middle-truncated value needs a definite width to fit. */}
+              <code className="min-w-0 flex-1 rounded bg-muted/40 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                <MiddleTruncation>{pathDisplay}</MiddleTruncation>
               </code>
               <CopyPathButton value={attachment.path ?? ""} />
             </div>
@@ -500,7 +576,7 @@ function AttachmentRow({
             <p className="font-mono text-[10px] text-muted-foreground/70">
               {[
                 attachment.mimeType,
-                attachment.sizeBytes != null ? formatSize(attachment.sizeBytes) : null,
+                attachment.sizeBytes != null ? formatBytes(attachment.sizeBytes) : null,
               ]
                 .filter(Boolean)
                 .join(" · ")}
@@ -525,14 +601,18 @@ function AttachmentRow({
                 <ChevronRight className="h-3.5 w-3.5" />
               )}
             </Button>
-          ) : href ? (
+          ) : null}
+          {/* The name opens Comb, so the live link moves here as "Open in agent-fs". */}
+          {href && (combTo || !previewKind) ? (
             <Button type="button" size="icon" variant="ghost" className="h-7 w-7" asChild>
               <a
                 href={href}
                 target="_blank"
                 rel="noopener noreferrer"
-                aria-label={`Open ${attachment.name}`}
-                title="Open"
+                aria-label={
+                  combTo ? `Open ${attachment.name} in agent-fs` : `Open ${attachment.name}`
+                }
+                title={combTo ? "Open in agent-fs" : "Open"}
               >
                 <ExternalLink className="h-3.5 w-3.5" />
               </a>
@@ -559,11 +639,7 @@ function AttachmentRow({
             aria-label={`Delete ${attachment.name}`}
             title="Delete"
           >
-            {deleting ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Trash2 className="h-3.5 w-3.5" />
-            )}
+            {deleting ? <Spinner className="size-3.5" /> : <Trash2 className="h-3.5 w-3.5" />}
           </Button>
         </div>
       </div>
@@ -572,7 +648,7 @@ function AttachmentRow({
         <div className="border-t border-border bg-muted/20 p-3">
           {preview.kind === "loading" ? (
             <div className="flex h-28 items-center justify-center gap-2 rounded-md border border-dashed border-border bg-background text-xs text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <Spinner className="size-3.5" />
               Loading preview
             </div>
           ) : preview.kind === "error" ? (
@@ -605,14 +681,16 @@ function AttachmentRow({
       <Dialog open={lightboxOpen} onOpenChange={setLightboxOpen}>
         <DialogContent className="max-h-[92vh] overflow-hidden p-4 sm:max-w-4xl">
           <DialogHeader className="pr-8">
-            <DialogTitle className="truncate text-base">{attachment.name}</DialogTitle>
+            <DialogTitle className="text-base">
+              <MiddleTruncation>{attachment.name}</MiddleTruncation>
+            </DialogTitle>
             <DialogDescription>
               {previewKind ? previewKindLabel(previewKind) : ""}
             </DialogDescription>
           </DialogHeader>
           {preview.kind === "loading" ? (
             <div className="flex h-48 items-center justify-center gap-2 rounded-md border border-dashed border-border bg-muted/20 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Spinner className="size-4" />
               Loading preview
             </div>
           ) : preview.kind === "error" ? (

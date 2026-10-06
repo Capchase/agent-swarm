@@ -16,7 +16,7 @@ function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSes
     agentId: "test-agent-id",
     taskId: "test-task-id",
     apiUrl: "http://localhost:3013",
-    apiKey: "test-key",
+    apiKey: "example-test-key",
     cwd: "/tmp",
     logFile: "/tmp/test-claude-adapter.jsonl",
     ...overrides,
@@ -95,15 +95,17 @@ describe("ClaudeSession spawn env — reasoning_effort", () => {
   // MAX_THINKING_TOKENS) would leak through and pollute the `toBeUndefined()`
   // assertions. Passing an explicit, minimal `env` sidesteps both — deterministic
   // regardless of the ambient process env the test happens to run in.
-  const CLEAN_ENV: Record<string, string> = { CLAUDE_CODE_OAUTH_TOKEN: "test-oauth-token" };
+  const CLEAN_ENV: Record<string, string> = { CLAUDE_CODE_OAUTH_TOKEN: "example-test-oauth-token" };
 
   beforeEach(() => {
     spawnedEnvs = [];
     spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
-      _cmd: readonly string[],
+      cmd: readonly string[],
       opts?: { env?: Record<string, string> },
     ) => {
-      spawnedEnvs.push(opts?.env);
+      if (cmd.at(-1) !== "--version") {
+        spawnedEnvs.push(opts?.env);
+      }
       return makeFakeProc();
     }) as typeof Bun.spawn);
   });
@@ -116,6 +118,16 @@ describe("ClaudeSession spawn env — reasoning_effort", () => {
     const adapter = new ClaudeAdapter(async () => {});
     await adapter.createSession(
       makeConfig({ model: "claude-opus-4-8", reasoningEffort: "high", env: CLEAN_ENV }),
+    );
+
+    expect(spawnedEnvs).toHaveLength(1);
+    expect(spawnedEnvs[0]?.CLAUDE_CODE_EFFORT_LEVEL).toBe("high");
+  });
+
+  test("reasoningEffort: 'high' on the tier-default shortname opus sets CLAUDE_CODE_EFFORT_LEVEL", async () => {
+    const adapter = new ClaudeAdapter(async () => {});
+    await adapter.createSession(
+      makeConfig({ model: "opus", reasoningEffort: "high", env: CLEAN_ENV }),
     );
 
     expect(spawnedEnvs).toHaveLength(1);
@@ -194,8 +206,9 @@ describe("Claude stream-json event parsing", () => {
 // stdout) rather than asserting on hand-built fixtures, so a message-shape
 // regression here is caught instead of silently shipping the wrong text.
 describe("ClaudeSession processStreams — ProviderResult.output capture", () => {
+  let originalClaudeTransport: string | undefined;
   let spawnSpy: ReturnType<typeof spyOn>;
-  const CLEAN_ENV: Record<string, string> = { CLAUDE_CODE_OAUTH_TOKEN: "test-oauth-token" };
+  const CLEAN_ENV: Record<string, string> = { CLAUDE_CODE_OAUTH_TOKEN: "example-test-oauth-token" };
 
   /** Fake Bun.Subprocess whose stdout streams the given NDJSON lines, then closes. */
   function makeStreamingFakeProc(lines: string[]): ReturnType<typeof Bun.spawn> {
@@ -232,11 +245,18 @@ describe("ClaudeSession processStreams — ProviderResult.output capture", () =>
   }
 
   beforeEach(() => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     spawnSpy = spyOn(Bun, "spawn");
   });
 
   afterEach(() => {
     spawnSpy.mockRestore();
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
+    }
   });
 
   test("multiple assistant turns: the last non-empty text wins", async () => {
@@ -285,8 +305,66 @@ describe("ClaudeSession processStreams — ProviderResult.output capture", () =>
     expect(summaryOpts!.transcript).toContain('Tool[Read] started: {"file_path":"/tmp/source.ts"}');
     expect(summaryOpts!.transcript).toContain("Tool result: export const value = 1");
     expect(summaryOpts!.transcriptPath).toBeUndefined();
-    expect(summaryOpts!.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("test-oauth-token");
+    expect(summaryOpts!.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("example-test-oauth-token");
     expect(summaryOpts!.env?.AGENT_SWARM_TASK_ID).toBe("test-task-id");
+  });
+
+  test("a credits_required rate_limit_event reaches the log file and raw_log without the seat payload", async () => {
+    const seatEvent = JSON.stringify({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "rejected",
+        resetsAt: 1790812800,
+        overageDisabledReason: "member_zero_credit_limit",
+        isUsingOverage: false,
+        errorCode: "credits_required",
+        canUserPurchaseCredits: false,
+        hasChargeableSavedPaymentMethod: true,
+      },
+      uuid: "bff51e54-9777-458a-aceb-b50aaa4255b5",
+      session_id: "9d326326-0c59-4b00-b819-b9b7dd3bf99f",
+    });
+    spawnSpy.mockImplementation((() =>
+      makeStreamingFakeProc([
+        seatEvent,
+        assistantLine([{ type: "text", text: "done" }]),
+      ])) as typeof Bun.spawn);
+
+    const logDir = await mkdtemp(join(tmpdir(), "claude-seat-egress-"));
+    const logFile = join(logDir, "session.jsonl");
+    try {
+      const adapter = new ClaudeAdapter(async () => {});
+      const session = await adapter.createSession(makeConfig({ env: CLEAN_ENV, logFile }));
+      const rawLogs: string[] = [];
+      session.onEvent((event) => {
+        if (event.type === "raw_log") rawLogs.push(event.content);
+      });
+      const result = await session.waitForCompletion();
+
+      // Error tracking still reads the original event.
+      expect(result.creditsRequired?.overageDisabledReason).toBe("member_zero_credit_limit");
+
+      const fileLog = await Bun.file(logFile).text();
+      const egress = [fileLog, ...rawLogs];
+      for (const content of egress) {
+        expect(content).not.toContain("overageDisabledReason");
+        expect(content).not.toContain("member_zero_credit_limit");
+        expect(content).not.toContain("canUserPurchaseCredits");
+        expect(content).not.toContain("hasChargeableSavedPaymentMethod");
+      }
+      const loggedEvent = rawLogs.find((line) => line.includes('"rate_limit_event"'));
+      expect(loggedEvent).toBeDefined();
+      expect(JSON.parse(loggedEvent!).rate_limit_info).toEqual({
+        status: "rejected",
+        resetsAt: 1790812800,
+        isUsingOverage: false,
+        errorCode: "credits_required",
+      });
+      expect(fileLog).toContain('"errorCode":"credits_required"');
+      expect(fileLog).toContain('"text":"done"');
+    } finally {
+      await rm(logDir, { recursive: true, force: true });
+    }
   });
 
   test("tool_use-only, thinking-only, and empty-text turns are skipped, not captured", async () => {

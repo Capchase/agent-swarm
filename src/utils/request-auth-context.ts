@@ -2,9 +2,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage } from "node:http";
 import type { User } from "../types";
 
-export type HttpRequestAuth =
+export type HttpRequestAuth = (
   | { kind: "operator"; fingerprint: string }
-  | { kind: "user"; userId: string; user: User };
+  | { kind: "user"; userId: string; user: User }
+  /** Ephemeral session token minted by the ACP adapter per session (aseph_ prefix). */
+  | { kind: "agent"; agentId: string; taskId: string }
+) & {
+  /** Verified page context for agent-scoped operations. This does not identify the viewer. */
+  page?: { id: string; executionAgentId: string };
+};
 
 /**
  * The ambient store holds a mutable slot, not the auth value itself.

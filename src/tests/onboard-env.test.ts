@@ -12,13 +12,56 @@ describe("generateEnv", () => {
   test("Claude harness includes CLAUDE_CODE_OAUTH_TOKEN with actual value", () => {
     const state = makeState({
       harness: "claude",
-      claudeOAuthToken: "oauth-tok-abc123",
-      apiKey: "my-api-key",
+      claudeOAuthToken: "example-oauth-tok-abc123",
+      apiKey: "example-my-api-key",
       services: [{ template: "official/coder", displayName: "Coder", count: 1, role: "coder" }],
       agentIds: { "worker-coder": "coder-uuid" },
     });
     const env = generateEnv(state);
-    expect(env).toContain("CLAUDE_CODE_OAUTH_TOKEN=oauth-tok-abc123");
+    expect(env).toContain("HARNESS_PROVIDER=claude");
+    expect(env).toContain("CLAUDE_CODE_OAUTH_TOKEN=example-oauth-tok-abc123");
+  });
+
+  test("OpenAI emits the codex harness and OpenAI credential", () => {
+    const env = generateEnv(
+      makeState({ provider: "openai", harness: "codex", openaiApiKey: "example-sk-openai" }),
+    );
+    expect(env).toContain("HARNESS_PROVIDER=codex");
+    expect(env).toContain("OPENAI_API_KEY=example-sk-openai");
+    expect(env).not.toContain("ANTHROPIC_API_KEY=");
+  });
+
+  test("OpenRouter emits the pi harness, credential, and suggested model", () => {
+    const env = generateEnv(
+      makeState({
+        provider: "openrouter",
+        harness: "pi",
+        openrouterApiKey: "example-sk-or-test",
+        modelOverride: "openrouter/qwen/qwen3-coder-flash",
+      }),
+    );
+    expect(env).toContain("HARNESS_PROVIDER=pi");
+    expect(env).toContain("OPENROUTER_API_KEY=example-sk-or-test");
+    expect(env).toContain("MODEL_OVERRIDE=openrouter/qwen/qwen3-coder-flash");
+  });
+
+  test("AWS Bedrock emits the pi harness, profile, region, model, and alpha warning", () => {
+    const env = generateEnv(
+      makeState({
+        provider: "bedrock",
+        harness: "pi",
+        awsProfile: "swarm",
+        awsRegion: "us-east-1",
+        modelOverride: "amazon-bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
+      }),
+    );
+    expect(env).toContain("HARNESS_PROVIDER=pi");
+    expect(env).toContain("BEDROCK_AUTH_MODE=sdk");
+    expect(env).toContain("AWS_PROFILE=swarm");
+    expect(env).toContain("AWS_REGION=us-east-1");
+    expect(env).toContain(
+      "Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock.",
+    );
   });
 
   // ── GitHub integration enabled ──
@@ -48,15 +91,32 @@ describe("generateEnv", () => {
       apiKey: "key",
       claudeOAuthToken: "tok",
       integrations: { github: false, slack: true, gitlab: false, sentry: false },
-      slackBotToken: "xoxb-slack-bot",
-      slackAppToken: "xapp-slack-app",
+      slackBotToken: "example-xoxb-slack-bot",
+      slackAppToken: "example-xapp-slack-app",
       services: [{ template: "official/coder", displayName: "Coder", count: 1, role: "coder" }],
       agentIds: { "worker-coder": "id-1" },
     });
     const env = generateEnv(state);
-    expect(env).toContain("SLACK_BOT_TOKEN=xoxb-slack-bot");
-    expect(env).toContain("SLACK_APP_TOKEN=xapp-slack-app");
+    expect(env).toContain("SLACK_BOT_TOKEN=example-xoxb-slack-bot");
+    expect(env).toContain("SLACK_APP_TOKEN=example-xapp-slack-app");
+    expect(env).toContain("SLACK_MODE=socket");
+    expect(env).not.toContain("SLACK_SIGNING_SECRET=");
     expect(env).toContain("SLACK_DISABLE=false");
+  });
+
+  test("Slack HTTP mode emits only its mode-specific credential", () => {
+    const env = generateEnv(
+      makeState({
+        integrations: { github: false, slack: true, gitlab: false, sentry: false },
+        slackMode: "http",
+        slackBotToken: "example-xoxb-slack-bot",
+        slackSigningSecret: "synthetic-signing-secret",
+      }),
+    );
+    expect(env).toContain("SLACK_MODE=http");
+    expect(env).toContain("SLACK_BOT_TOKEN=example-xoxb-slack-bot");
+    expect(env).toContain("SLACK_SIGNING_SECRET=synthetic-signing-secret");
+    expect(env).not.toContain("SLACK_APP_TOKEN=");
   });
 
   // ── No integrations: only core section ──
@@ -86,28 +146,28 @@ describe("generateEnv", () => {
 
   test("actual credential values appear, not placeholder text", () => {
     const state = makeState({
-      apiKey: "real-api-key-789",
-      claudeOAuthToken: "real-oauth-token-xyz",
+      apiKey: "example-real-api-key-789",
+      claudeOAuthToken: "example-real-oauth-token-xyz",
       integrations: { github: true, slack: true, gitlab: true, sentry: true },
-      githubToken: "ghp_realtoken",
+      githubToken: "example-ghp_realtoken",
       githubEmail: "real@mail.com",
       githubName: "Real Name",
-      slackBotToken: "xoxb-real",
-      slackAppToken: "xapp-real",
-      gitlabToken: "glpat-real",
+      slackBotToken: "example-xoxb-real",
+      slackAppToken: "example-xapp-real",
+      gitlabToken: "example-glpat-real",
       gitlabEmail: "gl@mail.com",
-      sentryToken: "sntrys_real",
+      sentryToken: "example-sntrys_real",
       sentryOrg: "my-org",
       services: [{ template: "official/coder", displayName: "Coder", count: 1, role: "coder" }],
       agentIds: { "worker-coder": "id-1" },
     });
     const env = generateEnv(state);
-    expect(env).toContain("API_KEY=real-api-key-789");
-    expect(env).toContain("CLAUDE_CODE_OAUTH_TOKEN=real-oauth-token-xyz");
-    expect(env).toContain("GITHUB_TOKEN=ghp_realtoken");
-    expect(env).toContain("SLACK_BOT_TOKEN=xoxb-real");
-    expect(env).toContain("GITLAB_TOKEN=glpat-real");
-    expect(env).toContain("SENTRY_AUTH_TOKEN=sntrys_real");
+    expect(env).toContain("API_KEY=example-real-api-key-789");
+    expect(env).toContain("CLAUDE_CODE_OAUTH_TOKEN=example-real-oauth-token-xyz");
+    expect(env).toContain("GITHUB_TOKEN=example-ghp_realtoken");
+    expect(env).toContain("SLACK_BOT_TOKEN=example-xoxb-real");
+    expect(env).toContain("GITLAB_TOKEN=example-glpat-real");
+    expect(env).toContain("SENTRY_AUTH_TOKEN=example-sntrys_real");
     expect(env).toContain("SENTRY_ORG=my-org");
     // No placeholder text like "your-token-here"
     expect(env).not.toContain("your-");
@@ -162,13 +222,13 @@ describe("generateEnv", () => {
       apiKey: "key",
       claudeOAuthToken: "tok",
       integrations: { github: false, slack: false, gitlab: false, sentry: true },
-      sentryToken: "sntrys-tok",
+      sentryToken: "example-sntrys-tok",
       sentryOrg: "sentry-org",
       services: [{ template: "official/coder", displayName: "Coder", count: 1, role: "coder" }],
       agentIds: { "worker-coder": "id-1" },
     });
     const env = generateEnv(state);
-    expect(env).toContain("SENTRY_AUTH_TOKEN=sntrys-tok");
+    expect(env).toContain("SENTRY_AUTH_TOKEN=example-sntrys-tok");
     expect(env).toContain("SENTRY_ORG=sentry-org");
   });
 });

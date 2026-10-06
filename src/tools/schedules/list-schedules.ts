@@ -22,6 +22,7 @@ const scheduleRowShape = {
   lastRunAt: z.string().optional(),
   nextRunAt: z.string().optional(),
   createdByAgentId: z.string().optional(),
+  parentTaskId: z.string().optional(),
   timezone: z.string().optional(),
   consecutiveErrors: z.number().optional(),
   lastErrorAt: z.string().optional(),
@@ -59,12 +60,14 @@ export const registerListSchedulesTool = (server: McpServer) => {
           .int()
           .min(0)
           .optional()
-          .describe("Only return schedules with at least this many consecutive errors."),
+          .describe(
+            "Only return schedules with at least this many consecutive dispatch errors (the scheduler failed to create the task, workflow run, or script run). Does not count spawned tasks that later failed; for those use get-tasks with scheduleId and status failed.",
+          ),
         lastRunStatus: z
           .enum(["failed", "succeeded"])
           .optional()
           .describe(
-            "Filter by derived last run status. `failed` means consecutiveErrors > 0; `succeeded` means lastRunAt is set and consecutiveErrors is 0.",
+            "Filter by derived last dispatch status. `failed` means consecutiveErrors > 0 (the last dispatch attempt errored); `succeeded` means lastRunAt is set and consecutiveErrors is 0. Reflects dispatch only, not the outcome of spawned tasks; for those use get-tasks with scheduleId and status failed.",
           ),
         includeFull: z
           .boolean()

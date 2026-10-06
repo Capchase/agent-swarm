@@ -43,8 +43,15 @@ describe("Tool Annotations & Classification", () => {
     initDb(TEST_DB_PATH);
     // Tier classification (core vs deferred) spans every tool, including ones
     // behind default-disabled capabilities — build the full-surface server.
-    server = await createServer({ fullSurface: true });
-    tools = getRegisteredTools(server);
+    const previousSteeringEnabled = process.env.STEERING_ENABLED;
+    process.env.STEERING_ENABLED = "true";
+    try {
+      server = await createServer({ fullSurface: true, scriptsOnly: false });
+      tools = getRegisteredTools(server);
+    } finally {
+      if (previousSteeringEnabled === undefined) delete process.env.STEERING_ENABLED;
+      else process.env.STEERING_ENABLED = previousSteeringEnabled;
+    }
   });
 
   afterAll(async () => {
@@ -131,7 +138,6 @@ describe("Tool Annotations & Classification", () => {
       "list-services",
       "list-schedules",
       "list-config",
-      "memory-search",
       "memory-get",
       "my-agent-info",
       "poll-task",
@@ -145,6 +151,10 @@ describe("Tool Annotations & Classification", () => {
         expect(tools[name].annotations?.readOnlyHint).toBe(true);
       }
     }
+  });
+
+  test("memory-search is not read-only because it records access telemetry", () => {
+    expect(tools["memory-search"]?.annotations?.readOnlyHint).toBe(false);
   });
 
   test("no tool has both readOnlyHint and destructiveHint set to true", () => {
@@ -189,8 +199,8 @@ describe("Tool Annotations & Classification", () => {
     expect(overlap).toEqual([]);
   });
 
-  test("CORE_TOOLS contains exactly 14 tools", () => {
-    expect(CORE_TOOLS.size).toBe(14);
+  test("CORE_TOOLS contains exactly 26 tools", () => {
+    expect(CORE_TOOLS.size).toBe(26);
   });
 
   test("ALL_TOOLS equals CORE_TOOLS union DEFERRED_TOOLS", () => {
@@ -241,6 +251,7 @@ describe("Tool Annotations & Classification", () => {
       "task-action",
       "send-task",
       "get-tasks",
+      "defer-task",
     ];
     for (const tool of lifecycleTools) {
       expect(CORE_TOOLS.has(tool)).toBe(true);
@@ -259,6 +270,34 @@ describe("Tool Annotations & Classification", () => {
     const memTools = ["memory-search", "memory-get", "memory-store"];
     for (const tool of memTools) {
       expect(CORE_TOOLS.has(tool)).toBe(true);
+    }
+  });
+
+  test("core tools include prevalent fleet operations", () => {
+    const frequentTools = [
+      "script-run",
+      "db-query",
+      "kv-get",
+      "script-query-types",
+      "get-repos",
+      "accept-steer",
+      "memory-edit",
+      "script-search",
+      "steer-task",
+      "kv-list",
+      "get-config",
+    ];
+    for (const tool of frequentTools) {
+      expect(CORE_TOOLS.has(tool)).toBe(true);
+      expect(DEFERRED_TOOLS.has(tool)).toBe(false);
+    }
+  });
+
+  test("Slack tools stay deferred for task-context gating", () => {
+    for (const tool of ALL_TOOLS) {
+      if (!tool.startsWith("slack-")) continue;
+      expect(CORE_TOOLS.has(tool)).toBe(false);
+      expect(DEFERRED_TOOLS.has(tool)).toBe(true);
     }
   });
 
@@ -323,8 +362,8 @@ describe("Tool Annotations & Classification", () => {
     }
   });
 
-  test("config tools are all deferred", () => {
-    const configTools = ["set-config", "get-config", "list-config", "delete-config"];
+  test("config tools other than get-config are deferred", () => {
+    const configTools = ["set-config", "list-config", "delete-config"];
     for (const tool of configTools) {
       expect(DEFERRED_TOOLS.has(tool)).toBe(true);
     }
@@ -339,7 +378,7 @@ describe("Tool Annotations & Classification", () => {
     // Includes 11 skill tools, 7 MCP server tools, reusable script tools, and the
     // native Kapso/WhatsApp tools (register/unregister number + send/reply message).
     expect(count).toBeGreaterThanOrEqual(45);
-    expect(count).toBeLessThanOrEqual(140);
+    expect(count).toBeLessThanOrEqual(151);
   });
 
   test("core tools are fewer than deferred tools", () => {

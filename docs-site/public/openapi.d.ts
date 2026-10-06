@@ -348,6 +348,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mcp-bridge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Generic MCP tool proxy for the scripts SDK bridge */
+        post: {
+            parameters: {
+                query?: never;
+                header?: {
+                    /** @description Identifies the concrete runtime instance (worker process) making the call, as generated at its boot. Required to acquire work through bridged tools when multi-runtime mode (MULTI_RUNTIME_ENABLED) is on; ignored otherwise. */
+                    "X-Runtime-Instance-ID"?: string;
+                };
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        tool: string;
+                        /** @default {} */
+                        args?: {
+                            [key: string]: unknown;
+                        };
+                    };
+                };
+            };
+            responses: {
+                /** @description Tool result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid tool name or args */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Tool not in SDK allowlist */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Tool not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ping": {
         parameters: {
             query?: never;
@@ -359,7 +433,7 @@ export interface paths {
         put?: never;
         /**
          * Report agent liveness
-         * @description Refreshes the calling agent's status. Workers may send `X-Runtime-Instance-ID`, the per-boot identifier of the calling process. It is ignored unless MULTI_RUNTIME_ENABLED is set. With multi-runtime mode on, the header must identify a live runtime of this agent; an absent, unknown, offline, or foreign identifier makes the call a no-op instead of an error, so workers predating the flag keep running.
+         * @description Refreshes the calling agent's status. Workers may send `X-Runtime-Instance-ID`, the per-boot identifier of the calling process. It is ignored unless MULTI_RUNTIME_ENABLED is set. With multi-runtime mode on, the header must identify a live runtime of this agent; an absent, unknown, offline, or foreign identifier makes the call a no-op instead of an error, so workers predating the flag keep running. While the API is draining after SIGTERM, every response (this one included) carries `X-Swarm-Draining: 1`: workers hand off in-flight tasks and take no new work.
          */
         post: {
             parameters: {
@@ -1863,7 +1937,7 @@ export interface paths {
                             ok: true;
                             taskId: string;
                             /** @enum {string} */
-                            status: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                            status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
                         } | {
                             ok: boolean;
                             result: {
@@ -2085,6 +2159,8 @@ export interface paths {
                             rows: unknown[][];
                             elapsed: number;
                             total: number;
+                            truncated: boolean;
+                            rowLimit: number | null;
                         };
                     };
                 };
@@ -2132,7 +2208,7 @@ export interface paths {
         };
         /**
          * List all agents
-         * @description Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`.
+         * @description Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`. Extension identities (`ext:<name>`, role `extension`) are never listed; they are API principals, not workers.
          */
         get: {
             parameters: {
@@ -2161,6 +2237,8 @@ export interface paths {
                                     max: number;
                                     available: number;
                                 };
+                                /** @enum {string} */
+                                claudeTransport?: "cli" | "sdk";
                             })[];
                         };
                     };
@@ -2186,10 +2264,16 @@ export interface paths {
                         capabilities?: string[];
                         maxTasks?: number;
                         /** @enum {string} */
-                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                         /** @enum {string} */
-                        harness_provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+                        harness_provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                         runtimeInstanceId?: string;
+                        modelTierOverrides?: {
+                            [key: string]: {
+                                [key: string]: string;
+                            };
+                        };
+                        harnessCliVersion?: string;
                     };
                 };
             };
@@ -2263,7 +2347,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        harness_provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+                        harness_provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                     };
                 };
             };
@@ -2312,7 +2396,53 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Get an agent's runtime configuration
+         * @description Returns the agent's explicit Claude transport override, the effective transport after config precedence, and whether Claude Bridge is effective. Values never include credentials.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    repoId?: string;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Agent runtime configuration */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            claude: {
+                                /** @enum {string|null} */
+                                transport: "cli" | "sdk" | null;
+                                /** @enum {string} */
+                                effectiveTransport: "cli" | "sdk";
+                                /** @enum {string} */
+                                inheritedTransport: "cli" | "sdk";
+                                bridgeEffective: boolean;
+                            };
+                        };
+                    };
+                };
+                /** @description Agent not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
         put?: never;
         post?: never;
         delete?: never;
@@ -2320,11 +2450,13 @@ export interface paths {
         head?: never;
         /**
          * Update an agent's runtime harness and default model
-         * @description Updates `agents.harness_provider` and upserts agent-scoped `swarm_config` rows for HARNESS_PROVIDER, MODEL_OVERRIDE, and REASONING_EFFORT_OVERRIDE. The settings apply to future provider sessions. For `model` and `reasoning_effort`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it.
+         * @description Updates `agents.harness_provider` and agent-scoped runtime config. The settings apply to future provider sessions. For `model`, `reasoning_effort`, and `claude.transport`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it. A `model` the model catalog does not list is a 400 unless `allow_custom_model` is true. A `latest:` alias is not accepted here (aliases resolve for a task's model and for `MODEL_TIER_*` values); `reasoning_effort` must be one the harness and model support.
          */
         patch: {
             parameters: {
-                query?: never;
+                query?: {
+                    repoId?: string;
+                };
                 header?: never;
                 path: {
                     id: string;
@@ -2335,12 +2467,27 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        harness_provider: "claude" | "codex" | "pi" | "opencode";
+                        harness_provider: "claude" | "codex" | "pi" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                         model?: string | null;
                         /** @default false */
                         allow_custom_model?: boolean;
                         /** @enum {string|null} */
                         reasoning_effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+                        acp?: {
+                            /** @enum {string} */
+                            target: "opencode" | "custom";
+                            command?: string | null;
+                            args?: string[];
+                            envKeys?: string[];
+                            modelEnvKey?: string | null;
+                            options?: {
+                                [key: string]: string | boolean;
+                            };
+                        };
+                        claude?: {
+                            /** @enum {string|null} */
+                            transport?: "cli" | "sdk" | null;
+                        };
                     };
                 };
             };
@@ -2509,7 +2656,7 @@ export interface paths {
         };
         /**
          * List runtime instances serving an agent
-         * @description Read-only view of the worker processes currently registered for a logical agent. Rows exist only for multi-runtime registrations (MULTI_RUNTIME_ENABLED), so the list is empty in the default configuration. `isLive` combines `status` with `lastSeenAt` freshness against the server's staleness cutoff (`staleThresholdMinutes`); `reportedSlots` is each process's self-reported capacity, distinct from the agent's logical `maxTasks` policy.
+         * @description Read-only view of the worker processes currently registered for a logical agent. Rows exist only for multi-runtime registrations (MULTI_RUNTIME_ENABLED), so the list is empty when the flag is disabled. `isLive` combines `status` with `lastSeenAt` freshness against the server's staleness cutoff (`staleThresholdMinutes`); `reportedSlots` is each process's self-reported capacity, distinct from the agent's logical `maxTasks` policy.
          */
         get: {
             parameters: {
@@ -2545,6 +2692,63 @@ export interface paths {
                                 isLive: boolean;
                             }[];
                             staleThresholdMinutes: number;
+                        };
+                    };
+                };
+                /** @description Agent not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/{id}/task-activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Daily task counts for an agent
+         * @description Number of tasks created for the agent per UTC day over the last `days` days (default 365, max 730), oldest first. Days with no tasks are omitted. Backs the activity heatmap on the agent page.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    days?: number;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Daily task counts */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            days: {
+                                date: string;
+                                count: number;
+                            }[];
                         };
                     };
                 };
@@ -2606,6 +2810,14 @@ export interface paths {
                         changeSource?: string;
                         changedByAgentId?: string;
                         changeReason?: string;
+                        expectedHashes?: {
+                            soulMd?: string;
+                            identityMd?: string;
+                            toolsMd?: string;
+                            claudeMd?: string;
+                            setupScript?: string;
+                            heartbeatMd?: string;
+                        };
                     };
                 };
             };
@@ -2734,6 +2946,8 @@ export interface paths {
                                 max: number;
                                 available: number;
                             };
+                            /** @enum {string} */
+                            claudeTransport?: "cli" | "sdk";
                         };
                     };
                 };
@@ -2788,9 +3002,9 @@ export interface paths {
                             status: "idle" | "busy" | "offline" | "waiting_for_credentials";
                             missing: string[];
                             /** @enum {string|null} */
-                            provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | null;
+                            provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
                             /** @enum {string|null} */
-                            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | null;
+                            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
                             credStatus: components["schemas"]["AgentCredStatus"] | null;
                             lastCheckedAt: string;
                         };
@@ -2827,6 +3041,7 @@ export interface paths {
                         missing?: string[] | null;
                         cred_status?: components["schemas"]["AgentCredStatus"] | null;
                         latest_model?: components["schemas"]["AgentLatestModel"];
+                        acp?: components["schemas"]["AgentAcpStatus"];
                     };
                 };
             };
@@ -2906,9 +3121,9 @@ export interface paths {
                                 status: "idle" | "busy" | "offline" | "waiting_for_credentials";
                                 missing: string[];
                                 /** @enum {string|null} */
-                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | null;
+                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
                                 /** @enum {string|null} */
-                                harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | null;
+                                harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
                                 credStatus: components["schemas"]["AgentCredStatus"] | null;
                                 lastCheckedAt: string;
                             }[];
@@ -2932,13 +3147,17 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List approval requests with optional filters */
+        /**
+         * List approval requests with optional filters
+         * @description Returns full approval requests by default. Pass `fields=slim` for the list-view shape: `questions`, `approvers`, `responses`, `resolutionReason` and `notificationChannels` are dropped and `questionCount` is added. Fetch one request in full via `GET /api/approval-requests/{id}`.
+         */
         get: {
             parameters: {
                 query?: {
                     status?: string;
                     workflowRunId?: string;
                     limit?: number | null;
+                    fields?: "full" | "slim";
                 };
                 header?: never;
                 path?: never;
@@ -2985,12 +3204,33 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3002,6 +3242,30 @@ export interface paths {
                                 createdBy?: string;
                                 createdAt: string;
                                 updatedAt: string;
+                            }[] | {
+                                id: string;
+                                title: string;
+                                workflowRunId: string | null;
+                                workflowRunStepId: string | null;
+                                sourceTaskId: string | null;
+                                /** @enum {string} */
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
+                                resolvedBy: string | null;
+                                resolvedAt: string | null;
+                                timeoutSeconds: number | null;
+                                expiresAt: string | null;
+                                createdBy?: string;
+                                createdAt: string;
+                                updatedAt: string;
+                                questionCount: number;
                             }[];
                         };
                     };
@@ -3052,6 +3316,7 @@ export interface paths {
                         workflowRunStepId?: string;
                         /** Format: uuid */
                         sourceTaskId?: string;
+                        /** @description Seconds until the request expires. After that the request becomes 'timeout' and you get a hitl-follow-up task. A request with no timeout is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7). */
                         timeoutSeconds?: number;
                         notifications?: {
                             /** @enum {string} */
@@ -3101,12 +3366,33 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3197,12 +3483,33 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3246,7 +3553,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Submit a response to an approval request */
+        /**
+         * Submit a response to an approval request
+         * @description Only a person may answer: a user token, a page session signed for a user, or the shared key with no agent identity (recorded as `operator`). The responder is taken from the credential. When the request lists `approvers.users` or `approvers.roles`, a user must match one of them. A rejection resolves the request at once; approvals resolve it when the `any`, `all` or `{ min: N }` policy is met, and until then it stays pending with the answer recorded in `approvals`.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -3262,12 +3572,13 @@ export interface paths {
                         responses: {
                             [key: string]: unknown;
                         };
+                        /** @description Unverified display name. Stored as `claimedRespondedBy` on the answer; never used as the responder. */
                         respondedBy?: string;
                     };
                 };
             };
             responses: {
-                /** @description Response recorded */
+                /** @description Response recorded. `status` stays `pending` while the policy needs more approvals. */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -3306,12 +3617,33 @@ export interface paths {
                                     };
                                 };
                                 /** @enum {string} */
-                                status: "pending" | "approved" | "rejected" | "timeout";
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
                                 responses: {
                                     [key: string]: unknown;
                                 } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
                                 resolvedBy: string | null;
                                 resolvedAt: string | null;
+                                resolutionReason: string | null;
                                 timeoutSeconds: number | null;
                                 expiresAt: string | null;
                                 notificationChannels: {
@@ -3336,6 +3668,15 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
+                /** @description Caller is an agent, or is not one of the request's approvers */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 /** @description Not found */
                 404: {
                     headers: {
@@ -3345,7 +3686,152 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description Already resolved */
+                /** @description Already resolved, or this responder already answered */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/approval-requests/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a pending approval request */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        reason?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Request cancelled, or already cancelled. A request that gates a running or waiting workflow run cancels that run too. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            approvalRequest: {
+                                id: string;
+                                title: string;
+                                questions: {
+                                    id: string;
+                                    /** @enum {string} */
+                                    type: "approval" | "text" | "single-select" | "multi-select" | "boolean";
+                                    label: string;
+                                    required?: boolean;
+                                    description?: string;
+                                    placeholder?: string;
+                                    multiline?: boolean;
+                                    options?: {
+                                        value: string;
+                                        label: string;
+                                        description?: string;
+                                    }[];
+                                    minSelections?: number;
+                                    maxSelections?: number;
+                                    defaultValue?: boolean;
+                                }[];
+                                workflowRunId: string | null;
+                                workflowRunStepId: string | null;
+                                sourceTaskId: string | null;
+                                approvers: {
+                                    users?: string[];
+                                    roles?: string[];
+                                    policy: "any" | "all" | {
+                                        min: number;
+                                    };
+                                };
+                                /** @enum {string} */
+                                status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
+                                responses: {
+                                    [key: string]: unknown;
+                                } | null;
+                                /** @description Every accepted answer, in order. A request with an `all` or `{ min: N }` policy stays pending until enough approve. */
+                                approvals: {
+                                    /** @description Who answered, from the credential: a user id, or `operator` for the shared key. */
+                                    responder: string;
+                                    approved: boolean;
+                                    responses: {
+                                        [key: string]: unknown;
+                                    };
+                                    /** @description The `respondedBy` the client sent. Unverified; display only. */
+                                    claimedRespondedBy?: string;
+                                    respondedAt: string;
+                                }[] | null;
+                                /** @description Quorum progress while the request is pending; null once it is resolved. */
+                                approvalProgress: {
+                                    /** @description Approvals that count toward the policy so far. */
+                                    approved: number;
+                                    /** @description Approvals the policy needs before the request resolves. */
+                                    required: number;
+                                } | null;
+                                /** @description Who resolved the request, from the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
+                                resolvedBy: string | null;
+                                resolvedAt: string | null;
+                                resolutionReason: string | null;
+                                timeoutSeconds: number | null;
+                                expiresAt: string | null;
+                                notificationChannels: {
+                                    /** @enum {string} */
+                                    channel: "slack" | "email";
+                                    target: string;
+                                    messageTs?: string;
+                                }[] | null;
+                                createdBy?: string;
+                                createdAt: string;
+                                updatedAt: string;
+                            };
+                            alreadyCancelled: boolean;
+                            runCancelled: boolean;
+                        };
+                    };
+                };
+                /** @description Caller may not cancel this request */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Already resolved with approved, rejected, or timeout, or its expiresAt passed */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -4013,72 +4499,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/oauth/keep-warm/codex": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Locked keep-warm refresh sweep across all Codex OAuth pool slots
-         * @description Enumerates codex_oauth_* slots and refreshes any older than ~7 days through the same locked getValidCodexOAuth path used at task time. Skips slots already benched by codex-auth-expiry-watch.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Per-slot keep-warm outcomes */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            results: ({
-                                slot: number;
-                                keySuffix: string;
-                                /** @enum {string} */
-                                outcome: "warm";
-                            } | {
-                                slot: number;
-                                keySuffix: string;
-                                /** @enum {string} */
-                                outcome: "refreshed";
-                            } | {
-                                slot: number;
-                                keySuffix: string;
-                                /** @enum {string} */
-                                outcome: "skipped-benched";
-                            } | {
-                                slot: number;
-                                /** @enum {string} */
-                                outcome: "no-credentials";
-                            } | {
-                                slot: number;
-                                keySuffix: string;
-                                /** @enum {string} */
-                                outcome: "failed";
-                                reason: string;
-                            })[];
-                        };
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/config/resolved": {
         parameters: {
             query?: never;
@@ -4092,6 +4512,8 @@ export interface paths {
                 query?: {
                     agentId?: string;
                     repoId?: string;
+                    /** @description Return only the entry with this exact key. Omit to return every resolved entry. */
+                    key?: string;
                     includeSecrets?: "true" | "false";
                 };
                 header?: never;
@@ -4326,6 +4748,8 @@ export interface paths {
                 query?: {
                     scope?: string;
                     scopeId?: string;
+                    /** @description Return only entries with this exact key. Omit to return every entry. */
+                    key?: string;
                     includeSecrets?: "true" | "false";
                 };
                 header?: never;
@@ -4392,6 +4816,357 @@ export interface paths {
             };
         };
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex-oauth/device": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start a Codex ChatGPT device login */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            responses: {
+                /** @description Device login started */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** Format: uuid */
+                            flowId: string;
+                            userCode: string;
+                            /** Format: uri */
+                            verificationUrl: string;
+                            intervalSeconds: number;
+                            /** Format: date-time */
+                            expiresAt: string;
+                        };
+                    };
+                };
+                /** @description Device login is not enabled */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Failed to store device login state */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description OpenAI device login request failed */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/codex-oauth/device/{flowId}/poll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Poll a Codex ChatGPT device login */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    flowId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            responses: {
+                /** @description Current device login status */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {string} */
+                            status: "pending" | "complete" | "failed" | "expired";
+                            slot?: number;
+                            error?: string;
+                        };
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/oauth/keep-warm/codex": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Locked keep-warm refresh sweep across all Codex OAuth pool slots
+         * @description Enumerates codex_oauth_* slots and refreshes any older than ~7 days through the same locked getValidCodexOAuth path used at task time. Skips slots with a codex-auth-watch bench marker (auth-failure bench or codex-auth-expiry-watch).
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Per-slot keep-warm outcomes */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            results: ({
+                                slot: number;
+                                keySuffix: string;
+                                /** @enum {string} */
+                                outcome: "warm";
+                            } | {
+                                slot: number;
+                                keySuffix: string;
+                                /** @enum {string} */
+                                outcome: "refreshed";
+                            } | {
+                                slot: number;
+                                keySuffix: string;
+                                /** @enum {string} */
+                                outcome: "skipped-benched";
+                            } | {
+                                slot: number;
+                                /** @enum {string} */
+                                outcome: "no-credentials";
+                            } | {
+                                slot: number;
+                                keySuffix: string;
+                                /** @enum {string} */
+                                outcome: "failed";
+                                reason: string;
+                            })[];
+                        };
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/comb/review-batches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send agent-fs comments to the swarm as one lead task
+         * @description Comb's 'Send to swarm'. The server reads each comment again from agent-fs with its bootstrap key, skips replies, resolved comments, and comments already sent, and creates ONE task for the lead. Each sent comment gets a `[comb:sent task=<id>]` reply from the swarm service account. A comment is sent at most once. When an earlier send lost its reply, the batch posts that reply again (`repaired`). Answers 404 while COMB_ENABLED is off.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        orgId: string;
+                        driveId: string;
+                        commentIds: string[];
+                        scopePath: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description No new task: the batch only posted missing 'sent' replies again */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            taskId: string | null;
+                            sent: string[];
+                            skipped: {
+                                id: string;
+                                /** @enum {string} */
+                                reason: "not-found" | "reply" | "resolved" | "already-sent";
+                                taskId?: string;
+                            }[];
+                            repaired: {
+                                id: string;
+                                taskId: string;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Task created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            taskId: string | null;
+                            sent: string[];
+                            skipped: {
+                                id: string;
+                                /** @enum {string} */
+                                reason: "not-found" | "reply" | "resolved" | "already-sent";
+                                taskId?: string;
+                            }[];
+                            repaired: {
+                                id: string;
+                                taskId: string;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Invalid body, or not the swarm drive */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Caller cannot create tasks */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Comb is not enabled */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Nothing to send (every comment was skipped) */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            error: string;
+                            skipped: {
+                                id: string;
+                                /** @enum {string} */
+                                reason: "not-found" | "reply" | "resolved" | "already-sent";
+                                taskId?: string;
+                            }[];
+                        };
+                    };
+                };
+                /** @description Task creation blocked by an extension */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs could not read a comment */
+                502: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description agent-fs or the swarm drive is not set up, or an operator disabled a Comb review template */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            error: string;
+                            skipped: {
+                                id: string;
+                                /** @enum {string} */
+                                reason: "not-found" | "reply" | "resolved" | "already-sent";
+                                taskId?: string;
+                            }[];
+                        };
+                    };
+                };
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
@@ -4602,6 +5377,7 @@ export interface paths {
                         taskId?: string;
                         scope?: string;
                         scopeId?: string;
+                        plan?: string;
                     };
                 };
             };
@@ -4715,6 +5491,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/keys/report-auth-failure": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Record an auth failure for a pooled key; bench it after 2 in a row */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        keyType: string;
+                        keySuffix: string;
+                        keyIndex: number;
+                        /** Format: uuid */
+                        taskId?: string;
+                        scope?: string;
+                        scopeId?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Failure recorded */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            success: true;
+                            consecutiveAuthFailures: number;
+                            benched: boolean;
+                            rateLimitedUntil: string | null;
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/keys/report-rate-limit-windows": {
         parameters: {
             query?: never;
@@ -4794,6 +5642,76 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/keys/report-seat-mismatch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Record that an API key's subscription seat cannot run a model family */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        keyType: string;
+                        keySuffix: string;
+                        keyIndex: number;
+                        /** @enum {string} */
+                        model: "fable" | "opus" | "sonnet" | "haiku";
+                        scope?: string;
+                        scopeId?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Seat mismatch recorded */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            success: true;
+                            message: string;
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/keys/available": {
         parameters: {
             query?: never;
@@ -4809,6 +5727,7 @@ export interface paths {
                     totalKeys: number;
                     scope?: string;
                     scopeId?: string;
+                    model?: "fable" | "opus" | "sonnet" | "haiku";
                 };
                 header?: never;
                 path?: never;
@@ -4827,6 +5746,10 @@ export interface paths {
                             success: true;
                             availableIndices: number[];
                             totalKeys: number;
+                            modelBlockedIndices?: number[];
+                            earliestModelResetAt?: string | null;
+                            seatBlockedIndices?: number[];
+                            authFailureFence: number;
                         };
                     };
                 };
@@ -4914,6 +5837,20 @@ export interface paths {
                                         lastSeenAt: string;
                                     };
                                 };
+                                plan: string | null;
+                                /** @enum {string|null} */
+                                planSource: "manual" | "detected" | "estimated" | null;
+                                lastSeatMismatchAt: string | null;
+                                lastSeatMismatchModel: string | null;
+                                consecutiveAuthFailures: number;
+                                lastAuthFailureAt: string | null;
+                                modelLimits: {
+                                    model: string;
+                                    window: string;
+                                    resetsAt: number;
+                                    resetsAtIso: string;
+                                    active: boolean;
+                                }[];
                                 createdAt: string;
                                 updatedAt: string;
                             }[];
@@ -5100,6 +6037,9 @@ export interface paths {
                         keySuffix: string;
                         scope?: string;
                         scopeId?: string;
+                        clearAuthBench?: boolean;
+                        keyIndex?: number;
+                        authFence?: number;
                     };
                 };
             };
@@ -5144,6 +6084,127 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/keys/plans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List subscription plans and their monthly list prices */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Plan catalog */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            checkedAt: string;
+                            plans: {
+                                id: string;
+                                label: string;
+                                keyType: string;
+                                monthlyUsd: number;
+                            }[];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/keys/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Set or clear the subscription plan of a pooled credential */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        keyType: string;
+                        keySuffix: string;
+                        plan: string | null;
+                    };
+                };
+            };
+            responses: {
+                /** @description Plan updated */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {boolean} */
+                            success: true;
+                            keyType: string;
+                            keySuffix: string;
+                            plan: string | null;
+                        };
+                    };
+                };
+                /** @description Unknown plan, or a plan for another credential type */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Key not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
     "/api/events": {
         parameters: {
             query?: never;
@@ -5156,7 +6217,7 @@ export interface paths {
             parameters: {
                 query?: {
                     category?: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
-                    event?: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+                    event?: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "system.profile_sync_conflict" | "script.global_upsert" | "schedule.deleted";
                     status?: "ok" | "error" | "timeout" | "skipped";
                     source?: "worker" | "api" | "hook" | "scheduler" | "cli";
                     agentId?: string;
@@ -5166,6 +6227,12 @@ export interface paths {
                     since?: string;
                     until?: string;
                     limit?: number;
+                    /** @description Comma-separated event names; matches any of them (ANDed with `event`) */
+                    events?: string;
+                    /** @description Comma-separated `data.field` values, used with latestPerDataField */
+                    dataFields?: string;
+                    /** @description When true, return only the newest event per (event, data.field) pair for every name in `event`/`events` and every value in `dataFields` */
+                    latestPerDataField?: "true" | "false";
                 };
                 header?: never;
                 path?: never;
@@ -5181,7 +6248,21 @@ export interface paths {
                     content: {
                         "application/json": {
                             events: components["schemas"]["SwarmEvent"][];
+                            /**
+                             * @description Present only when the request asked for latestPerDataField=true
+                             * @enum {boolean}
+                             */
+                            latestPerDataField?: true;
                         };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
             };
@@ -5201,7 +6282,7 @@ export interface paths {
                         /** @enum {string} */
                         category: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
                         /** @enum {string} */
-                        event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+                        event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "system.profile_sync_conflict" | "script.global_upsert" | "schedule.deleted";
                         /** @enum {string} */
                         status?: "ok" | "error" | "timeout" | "skipped";
                         /** @enum {string} */
@@ -5273,7 +6354,7 @@ export interface paths {
                             /** @enum {string} */
                             category: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
                             /** @enum {string} */
-                            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+                            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "system.profile_sync_conflict" | "script.global_upsert" | "schedule.deleted";
                             /** @enum {string} */
                             status?: "ok" | "error" | "timeout" | "skipped";
                             /** @enum {string} */
@@ -5371,6 +6452,196 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/extensions/install": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Install an extension from the catalog or an inline bundle
+         * @description Installs the named `template` from `GET /api/extensions/catalog`, or an inline `manifest` plus `files`. Inline bundles are rejected with `inline_install_disabled` unless `EXTENSION_ALLOW_INLINE_INSTALL` is on, and then only lead, operator, and dashboard-user callers may send them (workers get 403). Any authenticated agent can install a catalog draft owned by its agent ID. Workers can update only their own bundles. A new extension is always disabled; activation remains lead/operator-only.
+         */
+        post: operations["extensions_install"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List predefined extensions available to install */
+        get: operations["extensions_catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List installed extensions */
+        get: operations["extensions_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/type-defs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get extension authoring type definitions */
+        get: operations["extensions_type_defs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an extension bundle */
+        get: operations["extensions_get"];
+        put?: never;
+        post?: never;
+        /**
+         * Uninstall a disabled extension
+         * @description Workers may uninstall their own disabled extensions. Leads, operators, and dashboard users retain access to all extensions.
+         */
+        delete: operations["extensions_delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Update extension priority, config, or description
+         * @description Workers may edit their own disabled extensions. Leads, operators, and dashboard users retain access to all extensions.
+         */
+        patch: operations["extensions_update"];
+        trace?: never;
+    };
+    "/api/extensions/{id}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List extension versions */
+        get: operations["extensions_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/{id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List extension run log entries */
+        get: operations["extensions_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/{id}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Enable an extension
+         * @description Loads and enables an extension. Available to leads, operators, and dashboard users.
+         */
+        post: operations["extensions_enable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/{id}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disable an extension
+         * @description Unloads and disables an extension. Available to leads, operators, and dashboard users.
+         */
+        post: operations["extensions_disable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/extensions/{id}/activate-version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate an extension version
+         * @description Activates a stored version. Available to leads, operators, and dashboard users.
+         */
+        post: operations["extensions_activate_version"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/favorites": {
         parameters: {
             query?: never;
@@ -5382,7 +6653,7 @@ export interface paths {
         get: {
             parameters: {
                 query?: {
-                    itemType?: "page" | "workflow" | "schedule";
+                    itemType?: "page" | "workflow" | "schedule" | "agent-fs-path";
                     itemIds?: string;
                 };
                 header?: never;
@@ -5426,7 +6697,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        itemType: "page" | "workflow" | "schedule";
+                        itemType: "page" | "workflow" | "schedule" | "agent-fs-path";
                         itemId: string;
                         favorite: boolean;
                     };
@@ -5442,7 +6713,7 @@ export interface paths {
                         "application/json": {
                             favorite: boolean;
                             /** @enum {string} */
-                            itemType: "page" | "workflow" | "schedule";
+                            itemType: "page" | "workflow" | "schedule" | "agent-fs-path";
                             itemId: string;
                             row: components["schemas"]["UserFavorite"] | null;
                         };
@@ -6086,7 +7357,7 @@ export interface paths {
                 query: {
                     userId: string;
                     status?: "open" | "snoozed" | "dismissed" | "done";
-                    itemType?: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template";
+                    itemType?: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template" | "notification";
                 };
                 header?: never;
                 path?: never;
@@ -6143,12 +7414,14 @@ export interface paths {
                     "application/json": {
                         userId: string;
                         /** @enum {string} */
-                        itemType: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template";
+                        itemType: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template" | "notification";
                         itemId: string;
                         /** @enum {string} */
                         status: "open" | "snoozed" | "dismissed" | "done";
                         /** Format: date-time */
                         snoozeUntil?: string;
+                        /** Format: date-time */
+                        readAt?: string;
                     };
                 };
             };
@@ -6261,6 +7534,46 @@ export interface paths {
                         "application/json": {
                             mcpBaseUrl: string;
                             mcpUserUrl: string;
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/integrations/slack/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Build a Slack app manifest for this swarm */
+        get: {
+            parameters: {
+                query?: {
+                    name?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Slack app manifest */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            [key: string]: unknown;
                         };
                     };
                 };
@@ -6928,8 +8241,17 @@ export interface paths {
                         };
                     };
                 };
-                /** @description Validation error */
+                /** @description Validation error, or a sourcePath under /longterm that is not an allowed memory key */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description sourcePath is under a lead-only /longterm root and the caller is not the lead */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -6977,6 +8299,8 @@ export interface paths {
                         scope?: "agent" | "swarm" | "all";
                         /** @enum {string} */
                         source?: "manual" | "file_index" | "session_summary" | "task_completion";
+                        /** @description Only return memories whose key starts with this text (literal, case-sensitive), for example '/longterm/facts/'. */
+                        keyPrefix?: string;
                     };
                 };
             };
@@ -7002,6 +8326,7 @@ export interface paths {
                                 /** @enum {string} */
                                 scope: "agent" | "swarm";
                                 tags: string[];
+                                accessCount: number;
                             }[];
                         };
                     };
@@ -7079,6 +8404,15 @@ export interface paths {
                 };
                 /** @description Validation error */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Permission denied: requires memory owner or lead */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -7175,7 +8509,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** List or semantically search memories across all agents (debug/admin) */
+        /**
+         * List or semantically search memories (debug/admin)
+         * @description The operator key, a user, and the lead see every agent's memories. Any other agent (an `aseph_` session token, or the shared key with `X-Agent-ID`) sees only its own memories and swarm-scope memories.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -7238,6 +8575,10 @@ export interface paths {
                                 chunkIndex: number;
                                 totalChunks: number;
                                 tags: string[];
+                                key: string | null;
+                                updatedAt: string | null;
+                                /** @description Usefulness posterior mean alpha / (alpha + beta); 0.5 = no signal */
+                                rating: number;
                             }[];
                             total: number;
                             limit: number;
@@ -7258,6 +8599,192 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One aggregate row per keyed memory under a key prefix: chunks, usage, rating, estimated tokens (debug/admin)
+         * @description The operator key, a user, and the lead see every agent's memories. Any other agent sees only its own memories and swarm-scope memories.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Literal, case-sensitive key prefix (default '/longterm/'). */
+                    prefix?: string;
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Keyed memories grouped by (key, scope, agentId). accessCount is summed over chunk rows; rating pools alpha/beta over chunk rows; estTokens = ceil(chars / 4) */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            prefix: string;
+                            keys: {
+                                key: string;
+                                /** @enum {string} */
+                                scope: "agent" | "swarm";
+                                agentId: string | null;
+                                memoryId: string;
+                                name: string;
+                                /** @enum {string} */
+                                source: "manual" | "file_index" | "session_summary" | "task_completion";
+                                chunkRows: number;
+                                totalChunks: number;
+                                complete: boolean;
+                                chars: number;
+                                estTokens: number;
+                                accessCount: number;
+                                lastAccessedAt: string | null;
+                                rating: number;
+                                alpha: number;
+                                beta: number;
+                                usefulRatings: number;
+                                notUsefulRatings: number;
+                                createdAt: string;
+                                updatedAt: string;
+                            }[];
+                            truncated: boolean;
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/memory/chunks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every chunk row of one memory in chunkIndex order, with a chunk-integrity check (debug/admin). Does not count as an access
+         * @description Visibility matches the memory list: an agent other than the lead gets 404 for another agent's agent-scope memory.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Any chunk row of the memory. */
+                    memoryId?: string;
+                    key?: string;
+                    scope?: "agent" | "swarm";
+                    /** @description Owner agent id; pass an empty string for rows without one. */
+                    agentId?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Chunk rows and integrity findings */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            key: string | null;
+                            /** @enum {string} */
+                            scope: "agent" | "swarm";
+                            agentId: string | null;
+                            chunks: {
+                                id: string;
+                                agentId: string | null;
+                                /** @enum {string} */
+                                scope: "agent" | "swarm";
+                                key: string | null;
+                                name: string;
+                                content: string;
+                                /** @enum {string} */
+                                source: "manual" | "file_index" | "session_summary" | "task_completion";
+                                sourceTaskId: string | null;
+                                sourcePath: string | null;
+                                chunkIndex: number;
+                                totalChunks: number;
+                                tags: string[];
+                                createdAt: string;
+                                updatedAt: string | null;
+                                accessedAt: string;
+                                expiresAt: string | null;
+                                accessCount: number;
+                                embeddingModel: string | null;
+                                rating: number;
+                                alpha: number;
+                                beta: number;
+                                version: number;
+                                estTokens: number;
+                            }[];
+                            estTokens: number;
+                            integrity: {
+                                ok: boolean;
+                                expectedChunks: number;
+                                presentIndexes: number[];
+                                missingIndexes: number[];
+                                duplicateIndexes: number[];
+                                conflictingTotals: number[];
+                                outOfRangeIds: string[];
+                                issues: string[];
+                            };
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Memory not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -7500,7 +9027,10 @@ export interface paths {
         };
         put?: never;
         post?: never;
-        /** Delete a single memory by ID (debug/admin) */
+        /**
+         * Delete a single memory by ID (debug/admin)
+         * @description The operator key and users may delete any memory. The lead may delete its own memories and swarm-scope memories. Any other agent may delete only its own agent-scope memories.
+         */
         delete: {
             parameters: {
                 query?: never;
@@ -7521,6 +9051,15 @@ export interface paths {
                         "application/json": {
                             deleted: boolean;
                         };
+                    };
+                };
+                /** @description Caller may not delete this memory */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
                 /** @description Memory not found */
@@ -7570,6 +9109,8 @@ export interface paths {
                             taskId?: string;
                             /** @description Optional external source ID this memory references. Free-form string, convention "<source>:<identifier>" (e.g. "github:owner/repo#N", "linear:KEY-N", "customer:<slug>", "slack:<channel>:<ts>", "agentmail:<thread-id>"). Pick any prefix that fits — no closed enum. When present, an edge from this memory to the external source is created/updated. */
                             referencesSource?: string;
+                            /** @description Optional. Model that produced an `llm` rating, as "<provider>/<model-id>" (e.g. "openrouter/deepseek/deepseek-v4.1-flash"). Stored in memory_rating.model for `llm` events and ignored for `explicit-self`. */
+                            model?: string;
                         }[];
                     };
                 };
@@ -8226,10 +9767,14 @@ export interface paths {
                                             cost?: {
                                                 input?: number;
                                                 output?: number;
+                                                cache_read?: number;
+                                                cache_write?: number;
                                             };
                                             limit?: {
                                                 context?: number;
                                             };
+                                            release_date?: string;
+                                            status?: string;
                                             reasoning?: boolean;
                                             reasoning_options?: {
                                                 type: string;
@@ -8245,6 +9790,362 @@ export interface paths {
             };
         };
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models-catalog/tiers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview what each model tier resolves to per harness provider
+         * @description One row per provider and tier: the built-in default, the `MODEL_TIER_<PROVIDER>_<TIER>` value stored in swarm config (if any), which layer wins, and the concrete model it resolves to against the current catalog (`latest:` aliases resolved with the same soak and auto-upgrade rules as claim time, without recording a resolution). Ignores per-worker `MODEL_TIER_*` overrides and per-task models.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Tier previews */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tiers: {
+                                /** @enum {string} */
+                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                /** @enum {string} */
+                                tier: "smol" | "regular" | "smart" | "ultra";
+                                key: string;
+                                defaultValue: string;
+                                configured: string | null;
+                                /** @enum {string} */
+                                source: "tier-config" | "tier-default";
+                                resolvedModel: string | null;
+                                alias: string | null;
+                            }[];
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models-catalog/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Refresh the model catalog from models.dev
+         * @description Unforced calls skip the network when the last models.dev check is younger than 4h (`skipped-fresh`). `force: true` always fetches, still conditional on the stored ETag (`not-modified` on 304), but a forced call within a minute of the previous one returns `skipped-cooldown` with `retryAfterMs`. Concurrent refreshes share one fetch. Lead agent or operator only. `added` lists provider/modelId keys new since the previous fetch.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        force?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description Refresh outcome */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @enum {string} */
+                            status: "updated" | "not-modified" | "skipped-fresh" | "skipped-cooldown" | "error";
+                            models: number;
+                            added: string[];
+                            checkedAt: number | null;
+                            retryAfterMs?: number;
+                            error?: string;
+                        };
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models-catalog/overlay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Upsert one model-catalog overlay row
+         * @description Overlay facts win per non-null field over the models.dev row; overlay-only models are served too. Overlay prices fill pricing-table gaps (never override an active price). With `expiresWhenUpstreamMatches` (default true) the row is deleted once upstream matches every non-null fact.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        provider: string;
+                        modelId: string;
+                        name?: string;
+                        family?: string;
+                        releaseDate?: string;
+                        contextWindow?: number;
+                        maxOutput?: number;
+                        reasoning?: boolean;
+                        reasoningOptions?: {
+                            type: string;
+                            values?: string[];
+                        }[];
+                        pricing?: {
+                            input?: number;
+                            output?: number;
+                            cache_read?: number;
+                            cache_write?: number;
+                        };
+                        status?: string;
+                        reason: string;
+                        verifiedBy?: string;
+                        expiresWhenUpstreamMatches?: boolean;
+                    };
+                };
+            };
+            responses: {
+                /** @description Overlay row upserted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            provider: string;
+                            modelId: string;
+                            name?: string | null;
+                            family?: string | null;
+                            releaseDate?: string | null;
+                            contextWindow?: number | null;
+                            maxOutput?: number | null;
+                            reasoning?: boolean | null;
+                            reasoningOptions?: {
+                                type: string;
+                                values?: string[];
+                            }[] | null;
+                            pricing?: {
+                                input?: number;
+                                output?: number;
+                                cache_read?: number;
+                                cache_write?: number;
+                            } | null;
+                            status?: string | null;
+                            reason: string;
+                            verifiedBy?: string | null;
+                            expiresWhenUpstreamMatches: boolean;
+                            createdAt: number;
+                            updatedAt: number;
+                        };
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        /** Delete one model-catalog overlay row */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        provider: string;
+                        modelId: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Overlay row deleted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            deleted: boolean;
+                        };
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/models-catalog/harness-support": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List harness CLI model support rows
+         * @description Whether a catalog model runs on a given `claude` / `codex` CLI version, as recorded by workers after a model's first run. No row means unknown (allowed at claim).
+         */
+        get: {
+            parameters: {
+                query?: {
+                    harness?: string;
+                    cliVersion?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Support rows, newest first */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            rows: {
+                                harness: string;
+                                cliVersion: string;
+                                modelId: string;
+                                /** @enum {string} */
+                                status: "ok" | "unsupported" | "unknown";
+                                checkedAt: number;
+                                error: string | null;
+                            }[];
+                        };
+                    };
+                };
+            };
+        };
+        /**
+         * Record whether a harness CLI version accepts a model
+         * @description Written by workers: `ok` after a model's first successful run, `unsupported` when the CLI rejects the model id. Claim-time resolution falls back (alias/tier) or fails fast (explicit model) on `unsupported`.
+         */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        harness: string;
+                        cliVersion: string;
+                        modelId: string;
+                        /** @enum {string} */
+                        status: "ok" | "unsupported" | "unknown";
+                        error?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Support row upserted */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            harness: string;
+                            cliVersion: string;
+                            modelId: string;
+                            /** @enum {string} */
+                            status: "ok" | "unsupported" | "unknown";
+                            checkedAt: number;
+                            error: string | null;
+                        };
+                    };
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
         post?: never;
         delete?: never;
         options?: never;
@@ -8909,6 +10810,647 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Identity + setup readiness + live activity for the swarm dashboard
+         * @description Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; setup milestones each emit `unverified | configured | verified`; automations report `running | needs_setup` from the same runtime preflight used at dispatch; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set, plus the Comb settings (COMB_ENABLED, the browser-facing agent-fs URL, the shared org and drive ids, and the agent-fs user id of the swarm service account); telemetry reports the effective ANONYMIZED_TELEMETRY opt-out state.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Status payload */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            identity: {
+                                name: string;
+                                logo_url: string | null;
+                                brand_color: string | null;
+                                is_cloud: boolean;
+                                marketing_url: string | null;
+                                hide_cloud_promo: boolean;
+                                org_id: string | null;
+                            };
+                            setup: {
+                                /** @enum {string} */
+                                id: "harness" | "embeddings" | "slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs" | "workers" | "first_task";
+                                label: string;
+                                /** @enum {string} */
+                                state: "unverified" | "configured" | "verified";
+                                hint?: string;
+                                action_url?: string;
+                                /** @enum {string} */
+                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                providers?: {
+                                    /** @enum {string} */
+                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    /** @enum {string} */
+                                    state: "unverified" | "configured" | "verified";
+                                    workers: number;
+                                }[];
+                            }[];
+                            activity: {
+                                agents_online: number;
+                                leads_online: number;
+                                recent_tasks_count: number;
+                            };
+                            agent_fs: {
+                                configured: boolean;
+                                base_url: string | null;
+                                provider_id: string;
+                                capabilities: {
+                                    [key: string]: unknown;
+                                };
+                                comb: {
+                                    enabled: boolean;
+                                    api_url: string | null;
+                                    live_url: string;
+                                    org_id: string | null;
+                                    drive_id: string | null;
+                                    service_user_id: string | null;
+                                };
+                            };
+                            automations: {
+                                id: string;
+                                name: string;
+                                /** @enum {string} */
+                                kind: "schedule" | "workflow";
+                                /** @enum {string} */
+                                state: "running" | "needs_setup";
+                                missing: {
+                                    params: string[];
+                                    integrations: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
+                                };
+                                fixes: ({
+                                    /** @enum {string} */
+                                    type: "param";
+                                    key: string;
+                                    url: string;
+                                } | {
+                                    /** @enum {string} */
+                                    type: "integration";
+                                    /** @enum {string} */
+                                    key: "slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs";
+                                    url: string;
+                                })[];
+                                fixUrl: string;
+                            }[];
+                            /** @enum {string} */
+                            health: "ok" | "degraded" | "broken";
+                            telemetry?: {
+                                enabled: boolean;
+                            };
+                        };
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/status/test-connection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read worker-reported harness credential status
+         * @description Reads worker-reported credential checks from agent rows. This route makes no upstream request and returns a reported live-test result when one exists.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                    };
+                };
+            };
+            responses: {
+                /** @description Live-test result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            ok: boolean;
+                            error?: string;
+                            latency_ms: number;
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/onboarding": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get first-run onboarding state and live setup signals */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Onboarding state and signals */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            state: {
+                                /** @enum {number} */
+                                version: 1;
+                                /** Format: date-time */
+                                startedAt: string;
+                                /** @enum {string} */
+                                currentStep: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                                /** Format: date-time */
+                                minimizedAt: string | null;
+                                /** Format: date-time */
+                                dismissedAt: string | null;
+                                /** Format: date-time */
+                                completedAt: string | null;
+                                autoCompleted: boolean;
+                                firstTaskId: string | null;
+                                steps: {
+                                    connect: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "api_key" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    name: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "custom_name" | "default_name" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    ai: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "claude_setup_token" | "claude_api_key" | "codex_device" | "codex_cli" | "openrouter" | "openai_gateway" | "deepseek" | "devin" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    agents: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "cheap" | "optimal" | "max" | "mixed" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    memory: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "openai" | "openrouter" | "vercel" | "azure" | "custom" | "existing" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    integrations: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "slack" | "github" | "gitlab" | "linear_oauth" | "jira_oauth" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    first_task: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "suggestion" | "free_form" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                };
+                            };
+                            signals: {
+                                providers: {
+                                    /** @enum {string} */
+                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    /** @enum {string} */
+                                    state: "unverified" | "configured" | "verified";
+                                    workers: number;
+                                    verifiedWorkers: number;
+                                }[];
+                                embeddings: {
+                                    configured: boolean;
+                                    dimensions: number;
+                                };
+                                integrations: {
+                                    slack: boolean;
+                                    github: boolean;
+                                    gitlab: boolean;
+                                    linear: boolean;
+                                    jira: boolean;
+                                };
+                                agents: {
+                                    leadsOnline: number;
+                                    workersOnline: number;
+                                };
+                                firstTask: {
+                                    id: string;
+                                    status: string;
+                                } | null;
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        /** Apply a first-run onboarding state transition */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        action: "view";
+                        /** @enum {string} */
+                        step: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                    } | {
+                        /** @enum {string} */
+                        action: "complete";
+                        /** @enum {string} */
+                        step: "connect";
+                        /** @enum {string} */
+                        method: "api_key";
+                    } | {
+                        /** @enum {string} */
+                        action: "complete";
+                        /** @enum {string} */
+                        step: "name";
+                        /** @enum {string} */
+                        method: "custom_name" | "default_name";
+                    } | {
+                        /** @enum {string} */
+                        action: "complete";
+                        /** @enum {string} */
+                        step: "ai";
+                        /** @enum {string} */
+                        method: "claude_setup_token" | "claude_api_key" | "codex_device" | "codex_cli" | "openrouter" | "openai_gateway" | "deepseek" | "devin";
+                    } | {
+                        /** @enum {string} */
+                        action: "complete";
+                        /** @enum {string} */
+                        step: "agents";
+                        /** @enum {string} */
+                        method: "cheap" | "optimal" | "max" | "mixed";
+                    } | {
+                        /** @enum {string} */
+                        action: "complete";
+                        /** @enum {string} */
+                        step: "integrations";
+                        /** @enum {string} */
+                        method: "slack" | "github" | "gitlab" | "linear_oauth" | "jira_oauth";
+                    } | {
+                        /** @enum {string} */
+                        action: "skip";
+                        /** @enum {string} */
+                        step: "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                    } | {
+                        /** @enum {string} */
+                        action: "fail";
+                        /** @enum {string} */
+                        step: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                        /** @enum {string} */
+                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown";
+                    } | {
+                        /** @enum {string} */
+                        action: "first_task";
+                        taskId: string;
+                        /** @enum {string} */
+                        method: "suggestion" | "free_form";
+                    } | {
+                        /** @enum {string} */
+                        action: "minimize";
+                    } | {
+                        /** @enum {string} */
+                        action: "resume";
+                    } | {
+                        /** @enum {string} */
+                        action: "dismiss";
+                    };
+                };
+            };
+            responses: {
+                /** @description Updated onboarding state and signals */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            state: {
+                                /** @enum {number} */
+                                version: 1;
+                                /** Format: date-time */
+                                startedAt: string;
+                                /** @enum {string} */
+                                currentStep: "connect" | "name" | "ai" | "agents" | "memory" | "integrations" | "first_task";
+                                /** Format: date-time */
+                                minimizedAt: string | null;
+                                /** Format: date-time */
+                                dismissedAt: string | null;
+                                /** Format: date-time */
+                                completedAt: string | null;
+                                autoCompleted: boolean;
+                                firstTaskId: string | null;
+                                steps: {
+                                    connect: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "api_key" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    name: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "custom_name" | "default_name" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    ai: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "claude_setup_token" | "claude_api_key" | "codex_device" | "codex_cli" | "openrouter" | "openai_gateway" | "deepseek" | "devin" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    agents: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "cheap" | "optimal" | "max" | "mixed" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    memory: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "openai" | "openrouter" | "vercel" | "azure" | "custom" | "existing" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    integrations: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "slack" | "github" | "gitlab" | "linear_oauth" | "jira_oauth" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                    first_task: {
+                                        /** @enum {string} */
+                                        status: "todo" | "done" | "skipped" | "failed";
+                                        /** Format: date-time */
+                                        at: string | null;
+                                        /** @enum {string|null} */
+                                        method: "suggestion" | "free_form" | null;
+                                        /** @enum {string|null} */
+                                        errorClass: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown" | null;
+                                    };
+                                };
+                            };
+                            signals: {
+                                providers: {
+                                    /** @enum {string} */
+                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    /** @enum {string} */
+                                    state: "unverified" | "configured" | "verified";
+                                    workers: number;
+                                    verifiedWorkers: number;
+                                }[];
+                                embeddings: {
+                                    configured: boolean;
+                                    dimensions: number;
+                                };
+                                integrations: {
+                                    slack: boolean;
+                                    github: boolean;
+                                    gitlab: boolean;
+                                    linear: boolean;
+                                    jira: boolean;
+                                };
+                                agents: {
+                                    leadsOnline: number;
+                                    workersOnline: number;
+                                };
+                                firstTask: {
+                                    id: string;
+                                    status: string;
+                                } | null;
+                            };
+                        };
+                    };
+                };
+                /** @description Invalid transition */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description First task not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/onboarding/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test and save an embeddings configuration for onboarding */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        preset: "openai" | "openrouter" | "vercel" | "azure" | "custom" | "existing";
+                        /** Format: uri */
+                        baseUrl?: string;
+                        model?: string;
+                        apiKey?: string;
+                        /** @enum {string} */
+                        reuseKey?: "OPENAI_API_KEY" | "OPENROUTER_API_KEY";
+                    };
+                };
+            };
+            responses: {
+                /** @description Embedding probe result */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            ok: boolean;
+                            dimensions?: number;
+                            latencyMs: number;
+                            error?: string;
+                            /** @enum {string} */
+                            errorClass?: "auth" | "network" | "timeout" | "dimension" | "model" | "endpoint" | "not_enabled" | "expired" | "unknown";
+                        };
+                    };
+                };
+                /** @description Invalid memory configuration */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/@swarm/api/{path}": {
         parameters: {
             query?: never;
@@ -9114,7 +11656,7 @@ export interface paths {
                                 title: string;
                                 description?: string;
                                 /** @enum {string} */
-                                contentType: "text/html" | "application/json";
+                                contentType: "text/html" | "application/json" | "image/svg+xml";
                                 /** @enum {string} */
                                 authMode: "public" | "authed" | "password";
                                 passwordHash?: string;
@@ -9154,7 +11696,7 @@ export interface paths {
                         title: string;
                         description?: string;
                         /** @enum {string} */
-                        contentType: "text/html" | "application/json";
+                        contentType: "text/html" | "application/json" | "image/svg+xml";
                         /**
                          * @default authed
                          * @enum {string}
@@ -9270,7 +11812,7 @@ export interface paths {
                         title?: string;
                         description?: string | null;
                         /** @enum {string} */
-                        contentType?: "text/html" | "application/json";
+                        contentType?: "text/html" | "application/json" | "image/svg+xml";
                         /** @enum {string} */
                         authMode?: "public" | "authed" | "password";
                         password?: string | null;
@@ -9604,7 +12146,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Render a page (HTML inline; JSON redirects to SPA) */
+        /** Render a page (HTML/SVG inline; JSON redirects to SPA) */
         get: {
             parameters: {
                 query?: never;
@@ -9616,7 +12158,7 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description Rendered HTML page */
+                /** @description Rendered HTML page or raw SVG image */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -9697,7 +12239,7 @@ export interface paths {
                             title: string;
                             description?: string;
                             /** @enum {string} */
-                            contentType: "text/html" | "application/json";
+                            contentType: "text/html" | "application/json" | "image/svg+xml";
                             /** @enum {string} */
                             authMode: "public" | "authed" | "password";
                             body: string;
@@ -10288,13 +12830,18 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Poll for triggers (tasks, mentions) */
+        /**
+         * Poll for triggers (tasks, mentions)
+         * @description While the API is draining after SIGTERM it dispatches nothing: the answer is `{ trigger: null }` and carries `X-Swarm-Draining: 1`, the signal for a worker to hand off in-flight tasks.
+         */
         get: {
             parameters: {
                 query?: never;
                 header?: {
                     /** @description Identifies the concrete runtime instance (worker process) making the call, as generated at its boot. Required to poll for work when multi-runtime mode (MULTI_RUNTIME_ENABLED) is on; ignored otherwise. */
                     "X-Runtime-Instance-ID"?: string;
+                    /** @description URL-encoded JSON {provider: {tier: model}} of the worker's MODEL_TIER_* env overrides. Stored on the agent row and applied at claim time (modelSource=worker-env). */
+                    "X-Model-Tier-Overrides"?: string;
                 };
                 path?: never;
                 cookie?: never;
@@ -10314,6 +12861,7 @@ export interface paths {
                                 taskId: string;
                                 task: components["schemas"]["AgentTask"];
                                 requestedBy?: {
+                                    id?: string;
                                     name: string;
                                     email?: string;
                                     role?: string;
@@ -10324,6 +12872,7 @@ export interface paths {
                                 /** @enum {string} */
                                 type: "task_assigned";
                                 taskId: string;
+                                triggerSurface?: string;
                                 task: components["schemas"]["AgentTask"] & {
                                     attachments: {
                                         /** Format: uuid */
@@ -10334,6 +12883,7 @@ export interface paths {
                                     }[];
                                 };
                                 requestedBy?: {
+                                    id?: string;
                                     name: string;
                                     email?: string;
                                     role?: string;
@@ -10501,7 +13051,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -10529,7 +13079,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -10592,7 +13142,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -10644,7 +13194,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                     effectiveFrom: string;
@@ -10736,7 +13286,7 @@ export interface paths {
                         defaultBranch?: string;
                         autoClone?: boolean;
                         hooks?: components["schemas"]["RepoHooks"] | null;
-                        guidelines?: components["schemas"]["RepoGuidelines"];
+                        guidelines?: components["schemas"]["RepoGuidelinesInput"];
                     };
                 };
             };
@@ -10748,6 +13298,17 @@ export interface paths {
                     };
                     content: {
                         "application/json": components["schemas"]["SwarmRepo"];
+                    };
+                };
+                /** @description Only the lead, the operator or a user can change allowMerge */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            error: string;
+                        };
                     };
                 };
                 /** @description Repo not found */
@@ -10867,7 +13428,7 @@ export interface paths {
                         defaultBranch?: string;
                         autoClone?: boolean;
                         hooks?: components["schemas"]["RepoHooks"];
-                        guidelines?: components["schemas"]["RepoGuidelines"];
+                        guidelines?: components["schemas"]["RepoGuidelinesInput"];
                     };
                 };
             };
@@ -10892,6 +13453,17 @@ export interface paths {
                         };
                     };
                 };
+                /** @description Only the lead, the operator or a user can turn allowMerge on */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            error: string;
+                        };
+                    };
+                };
                 /** @description Duplicate repo */
                 409: {
                     headers: {
@@ -10901,6 +13473,522 @@ export interface paths {
                         "application/json": {
                             error: string;
                         };
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/realtime/ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Issue a one-shot dashboard realtime ticket */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description One-shot realtime ticket */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            ticket: string;
+                            expiresAt: number;
+                        };
+                    };
+                };
+                /** @description Comb presence is not allowed */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Comb is not enabled */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/@swarm/realtime.js": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Browser SDK for realtime rooms and channels */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description JavaScript module */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/rooms/get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read a realtime room */
+        get: {
+            parameters: {
+                query?: {
+                    name?: string;
+                    namespace?: string;
+                    schemaVersion?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Room view */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            room: {
+                                namespace: string;
+                                name: string;
+                                schemaVersion: number;
+                                generation: string;
+                                stale: boolean;
+                                state?: unknown;
+                                snapshot: string;
+                                bytes: number;
+                            };
+                        };
+                    };
+                };
+                /** @description Validation or room error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room access denied */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        /** Read a realtime room */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @default default */
+                        name?: string;
+                        namespace?: string;
+                        /** @default 1 */
+                        schemaVersion?: number;
+                    };
+                };
+            };
+            responses: {
+                /** @description Room view */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            room: {
+                                namespace: string;
+                                name: string;
+                                schemaVersion: number;
+                                generation: string;
+                                stale: boolean;
+                                state?: unknown;
+                                snapshot: string;
+                                bytes: number;
+                            };
+                        };
+                    };
+                };
+                /** @description Validation or room error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room access denied */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Request body exceeds the room body limit */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/rooms/change": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply operations to a realtime room */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @default default */
+                        name?: string;
+                        namespace?: string;
+                        /** @default 1 */
+                        schemaVersion?: number;
+                        operations: ({
+                            /** @enum {string} */
+                            type: "set";
+                            path: (string | number)[];
+                            value: unknown;
+                        } | {
+                            /** @enum {string} */
+                            type: "delete";
+                            path: (string | number)[];
+                        } | {
+                            /** @enum {string} */
+                            type: "insert";
+                            path: (string | number)[];
+                            index: number;
+                            values: unknown[];
+                        } | {
+                            /** @enum {string} */
+                            type: "increment";
+                            path: (string | number)[];
+                            by: number;
+                        } | {
+                            /** @enum {string} */
+                            type: "text";
+                            path: (string | number)[];
+                            index: number;
+                            deleteCount?: number;
+                            insert?: string;
+                        })[];
+                    };
+                };
+            };
+            responses: {
+                /** @description Changed room view */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            room: {
+                                namespace: string;
+                                name: string;
+                                schemaVersion: number;
+                                generation: string;
+                                stale: boolean;
+                                state?: unknown;
+                                snapshot: string;
+                                bytes: number;
+                            };
+                        };
+                    };
+                };
+                /** @description Validation or room error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room write denied */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room schema or size conflict */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Request body exceeds the room body limit */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/rooms/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset a realtime room */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @default default */
+                        name?: string;
+                        namespace?: string;
+                        /** @default 1 */
+                        schemaVersion?: number;
+                        state?: unknown;
+                    };
+                };
+            };
+            responses: {
+                /** @description Reset room view */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            room: {
+                                namespace: string;
+                                name: string;
+                                schemaVersion: number;
+                                generation: string;
+                                stale: boolean;
+                                state?: unknown;
+                                snapshot: string;
+                                bytes: number;
+                            };
+                        };
+                    };
+                };
+                /** @description Validation or room error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Room write denied */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Request body exceeds the room body limit */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/rooms/decode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Decode a realtime room snapshot */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        value?: unknown;
+                    };
+                };
+            };
+            responses: {
+                /** @description Decoded room state */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            schemaVersion: number;
+                            generation: string;
+                            state?: unknown;
+                        };
+                    };
+                };
+                /** @description Invalid room snapshot */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Request body exceeds the room body limit */
+                413: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
             };
@@ -10975,6 +14063,10 @@ export interface paths {
                                 /** Format: date-time */
                                 nextRunAt?: string;
                                 createdByAgentId?: string;
+                                parentTaskId?: string;
+                                requestedDelayMs?: number;
+                                /** Format: date-time */
+                                requestedRunAt?: string;
                                 /** @default UTC */
                                 timezone: string;
                                 /** @default 0 */
@@ -11001,6 +14093,11 @@ export interface paths {
                                 scriptArgs?: {
                                     [key: string]: unknown;
                                 };
+                                params?: {
+                                    [key: string]: unknown;
+                                };
+                                requiredParams?: string[];
+                                requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                                 /** Format: date-time */
                                 createdAt: string;
                                 /** Format: date-time */
@@ -11032,6 +14129,10 @@ export interface paths {
                                 /** Format: date-time */
                                 nextRunAt?: string;
                                 createdByAgentId?: string;
+                                parentTaskId?: string;
+                                requestedDelayMs?: number;
+                                /** Format: date-time */
+                                requestedRunAt?: string;
                                 /** @default UTC */
                                 timezone: string;
                                 /** @default 0 */
@@ -11058,6 +14159,11 @@ export interface paths {
                                 scriptArgs?: {
                                     [key: string]: unknown;
                                 };
+                                params?: {
+                                    [key: string]: unknown;
+                                };
+                                requiredParams?: string[];
+                                requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                                 /** Format: date-time */
                                 createdAt: string;
                                 /** Format: date-time */
@@ -11100,6 +14206,7 @@ export interface paths {
                         model?: string;
                         /** @enum {string} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra";
+                        allowCustomModel?: boolean;
                         /** @enum {string} */
                         scheduleType?: "recurring" | "one_time";
                         /** @enum {string} */
@@ -11110,6 +14217,11 @@ export interface paths {
                         scriptArgs?: {
                             [key: string]: unknown;
                         };
+                        params?: {
+                            [key: string]: unknown;
+                        };
+                        requiredParams?: string[];
+                        requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                         delayMs?: number;
                         runAt?: string;
                     };
@@ -11145,6 +14257,10 @@ export interface paths {
                             /** Format: date-time */
                             nextRunAt?: string;
                             createdByAgentId?: string;
+                            parentTaskId?: string;
+                            requestedDelayMs?: number;
+                            /** Format: date-time */
+                            requestedRunAt?: string;
                             /** @default UTC */
                             timezone: string;
                             /** @default 0 */
@@ -11171,6 +14287,11 @@ export interface paths {
                             scriptArgs?: {
                                 [key: string]: unknown;
                             };
+                            params?: {
+                                [key: string]: unknown;
+                            };
+                            requiredParams?: string[];
+                            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                             /** Format: date-time */
                             createdAt: string;
                             /** Format: date-time */
@@ -11258,6 +14379,10 @@ export interface paths {
                                 /** Format: date-time */
                                 nextRunAt?: string;
                                 createdByAgentId?: string;
+                                parentTaskId?: string;
+                                requestedDelayMs?: number;
+                                /** Format: date-time */
+                                requestedRunAt?: string;
                                 /** @default UTC */
                                 timezone: string;
                                 /** @default 0 */
@@ -11284,6 +14409,11 @@ export interface paths {
                                 scriptArgs?: {
                                     [key: string]: unknown;
                                 };
+                                params?: {
+                                    [key: string]: unknown;
+                                };
+                                requiredParams?: string[];
+                                requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                                 /** Format: date-time */
                                 createdAt: string;
                                 /** Format: date-time */
@@ -11371,6 +14501,10 @@ export interface paths {
                             /** Format: date-time */
                             nextRunAt?: string;
                             createdByAgentId?: string;
+                            parentTaskId?: string;
+                            requestedDelayMs?: number;
+                            /** Format: date-time */
+                            requestedRunAt?: string;
                             /** @default UTC */
                             timezone: string;
                             /** @default 0 */
@@ -11397,6 +14531,11 @@ export interface paths {
                             scriptArgs?: {
                                 [key: string]: unknown;
                             };
+                            params?: {
+                                [key: string]: unknown;
+                            };
+                            requiredParams?: string[];
+                            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                             /** Format: date-time */
                             createdAt: string;
                             /** Format: date-time */
@@ -11447,6 +14586,7 @@ export interface paths {
                         model?: string | null;
                         /** @enum {string|null} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra" | null;
+                        allowCustomModel?: boolean;
                         nextRunAt?: string | null;
                         /** @enum {string} */
                         targetType?: "agent-task" | "workflow" | "script";
@@ -11456,6 +14596,11 @@ export interface paths {
                         scriptArgs?: {
                             [key: string]: unknown;
                         } | null;
+                        params?: {
+                            [key: string]: unknown;
+                        };
+                        requiredParams?: string[];
+                        requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                     };
                 };
             };
@@ -11489,6 +14634,10 @@ export interface paths {
                             /** Format: date-time */
                             nextRunAt?: string;
                             createdByAgentId?: string;
+                            parentTaskId?: string;
+                            requestedDelayMs?: number;
+                            /** Format: date-time */
+                            requestedRunAt?: string;
                             /** @default UTC */
                             timezone: string;
                             /** @default 0 */
@@ -11515,6 +14664,11 @@ export interface paths {
                             scriptArgs?: {
                                 [key: string]: unknown;
                             };
+                            params?: {
+                                [key: string]: unknown;
+                            };
+                            requiredParams?: string[];
+                            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                             /** Format: date-time */
                             createdAt: string;
                             /** Format: date-time */
@@ -11624,6 +14778,7 @@ export interface paths {
                         model?: string | null;
                         /** @enum {string|null} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra" | null;
+                        allowCustomModel?: boolean;
                         nextRunAt?: string | null;
                         /** @enum {string} */
                         targetType?: "agent-task" | "workflow" | "script";
@@ -11633,6 +14788,11 @@ export interface paths {
                         scriptArgs?: {
                             [key: string]: unknown;
                         } | null;
+                        params?: {
+                            [key: string]: unknown;
+                        };
+                        requiredParams?: string[];
+                        requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                     };
                 };
             };
@@ -11666,6 +14826,10 @@ export interface paths {
                             /** Format: date-time */
                             nextRunAt?: string;
                             createdByAgentId?: string;
+                            parentTaskId?: string;
+                            requestedDelayMs?: number;
+                            /** Format: date-time */
+                            requestedRunAt?: string;
                             /** @default UTC */
                             timezone: string;
                             /** @default 0 */
@@ -11692,6 +14856,11 @@ export interface paths {
                             scriptArgs?: {
                                 [key: string]: unknown;
                             };
+                            params?: {
+                                [key: string]: unknown;
+                            };
+                            requiredParams?: string[];
+                            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                             /** Format: date-time */
                             createdAt: string;
                             /** Format: date-time */
@@ -12451,7 +15620,7 @@ export interface paths {
                         }[];
                         isError?: boolean;
                         /** @enum {string} */
-                        provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini";
+                        provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
                         createdAt?: number;
                     };
                 };
@@ -12530,6 +15699,7 @@ export interface paths {
                                 attributableCostUsd: number;
                                 excludedCostUsd: number;
                                 excludedTaskCount: number;
+                                subscriptionCostUsd: number;
                             };
                             daily: {
                                 date: string;
@@ -12537,6 +15707,7 @@ export interface paths {
                                 inputTokens: number;
                                 outputTokens: number;
                                 sessions: number;
+                                subscriptionCostUsd: number;
                             }[];
                             byAgent: {
                                 agentId: string;
@@ -12553,6 +15724,21 @@ export interface paths {
                                 outputTokens: number;
                                 tasks: number;
                                 durationMs: number;
+                            }[];
+                            byCredential: {
+                                keyType: string | null;
+                                keySuffix: string | null;
+                                name: string | null;
+                                subscription: boolean;
+                                plan: string | null;
+                                /** @enum {string|null} */
+                                planSource: "manual" | "detected" | "estimated" | null;
+                                costUsd: number;
+                                inputTokens: number;
+                                outputTokens: number;
+                                sessions: number;
+                                firstSessionAt: string;
+                                lastSessionAt: string;
                             }[];
                         };
                     };
@@ -12664,6 +15850,122 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sessions/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint an ephemeral session token for an ACP provider session
+         * @description Returns a short-lived aseph_ bearer for use by the ACP adapter in place of the full operator key. The token expires at the requested TTL and is actively revoked when the session ends. Only the operator key may mint session tokens.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        agentId: string;
+                        taskId: string;
+                        ttlMs: number;
+                    };
+                };
+            };
+            responses: {
+                /** @description Minted token plaintext (returned once) and its stable token ID */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tokenId: string;
+                            plaintext: string;
+                        };
+                    };
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/tokens/{tokenId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke an ephemeral session token
+         * @description Revokes an aseph_ bearer token by ID. No-op if already revoked.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tokenId: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Token revoked (or was already revoked) */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions": {
         parameters: {
             query?: never;
@@ -12683,6 +15985,7 @@ export interface paths {
                     source?: string;
                     q?: string;
                     requestedByUserId?: string;
+                    contextKeyPrefix?: string;
                     fields?: "full" | "slim";
                 };
                 header?: never;
@@ -12709,12 +16012,12 @@ export interface paths {
                                     task: string;
                                     title?: string;
                                     /** @enum {string} */
-                                    status: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                                    status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
                                     /**
                                      * @default mcp
                                      * @enum {string}
                                      */
-                                    source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira";
+                                    source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "azure-devops" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira" | "comb";
                                     taskType?: string;
                                     /** @default [] */
                                     tags: string[];
@@ -12733,7 +16036,7 @@ export interface paths {
                                     /** @enum {string} */
                                     effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
                                     /** @enum {string} */
-                                    provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+                                    provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                                     requestedByUserId?: string;
                                     progress?: string;
                                     /** Format: date-time */
@@ -12748,7 +16051,7 @@ export interface paths {
                                 chainTaskCount: number;
                                 lastActivityAt: string;
                                 /** @enum {string} */
-                                latestStatus: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                                latestStatus: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
                             }[];
                             total: number;
                             limit: number;
@@ -12802,10 +16105,34 @@ export interface paths {
                     content: {
                         "application/json": {
                             root: components["schemas"]["AgentTask"] & {
+                                citations: {
+                                    index: number;
+                                    /** @enum {string} */
+                                    kind: "task" | "memory" | "github" | "slack" | "agent-fs" | "page" | "script-run" | "url";
+                                    ref: string;
+                                    label?: string | null;
+                                    quote?: string | null;
+                                    general?: boolean;
+                                    resolvedUrl: string | null;
+                                    /** @enum {string} */
+                                    verified: "true" | "false" | "unchecked";
+                                }[];
                                 isLeadTask: boolean;
                                 supportedSteerModes: ("steer" | "queue")[];
                             };
                             chain: (components["schemas"]["AgentTask"] & {
+                                citations: {
+                                    index: number;
+                                    /** @enum {string} */
+                                    kind: "task" | "memory" | "github" | "slack" | "agent-fs" | "page" | "script-run" | "url";
+                                    ref: string;
+                                    label?: string | null;
+                                    quote?: string | null;
+                                    general?: boolean;
+                                    resolvedUrl: string | null;
+                                    /** @enum {string} */
+                                    verified: "true" | "false" | "unchecked";
+                                }[];
                                 isLeadTask: boolean;
                                 supportedSteerModes: ("steer" | "queue")[];
                             })[];
@@ -13902,80 +17229,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/mcp-bridge": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Generic MCP tool proxy for the scripts SDK bridge */
-        post: {
-            parameters: {
-                query?: never;
-                header?: {
-                    /** @description Identifies the concrete runtime instance (worker process) making the call, as generated at its boot. Required to acquire work through bridged tools when multi-runtime mode (MULTI_RUNTIME_ENABLED) is on; ignored otherwise. */
-                    "X-Runtime-Instance-ID"?: string;
-                };
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": {
-                        tool: string;
-                        /** @default {} */
-                        args?: {
-                            [key: string]: unknown;
-                        };
-                    };
-                };
-            };
-            responses: {
-                /** @description Tool result */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description Invalid tool name or args */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Tool not in SDK allowlist */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Tool not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/mcp-servers": {
         parameters: {
             query?: never;
@@ -14421,6 +17674,8 @@ export interface paths {
                                 failed: number | null;
                             };
                             steeringEnabled: boolean;
+                            multiRuntimeEnabled: boolean;
+                            devMode: boolean;
                         };
                     };
                 };
@@ -14486,6 +17741,76 @@ export interface paths {
                             skills: {
                                 total: number;
                             };
+                            retention: {
+                                sessionLogs?: {
+                                    at: string;
+                                    rowsDeleted: number;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
+                                };
+                                agentLog?: {
+                                    at: string;
+                                    rowsDeleted: number;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
+                                };
+                                events?: {
+                                    at: string;
+                                    rowsDeleted: number;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
+                                };
+                                contextVersions?: {
+                                    at: string;
+                                    rowsDeleted: number;
+                                    batches: number;
+                                    durationMs: number;
+                                    dryRun: boolean;
+                                    cumulativeRowsDeleted: number;
+                                    /** @enum {string} */
+                                    outcome: "converged" | "budget_exhausted" | "error";
+                                    drained: boolean;
+                                    backlogRemaining: number;
+                                    batchSize: number;
+                                    slowestStatementMs: number;
+                                    lastError?: string;
+                                    lastErrorAt?: string;
+                                    lastSuccessAt?: string;
+                                };
+                            };
                         };
                     };
                 };
@@ -14548,7 +17873,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List scheduled tasks */
+        /**
+         * List scheduled tasks
+         * @description Returns full schedules by default. Pass `fields=slim` for the list-view shape, which swaps the full `taskTemplate` for a bounded `taskTemplatePreview`. Fetch one schedule in full via `GET /api/schedules/{id}`.
+         */
         get: {
             parameters: {
                 query?: {
@@ -14559,6 +17887,7 @@ export interface paths {
                     targetType?: "agent-task" | "workflow" | "script";
                     workflowId?: string;
                     scriptName?: string;
+                    fields?: "full" | "slim";
                 };
                 header?: never;
                 path?: never;
@@ -14596,6 +17925,10 @@ export interface paths {
                                 /** Format: date-time */
                                 nextRunAt?: string;
                                 createdByAgentId?: string;
+                                parentTaskId?: string;
+                                requestedDelayMs?: number;
+                                /** Format: date-time */
+                                requestedRunAt?: string;
                                 /** @default UTC */
                                 timezone: string;
                                 /** @default 0 */
@@ -14622,6 +17955,11 @@ export interface paths {
                                 scriptArgs?: {
                                     [key: string]: unknown;
                                 };
+                                params?: {
+                                    [key: string]: unknown;
+                                };
+                                requiredParams?: string[];
+                                requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                                 /** Format: date-time */
                                 createdAt: string;
                                 /** Format: date-time */
@@ -14629,6 +17967,71 @@ export interface paths {
                                 createdBy?: string;
                                 updatedBy?: string;
                                 favorite?: boolean;
+                            }[] | {
+                                /** Format: uuid */
+                                id: string;
+                                /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
+                                key: string;
+                                name: string;
+                                description?: string;
+                                cronExpression?: string;
+                                intervalMs?: number;
+                                taskType?: string;
+                                /** @default [] */
+                                tags: string[];
+                                /** @default 50 */
+                                priority: number;
+                                targetAgentId?: string;
+                                /** @default true */
+                                enabled: boolean;
+                                /** Format: date-time */
+                                lastRunAt?: string;
+                                /** Format: date-time */
+                                nextRunAt?: string;
+                                createdByAgentId?: string;
+                                parentTaskId?: string;
+                                requestedDelayMs?: number;
+                                /** Format: date-time */
+                                requestedRunAt?: string;
+                                /** @default UTC */
+                                timezone: string;
+                                /** @default 0 */
+                                consecutiveErrors: number;
+                                /** Format: date-time */
+                                lastErrorAt?: string;
+                                lastErrorMessage?: string;
+                                model?: string;
+                                /** @enum {string} */
+                                modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                /**
+                                 * @default recurring
+                                 * @enum {string}
+                                 */
+                                scheduleType: "recurring" | "one_time";
+                                /**
+                                 * @default agent-task
+                                 * @enum {string}
+                                 */
+                                targetType: "agent-task" | "workflow" | "script";
+                                /** Format: uuid */
+                                workflowId?: string;
+                                scriptName?: string;
+                                scriptArgs?: {
+                                    [key: string]: unknown;
+                                };
+                                params?: {
+                                    [key: string]: unknown;
+                                };
+                                requiredParams?: string[];
+                                requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
+                                /** Format: date-time */
+                                createdAt: string;
+                                /** Format: date-time */
+                                lastUpdatedAt: string;
+                                createdBy?: string;
+                                updatedBy?: string;
+                                favorite: boolean;
+                                taskTemplatePreview: string;
                             }[];
                         };
                     };
@@ -14706,165 +18109,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Identity + setup readiness + live activity for the swarm dashboard
-         * @description Single source of truth consumed by the UI home page. Identity comes from SWARM_* envs; the 7 setup milestones each emit `unverified | configured | verified`; activity counts agents alive in the last 5 min and tasks created in the last 24h; agent_fs reports whether AGENT_FS_API_URL is set.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Status payload */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            identity: {
-                                name: string;
-                                logo_url: string | null;
-                                brand_color: string | null;
-                                is_cloud: boolean;
-                                marketing_url: string | null;
-                                hide_cloud_promo: boolean;
-                                org_id: string | null;
-                            };
-                            setup: {
-                                /** @enum {string} */
-                                id: "harness" | "slack" | "github" | "linear" | "jira" | "workers" | "first_task";
-                                label: string;
-                                /** @enum {string} */
-                                state: "unverified" | "configured" | "verified";
-                                hint?: string;
-                                action_url?: string;
-                                /** @enum {string} */
-                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
-                                providers?: {
-                                    /** @enum {string} */
-                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
-                                    /** @enum {string} */
-                                    state: "unverified" | "configured" | "verified";
-                                    workers: number;
-                                }[];
-                            }[];
-                            activity: {
-                                agents_online: number;
-                                leads_online: number;
-                                recent_tasks_count: number;
-                            };
-                            agent_fs: {
-                                configured: boolean;
-                                base_url: string | null;
-                                provider_id: string;
-                                capabilities: {
-                                    [key: string]: unknown;
-                                };
-                            };
-                            /** @enum {string} */
-                            health: "ok" | "degraded" | "broken";
-                        };
-                    };
-                };
-                /** @description Unauthorized */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/status/test-connection": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Live-test the harness provider's credentials
-         * @description Issues a real upstream call (Anthropic /v1/models, OpenAI /v1/models, etc.) for the given provider. Updates an in-memory cache so the next GET /status reports `harness.state = 'verified'` for SWARM_VERIFY_TTL_MS (default 1h).
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: {
-                content: {
-                    "application/json": {
-                        /** @enum {string} */
-                        provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
-                    };
-                };
-            };
-            responses: {
-                /** @description Live-test result */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            ok: boolean;
-                            error?: string;
-                            latency_ms: number;
-                        };
-                    };
-                };
-                /** @description Validation error */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-                /** @description Unauthorized */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ErrorResponse"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/tasks": {
         parameters: {
             query?: never;
@@ -14874,7 +18118,7 @@ export interface paths {
         };
         /**
          * List tasks with filters
-         * @description Returns tasks with the full `task` text replaced by a bounded `taskPreview` and completion/integration blobs dropped by default — list views only need the preview. Pass `fields=full` to restore the full `AgentTask`. Fetch a single task in full via `GET /api/tasks/{id}`.
+         * @description Returns tasks with the full `task` text replaced by a bounded `taskPreview` and completion/integration blobs dropped by default — list views only need the preview. Pass `fields=full` to restore the full `AgentTask`, or `fields=timeline` for the narrow shape the dashboard timeline draws. Fetch a single task in full via `GET /api/tasks/{id}`. `total` (the filtered row count, ignoring limit/offset) is computed only with `includeTotal=true`.
          */
         get: {
             parameters: {
@@ -14895,7 +18139,8 @@ export interface paths {
                     orderBy?: "lastUpdatedAt" | "createdAt";
                     limit?: number | null;
                     offset?: number | null;
-                    fields?: "full" | "slim";
+                    fields?: "full" | "slim" | "timeline";
+                    includeTotal?: "true" | "false";
                 };
                 header?: never;
                 path?: never;
@@ -14920,12 +18165,12 @@ export interface paths {
                                 task: string;
                                 title?: string;
                                 /** @enum {string} */
-                                status: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                                status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
                                 /**
                                  * @default mcp
                                  * @enum {string}
                                  */
-                                source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira";
+                                source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "azure-devops" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira" | "comb";
                                 taskType?: string;
                                 /** @default [] */
                                 tags: string[];
@@ -14941,10 +18186,13 @@ export interface paths {
                                 model?: string;
                                 /** @enum {string} */
                                 modelTier?: "smol" | "regular" | "smart" | "ultra";
+                                resolvedModel?: string;
+                                modelSource?: string;
+                                modelAlias?: string;
                                 /** @enum {string} */
                                 effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
                                 /** @enum {string} */
-                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                                 requestedByUserId?: string;
                                 progress?: string;
                                 /** Format: date-time */
@@ -14955,8 +18203,25 @@ export interface paths {
                                 finishedAt?: string;
                                 peakContextPercent?: number;
                                 totalCostUsd?: number;
+                            }[] | {
+                                /** Format: uuid */
+                                id: string;
+                                agentId: string | null;
+                                parentTaskId?: string;
+                                task: string;
+                                title?: string;
+                                /** @enum {string} */
+                                status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                                /** Format: date-time */
+                                createdAt: string;
+                                /** Format: date-time */
+                                lastUpdatedAt: string;
+                                /** Format: date-time */
+                                finishedAt?: string;
+                                peakContextTokens?: number;
+                                totalCostUsd?: number;
                             }[];
-                            total: number;
+                            total?: number;
                         };
                     };
                 };
@@ -14985,6 +18250,9 @@ export interface paths {
                     "application/json": {
                         task: string;
                         agentId?: string;
+                        /** @enum {string} */
+                        routingReason?: "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
+                        routingNote?: string;
                         taskType?: string;
                         tags?: string[];
                         priority?: number;
@@ -14995,17 +18263,20 @@ export interface paths {
                         /** @description Non-unique asset directory namespace (for example shared/ or personal/<user-id>/drafts/). Runtime write boundaries normalize and validate the canonical form. */
                         key?: string;
                         /** @enum {string} */
-                        source?: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira";
+                        source?: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "azure-devops" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira" | "comb";
                         outputSchema?: {
                             [key: string]: unknown;
                         };
                         contextKey?: string;
                         requestedByUserId?: string;
+                        /** @description Concrete model override for this task, interpreted by the assignee's harness/provider. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected. */
                         model?: string;
                         /** @enum {string} */
                         modelTier?: "smol" | "regular" | "smart" | "ultra";
+                        allowCustomModel?: boolean;
                         /** @enum {string} */
                         effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+                        draft?: boolean;
                     };
                 };
             };
@@ -15019,8 +18290,82 @@ export interface paths {
                         "application/json": components["schemas"]["AgentTask"];
                     };
                 };
-                /** @description Validation error */
+                /** @description Validation error, an unknown `model` (set `allowCustomModel` to store a custom id), or agentId/offeredTo targets an extension identity */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Task creation blocked by an extension */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            error: string;
+                            extension: {
+                                id: string;
+                                name: string;
+                            };
+                        };
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/promote-draft": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Promote a draft task out of the pre-dispatch draft state
+         * @description Transitions a `draft` task (#1240 — created with attachments still uploading) to its normal dispatch-eligible status: `offered` if it was offered to an agent, `pending` if it has an owning agent (the common case — UI-composer tasks default to Lead), otherwise `unassigned`. Called by the UI composer once its attachment upload batch settles, whether every file uploaded, some failed, or all failed — a draft must never be stranded by an upload error. Idempotent: calling it on a task that already left `draft` returns the current task unchanged rather than erroring, so a retried request is safe.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Task promoted (or already out of draft) */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AgentTask"];
+                    };
+                };
+                /** @description Caller does not own this task */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Task not found */
+                404: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -15069,9 +18414,12 @@ export interface paths {
                     } | {
                         claudeSessionId: string;
                         /** @enum {string} */
-                        provider?: "claude" | "codex" | "pi" | "claude-managed" | "opencode";
+                        provider?: "claude" | "codex" | "pi" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                         model?: string;
-                        providerMeta?: Record<string, never>;
+                        providerMeta?: {
+                            /** @enum {string} */
+                            transport?: "cli" | "sdk";
+                        };
                         harnessVariant?: string;
                         harnessVariantMeta?: {
                             [key: string]: unknown;
@@ -15143,6 +18491,15 @@ export interface paths {
                 };
                 /** @description Cannot cancel terminal task */
                 400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Agent caller is neither a lead nor the task creator */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -15620,6 +18977,18 @@ export interface paths {
                             supportedSteerModes: ("steer" | "queue")[];
                             logs: components["schemas"]["AgentLog"][];
                             attachments: components["schemas"]["TaskAttachment"][];
+                            citations: {
+                                index: number;
+                                /** @enum {string} */
+                                kind: "task" | "memory" | "github" | "slack" | "agent-fs" | "page" | "script-run" | "url";
+                                ref: string;
+                                label?: string | null;
+                                quote?: string | null;
+                                general?: boolean;
+                                resolvedUrl: string | null;
+                                /** @enum {string} */
+                                verified: "true" | "false" | "unchecked";
+                            }[];
                         };
                     };
                 };
@@ -15669,7 +19038,7 @@ export interface paths {
                 };
             };
             responses: {
-                /** @description Progress updated */
+                /** @description Progress updated; a no-op once the task is terminal */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -15679,6 +19048,15 @@ export interface paths {
                             /** @enum {boolean} */
                             success: true;
                         };
+                    };
+                };
+                /** @description Task is assigned to another agent */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
                 /** @description Task not found */
@@ -15725,6 +19103,8 @@ export interface paths {
                         output?: string;
                         failureReason?: string;
                         force?: boolean;
+                        /** @enum {string} */
+                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
                     };
                 };
             };
@@ -15824,7 +19204,9 @@ export interface paths {
                     };
                     content: {
                         "application/json": {
-                            tasks: components["schemas"]["AgentTask"][];
+                            tasks: (components["schemas"]["AgentTask"] & {
+                                attachments: components["schemas"]["TaskAttachment"][];
+                            })[];
                         };
                     };
                 };
@@ -16021,7 +19403,7 @@ export interface paths {
                             task: components["schemas"]["AgentTask"] | null;
                             resumeTaskId: string | null;
                             /** @enum {string} */
-                            resumeTaskStatus?: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                            resumeTaskStatus?: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
                         };
                     };
                 };
@@ -16087,7 +19469,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        vcsProvider: "github" | "gitlab";
+                        vcsProvider: "github" | "gitlab" | "azure-devops";
                         vcsRepo: string;
                         vcsNumber: number;
                         /** Format: uri */
@@ -16237,7 +19619,9 @@ export interface paths {
         /** Redirect to Atlassian OAuth consent screen */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    redirect?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -16734,7 +20118,9 @@ export interface paths {
         /** Redirect to Linear OAuth consent screen */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    redirect?: string;
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -18129,6 +21515,12 @@ export interface paths {
                         } | {
                             created: boolean;
                             taskId?: string;
+                            skipped?: boolean;
+                            reason?: string;
+                            extension?: {
+                                id: string;
+                                name: string;
+                            };
                         };
                     };
                 };
@@ -18186,6 +21578,12 @@ export interface paths {
                         "application/json": {
                             created: boolean;
                             taskId?: string;
+                            skipped?: boolean;
+                            reason?: string;
+                            extension?: {
+                                id: string;
+                                name: string;
+                            };
                         };
                     };
                 };
@@ -18199,6 +21597,69 @@ export interface paths {
                     };
                 };
                 /** @description GitLab integration not configured */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/azure-devops/webhook": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Handle Azure DevOps service-hook events */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Event processed */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            created: boolean;
+                            taskId?: string;
+                            skipped?: boolean;
+                            reason?: string;
+                            extension?: {
+                                id: string;
+                                name: string;
+                            };
+                        };
+                    };
+                };
+                /** @description Invalid Basic auth credentials */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
+                /** @description Azure DevOps integration not configured */
                 503: {
                     headers: {
                         [name: string]: unknown;
@@ -18255,7 +21716,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description AgentMail integration not configured */
+                /** @description AgentMail integration not configured or inbound archive unavailable */
                 503: {
                     headers: {
                         [name: string]: unknown;
@@ -18508,6 +21969,11 @@ export interface paths {
                             name: string;
                             description?: string;
                             enabled: boolean;
+                            params?: {
+                                [key: string]: unknown;
+                            };
+                            requiredParams?: string[];
+                            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                             dir?: string;
                             vcsRepo?: string;
                             createdByAgentId?: string;
@@ -18582,12 +22048,25 @@ export interface paths {
                                 format: "token-equality";
                                 /** @description Header containing the shared token to compare */
                                 header: string;
+                            } | {
+                                /** @enum {string} */
+                                format: "standard-webhooks";
+                                /**
+                                 * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                                 * @default 300
+                                 */
+                                toleranceSeconds?: number;
                             };
                         } | {
                             /** @enum {string} */
                             type: "schedule";
                             /** Format: uuid */
                             scheduleId: string;
+                        } | {
+                            /** @enum {string} */
+                            type: "event";
+                            /** @enum {string} */
+                            eventName: "slack.message";
                         })[];
                         cooldown?: {
                             hours?: number;
@@ -18600,6 +22079,11 @@ export interface paths {
                         triggerSchema?: {
                             [key: string]: unknown;
                         };
+                        params?: {
+                            [key: string]: unknown;
+                        };
+                        requiredParams?: string[];
+                        requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                         dir?: string;
                         vcsRepo?: string;
                     };
@@ -18612,7 +22096,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Workflow"];
+                        "application/json": components["schemas"]["Workflow"] & {
+                            warnings?: string[];
+                        };
                     };
                 };
                 /** @description Invalid definition */
@@ -18734,12 +22220,25 @@ export interface paths {
                                 format: "token-equality";
                                 /** @description Header containing the shared token to compare */
                                 header: string;
+                            } | {
+                                /** @enum {string} */
+                                format: "standard-webhooks";
+                                /**
+                                 * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                                 * @default 300
+                                 */
+                                toleranceSeconds?: number;
                             };
                         } | {
                             /** @enum {string} */
                             type: "schedule";
                             /** Format: uuid */
                             scheduleId: string;
+                        } | {
+                            /** @enum {string} */
+                            type: "event";
+                            /** @enum {string} */
+                            eventName: "slack.message";
                         })[];
                         cooldown?: {
                             hours?: number;
@@ -18752,6 +22251,11 @@ export interface paths {
                         triggerSchema?: {
                             [key: string]: unknown;
                         } | null;
+                        params?: {
+                            [key: string]: unknown;
+                        };
+                        requiredParams?: string[];
+                        requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
                         dir?: string | null;
                         vcsRepo?: string | null;
                         enabled?: boolean;
@@ -18765,7 +22269,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Workflow"];
+                        "application/json": components["schemas"]["Workflow"] & {
+                            warnings?: string[];
+                        };
                     };
                 };
                 /** @description Invalid definition */
@@ -18846,7 +22352,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Workflow"];
+                        "application/json": components["schemas"]["Workflow"] & {
+                            warnings?: string[];
+                        };
                     };
                 };
                 /** @description Invalid patch or resulting definition */
@@ -18898,11 +22406,11 @@ export interface paths {
             requestBody?: {
                 content: {
                     "application/json": {
-                        /** @description Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'validate', 'property-match' */
+                        /** @description Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'system-one-decision', 'validate', 'property-match' */
                         type?: string;
                         /** @description Human-readable label for UI display */
                         label?: string;
-                        /** @description Executor-specific config. For agent-task: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. For script: { runtime, script, args?, timeout? }. For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. Pass dynamic values through config.args instead (inline script receives them as argv; swarm-script receives its args object). NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}). */
+                        /** @description Executor-specific config. For agent-task: { template, outputSchema?, agentId?, routingReason?, routingNote?, tags?, priority?, dir?, vcsRepo?, model? }; configured agentId defaults routingReason to human_pinned. For script: { runtime, script, args?, timeout? }. For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. For system-one-decision (typed decisions, Jev by default): { provider? ('typesafe' default | 'openrouter' | 'laya'; a literal, never a {{token}}), state, questions: { <id>: { type: 'noul'|'choice'|'score', instructions, criteria? } }, returns: { <id>: { type } }, model? (provider-specific; unset = the provider's default, and laya has none so it sends no model and picks its own checkpoint), timeoutMs?, maxRetries? (0-3), humanReview? { band: { min, max } (0-1, inclusive), approvers: { users?, roles?, policy }, title?, timeout?, notifications? } }; each provider needs its own global secret (TYPESAFE_API_KEY, OPENROUTER_API_KEY, or LAYA_API_KEY; laya also needs the global config LAYA_URL), and a save warns and a run fails before any node executes when one is missing; system-one-decision nodes must not set retry or validation.retry. With humanReview, an answer whose confidence is inside the band waits for a person (human-in-the-loop approval), and next must map ports { approved, rejected?, timeout? }. Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. Pass dynamic values through config.args instead (inline script receives them as argv, with runtime: "bash" running bash -c <script> ...args so args[0] is $0 and args[1] is $1; swarm-script receives its args object). NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}). */
                         config?: {
                             [key: string]: unknown;
                         };
@@ -18934,7 +22442,9 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["Workflow"];
+                        "application/json": components["schemas"]["Workflow"] & {
+                            warnings?: string[];
+                        };
                     };
                 };
                 /** @description Invalid patch or resulting definition */
@@ -19094,7 +22604,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List runs for a workflow */
+        /**
+         * List runs for a workflow, newest first
+         * @description Returns one page of runs without `context` (fetch it with GET /api/workflow-runs/{id}). `limit` defaults to 50 and is capped at 100; follow `page.nextOffset` while `page.hasMore` is true.
+         */
         get: {
             parameters: {
                 query?: {
@@ -19110,14 +22623,14 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description Workflow run list */
+                /** @description One page of workflow runs */
                 200: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
-                        "application/json": components["schemas"]["WorkflowRun"][] | {
-                            runs: components["schemas"]["WorkflowRun"][];
+                        "application/json": {
+                            runs: components["schemas"]["WorkflowRunSummary"][];
                             page: {
                                 limit: number;
                                 offset: number;
@@ -19610,12 +23123,20 @@ export interface components {
             task: string;
             title?: string;
             /** @enum {string} */
-            status: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+            status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
             /**
              * @default mcp
              * @enum {string}
              */
-            source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira";
+            source: "mcp" | "slack" | "api" | "ui" | "github" | "gitlab" | "azure-devops" | "agentmail" | "system" | "schedule" | "workflow" | "linear" | "jira" | "comb";
+            /** @enum {string} */
+            routingReason?: "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
+            /**
+             * @description Origin of the routing reason: declared by the caller or chosen by the engine. Absent for unknown historical provenance or no reason.
+             * @enum {string}
+             */
+            routingSource?: "declared" | "engine_default";
+            routingNote?: string;
             taskType?: string;
             /** @default [] */
             tags: string[];
@@ -19649,7 +23170,7 @@ export interface components {
             slackProgressMessageTs?: string;
             slackTreeRootMessageTs?: string;
             /** @enum {string} */
-            vcsProvider?: "github" | "gitlab";
+            vcsProvider?: "github" | "gitlab" | "azure-devops";
             vcsRepo?: string;
             vcsEventType?: string;
             vcsNumber?: number;
@@ -19671,6 +23192,9 @@ export interface components {
             modelTier?: "smol" | "regular" | "smart" | "ultra";
             /** @enum {string} */
             effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+            resolvedModel?: string;
+            modelSource?: string;
+            modelAlias?: string;
             scheduleId?: string;
             /** Format: uuid */
             workflowRunId?: string | null;
@@ -19683,6 +23207,8 @@ export interface components {
             followUpConfig?: components["schemas"]["FollowUpConfig"];
             /** @default false */
             wasPaused: boolean;
+            /** Format: date-time */
+            deferredAt?: string;
             compactionCount?: number;
             peakContextPercent?: number;
             peakContextTokens?: number;
@@ -19692,7 +23218,7 @@ export interface components {
             requestedByUserId?: string;
             swarmVersion?: string;
             /** @enum {string} */
-            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
             providerMeta?: {
                 [key: string]: unknown;
             };
@@ -19702,6 +23228,7 @@ export interface components {
             };
             totalCostUsd?: number;
             routingAffinity?: components["schemas"]["RoutingAffinity"];
+            routingAffinityInvalid?: boolean;
         };
         FollowUpConfig: {
             disabled?: boolean;
@@ -19712,9 +23239,10 @@ export interface components {
             sourceAgentId?: string;
             role?: string;
             /** @enum {string} */
-            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
             /** @default [] */
             capabilities: string[];
+            leadOnly?: boolean;
         };
         AgentCredStatus: {
             ready: boolean;
@@ -19736,6 +23264,7 @@ export interface components {
              */
             reportKind: "boot" | "post_task";
             bedrock?: components["schemas"]["AgentBedrockStatus"];
+            acp?: components["schemas"]["AgentAcpStatus"];
         };
         /** @default null */
         AgentCredStatusLiveTest: {
@@ -19756,7 +23285,7 @@ export interface components {
              * @default null
              * @enum {string|null}
              */
-            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | null;
+            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
             reportedAt: number;
             /** @enum {string} */
             reasoningEffort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -19772,6 +23301,42 @@ export interface components {
                 name: string;
             }[];
             error?: string;
+        } | null;
+        /** @default null */
+        AgentAcpStatus: {
+            /** @enum {string} */
+            target: "opencode" | "custom";
+            configOptions: ({
+                /** @enum {string} */
+                type: "select";
+                id: string;
+                name: string;
+                description?: string | null;
+                category?: string | null;
+                currentValue: string;
+                options: ({
+                    value: string;
+                    name: string;
+                    description?: string | null;
+                } | {
+                    group: string;
+                    name: string;
+                    options: {
+                        value: string;
+                        name: string;
+                        description?: string | null;
+                    }[];
+                })[];
+            } | {
+                /** @enum {string} */
+                type: "boolean";
+                id: string;
+                name: string;
+                description?: string | null;
+                category?: string | null;
+                currentValue: boolean;
+            })[];
+            reportedAt: number;
         } | null;
         Agent: {
             id: string;
@@ -19795,9 +23360,9 @@ export interface components {
             /** Format: date-time */
             lastActivityAt?: string;
             /** @enum {string} */
-            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
             /** @enum {string|null} */
-            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | null;
+            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
             credentialMissing?: string[] | null;
             credStatus?: components["schemas"]["AgentCredStatus"] | null;
             avatar?: {
@@ -19913,7 +23478,7 @@ export interface components {
             /** @enum {string} */
             category: "tool" | "skill" | "session" | "api" | "task" | "workflow" | "system";
             /** @enum {string} */
-            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "script.global_upsert" | "schedule.deleted";
+            event: "tool.start" | "tool.end" | "skill.invoke" | "skill.complete" | "session.start" | "session.end" | "session.resume" | "session.cost" | "api.request" | "api.error" | "task.poll" | "task.assign" | "task.timeout" | "workflow.step.start" | "workflow.step.end" | "workflow.run.start" | "workflow.run.end" | "system.boot" | "system.migration" | "system.error" | "system.profile_sync_rejected" | "system.profile_sync_reconciled" | "system.profile_sync_conflict" | "script.global_upsert" | "schedule.deleted";
             /** @enum {string} */
             status: "ok" | "error" | "timeout" | "skipped";
             /** @enum {string} */
@@ -19930,11 +23495,131 @@ export interface components {
             /** Format: date-time */
             createdAt: string;
         };
+        Extension: {
+            id: string;
+            name: string;
+            description: string;
+            /** @enum {string} */
+            runtime: "api" | "worker";
+            manifestJson: string;
+            contentHash: string;
+            version: number;
+            activeVersion: number;
+            enabled: boolean;
+            priority: number;
+            configJson: string;
+            /** @enum {string} */
+            status: "disabled" | "enabled" | "error" | "auto-disabled";
+            consecutiveFailures: number;
+            lastError: string | null;
+            agentId: string | null;
+            createdByAgentId: string | null;
+            createdAt: string;
+            updatedAt: string;
+        };
+        ExtensionManifest: {
+            $schema?: string;
+            name: string;
+            description: string;
+            version: string;
+            /** @enum {string} */
+            runtime: "api" | "worker";
+            assets: {
+                hooks: string;
+                scripts?: {
+                    /** @description Global script name. Must start with `<extension name>-`. */
+                    name: string;
+                    /** @description Bundle path of the script source. */
+                    file: string;
+                    description: string;
+                    /** @description Defaults to `description`. */
+                    intent?: string;
+                }[];
+                schedules?: {
+                    /** @description Schedule name. Must start with `<extension name>-`. */
+                    name: string;
+                    description?: string;
+                    /** @description Name of a script declared in `assets.scripts`. */
+                    script: string;
+                    cronExpression?: string;
+                    intervalMs?: number;
+                    timezone?: string;
+                    args?: {
+                        [key: string]: unknown;
+                    };
+                }[];
+                workflows?: {
+                    /** @description Bundle path of a YAML or JSON workflow file. Its `name` must start with `<extension name>-`. */
+                    file: string;
+                }[];
+                skills?: {
+                    /** @description Bundle directory holding SKILL.md and optional files/**. The SKILL.md frontmatter `name` must start with `<extension name>-`. */
+                    dir: string;
+                }[];
+            };
+            /** Format: uri */
+            homepage?: string;
+            author?: string;
+        };
+        ExtensionInstallBody: {
+            /** @description Name of a predefined extension in the catalog (`GET /api/extensions/catalog`). Mutually exclusive with `manifest` and `files`. */
+            template?: string;
+            manifest?: components["schemas"]["ExtensionManifest"] & unknown;
+            /** @description Inline bundle files keyed by relative path. Requires `manifest`. */
+            files?: {
+                [key: string]: string;
+            };
+            /** @description Handler priority. Lower values run first. */
+            priority?: number;
+            /** @description Extension configuration. */
+            config?: {
+                [key: string]: unknown;
+            };
+        };
+        ExtensionCatalogItem: {
+            name: string;
+            description: string;
+            version: string;
+            manifestFile: string;
+            assets: {
+                [key: string]: number;
+            };
+            readme: string | null;
+            installed: {
+                id: string;
+                version: number;
+                enabled: boolean;
+            } | null;
+        };
+        ExtensionVersion: {
+            id: string;
+            extensionId: string;
+            version: number;
+            manifestJson: string;
+            filesJson: string;
+            contentHash: string;
+            changedByAgentId: string | null;
+            changedAt: string;
+            changeReason: string | null;
+        };
+        ExtensionRun: {
+            id: string;
+            extensionId: string;
+            version: number;
+            event: string;
+            /** @enum {string} */
+            action: "continue" | "modify" | "block" | "error" | "timeout" | "load-error";
+            durationMs: number | null;
+            message: string | null;
+            agentId: string | null;
+            subject: string | null;
+            createdAt: string;
+        };
         UserFavorite: {
             id: string;
             userId?: string;
             /** @enum {string} */
-            itemType: "page" | "workflow" | "schedule";
+            itemType: "page" | "workflow" | "schedule" | "agent-fs-path";
             itemId: string;
             createdAt: string;
             lastUpdatedAt: string;
@@ -19976,13 +23661,14 @@ export interface components {
             id: string;
             userId: string;
             /** @enum {string} */
-            itemType: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template";
+            itemType: "approval" | "credential_missing" | "broken_task" | "to_read" | "to_start_template" | "notification";
             itemId: string;
             /** @enum {string} */
             status: "open" | "snoozed" | "dismissed" | "done";
             snoozeUntil?: string;
             dismissedAt?: string;
             doneAt?: string;
+            readAt?: string;
             createdAt: string;
             lastUpdatedAt: string;
         };
@@ -20118,7 +23804,7 @@ export interface components {
             title: string;
             description?: string;
             /** @enum {string} */
-            contentType: "text/html" | "application/json";
+            contentType: "text/html" | "application/json" | "image/svg+xml";
             /** @enum {string} */
             authMode: "public" | "authed" | "password";
             passwordHash?: string;
@@ -20142,7 +23828,7 @@ export interface components {
             title: string;
             description?: string;
             /** @enum {string} */
-            contentType: "text/html" | "application/json";
+            contentType: "text/html" | "application/json" | "image/svg+xml";
             /** @enum {string} */
             authMode: "public" | "authed" | "password";
             passwordHash?: string;
@@ -20197,7 +23883,7 @@ export interface components {
         };
         PricingRow: {
             /** @enum {string} */
-            provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini";
+            provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
             model: string;
             /** @enum {string} */
             tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
@@ -20231,6 +23917,13 @@ export interface components {
             enabled: boolean;
         };
         RepoGuidelines: {
+            prChecks: string[];
+            mergeChecks: string[];
+            /** @default false */
+            allowMerge: boolean;
+            review: string[];
+        } | null;
+        RepoGuidelinesInput: {
             prChecks: string[];
             mergeChecks: string[];
             /** @default false */
@@ -20318,7 +24011,7 @@ export interface components {
              * @default harness
              * @enum {string}
              */
-            costSource: "harness" | "pricing-table" | "unpriced";
+            costSource: "harness" | "pricing-table" | "unpriced" | "estimated";
             harnessCostUsd?: number | null;
             cacheWrite5mTokens?: number | null;
             cacheWrite1hTokens?: number | null;
@@ -20446,7 +24139,7 @@ export interface components {
             /** Format: uuid */
             id: string;
             /** @enum {string} */
-            eventType: "agent_joined" | "agent_status_change" | "agent_left" | "task_created" | "task_status_change" | "task_progress" | "task_steering" | "task_offered" | "task_accepted" | "task_rejected" | "task_claimed" | "task_claim_rejected_affinity" | "task_released" | "channel_message" | "service_registered" | "service_unregistered" | "service_status_change" | "budget.upserted" | "budget.deleted" | "pricing.inserted" | "pricing.deleted" | "pricing.refresh" | "pricing.refresh.failed" | "task_superseded";
+            eventType: "agent_joined" | "agent_status_change" | "agent_left" | "task_created" | "task_status_change" | "task_progress" | "task_steering" | "task_offered" | "task_accepted" | "task_rejected" | "task_claimed" | "task_claim_rejected_affinity" | "task_dispatch_rejected_affinity" | "task_authorization_rejected" | "task_recovery_authorization" | "task_dependency_repointed" | "task_released" | "task_deferred_wait_woke" | "task_follow_up_suppressed" | "task_citation_check_refused" | "channel_message" | "service_registered" | "service_unregistered" | "service_status_change" | "budget.upserted" | "budget.deleted" | "pricing.inserted" | "pricing.deleted" | "pricing.refresh" | "pricing.refresh.failed" | "task_superseded" | "slack_delivery";
             agentId?: string;
             taskId?: string;
             oldValue?: string;
@@ -20514,6 +24207,7 @@ export interface components {
             deliveredMode?: "steer" | "queue";
             /** @enum {string} */
             source: "ui" | "mcp" | "script" | "slack" | "api";
+            senderLabel?: string;
             /** @enum {string} */
             createdByKind: "user" | "agent" | "system";
             createdByUserId?: string;
@@ -20584,11 +24278,11 @@ export interface components {
         WorkflowNode: {
             /** @description Unique node identifier, used in 'next' and 'inputs' mappings */
             id: string;
-            /** @description Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'validate', 'property-match' */
+            /** @description Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'system-one-decision', 'validate', 'property-match' */
             type: string;
             /** @description Human-readable label for UI display */
             label?: string;
-            /** @description Executor-specific config. For agent-task: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. For script: { runtime, script, args?, timeout? }. For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. Pass dynamic values through config.args instead (inline script receives them as argv; swarm-script receives its args object). NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}). */
+            /** @description Executor-specific config. For agent-task: { template, outputSchema?, agentId?, routingReason?, routingNote?, tags?, priority?, dir?, vcsRepo?, model? }; configured agentId defaults routingReason to human_pinned. For script: { runtime, script, args?, timeout? }. For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. For system-one-decision (typed decisions, Jev by default): { provider? ('typesafe' default | 'openrouter' | 'laya'; a literal, never a {{token}}), state, questions: { <id>: { type: 'noul'|'choice'|'score', instructions, criteria? } }, returns: { <id>: { type } }, model? (provider-specific; unset = the provider's default, and laya has none so it sends no model and picks its own checkpoint), timeoutMs?, maxRetries? (0-3), humanReview? { band: { min, max } (0-1, inclusive), approvers: { users?, roles?, policy }, title?, timeout?, notifications? } }; each provider needs its own global secret (TYPESAFE_API_KEY, OPENROUTER_API_KEY, or LAYA_API_KEY; laya also needs the global config LAYA_URL), and a save warns and a run fails before any node executes when one is missing; system-one-decision nodes must not set retry or validation.retry. With humanReview, an answer whose confidence is inside the band waits for a person (human-in-the-loop approval), and next must map ports { approved, rejected?, timeout? }. Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. Pass dynamic values through config.args instead (inline script receives them as argv, with runtime: "bash" running bash -c <script> ...args so args[0] is $0 and args[1] is $1; swarm-script receives its args object). NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}). */
             config: {
                 [key: string]: unknown;
             };
@@ -20687,12 +24381,25 @@ export interface components {
                     format: "token-equality";
                     /** @description Header containing the shared token to compare */
                     header: string;
+                } | {
+                    /** @enum {string} */
+                    format: "standard-webhooks";
+                    /**
+                     * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                     * @default 300
+                     */
+                    toleranceSeconds: number;
                 };
             } | {
                 /** @enum {string} */
                 type: "schedule";
                 /** Format: uuid */
                 scheduleId: string;
+            } | {
+                /** @enum {string} */
+                type: "event";
+                /** @enum {string} */
+                eventName: "slack.message";
             })[];
             cooldown?: {
                 hours?: number;
@@ -20705,6 +24412,11 @@ export interface components {
             triggerSchema?: {
                 [key: string]: unknown;
             };
+            params?: {
+                [key: string]: unknown;
+            };
+            requiredParams?: string[];
+            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
             dir?: string;
             vcsRepo?: string;
             createdByAgentId?: string;
@@ -20727,11 +24439,11 @@ export interface components {
                 nodeId: string;
                 /** @description Partial node data to merge */
                 node: {
-                    /** @description Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'validate', 'property-match' */
+                    /** @description Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'system-one-decision', 'validate', 'property-match' */
                     type?: string;
                     /** @description Human-readable label for UI display */
                     label?: string;
-                    /** @description Executor-specific config. For agent-task: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. For script: { runtime, script, args?, timeout? }. For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. Pass dynamic values through config.args instead (inline script receives them as argv; swarm-script receives its args object). NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}). */
+                    /** @description Executor-specific config. For agent-task: { template, outputSchema?, agentId?, routingReason?, routingNote?, tags?, priority?, dir?, vcsRepo?, model? }; configured agentId defaults routingReason to human_pinned. For script: { runtime, script, args?, timeout? }. For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. For system-one-decision (typed decisions, Jev by default): { provider? ('typesafe' default | 'openrouter' | 'laya'; a literal, never a {{token}}), state, questions: { <id>: { type: 'noul'|'choice'|'score', instructions, criteria? } }, returns: { <id>: { type } }, model? (provider-specific; unset = the provider's default, and laya has none so it sends no model and picks its own checkpoint), timeoutMs?, maxRetries? (0-3), humanReview? { band: { min, max } (0-1, inclusive), approvers: { users?, roles?, policy }, title?, timeout?, notifications? } }; each provider needs its own global secret (TYPESAFE_API_KEY, OPENROUTER_API_KEY, or LAYA_API_KEY; laya also needs the global config LAYA_URL), and a save warns and a run fails before any node executes when one is missing; system-one-decision nodes must not set retry or validation.retry. With humanReview, an answer whose confidence is inside the band waits for a person (human-in-the-loop approval), and next must map ports { approved, rejected?, timeout? }. Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. Pass dynamic values through config.args instead (inline script receives them as argv, with runtime: "bash" running bash -c <script> ...args so args[0] is $0 and args[1] is $1; swarm-script receives its args object). NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}). */
                     config?: {
                         [key: string]: unknown;
                     };
@@ -20768,6 +24480,25 @@ export interface components {
             triggerSchema?: {
                 [key: string]: unknown;
             } | null;
+            params?: {
+                [key: string]: unknown;
+            };
+            requiredParams?: string[];
+            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
+        };
+        WorkflowRunSummary: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            workflowId: string;
+            /** @enum {string} */
+            status: "running" | "waiting" | "completed" | "failed" | "skipped" | "cancelled";
+            triggerData?: unknown;
+            error?: string;
+            createdBy?: string;
+            startedAt: string;
+            lastUpdatedAt: string;
+            finishedAt?: string;
         };
         WorkflowRun: {
             /** Format: uuid */
@@ -20866,12 +24597,25 @@ export interface components {
                     format: "token-equality";
                     /** @description Header containing the shared token to compare */
                     header: string;
+                } | {
+                    /** @enum {string} */
+                    format: "standard-webhooks";
+                    /**
+                     * @description Maximum allowed clock skew, in seconds, for the webhook-timestamp header
+                     * @default 300
+                     */
+                    toleranceSeconds: number;
                 };
             } | {
                 /** @enum {string} */
                 type: "schedule";
                 /** Format: uuid */
                 scheduleId: string;
+            } | {
+                /** @enum {string} */
+                type: "event";
+                /** @enum {string} */
+                eventName: "slack.message";
             })[];
             cooldown?: {
                 hours?: number;
@@ -20884,6 +24628,11 @@ export interface components {
             triggerSchema?: {
                 [key: string]: unknown;
             };
+            params?: {
+                [key: string]: unknown;
+            };
+            requiredParams?: string[];
+            requires?: ("slack" | "github" | "linear" | "jira" | "gsc" | "agentmail" | "agentfs")[];
             dir?: string;
             vcsRepo?: string;
             enabled: boolean;
@@ -20897,6 +24646,531 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    extensions_install: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ExtensionInstallBody"];
+            };
+        };
+        responses: {
+            /** @description Installed extension */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extension: components["schemas"]["Extension"];
+                        manifest: components["schemas"]["ExtensionManifest"];
+                        contentDeduped: boolean;
+                        /** @description Asset changes made by this install. Null when the installed version is staged, not active. */
+                        assets: {
+                            created: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                            updated: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                            skipped: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                            deleted: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                            detached: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                        } | null;
+                    };
+                };
+            };
+            /** @description Inline install disabled, invalid body (template and manifest/files are mutually exclusive), or bundle validation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Permission denied, including inline bundles from workers */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Template not found in the catalog */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_catalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predefined extensions with their installed state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extensions: components["schemas"]["ExtensionCatalogItem"][];
+                    };
+                };
+            };
+        };
+    };
+    extensions_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed extensions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extensions: components["schemas"]["Extension"][];
+                    };
+                };
+            };
+        };
+    };
+    extensions_type_defs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Generated swarm-extension.d.ts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    extensions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Extension bundle */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extension: components["schemas"]["Extension"];
+                        manifest: components["schemas"]["ExtensionManifest"];
+                        files: {
+                            [key: string]: string;
+                        };
+                    };
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Extension uninstalled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {boolean} */
+                        deleted: true;
+                        assets: {
+                            deleted: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                            detached: {
+                                /** @enum {string} */
+                                kind: "script" | "schedule" | "workflow" | "skill";
+                                name: string;
+                            }[];
+                        };
+                    };
+                };
+            };
+            /** @description Permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Enabled extensions cannot be uninstalled */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_update: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    priority?: number;
+                    config?: {
+                        [key: string]: unknown;
+                    };
+                    description?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Updated extension */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extension: components["schemas"]["Extension"];
+                    };
+                };
+            };
+            /** @description Extension config validation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_versions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Extension versions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        versions: components["schemas"]["ExtensionVersion"][];
+                    };
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_runs: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Extension run log */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        runs: components["schemas"]["ExtensionRun"][];
+                    };
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_enable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Enabled extension */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extension: components["schemas"]["Extension"];
+                    };
+                };
+            };
+            /** @description Extension load or config validation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_disable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Disabled extension */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extension: components["schemas"]["Extension"];
+                    };
+                };
+            };
+            /** @description Permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Extension not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    extensions_activate_version: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    version: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Activated extension */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        extension: components["schemas"]["Extension"];
+                    };
+                };
+            };
+            /** @description Extension load or config validation failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Permission denied */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Extension or version not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     oauth_static_callback: {
         parameters: {
             query?: {
@@ -23001,12 +27275,16 @@ export interface operations {
                     template?: string;
                     task?: string;
                     agentId?: string;
+                    /** @enum {string} */
+                    routingReason?: "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
+                    routingNote?: string;
                     tags?: string[];
                     priority?: number;
                     offerMode?: boolean;
                     dir?: string;
                     vcsRepo?: string;
                     model?: string;
+                    allowCustomModel?: boolean;
                     /** Format: uuid */
                     parentTaskId?: string;
                     requestedByUserId?: string;
@@ -23038,7 +27316,7 @@ export interface operations {
                     "application/json": {
                         taskId: string;
                         /** @enum {string} */
-                        status: "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
+                        status: "draft" | "backlog" | "unassigned" | "offered" | "reviewing" | "pending" | "in_progress" | "paused" | "completed" | "failed" | "cancelled" | "superseded";
                     };
                 };
             };
@@ -23171,7 +27449,7 @@ export interface operations {
                         stderr: string;
                         exitCode: number;
                         /** @enum {string} */
-                        error?: "timeout" | "oom" | "killed" | "import_violation" | "eval_error" | "executor_error";
+                        error?: "timeout" | "oom" | "killed" | "import_violation" | "eval_error" | "executor_error" | "capacity_exceeded";
                         runtimeError?: {
                             name: string;
                             message: string;

@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import {
-  getAllAgents,
+  getAgentStatusCounts,
   getAllLogs,
   getAllServices,
   getConcurrentContext,
@@ -11,11 +11,15 @@ import {
   getTaskStats,
   withFavoriteFlags,
 } from "../be/db";
+import { getDbRetentionStats } from "../be/db-retention";
 import { isSteeringEnabled } from "../be/steering";
 import type { AgentLog } from "../types";
 import { AgentLogSchema, ScheduledTaskSchema, ServiceSchema } from "../types";
+import { isEnvFlagEnabled } from "../utils/env-flag";
+import { isMultiRuntimeEnabled } from "../utils/multi-runtime";
 import { resolveHttpFavoriteOwner } from "./favorite-owner";
 import { route } from "./route-def";
+import { scheduleSummaryWithFavoriteSchema } from "./schedules";
 
 // ─── Response schemas ────────────────────────────────────────────────────────
 
@@ -47,6 +51,26 @@ const DashboardStatsSchema = z.object({
   agents: AgentCountsSchema,
   tasks: TaskCountsSchema,
   steeringEnabled: z.boolean(),
+  multiRuntimeEnabled: z.boolean(),
+  devMode: z.boolean(),
+});
+
+/** Mirrors `DbRetentionTableStats` (src/be/db-retention.ts). */
+const RetentionTableStatsSchema = z.object({
+  at: z.string(),
+  rowsDeleted: z.number(),
+  batches: z.number(),
+  durationMs: z.number(),
+  dryRun: z.boolean(),
+  cumulativeRowsDeleted: z.number(),
+  outcome: z.enum(["converged", "budget_exhausted", "error"]),
+  drained: z.boolean(),
+  backlogRemaining: z.number(),
+  batchSize: z.number(),
+  slowestStatementMs: z.number(),
+  lastError: z.string().optional(),
+  lastErrorAt: z.string().optional(),
+  lastSuccessAt: z.string().optional(),
 });
 
 /** Mirrors `SwarmMetrics` (src/be/db.ts). */
@@ -57,6 +81,12 @@ const SwarmMetricsSchema = z.object({
   pages: z.object({ total: z.number() }),
   sessions: z.object({ active: z.number() }),
   skills: z.object({ total: z.number() }),
+  retention: z.object({
+    sessionLogs: RetentionTableStatsSchema.optional(),
+    agentLog: RetentionTableStatsSchema.optional(),
+    events: RetentionTableStatsSchema.optional(),
+    contextVersions: RetentionTableStatsSchema.optional(),
+  }),
 });
 
 /** Mirrors `ConcurrentContext` (src/be/db.ts). */
@@ -157,6 +187,8 @@ const listScheduledTasks = route({
   path: "/api/scheduled-tasks",
   pattern: ["api", "scheduled-tasks"],
   summary: "List scheduled tasks",
+  description:
+    "Returns full schedules by default. Pass `fields=slim` for the list-view shape, which swaps the full `taskTemplate` for a bounded `taskTemplatePreview`. Fetch one schedule in full via `GET /api/schedules/{id}`.",
   tags: ["Stats"],
   query: z.object({
     enabled: z.enum(["true", "false"]).optional(),
@@ -166,11 +198,18 @@ const listScheduledTasks = route({
     targetType: z.enum(["agent-task", "workflow", "script"]).optional(),
     workflowId: z.string().uuid().optional(),
     scriptName: z.string().optional(),
+    /** `slim` is the list-view shape (no full `taskTemplate`); default is full. */
+    fields: z.enum(["full", "slim"]).optional(),
   }),
   responses: {
     200: {
       description: "Scheduled tasks list",
-      schema: z.object({ scheduledTasks: z.array(ScheduledTaskSchema) }),
+      schema: z.object({
+        scheduledTasks: z.union([
+          z.array(ScheduledTaskSchema),
+          z.array(scheduleSummaryWithFavoriteSchema),
+        ]),
+      }),
     },
   },
 });
@@ -211,16 +250,11 @@ export async function handleStats(
   }
 
   if (getStats.match(req.method, pathSegments)) {
-    const agents = await getAllAgents();
+    const agents = await getAgentStatusCounts();
     const taskStats = await getTaskStats();
 
     const stats = {
-      agents: {
-        total: agents.length,
-        idle: agents.filter((a) => a.status === "idle").length,
-        busy: agents.filter((a) => a.status === "busy").length,
-        offline: agents.filter((a) => a.status === "offline").length,
-      },
+      agents,
       tasks: {
         total: taskStats.total,
         unassigned: taskStats.unassigned,
@@ -235,6 +269,18 @@ export async function handleStats(
       // Authenticated home for the steering feature flag — deliberately NOT on
       // the unauthenticated /health endpoint (config must not leak).
       steeringEnabled: isSteeringEnabled(),
+      devMode: isEnvFlagEnabled("SWARM_DEV_MODE", false),
+      // Same authenticated home, for the same reason. Read through the helper
+      // the server itself branches on, and read PER REQUEST rather than
+      // captured at module load, so the reported value tracks a `swarm_config`
+      // reload the way every other consumer of the flag does.
+      //
+      // Worth stating because the difference is not visible from the outside:
+      // when the mode is off, runtime-instance rows are never written, so an
+      // empty runtime-instance list means either "no runtimes registered" or
+      // "this server does not track them at all". Those need different
+      // responses from a client, and nothing else on the API separates them.
+      multiRuntimeEnabled: isMultiRuntimeEnabled(),
     };
 
     getStats.respond(res, 200, stats);
@@ -242,7 +288,10 @@ export async function handleStats(
   }
 
   if (getMetrics.match(req.method, pathSegments)) {
-    getMetrics.respond(res, 200, await getSwarmMetrics());
+    getMetrics.respond(res, 200, {
+      ...(await getSwarmMetrics()),
+      retention: getDbRetentionStats(),
+    });
     return true;
   }
 
@@ -261,7 +310,7 @@ export async function handleStats(
   if (listScheduledTasks.match(req.method, pathSegments)) {
     const parsed = await listScheduledTasks.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const scheduledTasks = await getScheduledTasks({
+    const filters = {
       enabled: parsed.query.enabled !== undefined ? parsed.query.enabled === "true" : undefined,
       name: parsed.query.name || undefined,
       scheduleType: (parsed.query.scheduleType as "recurring" | "one_time") || undefined,
@@ -272,13 +321,15 @@ export async function handleStats(
       targetType: parsed.query.targetType,
       workflowId: parsed.query.workflowId,
       scriptName: parsed.query.scriptName,
-    });
+    };
     const favoriteScope = (await resolveHttpFavoriteOwner(req, myAgentId))?.scope;
+    const favoriteOpts = { favoriteScope, itemType: "schedule" as const };
+    // Opt-in: API, MCP and script callers that don't ask keep the full rows.
     listScheduledTasks.respond(res, 200, {
-      scheduledTasks: await withFavoriteFlags(scheduledTasks, {
-        favoriteScope,
-        itemType: "schedule",
-      }),
+      scheduledTasks:
+        parsed.query.fields === "slim"
+          ? await withFavoriteFlags(await getScheduledTasks(filters, { slim: true }), favoriteOpts)
+          : await withFavoriteFlags(await getScheduledTasks(filters), favoriteOpts),
     });
     return true;
   }

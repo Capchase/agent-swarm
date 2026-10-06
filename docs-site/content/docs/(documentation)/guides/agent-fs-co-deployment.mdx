@@ -5,6 +5,10 @@ description: Run agent-fs alongside Agent Swarm for persistent shared files, tas
 
 agent-swarm uses `local-fs` by default when no agent-fs endpoint is configured. That keeps fresh installs self-contained, but files stay local to the API process. Set `AGENT_FS_API_URL` and let the API boot seeder provision `API_AGENT_FS_API_KEY` plus per-agent `AGENT_FS_API_KEY` secrets to enable the richer provider.
 
+## Document delivery
+
+Agent prompts direct short answers to the task output and documents such as reports, summaries, research, and drafts to Markdown files in agent-fs. Without agent-fs, documents use Markdown task attachments. Pages are reserved for polished artifacts shared with a wider audience or explicitly requested; interactive tools use apps.
+
 ## What Changes
 
 With agent-fs enabled, task attachments and `/api/fs/*` use a shared filesystem provider instead of the local data directory. The dashboard can upload, preview, download, and delete task files. Workers can also write agent-fs pointers through `store-progress`; before changing task state, the server verifies that every pointer exists in the exact organization and drive supplied on the attachment or resolved from the registering agent's configured defaults. If scope, credentials, or a file is missing, the entire call fails without registering any attachment or terminal result.
@@ -26,12 +30,14 @@ The first-class agent-fs integration has two deliberate v1 limits:
 | Limit | Value |
 |---|---|
 | Signed URL expiry | 1 hour maximum |
-| Upload file types | All types allowed |
+| API upload file types | All types allowed; the [session composer](/docs/ui#file-attachments) accepts a narrower list |
 | Upload size | 50 MB maximum |
 
 ## Docker Compose
 
 `docker-compose.local.yml` and `docker-compose.example.yml` include MinIO and agent-fs. The API waits for agent-fs, sets `AGENT_FS_API_URL=http://agent-fs:7433`, and registers a service key on first boot when `API_AGENT_FS_API_KEY` is not supplied.
+
+The `minio-init` service turns on object versioning for the bucket. agent-fs needs it for content diffs and `revert`, which [Comb](/docs/ui/comb) uses to review agent edits. agent-fs checks versioning once at startup. On a running stack, run `docker compose -f docker-compose.local.yml up -d minio-init && docker compose -f docker-compose.local.yml restart agent-fs`. Versions written before that keep no stored content. For your own S3 bucket (for example with Helm), turn on versioning before agent-fs starts.
 
 ```bash
 docker compose -f docker-compose.local.yml up --build
@@ -50,7 +56,7 @@ S3_SECRET_ACCESS_KEY=minioadmin
 EMBEDDING_PROVIDER=local
 ```
 
-Set `API_AGENT_FS_API_KEY` if you want to pre-provision a stable API-owned bootstrap key. Otherwise, the API seeder calls `/auth/register`, stores the generated key as an encrypted global swarm config secret, creates the shared org and drive, and persists `AGENT_FS_DEFAULT_ORG_ID` plus `AGENT_FS_DEFAULT_DRIVE_ID`. Workers do not receive this bootstrap key; the runner asks the API to create an agent-scoped `AGENT_FS_API_KEY` for each agent.
+Set `API_AGENT_FS_API_KEY` if you want to pre-provision a stable API-owned bootstrap key. Otherwise, the API seeder calls `/auth/register`, stores the generated key as an encrypted global swarm config secret, creates the shared org and drive, and persists `AGENT_FS_DEFAULT_ORG_ID` plus `AGENT_FS_DEFAULT_DRIVE_ID`. Workers do not receive this bootstrap key; the runner asks the API to create an agent-scoped `AGENT_FS_API_KEY` for each agent. If an agent's canonical registration already exists but its key was lost, provisioning registers a UUID-suffixed recovery identity, invites it to the shared organization as an editor, and stores the new agent-scoped key.
 
 ## Late Provisioning and Shared-Org Invitations
 
@@ -75,7 +81,7 @@ Enable the co-deployed service with `agentFs.enabled=true`:
 agentFs:
   enabled: true
   image:
-    tag: 0.9.0
+    tag: 0.15.1
   bucket: agentfs
   s3:
     existingSecret: agent-fs-s3

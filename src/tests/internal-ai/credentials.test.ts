@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DEFAULT_MODEL,
   type ResolveCredentialOptions,
   resolveCredential,
 } from "../../utils/internal-ai/credentials.js";
@@ -30,15 +31,38 @@ describe("resolveCredential", () => {
     expect(cred?.kind).toBe("openrouter");
     if (cred?.kind === "openrouter") {
       expect(cred.apiKey).toBe("or-1");
-      expect(cred.modelDefault).toBe("openrouter/google/gemini-3-flash-preview");
+      expect(cred.modelDefault).toBe("openrouter/deepseek/deepseek-v4.1-flash");
+    }
+  });
+
+  test("modelDefault follows the pinned rater model, not DEFAULT_MODEL", async () => {
+    const saved = process.env.MEMORY_RATER_MODEL;
+    delete process.env.MEMORY_RATER_MODEL;
+    const before = { ...DEFAULT_MODEL };
+    try {
+      DEFAULT_MODEL.openrouter = "openrouter/some/bumped-model";
+      DEFAULT_MODEL.anthropic = "anthropic/bumped";
+      const viaOpenRouter = await resolveCredential(
+        makeOpts({ env: { OPENROUTER_API_KEY: "or-1" } }),
+      );
+      expect(viaOpenRouter?.modelDefault).toBe("openrouter/deepseek/deepseek-v4.1-flash");
+      const viaAnthropic = await resolveCredential(
+        makeOpts({ env: { ANTHROPIC_API_KEY: "example-sk-ant-1" } }),
+      );
+      expect(viaAnthropic?.modelDefault).toBe("anthropic/claude-haiku-4-5");
+    } finally {
+      Object.assign(DEFAULT_MODEL, before);
+      if (saved !== undefined) process.env.MEMORY_RATER_MODEL = saved;
     }
   });
 
   test("ANTHROPIC_API_KEY when no openrouter", async () => {
-    const cred = await resolveCredential(makeOpts({ env: { ANTHROPIC_API_KEY: "sk-ant-1" } }));
+    const cred = await resolveCredential(
+      makeOpts({ env: { ANTHROPIC_API_KEY: "example-sk-ant-1" } }),
+    );
     expect(cred?.kind).toBe("anthropic");
     if (cred?.kind === "anthropic") {
-      expect(cred.apiKey).toBe("sk-ant-1");
+      expect(cred.apiKey).toBe("example-sk-ant-1");
       expect(cred.modelDefault).toBe("anthropic/claude-haiku-4-5");
     }
   });
@@ -48,7 +72,7 @@ describe("resolveCredential", () => {
     expect(cred?.kind).toBe("openai");
     if (cred?.kind === "openai") {
       expect(cred.apiKey).toBe("sk-o-1");
-      expect(cred.modelDefault).toBe("openai/gpt-5.4-mini");
+      expect(cred.modelDefault).toBe("openai/gpt-6-luna");
     }
   });
 
@@ -57,7 +81,7 @@ describe("resolveCredential", () => {
       makeOpts({
         env: {},
         apiUrl: "http://localhost:3013",
-        apiKey: "test-api-key",
+        apiKey: "example-test-api-key",
         _getValidCodexOAuth: async () => ({
           access: "at_codex",
           refresh: "rt_codex",
@@ -70,14 +94,14 @@ describe("resolveCredential", () => {
             refresh: "rt_codex_refreshed",
             expires: Date.now() + 3600_000,
           },
-          apiKey: "codex-api-key-derived",
+          apiKey: "example-codex-api-key-derived",
         }),
       }),
     );
     expect(cred?.kind).toBe("openai-codex");
     if (cred?.kind === "openai-codex") {
-      expect(cred.apiKey).toBe("codex-api-key-derived");
-      expect(cred.modelDefault).toBe("openai-codex/gpt-5.4-mini");
+      expect(cred.apiKey).toBe("example-codex-api-key-derived");
+      expect(cred.modelDefault).toBe("openai-codex/gpt-6-luna");
     }
   });
 
@@ -85,10 +109,10 @@ describe("resolveCredential", () => {
     const cred = await resolveCredential({
       env: {},
       apiUrl: "http://localhost:3013",
-      apiKey: "test-api-key",
+      apiKey: "example-test-api-key",
       _getEnvApiKey: () => undefined,
       _getValidCodexOAuth: async () => ({
-        access: "at_provider_runtime",
+        access: "example-at_provider_runtime",
         refresh: "rt_provider_runtime",
         expires: Date.now() + 3600_000,
         accountId: "acc-runtime",
@@ -98,8 +122,8 @@ describe("resolveCredential", () => {
 
     expect(cred).toEqual({
       kind: "openai-codex",
-      apiKey: "at_provider_runtime",
-      modelDefault: "openai-codex/gpt-5.4-mini",
+      apiKey: "example-at_provider_runtime",
+      modelDefault: "openai-codex/gpt-6-luna",
     });
   });
 
@@ -110,7 +134,7 @@ describe("resolveCredential", () => {
       makeOpts({
         env: {},
         apiUrl: "http://localhost:3013",
-        apiKey: "test-api-key",
+        apiKey: "example-test-api-key",
         _getValidCodexOAuth: async () => ({
           access: "at_codex",
           refresh: "rt_codex",
@@ -123,7 +147,7 @@ describe("resolveCredential", () => {
             refresh: "rt_rotated",
             expires: 999_999,
           },
-          apiKey: "codex-derived",
+          apiKey: "example-codex-derived",
         }),
         _persistCodexOAuth: async (_url, _key, creds) => {
           persisted = creds;
@@ -142,7 +166,7 @@ describe("resolveCredential", () => {
       makeOpts({
         env: {},
         apiUrl: "http://localhost:3013",
-        apiKey: "test-api-key",
+        apiKey: "example-test-api-key",
         _getValidCodexOAuth: async () => ({
           access: "at_codex",
           refresh: "rt_codex",
@@ -151,7 +175,7 @@ describe("resolveCredential", () => {
         }),
         _getOAuthApiKey: async () => ({
           newCredentials: { access: "a", refresh: "r", expires: 1 },
-          apiKey: "still-usable",
+          apiKey: "example-still-usable",
         }),
         _persistCodexOAuth: async () => {
           throw new Error("write failed");
@@ -171,7 +195,7 @@ describe("resolveCredential", () => {
 
   test("CLAUDE_CODE_OAUTH_TOKEN fallback", async () => {
     const cred = await resolveCredential(
-      makeOpts({ env: { CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth" } }),
+      makeOpts({ env: { CLAUDE_CODE_OAUTH_TOKEN: "example-claude-oauth" } }),
     );
     expect(cred?.kind).toBe("claude-cli");
     if (cred?.kind === "claude-cli") {
@@ -184,7 +208,7 @@ describe("resolveCredential", () => {
     // claude-adapter.ts sets AGENT_SWARM_CLAUDE_OAUTH_TOKEN as a mirror so
     // the hook can still resolve the claude-cli fallback.
     const cred = await resolveCredential(
-      makeOpts({ env: { AGENT_SWARM_CLAUDE_OAUTH_TOKEN: "mirror-oauth" } }),
+      makeOpts({ env: { AGENT_SWARM_CLAUDE_OAUTH_TOKEN: "example-mirror-oauth" } }),
     );
     expect(cred?.kind).toBe("claude-cli");
     if (cred?.kind === "claude-cli") {
@@ -248,7 +272,7 @@ describe("resolveCredential", () => {
     let probed = false;
     const cred = await resolveCredential(
       makeOpts({
-        env: { CLAUDE_CODE_OAUTH_TOKEN: "claude-token" },
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "example-claude-token" },
         _getValidCodexOAuth: async () => {
           probed = true;
           return null;
@@ -262,7 +286,7 @@ describe("resolveCredential", () => {
   test("with apiUrl/apiKey but codex OAuth not configured → falls through to CLAUDE_CODE_OAUTH_TOKEN", async () => {
     const cred = await resolveCredential(
       makeOpts({
-        env: { CLAUDE_CODE_OAUTH_TOKEN: "claude-token" },
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "example-claude-token" },
         apiUrl: "http://localhost:3013",
         apiKey: "k",
         _getValidCodexOAuth: async () => null,
@@ -274,7 +298,7 @@ describe("resolveCredential", () => {
   test("CLAUDE_CODE_OAUTH_TOKEN-only env → claude-cli kind (Phase 4 fallback)", async () => {
     const cred = await resolveCredential(
       makeOpts({
-        env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-test-oauth" },
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "example-sk-test-oauth" },
         callerTag: "claude-stop-hook",
       }),
     );

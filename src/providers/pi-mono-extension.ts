@@ -6,10 +6,11 @@
  * with full behavioral parity.
  */
 
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ExtensionFactory, McpServerConfig } from "@earendil-works/pi-coding-agent";
 import { buildRatingsFromLlm, fetchRetrievalsForTask, postRatings } from "../be/memory/raters/llm";
 import { checkToolLoop, clearToolHistory } from "../hooks/tool-loop-detection";
 import { summarizeSession as runSummarize } from "../utils/internal-ai";
+import { getMemoryRaterNames } from "../utils/memory-raters";
 import { scrubSecrets } from "../utils/secret-scrubber";
 
 export interface SwarmHooksConfig {
@@ -24,6 +25,11 @@ export interface SwarmHooksConfig {
    * `OPENROUTER_BASE_URL`) apply — they never reach `process.env`.
    */
   env?: Record<string, string | undefined>;
+  /**
+   * Agent-installed MCP servers, already in pi's config shape. Registered with
+   * pi's MCP extension on `session_start`, which connects them.
+   */
+  mcpServers?: Record<string, McpServerConfig>;
 }
 
 /** Standard headers for swarm API requests */
@@ -341,11 +347,7 @@ export async function summarizeSessionForPi(
 
     const taskDetails = await fetchTaskDetails(config).catch(() => null);
 
-    const memoryRaters = (process.env.MEMORY_RATERS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const wantRatings = memoryRaters.includes("llm");
+    const wantRatings = getMemoryRaterNames().includes("llm");
     const retrievals = wantRatings
       ? await _fetchRetrievals({
           apiUrl: config.apiUrl,
@@ -403,7 +405,7 @@ export async function summarizeSessionForPi(
     }
 
     if (wantRatings && result.ratings && result.ratings.length > 0) {
-      const ratingEvents = _buildRatings(result.ratings, retrievals);
+      const ratingEvents = _buildRatings(result.ratings, retrievals, result.model);
       if (ratingEvents.length > 0) {
         await _postRatings({
           apiUrl: config.apiUrl,
@@ -431,6 +433,16 @@ export function createSwarmHooksExtension(config: SwarmHooksConfig): ExtensionFa
 
     // === session_start → SessionStart ===
     pi.on("session_start", async (_event, _ctx) => {
+      // Installed MCP servers: pi's MCP extension connects them in the
+      // background; the first prompt waits for them (bounded by pi).
+      for (const [name, server] of Object.entries(config.mcpServers ?? {})) {
+        try {
+          pi.registerMcpServer(name, server);
+        } catch (err) {
+          console.warn(`[pi] Failed to register MCP server "${name}": ${err}`);
+        }
+      }
+
       // Ping server
       fireAndForget(`${config.apiUrl}/ping`, {
         method: "POST",

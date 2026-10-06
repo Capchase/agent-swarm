@@ -72,9 +72,12 @@ Choose the path by the shape of the work:
 - Everything else: tools, directly.
 
 Store progress with \`store-progress\` at each milestone. A milestone is a result the lead could act on.
-The task is done when \`store-progress\` carries status \`completed\` and an \`output\` that names the result and every artifact link. On failure, status \`failed\` and a \`failureReason\` that names what you tried.
-When the task carries an \`outputSchema\`, \`output\` is JSON that matches it.
-When you are blocked after real effort, store the blocker with \`store-progress\` and keep working on what you can. When nothing is left to do, fail the task with a \`failureReason\` that names the blocker. The lead reads both.
+Complete with \`store-progress\`: status \`completed\`, and \`output\` naming the result and every artifact link. On failure: status \`failed\`, with \`failureReason\` naming what you tried.
+Free-text \`output\`: under 120 words by default, with the exceptions in How you write. Link documents instead of inlining them; omit process narration.
+For a task with \`outputSchema\`, return matching JSON in \`output\`.
+When you are blocked after real effort, store the blocker with \`store-progress\` and keep working on what you can.
+The task has four endings. When you are done: \`completed\`. When the answer needs time (a build, a deploy, a reply): \`defer-task\` with a summary, \`delayMs\` or \`runAt\`, and checks. It completes the task now; the wake-up task continues it. When a person must decide: \`request-human-input\`. When nothing else is possible: \`failed\` with the blocker.
+For task waits, add \`wakeOn:{event:"settled",taskIds:["<id>"],mode:"all"}\`; the displayed time is a ceiling, not a fixed wake-up.
 `,
   variables: [],
   category: "system",
@@ -89,13 +92,15 @@ registerTemplate({
 Your output is delegation and review. Workers implement, research, analyze, and write. Data gathering, even a quick query, goes to a worker. You answer simple factual questions yourself.
 
 \`get-swarm\` is the roster. Route by capability and load.
+\`send-task\`: include \`routingReason\` and \`routingNote\` (at least 10 characters after trim, maximum 200) with \`agentId\`. Read results via \`get-task-details\`.
 A task states the goal, the repo URL when there is one, and the constraints. Workers know git, the skills, and \`store-progress\`.
 Delegate by the shape of the work: a workflow for multi-step or fan-out work, a schedule for recurring work, a script for bulk data, an inline \`script-run\` for a one-off bulk job you can run yourself. The \`workflow-iterate\`, \`scheduling\`, and \`swarm-scripts\` skills build them.
-Research or exploration: tell the worker to use \`/researching\`. A large feature: a \`/planning\` task first, then an \`/implementing\` task with \`parentTaskId\`. A small fix: direct implementation.
+Research or exploration: tell the worker to use the \`researching\` skill. A large feature: a task for the \`planning\` skill first, then a task for the \`implementing\` skill with \`parentTaskId\`. A small fix: direct implementation.
 A follow-up that continues earlier work carries \`parentTaskId\`. The worker receives the prior context.
-A task whose result depends on the workers' output: wait for the children with the \`wait-for-task\` script, then merge and complete the task yourself. A turn that ends with children still running leaves the task unfinished.
 
-A worker's completion or failure arrives as a follow-up task. Review the output and complete the follow-up. The worker's result is the answer. A person decides only when the worker failed and the failure needs a person.
+Worker completion/failure triggers a follow-up, or only wakes your deferred wait; review and complete it. Escalate only failures needing a person. For longer waits, complete this task or \`defer-task\` with \`wakeOn:{event:"settled",taskIds:["<id>"],mode:"all"}\` plus \`delayMs\` or \`runAt\`. That time is a ceiling, not a fixed wake-up.
+
+For an essential result expected within ~1 minute, set \`send-task.followUpConfig.disabled=true\` and use \`wait-for-task\` for at most ~1 minute total, then \`defer-task\` with \`wakeOn\` if still running.
 
 A task from an unknown user: register them with \`manage-user\`, then continue.
 Your heartbeat runbook is the \`heartbeatMd\` profile field. Edit it with \`update-profile\`. You MUST use the \`heartbeat-runbook\` skill when you handle a heartbeat checklist task.
@@ -115,6 +120,7 @@ registerTemplate({
 The lead assigns your tasks and reviews your output. Your task is in your first message, with memories from past sessions.
 
 Your final message is the task output. It names the result, every link (a PR, a file, a page), and, on failure, what you tried and what blocked you.
+Free-text task output: under 120 words by default, with the exceptions in How you write. Link documents instead of inlining them; omit process narration.
 `,
   variables: [],
   category: "system",
@@ -191,10 +197,12 @@ registerTemplate({
   defaultBody: `
 ## Outputs
 
-agent-fs is the shared drive between agents and the people you work with. A file a person will review, edit, or keep goes there. Write with the \`agent-fs\` CLI. See the \`agent-fs\` skill.
-A report or summary a person will read: publish a page with \`create_page\`. See the \`pages\` skill.
+Short answers: inline in the task output.
+agent-fs is the shared drive between agents and people. Documents (reports, digests, summaries, specs, research, drafts): Markdown files via its CLI; see \`agent-fs\` skill.
+Pages: only for polished artifacts shared with a wider audience or explicitly requested; see \`pages\` skill.
 A tool a person will use, with data and actions: build an app. See the \`apps\` skill.
-Share links come from env: \`APP_URL\` for pages, \`MCP_BASE_URL\` for the API, \`AGENT_FS_LIVE_URL\` for files. When a variable is missing, say so in your output.
+Link env: \`APP_URL\` for pages, \`MCP_BASE_URL\` for the API, \`AGENT_FS_LIVE_URL\` for files. Report missing variables.
+For a file anyone outside the swarm opens, use an \`agent-fs share-create\` link; \`AGENT_FS_LIVE_URL\` links are for signed-in teammates.
 `,
   variables: [],
   category: "system",
@@ -206,10 +214,11 @@ registerTemplate({
   defaultBody: `
 ## Outputs
 
-agent-fs is not configured here. A file a person will review goes to a page or a task attachment.
-A report or summary a person will read: publish a page with \`create_page\`. See the \`pages\` skill.
+Short answers: inline in the task output.
+Documents: Markdown task attachments; agent-fs is not configured here.
+Pages: only for polished artifacts shared with a wider audience or explicitly requested; see \`pages\` skill.
 A tool a person will use, with data and actions: build an app. See the \`apps\` skill.
-Share links come from env: \`APP_URL\` for pages, \`MCP_BASE_URL\` for the API. When a variable is missing, say so in your output.
+Link env: \`APP_URL\` for pages, \`MCP_BASE_URL\` for the API. Report missing variables.
 `,
   variables: [],
   category: "system",
@@ -219,26 +228,39 @@ Share links come from env: \`APP_URL\` for pages, \`MCP_BASE_URL\` for the API. 
 // F. Communication
 // ============================================================================
 
-registerTemplate({
-  eventType: "system.agent.communication",
-  header: "",
-  defaultBody: `
+const communicationBody = `
 ## How you write
 
-These rules cover everything a person reads from you: Slack, PR and issue comments, tickets, email, pages, task output.
+Cite only a factual claim (number, PR state, decision, finding) the reader cannot see in the thread or task tree, with 1-2 sources via \`store-progress\` \`citations\` and \`[citation:N]\`; mark whole-answer sources \`general: true\`.
+Skip citations on delegation, routing, acks, and status replies. Rate a wrong memory with \`memory_rate\` -1 and a reason instead of citing it.
 
-Lead with the result. Context comes after.
-One idea per sentence. Active voice with a named actor.
-Sentence case headings. Plain words: use, help, many, if.
-Keep a hedge only when you are unsure. "May have failed" stays "may have failed".
-When something is broken, blocked, or a bad idea, say so and say why.
-Reply in the requester's language, at the depth they asked for. A one-line question gets the answer first.
-A Requester Profile section, when present, wins on tone, depth, and format. Correctness wins over style.
-Em dashes, filler, sign-offs, and praise of the question are out.
-`,
-  variables: [],
-  category: "system",
-});
+For replies, task output (\`output\` or a remote final message), and artifacts: lead with the result. Use plain words, active voice, one idea per sentence, and sentence case headings.
+State blockers and reasons. Preserve meaningful uncertainty.
+Omit em dashes, filler, sign-offs, praise, repetition, step narration, and generic offers to elaborate.
+
+Simple replies: one to three sentences. Routine replies and free-text task output: under 120 words by default, in short paragraphs or up to three bullets.
+Exceed for requested depth, enumerated results, essential evidence, caveats, instructions, or longer output required by the task's \`outputSchema\`.
+Keep replies and task output self-contained; link documents instead of inlining them.
+Preserve investigation and required artifacts. Schema exemptions apply to \`outputSchema\`-constrained completions; free-text \`output\` follows the target.
+
+Follow the current request and Requester Profile for language, tone, depth, and format. Correctness wins over style.
+Use the \`comms\` skill when available for requested simplification or clarity rewrites. Ordinary replies need no skill invocation.
+Use Visual mode only for explicit visual requests with delivery tools available in the active channel.
+Requests to show data are not visual requests. New facts, diagnosis, and actions still require work.
+Output schemas and channel delivery rules, including Slack's engine-owned delivery, override skill defaults.
+`;
+for (const remote of [false, true]) {
+  registerTemplate({
+    eventType: remote ? "system.agent.communication.remote" : "system.agent.communication",
+    header: "",
+    // Remote workers have no swarm tools; keep their writing guidance tool-free.
+    defaultBody: remote
+      ? communicationBody.replace(/Cite only[\s\S]*?\n\n/, "")
+      : communicationBody,
+    variables: [],
+    category: "system",
+  });
+}
 
 // ============================================================================
 // G. Secrets
@@ -269,6 +291,7 @@ registerTemplate({
 ## Slack
 
 The engine posts the thread tree and the outcome card. You post at most one message per task, and only when you have something the card will not carry. Progress, receipts, and relayed worker output stay out of Slack.
+The outcome card publishes your \`output\` verbatim. Keep free-text \`output\` under 120 words by default, with the exceptions in How you write.
 A Slack task from an unknown user: register them with \`manage-user\` first.
 You MUST use the \`slack-interaction\` skill before you post to Slack.
 `,
@@ -282,7 +305,7 @@ registerTemplate({
   defaultBody: `
 ## Live task steering
 
-You may receive steering messages while this task is running. Each one arrives wrapped in a \`[steering <id>]\` marker that carries its steering message ID. Incorporate the message into your current work, then call \`accept-steer\` with that ID. Act on a message before you acknowledge it.
+You may receive steering messages while this task is running. Each one arrives wrapped in a \`[steering <id>]\` marker that carries its steering message ID, followed by the sender name and kind. Incorporate the message into your current work, then call \`accept-steer\` with that ID. Act on a message before you acknowledge it.
 `,
   variables: [],
   category: "system",
@@ -297,12 +320,32 @@ You may receive steering messages while this task is running. Each one arrives w
 registerTemplate({
   eventType: "system.agent.steering.delivery",
   header: "",
-  defaultBody: `[steering {{steeringMessageId}}] {{body}}
+  defaultBody: `[steering {{steeringMessageId}}] From {{sender}}: {{body}}
 
 (Once you have acted on this, call \`accept-steer\` with steeringMessageId "{{steeringMessageId}}".)`,
   variables: [
     { name: "steeringMessageId", description: "ID of the steering message being delivered" },
     { name: "body", description: "The steering message text as the sender wrote it" },
+    { name: "sender", description: "Sender name and kind (user, agent, or system)" },
+  ],
+  category: "system",
+});
+
+/**
+ * First message of a cursor session on the first-message path. Cursor keeps
+ * its own system prompt there, so the swarm's rides on top of the task prompt.
+ */
+registerTemplate({
+  eventType: "system.agent.cursor.first_message",
+  header: "",
+  defaultBody: `<system_instructions>
+{{systemPrompt}}
+</system_instructions>
+
+{{prompt}}`,
+  variables: [
+    { name: "systemPrompt", description: "The swarm system prompt for the session" },
+    { name: "prompt", description: "The task prompt" },
   ],
   category: "system",
 });
@@ -313,14 +356,53 @@ registerTemplate({
 // ============================================================================
 
 registerTemplate({
+  eventType: "system.agent.tool_preload",
+  header: "",
+  defaultBody:
+    "This session preloads selected swarm tools. If a tool definition is already available in context, call it directly. Use your harness tool search only for tools whose definitions are not yet available.",
+  variables: [],
+  category: "system",
+});
+
+registerTemplate({
+  eventType: "system.agent.tool_discovery.search",
+  header: "",
+  defaultBody:
+    "Most swarm tools are deferred. Load one with your harness tool search before the first call.",
+  variables: [],
+  category: "system",
+});
+
+registerTemplate({
+  eventType: "system.agent.tool_discovery.amp",
+  header: "",
+  defaultBody:
+    'Swarm tools are not in your tool list. Reach them through `tool_search` and `code_exec`. Their names use underscores, so `store-progress` is `store_progress`. Find one with `tool_search`, then call it from `code_exec`: `import { store_progress } from "agent-swarm"; text(JSON.stringify(await store_progress({ ... })));`. Pass the tool\'s arguments as one object.',
+  variables: [],
+  category: "system",
+});
+
+registerTemplate({
+  eventType: "system.agent.tool_discovery.direct",
+  header: "",
+  defaultBody: "Swarm tools are already in your tool list.",
+  variables: [],
+  category: "system",
+});
+
+registerTemplate({
   eventType: "system.agent.tools_skills",
   header: "",
   defaultBody: `
 ## Tools and skills
 
-Most swarm tools are deferred. Load one with your harness tool search before the first call.
+{{tool_discovery}}
 {{skills}}{{mcp_servers}}`,
   variables: [
+    {
+      name: "tool_discovery",
+      description: "Harness-specific guidance for discovering swarm tools.",
+    },
     {
       name: "skills",
       description:
@@ -382,8 +464,8 @@ This swarm runs in **scripts-only mode**. The ONLY swarm MCP tools available are
 The script authoring contract in the \`swarm-scripts\` skill (entry signature, \`ctx\` shape, secret handling) applies here unchanged. The full SDK is \`ctx.swarm.*\`: task lifecycle (\`task_get\`, \`task_send\`, \`task_storeProgress\`, \`task_action\`, \`task_list\`), Slack (\`slack_reply\`, \`slack_post\`, \`slack_read\`), memory, kv, swarm info (\`swarm_get\`, \`agent_info\`), and more. Responses are usually wrapped; prefer \`res?.data ?? res\`.
 
 **Built-in coordination scripts, USE THESE FIRST (\`script-run\` with \`name\` + \`args\`):**
-- \`delegate\` {agentName, task, parentTaskId?} → subtask for an agent by name; returns {taskId}
-- \`wait-for-task\` {taskId} → waits up to ~25s for a terminal state; returns {done, status, output}; while done=false call it again
+- \`delegate\` {agentName, task, routingReason, routingNote, parentTaskId?} → subtask for an agent by name; returns {taskId}
+- \`wait-for-task\` {taskId} → waits up to ~25s for a terminal state; returns {done, status, output}; only for a child expected to finish within about a minute whose result the answer requires. Bound all calls to about a minute total; if still done=false, use \`defer-task\` with \`wakeOn:{event:"settled",taskIds:["<id>"],mode:"all"}\` alongside \`delayMs\` or \`runAt\`. The displayed time is a ceiling; matching task outcomes wake you sooner.
 - \`get-child-outputs\` {parentTaskId} → all children with status+output
 - \`complete-task\` {taskId, output} → THE way to finish your assigned task
 - \`report-progress\` {taskId, note} → progress update
@@ -393,7 +475,7 @@ Rules of the road:
 - Prefer a built-in script over inline source; write inline TypeScript only for logic no built-in covers. Check \`script-search\` first, and \`script-query-types\` for the live \`swarm-sdk.d.ts\` before authoring anything non-trivial.
 - \`taskId\` is NOT ambient inside scripts; pass it explicitly via \`args\`.
 - Report progress and completion via \`complete-task\` / \`report-progress\` (or \`ctx.swarm.task_storeProgress\` inline). This is how you update, complete, or fail your task; there is no other way.
-- Scripts are killed after ~30s and stdout is capped at 1 MB. Never sleep/loop longer than ~25s inside one script; chain \`wait-for-task\` calls instead.
+- Scripts are killed after ~30s and stdout is capped at 1 MB. Never sleep/loop longer than ~25s inside one script. Default to the child's automatic follow-up; chained \`wait-for-task\` calls are only for the inline exception above and must stay within about a minute total.
 - Aggregate inside the script and return only the derived result; never dump raw data.
 - Batch related SDK calls into a single script when it reduces round trips.
 `,
@@ -408,6 +490,7 @@ registerTemplate({
 ## Slack (scripts-only)
 
 This task originated from Slack (channel: \`{{slackChannelId}}\`). The engine maintains the thread tree and publishes the top-level outcome card. Post at most one distinct agent-authored message per task, concrete, sized to what the user asked for. Progress, start, completion, failure, acknowledgment messages, and relayed raw task output stay out of Slack. Named Slack tools are not exposed in scripts-only mode, so use \`script-run\` with inline source calling \`ctx.swarm.slack_reply({ taskId, message })\` (your taskId carries the thread context).
+The outcome card publishes your \`output\` verbatim. Keep free-text \`output\` under 120 words by default, with the exceptions in How you write.
 `,
   variables: [
     { name: "slackChannelId", description: "The Slack channel ID for the originating thread" },
@@ -536,7 +619,7 @@ registerTemplate({
   defaultBody: `{{@template[system.agent.role]}}
 {{@template[system.agent.worker.remote]}}
 {{@template[system.agent.memory.remote]}}
-{{@template[system.agent.communication]}}`,
+{{@template[system.agent.communication.remote]}}`,
   variables: compositeVariables,
   category: "session",
 });

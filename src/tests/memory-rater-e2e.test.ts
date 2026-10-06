@@ -49,7 +49,7 @@ import { getFreePort, SERVER_BOOT_HOOK_TIMEOUT_MS, waitForServer } from "./test-
 let TEST_PORT = 0;
 const TEST_DB_PATH = `/tmp/test-memory-rater-e2e-${Date.now()}.sqlite`;
 let BASE = "";
-const API_KEY = "test-key";
+const API_KEY = "example-test-key";
 
 let serverProc: Subprocess;
 let store: SqliteMemoryStore;
@@ -292,9 +292,8 @@ describe("memory-rater v1.5 — cross-cutting e2e", () => {
 
     // Fire the server-rater orchestration the way `store-progress` does.
     // Inject the rater explicitly — the test process inherits its own
-    // MEMORY_RATERS env (typically unset to avoid disturbing other suites),
-    // and we want to exercise this rater regardless. Step G covers the
-    // unset-env "byte-identical" backward-compat case separately.
+    // MEMORY_RATERS env (unset defaults to implicit-citation,explicit-self),
+    // and we want to exercise implicit-citation regardless.
     const evidenceRows = await getDbClient().query<{ content: string }>(
       "SELECT content FROM session_logs WHERE taskId = ? ORDER BY iteration, lineNumber",
       [taskId],

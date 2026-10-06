@@ -1,0 +1,66 @@
+/**
+ * HTTP helpers used by the ACP adapter to mint and revoke ephemeral session
+ * tokens via the swarm API. This keeps the provider layer free of direct
+ * DB imports while still allowing the adapter to exchange the full operator
+ * key for a short-lived aseph_ bearer before handing credentials to the
+ * ACP target process.
+ */
+import { scrubSecrets } from "./secret-scrubber";
+
+const REVOKE_TIMEOUT_MS = 5000;
+
+/** Wall-clock TTL for a session token: 24 hours. Long enough for any realistic
+ * ACP session; the token is actively revoked when the session finishes anyway. */
+export const ACP_SESSION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Ask the swarm API to mint a short-lived `aseph_` bearer for the given
+ * agent + task. Throws if the request fails so callers fail closed rather
+ * than falling back to the full operator key.
+ */
+export async function mintAcpSessionToken(
+  apiUrl: string,
+  apiKey: string,
+  agentId: string,
+  taskId: string,
+): Promise<{ tokenId: string; plaintext: string }> {
+  const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/sessions/tokens`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ agentId, taskId, ttlMs: ACP_SESSION_TOKEN_TTL_MS }),
+  });
+  if (!res.ok) {
+    throw new Error(`\x1b[33m[acp]\x1b[0m Session token mint failed (${res.status})`);
+  }
+  const data = (await res.json()) as { tokenId: string; plaintext: string };
+  return { tokenId: data.tokenId, plaintext: data.plaintext };
+}
+
+/**
+ * Ask the swarm API to revoke a previously-minted `aseph_` token. Best-effort:
+ * the request is bounded, and errors are logged but never propagated to the
+ * caller. ACP completion does not wait for this cleanup.
+ */
+export async function revokeAcpSessionToken(
+  apiUrl: string,
+  apiKey: string,
+  tokenId: string,
+): Promise<void> {
+  try {
+    const res = await fetch(`${apiUrl.replace(/\/+$/, "")}/api/sessions/tokens/${tokenId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch (error) {
+    console.warn(
+      scrubSecrets(
+        `[acp] Session token revoke failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+  }
+}

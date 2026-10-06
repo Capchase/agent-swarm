@@ -31,9 +31,12 @@ describe("generateManifest", () => {
     expect(manifest).toHaveProperty("createdAt");
     expect(manifest).toHaveProperty("deployType");
     expect(manifest).toHaveProperty("preset");
+    expect(manifest).toHaveProperty("provider");
+    expect(manifest).toHaveProperty("providerLabel");
     expect(manifest).toHaveProperty("harness");
     expect(manifest).toHaveProperty("services");
     expect(manifest).toHaveProperty("integrations");
+    expect(manifest).toHaveProperty("slackMode");
     expect(manifest).toHaveProperty("composePath");
     expect(manifest).toHaveProperty("envPath");
     expect(manifest).toHaveProperty("apiUrl");
@@ -80,11 +83,25 @@ describe("generateManifest", () => {
 
   // ── State values propagate ──
 
-  test("deployType, preset, and harness match state", () => {
+  test("deployType, preset, provider, and harness match state", () => {
     const manifest = generateManifest(devState) as Record<string, unknown>;
     expect(manifest.deployType).toBe("local");
     expect(manifest.preset).toBe("dev");
+    expect(manifest.provider).toBe("claude");
+    expect(manifest.providerLabel).toBe("Claude Code");
     expect(manifest.harness).toBe("claude");
+  });
+
+  test("labels Bedrock as alpha and includes the capability warning", () => {
+    const manifest = generateManifest({
+      ...devState,
+      provider: "bedrock",
+      harness: "pi",
+    }) as Record<string, unknown>;
+    expect(manifest.providerLabel).toBe("AWS Bedrock (alpha)");
+    expect(manifest.providerNotice).toBe(
+      "Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock.",
+    );
   });
 
   // ── Integration flags match state ──
@@ -96,6 +113,17 @@ describe("generateManifest", () => {
     expect(integrations.slack).toBe(false);
     expect(integrations.gitlab).toBe(false);
     expect(integrations.sentry).toBe(true);
+    expect(manifest.slackMode).toBe("socket");
+  });
+
+  test("records HTTP transport without persisting its signing secret", () => {
+    const manifest = generateManifest({
+      ...devState,
+      slackMode: "http",
+      slackSigningSecret: "synthetic-signing-secret",
+    }) as Record<string, unknown>;
+    expect(manifest.slackMode).toBe("http");
+    expect(JSON.stringify(manifest)).not.toContain("synthetic-signing-secret");
   });
 
   test("all integrations false when none enabled", () => {

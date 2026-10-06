@@ -1,9 +1,11 @@
 import type { LiveModelsCatalog } from "@/lib/agent-runtime-models";
 import { getConfig } from "@/lib/config";
 import type {
+  AcpRuntimeConfig,
   AgentAvatar,
   AgentMcpServersResponse,
   AgentRuntimeInstancesResponse,
+  AgentRuntimeResponse,
   AgentSkillsResponse,
   AgentsResponse,
   AgentTask,
@@ -14,6 +16,7 @@ import type {
   AppListItem,
   AppRow,
   ApprovalRequest,
+  ApprovalRequestSummariesResponse,
   ApprovalRequestsResponse,
   AppUserConfigResponse,
   AppUserConfigValue,
@@ -28,14 +31,28 @@ import type {
   BudgetsResponse,
   ChannelMessage,
   ChannelsResponse,
+  ClaudeRuntimeConfig,
+  CombReviewBatchInput,
+  CombReviewBatchResult,
+  CombSkippedComment,
   CreateUserInput,
   CredentialMissingAgent,
   CredentialMissingAgentsResponse,
   DashboardCostResponse,
   EventDefinition,
+  Extension,
+  ExtensionBundle,
+  ExtensionCatalogItem,
+  ExtensionDeleteResult,
+  ExtensionInstallInput,
+  ExtensionInstallResult,
+  ExtensionPatchInput,
+  ExtensionRun,
+  ExtensionVersion,
   FavoriteItemType,
   FavoriteSetResponse,
   FavoritesResponse,
+  FeedbackInput,
   IdentitiesResponse,
   IdentityEvent,
   IdentityEventsResponse,
@@ -59,6 +76,7 @@ import type {
   MetricSaveResponse,
   MetricsListResponse,
   MintTokenResponse,
+  ModelTierPreview,
   OAuthAppDiscoveryResult,
   OAuthAuthorization,
   OAuthAuthorizeUrlResult,
@@ -109,6 +127,7 @@ import type {
   SteeringMessagesResponse,
   SteerMode,
   SteerResult,
+  SubscriptionPlansResponse,
   SwarmConfig,
   SwarmConfigsResponse,
   SwarmRepo,
@@ -136,6 +155,8 @@ import type {
   Workflow,
   WorkflowRun,
   WorkflowRunStep,
+  WorkflowRunSummary,
+  WorkflowRunsPage,
   WorkflowRunWithSteps,
   WorkflowSummary,
   WorkflowsResponse,
@@ -179,6 +200,20 @@ export class AppApiError extends Error {
 }
 
 /**
+ * A refused answer to an approval request. `message` is the server's reason;
+ * `status` tells a 403 (this credential may not answer) from a 409 (already
+ * resolved, or this responder already answered).
+ */
+export class ApprovalRespondError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApprovalRespondError";
+    this.status = status;
+  }
+}
+
+/**
  * Inspect a non-OK Response. If the body matches the frozen
  * `{ error: "TriggerSchemaError", message, details }` contract, throw a
  * `TriggerSchemaApiError`. Otherwise throw a generic Error using `genericLabel`.
@@ -211,11 +246,55 @@ async function throwTriggerSchemaErrorIfMatch(res: Response, genericLabel: strin
   throw new Error(`${genericLabel}: ${res.status}`);
 }
 
+/**
+ * "Send to swarm" failed. A 409 or 503 carries why each comment was left out
+ * (an "already-sent" entry names its task when known).
+ */
+export class CombSendError extends Error {
+  readonly status: number;
+  readonly skipped: CombSkippedComment[];
+
+  constructor(message: string, status: number, skipped: CombSkippedComment[] = []) {
+    super(message);
+    this.name = "CombSendError";
+    this.status = status;
+    this.skipped = skipped;
+  }
+}
+
+/**
+ * A rejected extension install. `POST /api/extensions/install` answers 400 with
+ * `{ error: "extension_validation_failed", diagnostics: string[] }` when the
+ * catalog bundle fails validation, and 404 for an unknown template; the catalog
+ * page renders `diagnostics` inline, one line per finding.
+ */
+export class ExtensionInstallError extends Error {
+  readonly diagnostics: string[];
+  constructor(message: string, diagnostics: string[]) {
+    super(message);
+    this.name = "ExtensionInstallError";
+    this.diagnostics = diagnostics;
+  }
+}
+
+/** Unwrap the `{ extension }` envelope every extension lifecycle route answers with. */
+async function extractExtension(res: Response, label: string): Promise<Extension> {
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error || `${label} (${res.status})`);
+  }
+  const data = (await res.json()) as { extension: Extension };
+  return data.extension;
+}
+
 export interface ModelsCatalogResponse {
   source: "live" | "snapshot";
   updatedAt: number | null;
   providers: LiveModelsCatalog;
 }
+
+/** Runs fetched per workflow for the all-workflows Runs tab. */
+export const ALL_WORKFLOW_RUNS_PER_WORKFLOW = 50;
 
 class ApiClient {
   private getHeaders(): HeadersInit {
@@ -244,6 +323,13 @@ class ApiClient {
     return res.json();
   }
 
+  async fetchModelTiers(): Promise<{ tiers: ModelTierPreview[] }> {
+    const url = `${this.getBaseUrl()}/api/models-catalog/tiers`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch model tiers: ${res.status}`);
+    return res.json();
+  }
+
   async fetchAgents(includeTasks = true): Promise<AgentsResponse> {
     const url = `${this.getBaseUrl()}/api/agents${includeTasks ? "?include=tasks" : ""}`;
     const res = await fetch(url, { headers: this.getHeaders() });
@@ -262,6 +348,27 @@ class ApiClient {
     const url = `${this.getBaseUrl()}/api/agents/${id}/runtime-instances`;
     const res = await fetch(url, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch runtime instances: ${res.status}`);
+    return res.json();
+  }
+
+  async fetchAgentTaskActivity(
+    id: string,
+    days = 365,
+  ): Promise<{ days: { date: string; count: number }[] }> {
+    const url = `${this.getBaseUrl()}/api/agents/${id}/task-activity?days=${days}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch agent task activity: ${res.status}`);
+    return res.json();
+  }
+
+  async fetchAgentRuntime(id: string, repoId?: string): Promise<AgentRuntimeResponse | null> {
+    const params = new URLSearchParams();
+    if (repoId) params.set("repoId", repoId);
+    const query = params.toString();
+    const url = `${this.getBaseUrl()}/api/agents/${id}/runtime${query ? `?${query}` : ""}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`Failed to fetch agent runtime: ${res.status}`);
     return res.json();
   }
 
@@ -310,13 +417,19 @@ class ApiClient {
 
   async updateAgentRuntime(data: {
     id: string;
-    harnessProvider: "claude" | "codex" | "pi" | "opencode";
-    model: string;
+    repoId?: string;
+    harnessProvider: "claude" | "codex" | "pi" | "opencode" | "acp" | "dsh" | "cursor" | "amp";
+    model: string | null;
     allowCustomModel?: boolean;
     /** `null` clears `REASONING_EFFORT_OVERRIDE`; omitted leaves it unchanged; a level sets it. */
     reasoningEffort?: ReasoningEffortLevel | null;
+    acp?: AcpRuntimeConfig;
+    claude?: ClaudeRuntimeConfig;
   }): Promise<AgentWithTasks> {
-    const url = `${this.getBaseUrl()}/api/agents/${data.id}/runtime`;
+    const params = new URLSearchParams();
+    if (data.repoId) params.set("repoId", data.repoId);
+    const query = params.toString();
+    const url = `${this.getBaseUrl()}/api/agents/${data.id}/runtime${query ? `?${query}` : ""}`;
     const res = await fetch(url, {
       method: "PATCH",
       headers: this.getHeaders(),
@@ -325,6 +438,8 @@ class ApiClient {
         model: data.model,
         allow_custom_model: data.allowCustomModel ?? false,
         ...(data.reasoningEffort !== undefined ? { reasoning_effort: data.reasoningEffort } : {}),
+        ...(data.acp ? { acp: data.acp } : {}),
+        ...(data.claude ? { claude: data.claude } : {}),
       }),
     });
     if (!res.ok) {
@@ -354,6 +469,10 @@ class ApiClient {
     source?: string[];
     /** Exact requester user id, or the sentinel `none` for unattributed (NULL) rows. */
     requestedByUserId?: string;
+    /** Row projection; `timeline` is the narrow shape the dashboard timeline draws. */
+    fields?: "full" | "slim" | "timeline";
+    /** Ask for the filtered `total` (an extra COUNT(*)); only pagers need it. */
+    includeTotal?: boolean;
   }): Promise<TasksResponse> {
     const params = new URLSearchParams();
     if (filters?.status) params.set("status", filters.status);
@@ -371,6 +490,8 @@ class ApiClient {
     if (filters?.source && filters.source.length > 0)
       params.set("source", filters.source.join(","));
     if (filters?.requestedByUserId) params.set("requestedByUserId", filters.requestedByUserId);
+    if (filters?.fields) params.set("fields", filters.fields);
+    if (filters?.includeTotal) params.set("includeTotal", "true");
     const queryString = params.toString();
     const url = `${this.getBaseUrl()}/api/tasks${queryString ? `?${queryString}` : ""}`;
     const res = await fetch(url, { headers: this.getHeaders() });
@@ -389,6 +510,8 @@ class ApiClient {
     task: string;
     key?: string;
     agentId?: string;
+    routingReason?: "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
+    routingNote?: string;
     taskType?: string;
     tags?: string[];
     priority?: number;
@@ -404,6 +527,12 @@ class ApiClient {
     model?: string;
     modelTier?: string;
     effort?: string;
+    /**
+     * Create in `draft` status (#1240) — visible to the owner but not
+     * dispatch-eligible. Used while attachments are still uploading; the
+     * caller must follow up with `promoteDraftTask` once the batch settles.
+     */
+    draft?: boolean;
   }): Promise<TaskWithLogs> {
     const url = `${this.getBaseUrl()}/api/tasks`;
     const res = await fetch(url, {
@@ -414,6 +543,23 @@ class ApiClient {
     if (!res.ok) {
       const error = await res.json().catch(() => ({ error: "Failed to create task" }));
       throw new Error(error.error || `Failed to create task: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Promote a `draft` task (#1240) out of the pre-dispatch draft state.
+   * Idempotent — safe to call on a task that already left `draft`.
+   */
+  async promoteDraftTask(id: string): Promise<TaskWithLogs> {
+    const url = `${this.getBaseUrl()}/api/tasks/${id}/promote-draft`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ error: "Failed to promote draft task" }));
+      throw new Error(error.error || `Failed to promote draft task: ${res.status}`);
     }
     return res.json();
   }
@@ -550,6 +696,137 @@ class ApiClient {
     return res.json();
   }
 
+  /**
+   * First-run onboarding state + live signals. `null` on 404: the API predates
+   * `/api/onboarding`, so the UI keeps today's behavior (no stepper, pill, or card).
+   */
+  async fetchOnboarding(): Promise<import("./types").OnboardingResponse | null> {
+    const url = `${this.getBaseUrl()}/api/onboarding`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`Failed to fetch onboarding: ${res.status}`);
+    return res.json();
+  }
+
+  async updateOnboarding(
+    action: import("./types").OnboardingAction,
+  ): Promise<import("./types").OnboardingResponse> {
+    const url = `${this.getBaseUrl()}/api/onboarding`;
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: this.getHeaders(),
+      body: JSON.stringify(action),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to update onboarding" }));
+      throw new Error(err.error || `Failed to update onboarding: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /** Test an embeddings endpoint; on success the API saves the EMBEDDING_* rows. */
+  async testOnboardingMemory(
+    body: import("./types").OnboardingMemoryTestRequest,
+  ): Promise<import("./types").OnboardingMemoryTestResponse> {
+    const url = `${this.getBaseUrl()}/api/onboarding/memory`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to test embeddings" }));
+      throw new Error(err.error || `Failed to test embeddings: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  async startCodexDevice(): Promise<import("./types").CodexDeviceStartResponse> {
+    const url = `${this.getBaseUrl()}/api/codex-oauth/device`;
+    const res = await fetch(url, { method: "POST", headers: this.getHeaders(), body: "{}" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to start Codex sign-in" }));
+      throw new Error(err.error || `Failed to start Codex sign-in: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  async pollCodexDevice(flowId: string): Promise<import("./types").CodexDevicePollResponse> {
+    const url = `${this.getBaseUrl()}/api/codex-oauth/device/${encodeURIComponent(flowId)}/poll`;
+    const res = await fetch(url, { method: "POST", headers: this.getHeaders(), body: "{}" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to poll Codex sign-in" }));
+      throw new Error(err.error || `Failed to poll Codex sign-in: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /** Live harness switch for one agent (worker reconciles within ~10s). */
+  async setAgentHarnessProvider(
+    id: string,
+    harnessProvider: import("./types").ProviderName,
+  ): Promise<void> {
+    const url = `${this.getBaseUrl()}/api/agents/${encodeURIComponent(id)}/harness-provider`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ harness_provider: harnessProvider }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to switch harness" }));
+      throw new Error(err.error || `Failed to switch harness: ${res.status}`);
+    }
+  }
+
+  /** Slack app manifest pre-filled with the swarm name. */
+  async fetchSlackManifest(name: string): Promise<Record<string, unknown>> {
+    const url = `${this.getBaseUrl()}/api/integrations/slack/manifest?name=${encodeURIComponent(name)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch Slack manifest: ${res.status}`);
+    return res.json();
+  }
+
+  async submitFeedback(endpoint: string, data: FeedbackInput): Promise<void> {
+    let parsedEndpoint: URL;
+    try {
+      parsedEndpoint = new URL(endpoint);
+    } catch {
+      throw new Error("Invalid feedback endpoint");
+    }
+
+    const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+    if (
+      parsedEndpoint.protocol !== "https:" &&
+      !(parsedEndpoint.protocol === "http:" && loopbackHosts.has(parsedEndpoint.hostname))
+    ) {
+      throw new Error("Invalid feedback endpoint");
+    }
+
+    const body = JSON.stringify(data);
+    let response: Response;
+
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+    } catch {
+      // Arbitrary self-hosted origins are not allowlisted by the shared proxy.
+      // Their preflight is blocked before the POST, so retain the simple opaque
+      // request as a fire-and-forget fallback.
+      await fetch(endpoint, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body,
+      });
+      return;
+    }
+
+    if (!response.ok) throw new Error(`Failed to submit feedback: ${response.status}`);
+  }
+
   async testConnection(
     provider: import("./types").ProviderName,
   ): Promise<import("./types").TestConnectionResponse> {
@@ -562,6 +839,50 @@ class ApiClient {
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: "Failed to test connection" }));
       throw new Error(err.error || `Failed to test connection: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Invite an agent-fs user (by email) into the swarm's shared org and drive.
+   * The API runs the invite with its own bootstrap key. Only the email is sent.
+   */
+  async inviteAgentFsMember(data: {
+    email: string;
+    role: "viewer" | "editor" | "admin";
+  }): Promise<{ orgId: string; invited: boolean }> {
+    const url = `${this.getBaseUrl()}/api/fs/members/invite`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Failed to invite agent-fs member: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Comb "Send to swarm": one lead task for these agent-fs comments. The
+   * server reads each comment again and skips any that are resolved,
+   * replies, or already sent.
+   */
+  async sendCombReviewBatch(data: CombReviewBatchInput): Promise<CombReviewBatchResult> {
+    const url = `${this.getBaseUrl()}/api/comb/review-batches`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new CombSendError(
+        err.error || `Failed to send comments to the swarm: ${res.status}`,
+        res.status,
+        Array.isArray(err.skipped) ? err.skipped : [],
+      );
     }
     return res.json();
   }
@@ -738,7 +1059,8 @@ class ApiClient {
     if (filters?.workflowId) params.set("workflowId", filters.workflowId);
     if (filters?.scriptName) params.set("scriptName", filters.scriptName);
     const usesAssetNamespaceFilter = !!(filters?.key || filters?.keyPrefix);
-    if (usesAssetNamespaceFilter) params.set("fields", "full");
+    // List views never render the full template; ask for the slim row.
+    params.set("fields", usesAssetNamespaceFilter ? "full" : "slim");
     const queryString = params.toString();
     const route = usesAssetNamespaceFilter ? "/api/schedules" : "/api/scheduled-tasks";
     const url = `${this.getBaseUrl()}${route}${queryString ? `?${queryString}` : ""}`;
@@ -995,6 +1317,7 @@ class ApiClient {
     id: string,
     data: Partial<
       Pick<Workflow, "key" | "name" | "description" | "enabled"> & {
+        params: Record<string, unknown>;
         // null = clear, object = set/replace, undefined/omitted = unchanged.
         triggerSchema: Record<string, unknown> | null;
       }
@@ -1052,23 +1375,37 @@ class ApiClient {
     }
   }
 
-  async fetchWorkflowRuns(workflowId: string): Promise<WorkflowRun[]> {
-    const url = `${this.getBaseUrl()}/api/workflows/${workflowId}/runs`;
+  async fetchWorkflowRuns(
+    workflowId: string,
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<WorkflowRunsPage> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.offset !== undefined) query.set("offset", String(options.offset));
+    const qs = query.size > 0 ? `?${query}` : "";
+    const url = `${this.getBaseUrl()}/api/workflows/${workflowId}/runs${qs}`;
     const res = await fetch(url, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch workflow runs: ${res.status}`);
     return res.json();
   }
 
-  async fetchAllWorkflowRuns(): Promise<WorkflowRun[]> {
+  /**
+   * The newest `perWorkflowLimit` runs of every workflow, merged newest first.
+   * `capped` is true when some workflow has older runs than the ones returned.
+   */
+  async fetchAllWorkflowRuns(
+    perWorkflowLimit = ALL_WORKFLOW_RUNS_PER_WORKFLOW,
+  ): Promise<{ runs: WorkflowRunSummary[]; capped: boolean }> {
     const { workflows } = await this.fetchWorkflows();
-    const allRuns: WorkflowRun[] = [];
+    const runs: WorkflowRunSummary[] = [];
+    let capped = false;
     for (const w of workflows) {
-      const runs = await this.fetchWorkflowRuns(w.id);
-      allRuns.push(...runs);
+      const result = await this.fetchWorkflowRuns(w.id, { limit: perWorkflowLimit });
+      runs.push(...result.runs);
+      capped ||= result.page.hasMore;
     }
-    return allRuns.sort(
-      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
-    );
+    runs.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+    return { runs, capped };
   }
 
   async fetchWorkflowRun(id: string): Promise<WorkflowRunWithSteps> {
@@ -1210,6 +1547,124 @@ class ApiClient {
       throw new Error(`${error.error || `Failed to save script (${res.status})`}${detail}`);
     }
     return res.json();
+  }
+
+  // ── Extensions ──
+
+  async fetchExtensions(): Promise<Extension[]> {
+    const url = `${this.getBaseUrl()}/api/extensions`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch extensions: ${res.status}`);
+    const data = (await res.json()) as { extensions: Extension[] };
+    return data.extensions;
+  }
+
+  async fetchExtension(id: string): Promise<ExtensionBundle> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch extension: ${res.status}`);
+    return res.json();
+  }
+
+  async fetchExtensionVersions(id: string): Promise<ExtensionVersion[]> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}/versions`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch extension versions: ${res.status}`);
+    const data = (await res.json()) as { versions: ExtensionVersion[] };
+    return data.versions;
+  }
+
+  async fetchExtensionRuns(id: string, limit = 50): Promise<ExtensionRun[]> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}/runs?limit=${limit}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch extension runs: ${res.status}`);
+    const data = (await res.json()) as { runs: ExtensionRun[] };
+    return data.runs;
+  }
+
+  /** `swarm-extension.d.ts` for the Monaco editor. Served as plain text, not JSON. */
+  async fetchExtensionTypeDefs(): Promise<string> {
+    const url = `${this.getBaseUrl()}/api/extensions/type-defs`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch extension type defs: ${res.status}`);
+    return res.text();
+  }
+
+  /** Predefined bundles (`templates/extensions/`) with their installed state. */
+  async fetchExtensionCatalog(): Promise<ExtensionCatalogItem[]> {
+    const url = `${this.getBaseUrl()}/api/extensions/catalog`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch extension catalog: ${res.status}`);
+    const data = (await res.json()) as { extensions: ExtensionCatalogItem[] };
+    return data.extensions;
+  }
+
+  /** Install (or stage a new version of) a catalog template by name. */
+  async installExtension(input: ExtensionInstallInput): Promise<ExtensionInstallResult> {
+    const url = `${this.getBaseUrl()}/api/extensions/install`;
+    const body: ExtensionInstallInput = { template: input.template };
+    if (input.priority !== undefined) body.priority = input.priority;
+    if (input.config !== undefined) body.config = input.config;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+        diagnostics?: string[];
+      };
+      const message =
+        err.error === "extension_validation_failed"
+          ? "Bundle validation failed"
+          : err.message || err.error || `Failed to install extension (${res.status})`;
+      throw new ExtensionInstallError(message, err.diagnostics ?? []);
+    }
+    return res.json();
+  }
+
+  async deleteExtension(id: string): Promise<ExtensionDeleteResult> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}`;
+    const res = await fetch(url, { method: "DELETE", headers: this.getHeaders() });
+    if (!res.ok) {
+      const err = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
+      throw new Error(err.message || err.error || `Failed to delete extension (${res.status})`);
+    }
+    return res.json();
+  }
+
+  async patchExtension(id: string, input: ExtensionPatchInput): Promise<Extension> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: this.getHeaders(),
+      body: JSON.stringify(input),
+    });
+    return extractExtension(res, "Failed to update extension");
+  }
+
+  async enableExtension(id: string): Promise<Extension> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}/enable`;
+    const res = await fetch(url, { method: "POST", headers: this.getHeaders() });
+    return extractExtension(res, "Failed to enable extension");
+  }
+
+  async disableExtension(id: string): Promise<Extension> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}/disable`;
+    const res = await fetch(url, { method: "POST", headers: this.getHeaders() });
+    return extractExtension(res, "Failed to disable extension");
+  }
+
+  async activateExtensionVersion(id: string, version: number): Promise<Extension> {
+    const url = `${this.getBaseUrl()}/api/extensions/${encodeURIComponent(id)}/activate-version`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ version }),
+    });
+    return extractExtension(res, "Failed to activate extension version");
   }
 
   // ── Script connections ──
@@ -1687,6 +2142,20 @@ class ApiClient {
     return res.json();
   }
 
+  /** List-view rows (`fields=slim`): no question bodies or answers, plus `questionCount`. */
+  async fetchApprovalRequestSummaries(filters?: {
+    status?: string;
+    limit?: number;
+  }): Promise<ApprovalRequestSummariesResponse> {
+    const params = new URLSearchParams({ fields: "slim" });
+    if (filters?.status) params.set("status", filters.status);
+    if (filters?.limit != null) params.set("limit", String(filters.limit));
+    const url = `${this.getBaseUrl()}/api/approval-requests?${params.toString()}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch approval requests: ${res.status}`);
+    return res.json();
+  }
+
   async fetchApprovalRequest(id: string): Promise<{ approvalRequest: ApprovalRequest }> {
     const url = `${this.getBaseUrl()}/api/approval-requests/${id}`;
     const res = await fetch(url, { headers: this.getHeaders() });
@@ -1694,16 +2163,22 @@ class ApiClient {
     return res.json();
   }
 
+  /**
+   * The server records the responder from the credential (a user token's user,
+   * or `operator` for the shared key). `claimedRespondedBy` travels as the
+   * body's `respondedBy` and is stored only as an unverified display name.
+   * A 200 can leave the request `pending` while its policy needs more approvals.
+   */
   async respondToApprovalRequest(
     id: string,
     responses: Record<string, unknown>,
-    respondedBy?: string,
+    claimedRespondedBy?: string,
   ): Promise<{ approvalRequest: ApprovalRequest }> {
     const url = `${this.getBaseUrl()}/api/approval-requests/${id}/respond`;
     const res = await fetch(url, {
       method: "POST",
       headers: this.getHeaders(),
-      body: JSON.stringify({ responses, respondedBy }),
+      body: JSON.stringify({ responses, respondedBy: claimedRespondedBy }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => null);
@@ -1713,8 +2188,26 @@ class ApiClient {
         typeof (body as { error?: unknown }).error === "string"
           ? (body as { error: string }).error
           : `Failed to respond to approval request: ${res.status}`;
-      throw new Error(message);
+      throw new ApprovalRespondError(message, res.status);
     }
+    return res.json();
+  }
+
+  async cancelApprovalRequest(
+    id: string,
+    reason?: string,
+  ): Promise<{
+    approvalRequest: ApprovalRequest;
+    alreadyCancelled: boolean;
+    runCancelled: boolean;
+  }> {
+    const url = `${this.getBaseUrl()}/api/approval-requests/${id}/cancel`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ reason }),
+    });
+    if (!res.ok) throw new Error(`Failed to cancel approval request: ${res.status}`);
     return res.json();
   }
 
@@ -2002,6 +2495,32 @@ class ApiClient {
     return res.json();
   }
 
+  async fetchSubscriptionPlans(): Promise<SubscriptionPlansResponse> {
+    const url = `${this.getBaseUrl()}/api/keys/plans`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch subscription plans: ${res.status}`);
+    return res.json();
+  }
+
+  /** Set a credential's subscription plan. `plan: null` goes back to the detected plan. */
+  async setApiKeyPlan(args: {
+    keyType: string;
+    keySuffix: string;
+    plan: string | null;
+  }): Promise<{ success: boolean; keyType: string; keySuffix: string; plan: string | null }> {
+    const url = `${this.getBaseUrl()}/api/keys/plan`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: this.getHeaders(),
+      body: JSON.stringify(args),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to set key plan" }));
+      throw new Error(err.error || `Failed to set key plan: ${res.status}`);
+    }
+    return res.json();
+  }
+
   async clearApiKeyRateLimit(args: {
     keyType: string;
     keySuffix: string;
@@ -2228,6 +2747,26 @@ class ApiClient {
     return res.json();
   }
 
+  async listMemoryKeys(prefix: string): Promise<import("./types").MemoryKeysResponse> {
+    const url = `${this.getBaseUrl()}/api/memory/keys?prefix=${encodeURIComponent(prefix)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to list memory keys" }));
+      throw new Error(err.error || `Failed to list memory keys: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  async getMemoryChunks(memoryId: string): Promise<import("./types").MemoryChunksResponse> {
+    const url = `${this.getBaseUrl()}/api/memory/chunks?memoryId=${encodeURIComponent(memoryId)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Failed to load memory" }));
+      throw new Error(err.error || `Failed to load memory: ${res.status}`);
+    }
+    return res.json();
+  }
+
   async deleteMemory(id: string): Promise<{ deleted: boolean }> {
     const url = `${this.getBaseUrl()}/api/memory/${id}`;
     const res = await fetch(url, { method: "DELETE", headers: this.getHeaders() });
@@ -2262,6 +2801,31 @@ class ApiClient {
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`Failed to resolve whoami: ${res.status}`);
     return (await res.json()) as WhoamiResponse;
+  }
+
+  /**
+   * A one-shot ticket for the realtime socket (a browser WebSocket cannot send
+   * `Authorization`). Single use, 60 s. The error carries the HTTP `status`.
+   */
+  async fetchRealtimeTicket(): Promise<string> {
+    const res = await fetch(`${this.getBaseUrl()}/api/realtime/ticket`, {
+      method: "POST",
+      headers: this.getHeaders(),
+    });
+    if (!res.ok) {
+      throw Object.assign(new Error(`Failed to get a realtime ticket: ${res.status}`), {
+        status: res.status,
+      });
+    }
+    return ((await res.json()) as { ticket: string }).ticket;
+  }
+
+  /** The realtime socket URL for a ticket. The dev proxy forwards `/api` upgrades. */
+  realtimeSocketUrl(ticket: string): string {
+    const url = new URL(`${this.getBaseUrl() || window.location.origin}/api/realtime`);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.searchParams.set("ticket", ticket);
+    return url.toString();
   }
 
   async listUsers(opts?: { recentEvents?: number }): Promise<User[]> {
@@ -2455,6 +3019,8 @@ class ApiClient {
     q?: string;
     /** When set, restrict results to sessions owned by this user. NULL rows are excluded. */
     requestedByUserId?: string;
+    /** Root tasks whose `contextKey` starts with this prefix (≥1.157.1). */
+    contextKeyPrefix?: string;
   }): Promise<SessionListItem[]> {
     const params = new URLSearchParams();
     if (opts?.limit != null) params.set("limit", String(opts.limit));
@@ -2462,6 +3028,7 @@ class ApiClient {
     if (opts?.source && opts.source.length > 0) params.set("source", opts.source.join(","));
     if (opts?.q && opts.q.length > 0) params.set("q", opts.q);
     if (opts?.requestedByUserId) params.set("requestedByUserId", opts.requestedByUserId);
+    if (opts?.contextKeyPrefix) params.set("contextKeyPrefix", opts.contextKeyPrefix);
     const qs = params.toString();
     const url = `${this.getBaseUrl()}/api/sessions${qs ? `?${qs}` : ""}`;
     const res = await fetch(url, { headers: this.getHeaders() });
@@ -2535,6 +3102,8 @@ class ApiClient {
     status: InboxItemStatus;
     /** ISO 8601 datetime; required when status === "snoozed". */
     snoozeUntil?: string;
+    /** ISO 8601 datetime; first-viewed marker, sticky server-side. */
+    readAt?: string;
   }): Promise<InboxItemState> {
     const url = `${this.getBaseUrl()}/api/inbox-state`;
     const res = await fetch(url, {
@@ -2864,6 +3433,33 @@ class ApiClient {
 
   async listApps(): Promise<{ apps: AppListItem[] }> {
     return this.appRequest("/api/apps", undefined, "Failed to list apps");
+  }
+
+  async inspectPageRoom(
+    pageId: string,
+    name: string,
+  ): Promise<{
+    schemaVersion: number;
+    generation: string;
+    state: unknown;
+  } | null> {
+    const namespace = encodeURIComponent(`task:page:${pageId}`);
+    const key = `_room/${name}`;
+    const params = new URLSearchParams({ prefix: key, limit: "1" });
+    const response = await fetch(`${this.getBaseUrl()}/api/kv/_/${namespace}?${params}`, {
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) throw new Error(`Cannot read the saved room: ${response.status}`);
+    const result = (await response.json()) as { entries: { key: string; value: unknown }[] };
+    const entry = result.entries.find((candidate) => candidate.key === key);
+    if (!entry) return null;
+    const decoded = await fetch(`${this.getBaseUrl()}/api/rooms/decode`, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ value: entry.value }),
+    });
+    if (!decoded.ok) throw new Error(`Cannot decode the saved room: ${decoded.status}`);
+    return decoded.json();
   }
 
   async getApp(id: string): Promise<{ app: AppDetail }> {

@@ -19,7 +19,11 @@ import {
   startTask,
 } from "../be/db";
 import { requestSteering } from "../be/steering";
-import { createSteeringDispatchState, pollAndDispatchSteering } from "../commands/runner";
+import {
+  createSteeringDispatchState,
+  pollAndDispatchSteering,
+  scheduleSteeringDispatch,
+} from "../commands/runner";
 import { handleTasks } from "../http/tasks";
 import { getPathSegments, parseQueryParams } from "../http/utils";
 import { getBasePrompt } from "../prompts/base-prompt";
@@ -94,8 +98,99 @@ afterAll(async () => {
 });
 
 describe("steering worker transport", () => {
+  test("a pending queue allows a later steer for the same task without duplicate delivery", async () => {
+    const taskId = crypto.randomUUID();
+    const first = pendingMessage({ taskId, mode: "queue" });
+    const second = pendingMessage({ taskId, mode: "steer" });
+    let pollCount = 0;
+    const deliveryCounts = new Map<string, number>();
+    let resolveFirstDelivery!: (value: { delivered: true; mode: "queue" }) => void;
+    const firstDelivery = new Promise<{ delivered: true; mode: "queue" }>((resolve) => {
+      resolveFirstDelivery = resolve;
+    });
+    let resolveFirstDeliveryStarted!: () => void;
+    const firstDeliveryStarted = new Promise<void>((resolve) => {
+      resolveFirstDeliveryStarted = resolve;
+    });
+    let resolveFirstReport!: () => void;
+    let resolveSecondReport!: () => void;
+    const firstReported = new Promise<void>((resolve) => {
+      resolveFirstReport = resolve;
+    });
+    const secondReported = new Promise<void>((resolve) => {
+      resolveSecondReport = resolve;
+    });
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/steering-messages") {
+        pollCount += 1;
+        return Response.json({ messages: pollCount === 1 ? [first] : [first, second] });
+      }
+      if (url.pathname.includes(first.id)) resolveFirstReport();
+      if (url.pathname.includes(second.id)) resolveSecondReport();
+      return Response.json({});
+    }) as typeof fetch;
+    const providerSession = session(async (delivery) => {
+      deliveryCounts.set(delivery.mode, (deliveryCounts.get(delivery.mode) ?? 0) + 1);
+      if (delivery.mode === "queue") {
+        resolveFirstDeliveryStarted();
+        return firstDelivery;
+      }
+      return { delivered: true, mode: "steer" };
+    });
+    const dispatchState = createSteeringDispatchState();
+    const config = { apiUrl: "http://steering.test", apiKey: "key", agentId: "agent" };
+    const errors: unknown[] = [];
+
+    expect(
+      scheduleSteeringDispatch(
+        config,
+        taskId,
+        providerSession,
+        dispatchState,
+        (error) => errors.push(error),
+        fetchImpl,
+      ),
+    ).toBe(true);
+    expect(
+      scheduleSteeringDispatch(
+        config,
+        taskId,
+        providerSession,
+        dispatchState,
+        (error) => errors.push(error),
+        fetchImpl,
+      ),
+    ).toBe(false);
+    await firstDeliveryStarted;
+    await Bun.sleep(0);
+    expect(
+      scheduleSteeringDispatch(
+        config,
+        taskId,
+        providerSession,
+        dispatchState,
+        (error) => errors.push(error),
+        fetchImpl,
+      ),
+    ).toBe(true);
+
+    await secondReported;
+    expect(pollCount).toBe(2);
+    expect(deliveryCounts.get("queue")).toBe(1);
+    expect(deliveryCounts.get("steer")).toBe(1);
+    expect(dispatchState.inFlightMessageIds.has(first.id)).toBe(true);
+
+    resolveFirstDelivery({ delivered: true, mode: "queue" });
+    await firstReported;
+    await Bun.sleep(0);
+    expect(dispatchState.inFlightMessageIds.size).toBe(0);
+    expect(dispatchState.pollingTaskIds.size).toBe(0);
+    expect(errors).toEqual([]);
+  });
+
   test("delivers pending rows once and reports the adapter's actual mode", async () => {
-    const pending = pendingMessage();
+    const pending = pendingMessage({ createdByKind: "agent", senderLabel: "Lead (agent)" });
     const nonPending = pendingMessage({ id: crypto.randomUUID(), status: "delivered" });
     const deliveries: Array<{ mode: string; text: string }> = [];
     const reports: Array<{ path: string; body: unknown }> = [];
@@ -125,7 +220,7 @@ describe("steering worker transport", () => {
     // The body is wrapped in the delivery envelope, which MUST carry the
     // steering message ID — `accept-steer` needs it, and it is the only route
     // to `handled`. Without it the agent obeys but can never acknowledge.
-    expect(deliveries[0]?.text).toContain("change course");
+    expect(deliveries[0]?.text).toContain("From Lead (agent): change course");
     expect(deliveries[0]?.text).toContain(pending.id);
     expect(deliveries[0]?.text).toContain("accept-steer");
     expect(state.dispatchedIds.has(pending.id)).toBe(true);
@@ -138,7 +233,7 @@ describe("steering worker transport", () => {
 
   test("scrubs provider errors before reporting an undeliverable reason", async () => {
     const pending = pendingMessage();
-    const secret = "sk-proj-steering-transport-secret-1234567890";
+    const secret = `sk-proj-${"steering".repeat(4)}`;
     let reportedBody = "";
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
       if (String(input).includes("/api/steering-messages?")) {
@@ -185,7 +280,7 @@ describe("steering worker transport", () => {
     expect(requested.outcome).toBe("queued");
 
     await pollAndDispatchSteering(
-      { apiUrl: baseUrl, apiKey: "test-key", agentId: agent.id },
+      { apiUrl: baseUrl, apiKey: "example-test-key", agentId: agent.id },
       task.id,
       session(),
       createSteeringDispatchState(),
@@ -204,11 +299,7 @@ describe("steering worker transport", () => {
     ]);
   });
 
-  test("codex rows stay pending: the runner skips externally-delivered sessions", async () => {
-    // Codex delivery is harness-side (codex-hook). The row must queue at
-    // request time, and the runner's dispatch poll must leave it untouched —
-    // dispatching would synthesize a false undeliverable and promote it out
-    // from under the hook.
+  test("the runner preserves rows for explicitly external delivery", async () => {
     const agent = await createAgent({
       name: "codex steering worker",
       isLead: false,
@@ -230,13 +321,13 @@ describe("steering worker transport", () => {
       createdByKind: "system",
     });
 
-    expect(requested).toMatchObject({ outcome: "queued", degradedFrom: "steer" });
+    expect(requested).toMatchObject({ outcome: "steered", effectiveMode: "steer" });
 
     // Session without deliverSteering — would normally be reported
     // undeliverable — but the external-delivery flag short-circuits the poll.
     const codexLikeSession = { ...session(), steeringDeliveredExternally: true };
     await pollAndDispatchSteering(
-      { apiUrl: baseUrl, apiKey: "test-key", agentId: agent.id },
+      { apiUrl: baseUrl, apiKey: "example-test-key", agentId: agent.id },
       task.id,
       codexLikeSession,
       createSteeringDispatchState(),
@@ -252,7 +343,7 @@ describe("steering worker transport", () => {
     const previousBaseUrl = process.env.MCP_BASE_URL;
     const previousApiKey = process.env.AGENT_SWARM_API_KEY;
     process.env.MCP_BASE_URL = baseUrl;
-    process.env.AGENT_SWARM_API_KEY = "test-key";
+    process.env.AGENT_SWARM_API_KEY = "example-test-key";
     try {
       const agent = await createAgent({
         name: "accept steering worker",

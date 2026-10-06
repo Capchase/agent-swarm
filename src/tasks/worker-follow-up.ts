@@ -1,21 +1,48 @@
+import { z } from "zod";
 import {
   buildRoutingAffinityFromAgent,
+  createLogEntry,
   createTaskExtended,
   getActiveTaskCount,
   getAgentById,
   getDependentTasks,
   getLeadAgent,
+  getLogsByTaskIdAndEventType,
   getTaskAttachments,
   getTaskById,
   hasNonTerminalRerouteDecisionChild,
+  isAgentEligibleForTask,
 } from "../be/db";
 import { repointTrackerSyncBySwarmId } from "../be/db-queries/tracker";
+import { dispatchPre } from "../extensions/dispatcher";
 import { resolveTemplate } from "../prompts/resolver";
-import type { Agent, AgentTask, ResumeReason, TaskAttachment } from "../types";
+import {
+  DEFERRED_WAIT_WOKE_EVENT,
+  reconcileDeferredTaskWaits,
+} from "../scheduler/deferred-task-waits";
+import {
+  type Agent,
+  type AgentTask,
+  CreateTaskOptionsSchema,
+  type ResumeReason,
+  type RoutingAffinity,
+  type TaskAttachment,
+} from "../types";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { taskAttachmentDisplayUrl } from "../utils/task-attachment-links";
+import { createTaskWithSiblingAwareness } from "./sibling-awareness";
 // Side-effect import: registers task lifecycle templates in the in-memory registry.
 import "../tools/templates";
+
+/** Runtime check for `pre.task.followUp` modifications (mirrors `TaskFollowUpModify`). */
+const TaskFollowUpModifySchema = CreateTaskOptionsSchema.pick({
+  agentId: true,
+  priority: true,
+  followUpConfig: true,
+})
+  .partial()
+  .extend({ description: z.string().trim().min(1).optional() })
+  .strict();
 
 /**
  * Liveness window (seconds) for considering a worker "online" enough to
@@ -97,6 +124,29 @@ export async function getPinCandidateAgent(agentId: string): Promise<Agent | nul
   return candidate;
 }
 
+/**
+ * Applies the Lead-only recovery boundary shared by normal resume and reboot
+ * recovery. A worker source is never a valid pin; use an available Lead or
+ * leave the task unassigned so only a Lead can claim it.
+ */
+export async function resolveLeadOnlyRecoveryAssignment(
+  task: Pick<AgentTask, "routingAffinity" | "routingAffinityInvalid">,
+  sourceCandidate: Agent | null,
+): Promise<{
+  agentId?: string;
+  decision?: "source_lead_pin" | "rerouted_to_lead" | "escalated_unassigned";
+}> {
+  if (!task.routingAffinity?.leadOnly) return {};
+  if (sourceCandidate?.isLead && isAgentEligibleForTask(sourceCandidate, task)) {
+    return { agentId: sourceCandidate.id, decision: "source_lead_pin" };
+  }
+  const lead = await getLeadAgent();
+  if (lead && lead.status !== "offline" && isAgentEligibleForTask(lead, task)) {
+    return { agentId: lead.id, decision: "rerouted_to_lead" };
+  }
+  return { decision: "escalated_unassigned" };
+}
+
 export function getResumeGeneration(task: Pick<AgentTask, "tags">): number {
   const tag = task.tags.find((value) => value.startsWith(RESUME_GENERATION_TAG_PREFIX));
   if (!tag) return 0;
@@ -123,6 +173,51 @@ function formatAttachmentsBlock(attachments: TaskAttachment[]): string {
   return `\n\nAttachments (${attachments.length}):\n${lines.join("\n")}`;
 }
 
+type DeferredWake = { scheduleId: string; waiterTaskId: string | null; wakeTaskId: string };
+
+/**
+ * The deferred wake this settlement fired for `agentId`, if any.
+ *
+ * Runs the wake reconcile for this task first and waits for it, so the answer
+ * comes from the claim that actually resumed the waiter: the claim writes
+ * `DEFERRED_WAIT_WOKE_EVENT` on the trigger task in its own transaction. When
+ * the event-bus listener claims first, its commit is visible here because our
+ * reconcile only returns after its own claim attempt lost to that commit.
+ */
+async function findDeferredWakeFor(taskId: string, agentId: string): Promise<DeferredWake | null> {
+  try {
+    await reconcileDeferredTaskWaits(taskId);
+    for (const log of await getLogsByTaskIdAndEventType(taskId, DEFERRED_WAIT_WOKE_EVENT)) {
+      const meta = JSON.parse(log.metadata ?? "{}") as Partial<DeferredWake> & {
+        wakeAgentId?: string | null;
+      };
+      if (meta.wakeAgentId === agentId && meta.scheduleId && meta.wakeTaskId) {
+        return {
+          scheduleId: meta.scheduleId,
+          waiterTaskId: meta.waiterTaskId ?? null,
+          wakeTaskId: meta.wakeTaskId,
+        };
+      }
+    }
+  } catch (err) {
+    // Fail open: a broken lookup must never drop the follow-up.
+    console.warn(
+      `[worker-follow-up] Deferred wake lookup failed for ${taskId.slice(0, 8)}: ${err}`,
+    );
+  }
+  return null;
+}
+
+/**
+ * Create the lead follow-up for a finished worker task.
+ *
+ * Skipped when this settlement woke a deferred waiter (`defer-task` with
+ * `wakeOn`) assigned to the same agent the follow-up targets: that wake-up
+ * task already reviews the result, so a follow-up would duplicate it. An
+ * `all` wait with siblings still pending wakes nobody, so the follow-up stays.
+ * A `followUpConfig.onCompleted` / `onFailed` instruction for this status also
+ * keeps the follow-up, because the wake-up task does not carry that text.
+ */
 export async function createWorkerTaskFollowUp(args: {
   task: AgentTask;
   status: "completed" | "failed";
@@ -192,15 +287,72 @@ export async function createWorkerTaskFollowUp(args: {
     }
   }
 
-  return await createTaskExtended(followUpDescription, {
-    agentId: leadAgent.id,
-    source: "system",
-    taskType: "follow-up",
-    parentTaskId: task.id,
-    slackChannelId: task.slackChannelId,
-    slackThreadTs: task.slackThreadTs,
-    slackUserId: task.slackUserId,
-  });
+  const preFollowUp = await dispatchPre(
+    "pre.task.followUp",
+    {
+      completedTask: task,
+      status,
+      output,
+      failureReason,
+      workerAgentId: taskAgent.id,
+      leadAgentId: leadAgent.id,
+      summary: followUpDescription,
+    },
+    {
+      // A modification that violates the task schema (for example `priority: -1`)
+      // is attributed to the extension and ignored, so the follow-up is still created.
+      validateModify: (data) => {
+        const parsed = TaskFollowUpModifySchema.safeParse(data);
+        return parsed.success
+          ? { success: true, data: parsed.data }
+          : { success: false, error: new Error(parsed.error.message) };
+      },
+    },
+  );
+  if (preFollowUp.action === "block") return null;
+
+  const changes = preFollowUp.action === "modify" ? preFollowUp.data : {};
+  const followUpAgentId = changes.agentId === undefined ? leadAgent.id : changes.agentId;
+
+  const wake =
+    followUpAgentId && !instructions ? await findDeferredWakeFor(task.id, followUpAgentId) : null;
+  if (wake) {
+    try {
+      await createLogEntry({
+        eventType: "task_follow_up_suppressed",
+        taskId: task.id,
+        agentId: followUpAgentId ?? undefined,
+        metadata: {
+          reason: "deferred_wait_woke",
+          status,
+          waiterTaskId: wake.waiterTaskId,
+          wakeTaskId: wake.wakeTaskId,
+          scheduleId: wake.scheduleId,
+        },
+      });
+    } catch {}
+    console.log(
+      `[worker-follow-up] Skipped follow-up for ${status} task ${task.id.slice(0, 8)}: woke deferred waiter ${wake.waiterTaskId?.slice(0, 8) ?? "?"} (wake-up task ${wake.wakeTaskId.slice(0, 8)})`,
+    );
+    return null;
+  }
+  return await createTaskWithSiblingAwareness(
+    changes.description ?? followUpDescription,
+    {
+      agentId: followUpAgentId,
+      routingReason: followUpAgentId ? "skill" : undefined,
+      routingSource: followUpAgentId ? "engine_default" : undefined,
+      source: "system",
+      taskType: "follow-up",
+      priority: changes.priority,
+      parentTaskId: task.id,
+      slackChannelId: task.slackChannelId,
+      slackThreadTs: task.slackThreadTs,
+      slackUserId: task.slackUserId,
+      followUpConfig: changes.followUpConfig,
+    },
+    { origin: "followUp" },
+  );
 }
 
 /** Result of `createResumeFollowUp`. */
@@ -291,6 +443,12 @@ export async function createResumeFollowUp(args: {
   //   - `context_limits` / `manual_supersede`: the worker is alive and
   //     responsive, so keep requiring `fresh`.
   let preferredAgentId: string | undefined;
+  let authorizationDecision:
+    | "source_lead_pin"
+    | "rerouted_to_lead"
+    | "escalated_unassigned"
+    | undefined;
+  const leadOnly = parent.routingAffinity?.leadOnly === true;
   if (parent.agentId) {
     const candidate = await getPinCandidateAgent(parent.agentId);
     if (candidate) {
@@ -306,8 +464,13 @@ export async function createResumeFollowUp(args: {
       const isFreshPinnedReason = !isGracefulShutdown && fresh;
       // crash_recovery and graceful_shutdown pins ignore `fresh` when their
       // kill-switches are on; context_limits/manual_supersede still require it.
-      if (hasCap && (isCrashRecovery || isGracefulPin || isFreshPinnedReason)) {
+      if (
+        hasCap &&
+        (isCrashRecovery || isGracefulPin || isFreshPinnedReason) &&
+        (!leadOnly || candidate.isLead)
+      ) {
         preferredAgentId = candidate.id;
+        if (leadOnly) authorizationDecision = "source_lead_pin";
       } else if ((isCrashRecovery || isGracefulPin) && !hasCap) {
         // Surface capacity-driven pool fallback instead of letting a protected
         // pinned-reason skip happen silently.
@@ -316,6 +479,16 @@ export async function createResumeFollowUp(args: {
         );
       }
     }
+  }
+
+  // Apply the same Lead-only recovery decision used by reboot recovery. A
+  // non-Lead source can never win the earlier pin attempt, so this chooses a
+  // Lead reroute or an authorization-gated unassigned fallback.
+  if (leadOnly) {
+    const source = preferredAgentId ? await getAgentById(preferredAgentId) : null;
+    const resolution = await resolveLeadOnlyRecoveryAssignment(parent, source);
+    preferredAgentId = resolution.agentId;
+    authorizationDecision = resolution.decision;
   }
 
   const parentDesc = parent.task.slice(0, 200);
@@ -342,41 +515,77 @@ export async function createResumeFollowUp(args: {
   // pooled resume — including a crash_recovery resume that fell to the pool at
   // capacity — never gets this tag, so it can't be mistaken for a stale pin
   // after autoAssignPoolTasks flips it to `pending`.
-  if (args.reason === "crash_recovery" && preferredAgentId !== undefined) {
+  if (args.reason === "crash_recovery" && preferredAgentId === parent.agentId) {
     tags.push(CRASH_RECOVERY_PIN_TAG);
   }
-  if (args.reason === "graceful_shutdown" && preferredAgentId !== undefined) {
+  if (args.reason === "graceful_shutdown" && preferredAgentId === parent.agentId) {
     tags.push(GRACEFUL_SHUTDOWN_PIN_TAG);
   }
 
   // Identity-shaped fields (dir, VCS provider/repo/number/url/etc.,
   // outputSchema, slack channel/thread/user, agentmail, mention, contextKey,
-  // requestedByUserId, followUpConfig) are auto-inherited from the parent by
-  // `createTaskExtended`'s parentTaskId block (see src/be/db.ts). `model` is
+  // requestedByUserId) are auto-inherited from the parent by
+  // `createTaskExtended`'s parentTaskId block (see src/be/db.ts);
+  // followUpConfig is opt-in and set below. `model` is
   // deliberately excluded there so the resume task resolves to the claiming
   // agent's own provider/model — never the parent's concrete model string.
   // We only override what's SPECIFIC to the resume task here.
   //
   // Routing affinity: stamp a FRESH snapshot from the parent's own agent —
   // this covers every leg (pinned AND the pool-fallback legs) so a resume
-  // that falls to the unassigned pool is still role/capability-gated. When
-  // the agent row is already gone, `buildRoutingAffinityFromAgent` returns
-  // `null` and we pass `undefined`, letting `createTaskExtended`'s
+  // that falls to the unassigned pool is still role/capability-gated. A
+  // Lead-only task retains its parent-declared required capabilities instead:
+  // the source snapshot is provenance, not an authorization requirement.
+  // When the agent row is already gone, `buildRoutingAffinityFromAgent`
+  // returns `null` and we pass `undefined`, letting `createTaskExtended`'s
   // parentTaskId inheritance block fall back to the parent's OWN
   // (already-inherited) `routingAffinity` instead.
-  const routingAffinity = parent.agentId
+  const sourceAffinity = parent.agentId
     ? ((await buildRoutingAffinityFromAgent(parent.agentId)) ?? undefined)
     : undefined;
+  const routingAffinity = leadOnly
+    ? {
+        ...(sourceAffinity ?? parent.routingAffinity),
+        capabilities: parent.routingAffinity?.capabilities ?? [],
+        leadOnly: true,
+      }
+    : sourceAffinity;
   const created = await createTaskExtended(followUpDescription, {
     agentId: preferredAgentId,
+    routingReason:
+      preferredAgentId === undefined
+        ? undefined
+        : preferredAgentId === parent.agentId
+          ? "continuity"
+          : "reroute_fault",
+    routingSource: preferredAgentId === undefined ? undefined : "engine_default",
     creatorAgentId: parent.creatorAgentId,
     source: "system",
     taskType: "resume",
     tags,
     priority,
     parentTaskId: parent.id,
+    // Same work, new session: the creator's onCompleted/onFailed must still
+    // fire when this resume finishes.
+    inheritParentFollowUpConfig: true,
     routingAffinity,
   });
+
+  if (authorizationDecision) {
+    try {
+      await createLogEntry({
+        eventType: "task_recovery_authorization",
+        taskId: created.id,
+        agentId: preferredAgentId,
+        metadata: {
+          leadOnly: true,
+          parentTaskId: parent.id,
+          sourceAgentId: parent.agentId,
+          decision: authorizationDecision,
+        },
+      });
+    } catch {}
+  }
 
   // Repoint Linear / Jira `tracker_sync` rows from the (now terminal) parent
   // to the resume child. Without this, outbound completion posts for the
@@ -471,6 +680,8 @@ export async function createRerouteDecisionTask(args: {
   // via parentTaskId. taskType is the distinct "reroute-decision" marker.
   const created = await createTaskExtended(decision.text, {
     agentId: leadAgent.id,
+    routingReason: "reroute_fault",
+    routingSource: "engine_default",
     creatorAgentId: original.creatorAgentId,
     source: "system",
     taskType: "reroute-decision",
@@ -483,6 +694,8 @@ export async function createRerouteDecisionTask(args: {
     // make store-progress reject the Lead's completion and strand the decision
     // (blocking further escalation via the duplicate-decision guard) — DES-523.
     inheritParentOutputSchema: false,
+    inheritParentRoutingAffinity: false,
+    routingAffinity: leadControlPlaneRoutingAffinity(),
   });
 
   return { kind: "created", task: created };
@@ -492,6 +705,16 @@ export async function createRerouteDecisionTask(args: {
 export type CreatePoolStarvationDecisionResult =
   | { kind: "created"; task: AgentTask }
   | { kind: "skipped"; reason: "lead_not_found" | "duplicate_exists" };
+
+/**
+ * Control-plane decisions are new Lead-owned work, not continuations of the
+ * requirements that made the original task unroutable. Give both reroute
+ * producers the same explicit authorization so parent affinity cannot veto
+ * dispatch to a replacement Lead.
+ */
+function leadControlPlaneRoutingAffinity(): RoutingAffinity {
+  return { leadOnly: true, capabilities: [] };
+}
 
 /**
  * Hand the Lead a re-delegation DECISION task for a pooled, affinity-tagged
@@ -538,6 +761,8 @@ export async function createPoolStarvationDecisionTask(args: {
 
   const created = await createTaskExtended(decision.text, {
     agentId: leadAgent.id,
+    routingReason: "overflow",
+    routingSource: "engine_default",
     creatorAgentId: original.creatorAgentId,
     source: "system",
     taskType: "reroute-decision",
@@ -547,6 +772,23 @@ export async function createPoolStarvationDecisionTask(args: {
     // Same rationale as createRerouteDecisionTask: don't hold the Lead's
     // re-delegation decision to the original work's output contract.
     inheritParentOutputSchema: false,
+    inheritParentRoutingAffinity: false,
+    // Explicit authorization, not an inherited-affinity side effect. Without
+    // this, a plain parent-fallback inherit would carry `original`'s own
+    // routing affinity onto this direct assignment, and createTaskExtended's
+    // direct-assignment gate (isAgentEligibleForTask) evaluates it against
+    // the LEAD, not the original task's intended worker. A caller-declared,
+    // capability-only affinity (no role/sourceAgentId — the exact shape
+    // `send-task`/`task-action`'s `requiredCapabilities` build) has no
+    // fail-open per isAgentEligibleForTask's "no fail-open" contract, so the
+    // inherited gate rejects the Lead too — this function is invoked
+    // (`escalateStarvedPoolTasks`) ONLY when isAgentEligibleForTask already
+    // found zero eligible registered agents for `original`, and it throws
+    // before the decision task is ever created. This escalation is a
+    // deliberate system override, not a continuation of the original's
+    // requirements, so it asserts its own authorization instead of
+    // depending on how `original`'s affinity happens to be shaped.
+    routingAffinity: leadControlPlaneRoutingAffinity(),
   });
 
   return { kind: "created", task: created };

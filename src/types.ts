@@ -3,6 +3,7 @@
 // reference them emit `$ref`s and SDK generators produce named types.
 
 import { normalizeAssetKey } from "./assets/key";
+import { isSafeBundlePath } from "./extensions/bundle-path";
 import { MAX_PROFILE_FILE_LENGTH } from "./utils/constants";
 import { z } from "./utils/zod-openapi";
 // ─── Asset namespaces ──────────────────────────────────────────────────────
@@ -135,22 +136,53 @@ export const DEFAULT_MODEL_TIER_MAP: Record<ProviderName, Record<ModelTier, stri
     ultra: "gpt-5.6-sol",
   },
   pi: {
-    smol: "openrouter/deepseek/deepseek-v4-flash",
-    regular: "openrouter/deepseek/deepseek-v4-flash",
-    smart: "openrouter/deepseek/deepseek-v4-pro",
-    ultra: "openrouter/anthropic/claude-opus-4.8",
+    smol: "openrouter/deepseek/deepseek-v4.1-flash",
+    regular: "openrouter/deepseek/deepseek-v4.1-flash",
+    smart: "openrouter/deepseek/deepseek-v4-pro-0813",
+    ultra: "openrouter/anthropic/claude-opus-5.5",
   },
   opencode: {
-    smol: "openrouter/deepseek/deepseek-v4-flash",
-    regular: "openrouter/deepseek/deepseek-v4-flash",
-    smart: "openrouter/deepseek/deepseek-v4-pro",
-    ultra: "openrouter/anthropic/claude-opus-4.8",
+    smol: "openrouter/deepseek/deepseek-v4.1-flash",
+    regular: "openrouter/deepseek/deepseek-v4.1-flash",
+    smart: "openrouter/deepseek/deepseek-v4-pro-0813",
+    ultra: "openrouter/anthropic/claude-opus-5.5",
+  },
+  dsh: {
+    smol: "openrouter/deepseek/deepseek-v4.1-flash",
+    regular: "openrouter/deepseek/deepseek-v4.1-flash",
+    smart: "openrouter/deepseek/deepseek-v4-pro-0813",
+    ultra: "openrouter/anthropic/claude-opus-5.5",
+  },
+  // Bare Cursor model ids (`Cursor.models.list()`); reasoning effort rides in
+  // the model's own params (see src/providers/cursor-adapter.ts).
+  cursor: {
+    smol: "gpt-5.4-mini",
+    regular: "claude-sonnet-5-5",
+    smart: "claude-opus-5-5",
+    ultra: "claude-fable-5-1",
   },
   devin: {
     smol: "devin",
     regular: "devin",
     smart: "devin",
     ultra: "devin",
+  },
+  // Amp picks the model server-side per mode, so the tiers map onto its four
+  // built-in modes. `low` is the cheapest (GLM-5.3 Flash when verified live).
+  amp: {
+    smol: "low",
+    regular: "medium",
+    smart: "high",
+    ultra: "ultra",
+  },
+  // ACP has no portable tier-to-model mapping. Operators may set an explicit
+  // MODEL_OVERRIDE, which the adapter applies through an advertised `model`
+  // config option with a target-specific startup fallback.
+  acp: {
+    smol: "",
+    regular: "",
+    smart: "",
+    ultra: "",
   },
 };
 
@@ -215,6 +247,25 @@ export function resolveModelTier(opts: {
   return DEFAULT_MODEL_TIER_MAP[opts.harnessProvider]?.[tier];
 }
 
+export type ModelTierOverrides = Partial<Record<string, Partial<Record<ModelTier, string>>>>;
+
+/**
+ * The worker's own MODEL_TIER_<TIER> / MODEL_TIER_MAP overrides, keyed by its
+ * harness provider, in the shape the worker sends on register and poll so the
+ * server can apply them at claim time. Values only (model ids), never secrets.
+ */
+export function parseWorkerModelTierOverrides(
+  env: Record<string, string | undefined>,
+  harnessProvider: ProviderName,
+): ModelTierOverrides {
+  const tiers: Partial<Record<ModelTier, string>> = { ...parseTierMapJson(env.MODEL_TIER_MAP) };
+  for (const tier of MODEL_TIERS) {
+    const direct = env[`MODEL_TIER_${tier.toUpperCase()}`]?.trim();
+    if (direct) tiers[tier] = direct;
+  }
+  return Object.keys(tiers).length > 0 ? { [harnessProvider]: tiers } : {};
+}
+
 export function resolveTaskModelSelection(opts: {
   model?: string | null;
   modelTier?: string | null;
@@ -237,6 +288,7 @@ export function resolveTaskModelSelection(opts: {
 
 // Task status - includes new unassigned and offered states
 export const AgentTaskStatusSchema = z.enum([
+  "draft", // Created but not yet dispatch-eligible (UI attachments still uploading, #1240); promoted to pending/offered/unassigned once the upload batch settles or times out
   "backlog", // Task is in backlog, not yet ready for pool
   "unassigned", // Task pool - no owner yet
   "offered", // Offered to agent, awaiting accept/reject
@@ -321,14 +373,28 @@ export const AgentTaskSourceSchema = z.enum([
   "ui",
   "github",
   "gitlab",
+  "azure-devops",
   "agentmail",
   "system",
   "schedule",
   "workflow",
   "linear",
   "jira",
+  "comb",
 ]);
 export type AgentTaskSource = z.infer<typeof AgentTaskSourceSchema>;
+
+export const RoutingReasonSchema = z.enum([
+  "skill",
+  "continuity",
+  "overflow",
+  "human_pinned",
+  "reroute_fault",
+]);
+export type RoutingReason = z.infer<typeof RoutingReasonSchema>;
+
+export const RoutingSourceSchema = z.enum(["declared", "engine_default"]);
+export type RoutingSource = z.infer<typeof RoutingSourceSchema>;
 
 // ---------------------------------------------------------------------------
 // Harness Provider
@@ -343,6 +409,10 @@ export const ProviderNameSchema = z.enum([
   "devin",
   "claude-managed",
   "opencode",
+  "acp",
+  "dsh",
+  "amp",
+  "cursor",
 ]);
 export type ProviderName = z.infer<typeof ProviderNameSchema>;
 
@@ -377,6 +447,8 @@ export const SteeringMessageSchema = z
     status: SteeringStatusSchema,
     deliveredMode: SteerModeSchema.optional(),
     source: SteeringSourceSchema,
+    /** Display label resolved by the API from the sender identity. */
+    senderLabel: z.string().optional(),
     createdByKind: z.enum(["user", "agent", "system"]),
     createdByUserId: z.string().optional(),
     createdByAgentId: z.string().optional(),
@@ -425,13 +497,19 @@ export const PROVIDER_STEER_CAPABILITIES: Record<ProviderName, SteerMode[]> = {
   // only what we can honor; revisit if the abort+prompt path is fixed.
   opencode: ["queue"],
   claude: ["queue"],
-  // Codex has no in-process delivery primitive (`@openai/codex-sdk` drives
-  // `codex exec` with stdin closed; `turn/steer` is app-server-only, see
-  // issue #1034). Delivery happens harness-side instead: the codex-hook
-  // (SessionStart/PostToolUse/Stop) polls pending rows and injects them as
-  // hook `additionalContext`, so the runner must leave codex rows `pending`
-  // (`ProviderSession.steeringDeliveredExternally`).
-  codex: ["queue"],
+  // App-server steers the active turn and starts queued prompts in later turns.
+  codex: ["steer", "queue"],
+  // The ACP adapter implements no steering primitive: `session/prompt` is a
+  // single in-flight turn and the only interrupt is `session/cancel` (abort).
+  // Advertise nothing rather than promise semantics we can't honor.
+  acp: [],
+  dsh: [],
+  // `--stream-json-input` queues a stdin message until the running turn ends
+  // (verified live); there is no interrupt primitive, so queue only.
+  amp: ["queue"],
+  // `run.steer()` reaches the in-flight run; a message the SDK reverts to a
+  // follow-up, and every queued one, starts the next run on the same agent.
+  cursor: ["steer", "queue"],
 };
 
 export type DevinProviderMeta = {
@@ -445,11 +523,15 @@ type NoProviderMeta = Record<string, never>;
 
 export type ProviderMetaMap = {
   devin: DevinProviderMeta;
-  claude: NoProviderMeta;
+  claude: { transport?: "cli" | "sdk" };
   codex: NoProviderMeta;
   pi: NoProviderMeta;
   "claude-managed": NoProviderMeta;
   opencode: NoProviderMeta;
+  acp: NoProviderMeta;
+  dsh: NoProviderMeta;
+  amp: NoProviderMeta;
+  cursor: NoProviderMeta;
 };
 
 export const FollowUpConfigSchema = z
@@ -474,6 +556,8 @@ export const RoutingAffinitySchema = z
     role: z.string().max(100).optional(),
     harnessProvider: ProviderNameSchema.optional(),
     capabilities: z.array(z.string()).default([]),
+    /** Explicit authorization boundary for merge and other control-plane work. */
+    leadOnly: z.boolean().optional(),
   })
   .openapi("RoutingAffinity");
 export type RoutingAffinity = z.infer<typeof RoutingAffinitySchema>;
@@ -491,6 +575,11 @@ export const AgentTaskSchema = z
     title: z.string().optional(), // Human-facing display title override (e.g. session rename); falls back to `task` when unset
     status: AgentTaskStatusSchema,
     source: AgentTaskSourceSchema.default("mcp"),
+    routingReason: RoutingReasonSchema.optional(),
+    routingSource: RoutingSourceSchema.optional().describe(
+      "Origin of the routing reason: declared by the caller or chosen by the engine. Absent for unknown historical provenance or no reason.",
+    ),
+    routingNote: z.string().max(200).optional(),
 
     // Task metadata
     taskType: z.string().max(50).optional(), // e.g., "bug", "feature", "chore"
@@ -530,8 +619,8 @@ export const AgentTaskSchema = z
     slackProgressMessageTs: z.string().optional(),
     slackTreeRootMessageTs: z.string().optional(),
 
-    // VCS metadata (GitHub / GitLab — provider-agnostic)
-    vcsProvider: z.enum(["github", "gitlab"]).optional(),
+    // VCS metadata (GitHub / GitLab / Azure DevOps — provider-agnostic)
+    vcsProvider: z.enum(["github", "gitlab", "azure-devops"]).optional(),
     vcsRepo: z.string().optional(),
     vcsEventType: z.string().optional(),
     vcsNumber: z.number().int().optional(),
@@ -570,6 +659,12 @@ export const AgentTaskSchema = z
     model: z.string().optional(),
     modelTier: ModelTierSchema.optional(),
     effort: ReasoningEffortSchema.optional(),
+    // Claim-time model resolution (server-side, see runbooks/model-tiers.md).
+    // resolvedModel is what the worker runs; modelSource says which layer won;
+    // modelAlias is the `latest:` alias the value came from, when any.
+    resolvedModel: z.string().optional(),
+    modelSource: z.string().optional(),
+    modelAlias: z.string().optional(),
 
     // Schedule linking (optional — set when task was created by a schedule).
     // z.string(): also reachable verbatim from the create-task query param.
@@ -592,6 +687,12 @@ export const AgentTaskSchema = z
 
     // Pause tracking
     wasPaused: z.boolean().default(false),
+
+    // Set by `defer-task` when this task ends in a deferral. The task's status
+    // is `completed` either way, so this is what tells "parked, resuming in a
+    // wake-up task" apart from "done" — see `isDeferredTask` in
+    // src/slack/task-output.ts.
+    deferredAt: z.iso.datetime().optional(),
 
     // Context usage aggregates
     compactionCount: z.number().int().min(0).optional(),
@@ -630,6 +731,9 @@ export const AgentTaskSchema = z
     // behavior. Inherited from parentTaskId when not explicitly set (see
     // `createTaskExtended` in src/be/db.ts). See `isAgentEligibleForTask`.
     routingAffinity: RoutingAffinitySchema.optional(),
+    // Stored affinity that fails validation is quarantined rather than silently
+    // treated as an ordinary, claimable task. Internal read-path signal.
+    routingAffinityInvalid: z.boolean().optional(),
   })
   .openapi("AgentTask");
 
@@ -648,13 +752,16 @@ export const CreateTaskOptionsSchema = z.object({
   agentId: z.string().nullable().optional(),
   creatorAgentId: z.string().optional(),
   source: AgentTaskSourceSchema.optional(),
+  routingReason: RoutingReasonSchema.optional(),
+  routingSource: RoutingSourceSchema.optional(),
+  routingNote: z.string().max(200).optional(),
   taskType: z.string().max(50).optional(),
   tags: z.array(z.string()).optional(),
   priority: z.number().int().min(0).max(100).optional(),
   dependsOn: z.array(z.string()).optional(),
   offeredTo: z.string().optional(),
   /** Explicitly set initial status. */
-  status: z.enum(["backlog", "unassigned"]).optional(),
+  status: z.enum(["draft", "backlog", "unassigned"]).optional(),
   slackChannelId: z.string().optional(),
   slackThreadTs: z.string().optional(),
   /** Exact Slack message that directly triggered this task; never inherited. */
@@ -670,7 +777,7 @@ export const CreateTaskOptionsSchema = z.object({
    * this boundary must not let a caller silently persist a mismatch.
    */
   overrideSlackContext: z.boolean().optional(),
-  vcsProvider: z.enum(["github", "gitlab"]).optional(),
+  vcsProvider: z.enum(["github", "gitlab", "azure-devops"]).optional(),
   vcsRepo: z.string().optional(),
   vcsEventType: z.string().optional(),
   vcsNumber: z.number().int().optional(),
@@ -711,6 +818,20 @@ export const CreateTaskOptionsSchema = z.object({
    * contract on completion (which would block the control task — DES-523).
    */
   inheritParentOutputSchema: z.boolean().optional(),
+  /**
+   * Skip parent routing requirements only for a child with its own explicit
+   * Lead-only control-plane authorization.
+   */
+  inheritParentRoutingAffinity: z.boolean().optional(),
+  /**
+   * `followUpConfig` belongs to one piece of work, not to the thread, so a
+   * child does NOT inherit the parent's by default. Set this to `true` only on
+   * a continuation of the SAME work (interrupted-task resume, reboot-sweep
+   * retry, defer-task wake-up, a Lead `resume` re-delegation) so the creator's
+   * onCompleted/onFailed still fires when that work truly ends. An explicit
+   * `followUpConfig` always wins.
+   */
+  inheritParentFollowUpConfig: z.boolean().optional(),
   followUpConfig: FollowUpConfigSchema.optional(),
   requestedByUserId: z.string().optional(),
   contextKey: z.string().optional(),
@@ -721,9 +842,11 @@ export const CreateTaskOptionsSchema = z.object({
    */
   bypassTrackerContextDedup: z.boolean().optional(),
   /**
-   * Routing-affinity snapshot gating pool eligibility (see
-   * `isAgentEligibleForTask`). Inherited from the parent (via `parentTaskId`)
-   * when not explicitly set — same treatment as `vcsRepo`/`contextKey`.
+   * Routing-affinity snapshot gating task authorization (see
+   * `isAgentEligibleForTask`). `leadOnly: true` is an explicit, structured
+   * constraint: only an agent with `isLead` may be assigned, offered, claim,
+   * or recover this task. It is never inferred from task text. Inherited from
+   * the parent unless a control-plane child explicitly opts out.
    */
   routingAffinity: RoutingAffinitySchema.optional(),
 });
@@ -905,6 +1028,9 @@ export type IdentityEventType = z.infer<typeof IdentityEventTypeSchema>;
 //   - broken_task        — tasks in failed/cancelled status
 //   - to_read            — sessions/tasks marked unread for the user
 //   - to_start_template  — task-templates the user hasn't dismissed
+//   - notification       — dashboard notification-center items (see
+//                           apps/ui/src/lib/notifications/definitions.ts);
+//                           itemId is the notification definition's key
 //
 // Statuses:
 //   - open      — visible in inbox
@@ -917,6 +1043,7 @@ export const InboxItemTypeSchema = z.enum([
   "broken_task",
   "to_read",
   "to_start_template",
+  "notification",
 ]);
 export type InboxItemType = z.infer<typeof InboxItemTypeSchema>;
 
@@ -933,6 +1060,8 @@ export const InboxItemStateSchema = z
     snoozeUntil: z.string().optional(),
     dismissedAt: z.string().optional(),
     doneAt: z.string().optional(),
+    /** First-viewed timestamp, set once on first panel open. Independent of status. */
+    readAt: z.string().optional(),
     createdAt: z.string(),
     lastUpdatedAt: z.string(),
   })
@@ -943,7 +1072,7 @@ export type InboxItemState = z.infer<typeof InboxItemStateSchema>;
 // User Favorites (principal-scoped stars for app navigation)
 // ============================================================================
 
-export const FavoriteItemTypeSchema = z.enum(["page", "workflow", "schedule"]);
+export const FavoriteItemTypeSchema = z.enum(["page", "workflow", "schedule", "agent-fs-path"]);
 export type FavoriteItemType = z.infer<typeof FavoriteItemTypeSchema>;
 
 export const UserFavoriteSchema = z
@@ -1122,8 +1251,8 @@ export type AgentLatestModel = z.infer<typeof AgentLatestModelSchema>;
 
 /**
  * Worker-reported Bedrock enumeration block. Only present when the pi harness
- * is in Bedrock SDK mode (`BEDROCK_AUTH_MODE=sdk` or
- * `MODEL_OVERRIDE=amazon-bedrock/*`). Rides inside `cred_status` JSON (no new
+ * is in a Bedrock mode (`BEDROCK_AUTH_MODE=sdk`, `BEDROCK_AUTH_MODE=bearer`,
+ * or `MODEL_OVERRIDE=amazon-bedrock/*`). Rides inside `cred_status` JSON (no new
  * DB column). `models` is the intersection of the models invocable by this
  * account/region (on-demand/ACTIVE foundation models ∪ inference profiles) with
  * the set the pi-ai Converse harness can actually drive — Converse-incompatible
@@ -1141,6 +1270,50 @@ export const AgentBedrockStatusSchema = z
   .openapi("AgentBedrockStatus");
 export type AgentBedrockStatus = z.infer<typeof AgentBedrockStatusSchema>;
 
+const AcpSessionConfigSelectValueSchema = z.object({
+  value: z.string(),
+  name: z.string(),
+  description: z.string().nullable().optional(),
+});
+
+const AcpSessionConfigSelectGroupSchema = z.object({
+  group: z.string(),
+  name: z.string(),
+  options: z.array(AcpSessionConfigSelectValueSchema),
+});
+
+export const AcpSessionConfigOptionSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("select"),
+    id: z.string(),
+    name: z.string(),
+    description: z.string().nullable().optional(),
+    category: z.string().nullable().optional(),
+    currentValue: z.string(),
+    options: z.array(
+      z.union([AcpSessionConfigSelectValueSchema, AcpSessionConfigSelectGroupSchema]),
+    ),
+  }),
+  z.object({
+    type: z.literal("boolean"),
+    id: z.string(),
+    name: z.string(),
+    description: z.string().nullable().optional(),
+    category: z.string().nullable().optional(),
+    currentValue: z.boolean(),
+  }),
+]);
+export type AcpSessionConfigOption = z.infer<typeof AcpSessionConfigOptionSchema>;
+
+export const AgentAcpStatusSchema = z
+  .object({
+    target: z.enum(["opencode", "custom"]),
+    configOptions: z.array(AcpSessionConfigOptionSchema),
+    reportedAt: z.number(),
+  })
+  .openapi("AgentAcpStatus");
+export type AgentAcpStatus = z.infer<typeof AgentAcpStatusSchema>;
+
 export const AgentCredStatusSchema = z
   .object({
     ready: z.boolean(),
@@ -1156,6 +1329,8 @@ export const AgentCredStatusSchema = z
     reportKind: z.enum(["boot", "post_task"]).default("boot"),
     /** Pi-mono Bedrock enumeration block — null when not in Bedrock mode. */
     bedrock: AgentBedrockStatusSchema.nullable().default(null),
+    /** ACP options advertised by the most recently created session. */
+    acp: AgentAcpStatusSchema.nullable().default(null),
   })
   .openapi("AgentCredStatus");
 export type AgentCredStatus = z.infer<typeof AgentCredStatusSchema>;
@@ -1216,6 +1391,20 @@ export type VersionMeta = {
   changeSource?: ChangeSource;
   changedByAgentId?: string | null;
   changeReason?: string | null;
+};
+
+/**
+ * Compare-and-set token for a profile update, per field: the content hash the
+ * writer based its edit on (e.g. what a session materialized from the DB). A
+ * field whose current DB hash differs is dropped: the DB moved since the writer
+ * read it, so its copy is stale, not an edit.
+ */
+export type ProfileExpectedHashes = Partial<Record<VersionableField, string>>;
+
+export type ProfileSyncConflict = {
+  field: VersionableField;
+  expectedHash: string;
+  currentHash: string;
 };
 
 // Channel Types
@@ -1295,7 +1484,18 @@ export const AgentLogEventTypeSchema = z.enum([
   "task_rejected",
   "task_claimed",
   "task_claim_rejected_affinity",
+  "task_dispatch_rejected_affinity",
+  "task_authorization_rejected",
+  "task_recovery_authorization",
+  // Reboot sweep moved a never-started dependent from the swept task to its retry
+  "task_dependency_repointed",
   "task_released",
+  // A settled task's settlement fired a deferred wait (metadata names the waiter)
+  "task_deferred_wait_woke",
+  // The lead follow-up was skipped because the woken waiter already carries the result
+  "task_follow_up_suppressed",
+  // store-progress refused a completion once because its citations were inaccurate
+  "task_citation_check_refused",
   "channel_message",
   // Service registry events
   "service_registered",
@@ -1310,6 +1510,8 @@ export const AgentLogEventTypeSchema = z.enum([
   "pricing.refresh.failed",
   // Graceful pause/resume via follow-up
   "task_superseded",
+  // Slack render v2 delegated-delivery observability (plan section 3.10)
+  "slack_delivery",
 ]);
 
 // Reasons a task can be superseded (terminal) and replaced by a "resume" follow-up.
@@ -1356,7 +1558,12 @@ export type SessionLog = z.infer<typeof SessionLogSchema>;
 // Session Cost Types (aggregated cost data per session)
 // Migration 063 widened the set to include 'unpriced' for cases where the API
 // recompute path couldn't find pricing rows for the (provider, model, token_class).
-export const SessionCostSourceSchema = z.enum(["harness", "pricing-table", "unpriced"]);
+export const SessionCostSourceSchema = z.enum([
+  "harness",
+  "pricing-table",
+  "unpriced",
+  "estimated",
+]);
 export type SessionCostSource = z.infer<typeof SessionCostSourceSchema>;
 
 export const SessionCostModelBreakdownSchema = z
@@ -1400,6 +1607,8 @@ export const SessionCostSchema = z
     //   'unpriced'       — the API tried to recompute but the (provider, model)
     //                      had no matching pricing rows; totalCostUsd is whatever
     //                      the worker submitted (often 0).
+    //   'estimated'      — the API priced fallback token counts at an assumed
+    //                      model (amp with a failed thread export).
     costSource: SessionCostSourceSchema.default("harness"),
     // Migration 128: adapter-reported amount retained for reconciliation only.
     harnessCostUsd: z.number().nullable().optional(),
@@ -1460,6 +1669,7 @@ export const EventNameSchema = z.enum([
   "system.error",
   "system.profile_sync_rejected",
   "system.profile_sync_reconciled",
+  "system.profile_sync_conflict",
   // Script catalog events
   "script.global_upsert",
   // Schedule events
@@ -1494,6 +1704,17 @@ export type SwarmEvent = z.infer<typeof SwarmEventSchema>;
 // Scheduled Task Types
 // ============================================================================
 
+export const AutomationIntegrationIdSchema = z.enum([
+  "slack",
+  "github",
+  "linear",
+  "jira",
+  "gsc",
+  "agentmail",
+  "agentfs",
+]);
+export type AutomationIntegrationId = z.infer<typeof AutomationIntegrationIdSchema>;
+
 export const ScheduledTaskTargetTypeSchema = z.enum(["agent-task", "workflow", "script"]);
 export type ScheduledTaskTargetType = z.infer<typeof ScheduledTaskTargetTypeSchema>;
 
@@ -1514,6 +1735,14 @@ export const ScheduledTaskSchema = z
     lastRunAt: z.iso.datetime().optional(),
     nextRunAt: z.iso.datetime().optional(),
     createdByAgentId: z.string().optional(),
+    // Set only by `defer-task`: the task this schedule wakes up to continue.
+    // Passed through as the created task's `parentTaskId`.
+    parentTaskId: z.string().optional(),
+    // Set only by `defer-task`: what the caller asked for, kept because the
+    // scheduler clears `nextRunAt` once a one_time schedule fires. Exactly one
+    // of the two is present. Provenance only — never read to schedule a run.
+    requestedDelayMs: z.number().int().positive().optional(),
+    requestedRunAt: z.iso.datetime().optional(),
     timezone: z.string().default("UTC"),
     consecutiveErrors: z.number().int().min(0).default(0),
     lastErrorAt: z.iso.datetime().optional(),
@@ -1525,6 +1754,9 @@ export const ScheduledTaskSchema = z
     workflowId: z.uuid().optional(),
     scriptName: z.string().optional(),
     scriptArgs: z.record(z.string(), z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
+    requiredParams: z.array(z.string()).optional(),
+    requires: z.array(AutomationIntegrationIdSchema).optional(),
     createdAt: z.iso.datetime(),
     lastUpdatedAt: z.iso.datetime(),
     createdBy: z.string().optional(),
@@ -1603,6 +1835,21 @@ export const RepoGuidelinesSchema = z
   .openapi("RepoGuidelines");
 
 export type RepoGuidelines = z.infer<typeof RepoGuidelinesSchema>;
+
+/** Upper bound per guideline list. The repository prompt section renders every
+ * entry outside the bootstrap budget, so the cap lives at the write boundary. */
+export const REPO_GUIDELINES_MAX_ENTRIES = 50;
+
+/** Write-side guidelines schema: same shape, bounded lists. Reads keep the
+ * unbounded `RepoGuidelinesSchema` so an older row never fails a response. */
+export const RepoGuidelinesInputSchema = z
+  .object({
+    prChecks: z.array(z.string()).max(REPO_GUIDELINES_MAX_ENTRIES),
+    mergeChecks: z.array(z.string()).max(REPO_GUIDELINES_MAX_ENTRIES),
+    allowMerge: z.boolean().optional().default(false),
+    review: z.array(z.string()).max(REPO_GUIDELINES_MAX_ENTRIES),
+  })
+  .openapi("RepoGuidelinesInput");
 
 export const RepoHooksSchema = z
   .object({
@@ -1809,18 +2056,19 @@ export const WorkflowNodeSchema = z
     type: z
       .string()
       .describe(
-        "Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'validate', 'property-match'",
+        "Executor type: 'agent-task', 'script', 'swarm-script', 'raw-llm', 'system-one-decision', 'validate', 'property-match'",
       ),
     label: z.string().optional().describe("Human-readable label for UI display"),
     config: z
       .record(z.string(), z.unknown())
       .describe(
-        "Executor-specific config. For agent-task: { template, outputSchema?, agentId?, tags?, priority?, dir?, vcsRepo?, model? }. " +
+        "Executor-specific config. For agent-task: { template, outputSchema?, agentId?, routingReason?, routingNote?, tags?, priority?, dir?, vcsRepo?, model? }; configured agentId defaults routingReason to human_pinned. " +
           "For script: { runtime, script, args?, timeout? }. " +
           "For swarm-script: { scriptName, scope?, pinHash?, args?, fsMode?, timeoutMs? (1000-300000) }. " +
+          "For system-one-decision (typed decisions, Jev by default): { provider? ('typesafe' default | 'openrouter' | 'laya'; a literal, never a {{token}}), state, questions: { <id>: { type: 'noul'|'choice'|'score', instructions, criteria? } }, returns: { <id>: { type } }, model? (provider-specific; unset = the provider's default, and laya has none so it sends no model and picks its own checkpoint), timeoutMs?, maxRetries? (0-3), humanReview? { band: { min, max } (0-1, inclusive), approvers: { users?, roles?, policy }, title?, timeout?, notifications? } }; each provider needs its own global secret (TYPESAFE_API_KEY, OPENROUTER_API_KEY, or LAYA_API_KEY; laya also needs the global config LAYA_URL), and a save warns and a run fails before any node executes when one is missing; system-one-decision nodes must not set retry or validation.retry. With humanReview, an answer whose confidence is inside the band waits for a person (human-in-the-loop approval), and next must map ports { approved, rejected?, timeout? }. " +
           "Agent-task templates and ordinary config values support {{interpolation}} from the node's inputs context, including trigger and declared upstream aliases. " +
           "SECURITY: executable source for script/swarm-script nodes does not interpolate trigger.* or upstream node outputs; only input/workflow/swarm/run values are allowed in inline script source, and named swarm-script source is not workflow-interpolated. " +
-          "Pass dynamic values through config.args instead (inline script receives them as argv; swarm-script receives its args object). " +
+          'Pass dynamic values through config.args instead (inline script receives them as argv, with runtime: "bash" running bash -c <script> ...args so args[0] is $0 and args[1] is $1; swarm-script receives its args object). ' +
           "NOTE: config.outputSchema on agent-task nodes validates the AGENT's raw JSON output, " +
           "while node-level outputSchema validates the EXECUTOR's return value ({taskId, taskOutput}).",
       ),
@@ -1923,6 +2171,9 @@ export const WorkflowPatchSchema = z
           "Validator subset: type, required, properties, enum, const, items. " +
           "Other JSON-Schema keywords are silently ignored.",
       ),
+    params: z.record(z.string(), z.unknown()).optional(),
+    requiredParams: z.array(z.string()).optional(),
+    requires: z.array(AutomationIntegrationIdSchema).optional(),
   })
   .openapi("WorkflowPatch");
 export type WorkflowPatch = z.infer<typeof WorkflowPatchSchema>;
@@ -1937,6 +2188,8 @@ export interface PatchResult {
 
 // Presets only: Slack-style separate timestamp headers, asymmetric signatures,
 // and generic signature-template DSLs are intentionally out of scope for v1.
+// `standard-webhooks` follows https://www.standardwebhooks.com/ (symmetric v1 only):
+// fixed webhook-id / webhook-timestamp / webhook-signature headers, so no `header`.
 export const WebhookVerificationSchema = z.discriminatedUnion("format", [
   z.object({
     format: z.literal("hmac-sha256"),
@@ -1971,6 +2224,15 @@ export const WebhookVerificationSchema = z.discriminatedUnion("format", [
     format: z.literal("token-equality"),
     header: z.string().min(1).describe("Header containing the shared token to compare"),
   }),
+  z.object({
+    format: z.literal("standard-webhooks"),
+    toleranceSeconds: z
+      .number()
+      .int()
+      .positive()
+      .default(300)
+      .describe("Maximum allowed clock skew, in seconds, for the webhook-timestamp header"),
+  }),
 ]);
 export type WebhookVerification = z.infer<typeof WebhookVerificationSchema>;
 
@@ -1992,6 +2254,10 @@ export const TriggerConfigSchema = z
     z.object({
       type: z.literal("schedule"),
       scheduleId: z.string().uuid(),
+    }),
+    z.object({
+      type: z.literal("event"),
+      eventName: z.literal("slack.message"),
     }),
   ])
   .superRefine((trigger, ctx) => {
@@ -2060,6 +2326,9 @@ export const WorkflowSnapshotSchema = z
     cooldown: CooldownConfigSchema.optional(),
     input: z.record(z.string(), InputValueSchema).optional(),
     triggerSchema: z.record(z.string(), z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
+    requiredParams: z.array(z.string()).optional(),
+    requires: z.array(AutomationIntegrationIdSchema).optional(),
     dir: z.string().min(1).startsWith("/").optional(),
     vcsRepo: z.string().min(1).optional(),
     enabled: z.boolean(),
@@ -2081,6 +2350,9 @@ export const WorkflowSchema = z
     cooldown: CooldownConfigSchema.optional(),
     input: z.record(z.string(), InputValueSchema).optional(),
     triggerSchema: z.record(z.string(), z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
+    requiredParams: z.array(z.string()).optional(),
+    requires: z.array(AutomationIntegrationIdSchema).optional(),
     dir: z.string().min(1).startsWith("/").optional(),
     vcsRepo: z.string().min(1).optional(),
     createdByAgentId: z.string().optional(),
@@ -2111,10 +2383,10 @@ export type WorkflowVersion = z.infer<typeof WorkflowVersionSchema>;
 // Pages — DB-backed lightweight artifacts (HTML or JSON spec) stored in
 // SQLite and served at /p/:id. See plan: thoughts/taras/plans/2026-05-12-db-backed-pages/.
 // PageContentTypeSchema + PageAuthModeSchema MUST stay in sync with the SQL
-// CHECK constraints in src/be/migrations/059_pages.sql.
+// CHECK constraints in src/be/migrations/148_pages_svg.sql.
 // ---------------------------------------------------------------------------
 
-export const PageContentTypeSchema = z.enum(["text/html", "application/json"]);
+export const PageContentTypeSchema = z.enum(["text/html", "application/json", "image/svg+xml"]);
 export type PageContentType = z.infer<typeof PageContentTypeSchema>;
 
 export const PageAuthModeSchema = z.enum(["public", "authed", "password"]);
@@ -2212,6 +2484,9 @@ export type AgentTaskSummary = Pick<
   | "scheduleId"
   | "model"
   | "modelTier"
+  | "resolvedModel"
+  | "modelSource"
+  | "modelAlias"
   | "effort"
   | "provider"
   | "requestedByUserId"
@@ -2220,6 +2495,26 @@ export type AgentTaskSummary = Pick<
   | "lastUpdatedAt"
   | "finishedAt"
   | "peakContextPercent"
+  | "totalCostUsd"
+>;
+
+/**
+ * `/api/tasks?fields=timeline` list item: only what the dashboard activity
+ * timeline draws (lane, bar extent, label, hover stats). Same bounded `task`
+ * preview as `AgentTaskSummary`.
+ */
+export type AgentTaskTimelineItem = Pick<
+  AgentTask,
+  | "id"
+  | "agentId"
+  | "parentTaskId"
+  | "task"
+  | "title"
+  | "status"
+  | "createdAt"
+  | "lastUpdatedAt"
+  | "finishedAt"
+  | "peakContextTokens"
   | "totalCostUsd"
 >;
 
@@ -2404,6 +2699,12 @@ export const WorkflowRunSchema = z
   })
   .openapi("WorkflowRun");
 export type WorkflowRun = z.infer<typeof WorkflowRunSchema>;
+
+/** List row of a run: no `context`, which `GET /api/workflow-runs/{id}` serves. */
+export const WorkflowRunSummarySchema = WorkflowRunSchema.omit({ context: true }).openapi(
+  "WorkflowRunSummary",
+);
+export type WorkflowRunSummary = z.infer<typeof WorkflowRunSummarySchema>;
 
 // --- Script Workflow Runs ---
 
@@ -2638,6 +2939,273 @@ export const ScriptVersionRecordSchema = z
   })
   .openapi("ScriptVersionRecord");
 export type ScriptVersionRecord = z.infer<typeof ScriptVersionRecordSchema>;
+
+// ============================================================================
+// Extension Types
+// ============================================================================
+
+const ExtensionNameSchema = z
+  .string()
+  .min(1)
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must be a lowercase slug");
+
+const SemverSchema = z
+  .string()
+  .regex(
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+    "must be a semantic version",
+  );
+
+const ExtensionBundlePathSchema = z
+  .string()
+  .min(1)
+  .refine(
+    isSafeBundlePath,
+    "Must be a relative POSIX file path without empty, dot, or parent segments, at most 256 characters",
+  );
+
+const ExtensionAssetNameSchema = z.string().min(1).max(200);
+
+export const ExtensionScriptAssetSchema = z
+  .object({
+    name: ExtensionAssetNameSchema.describe(
+      "Global script name. Must start with `<extension name>-`.",
+    ),
+    file: ExtensionBundlePathSchema.describe("Bundle path of the script source."),
+    description: z.string().min(1),
+    intent: z.string().min(1).optional().describe("Defaults to `description`."),
+  })
+  .strict();
+export type ExtensionScriptAsset = z.infer<typeof ExtensionScriptAssetSchema>;
+
+export const ExtensionScheduleAssetSchema = z
+  .object({
+    name: ExtensionAssetNameSchema.describe("Schedule name. Must start with `<extension name>-`."),
+    description: z.string().min(1).optional(),
+    script: ExtensionAssetNameSchema.describe("Name of a script declared in `assets.scripts`."),
+    cronExpression: z.string().min(1).optional(),
+    intervalMs: z.number().int().positive().optional(),
+    timezone: z.string().min(1).optional(),
+    args: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+export type ExtensionScheduleAsset = z.infer<typeof ExtensionScheduleAssetSchema>;
+
+export const ExtensionWorkflowAssetSchema = z
+  .object({
+    file: ExtensionBundlePathSchema.describe(
+      "Bundle path of a YAML or JSON workflow file. Its `name` must start with `<extension name>-`.",
+    ),
+  })
+  .strict();
+export type ExtensionWorkflowAsset = z.infer<typeof ExtensionWorkflowAssetSchema>;
+
+export const ExtensionSkillAssetSchema = z
+  .object({
+    dir: ExtensionBundlePathSchema.describe(
+      "Bundle directory holding SKILL.md and optional files/**. The SKILL.md frontmatter `name` must start with `<extension name>-`.",
+    ),
+  })
+  .strict();
+export type ExtensionSkillAsset = z.infer<typeof ExtensionSkillAssetSchema>;
+
+/** The content of a workflow file an extension ships (`assets.workflows[].file`). */
+export const ExtensionWorkflowFileSchema = z
+  .object({
+    $schema: z.string().optional(),
+    name: z.string().min(1),
+    description: z.string().optional(),
+    definition: WorkflowDefinitionSchema,
+    triggers: z.array(TriggerConfigSchema).optional(),
+    cooldown: CooldownConfigSchema.optional(),
+    input: z.record(z.string(), InputValueSchema).optional(),
+    triggerSchema: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
+export type ExtensionWorkflowFile = z.infer<typeof ExtensionWorkflowFileSchema>;
+
+export const ExtensionManifestSchema = z
+  .object({
+    $schema: z.string().optional(),
+    name: ExtensionNameSchema,
+    description: z.string(),
+    version: SemverSchema,
+    runtime: z.enum(["api", "worker"]),
+    assets: z
+      .object({
+        hooks: ExtensionBundlePathSchema,
+        // Readonly so a hooks file's `const manifest = {...} as const` satisfies the type.
+        scripts: z.array(ExtensionScriptAssetSchema).readonly().optional(),
+        schedules: z.array(ExtensionScheduleAssetSchema).readonly().optional(),
+        workflows: z.array(ExtensionWorkflowAssetSchema).readonly().optional(),
+        skills: z.array(ExtensionSkillAssetSchema).readonly().optional(),
+      })
+      .strict(),
+    homepage: z.string().url().optional(),
+    author: z.string().min(1).optional(),
+  })
+  .strict()
+  .superRefine((manifest, ctx) => {
+    const prefix = `${manifest.name}-`;
+    const scriptNames = new Set<string>();
+    const seen = new Set<string>();
+    const checkName = (kind: string, name: string, path: (string | number)[]) => {
+      if (!name.startsWith(prefix)) {
+        ctx.addIssue({ code: "custom", path, message: `${kind} name must start with "${prefix}"` });
+      }
+      const key = `${kind}:${name}`;
+      if (seen.has(key)) {
+        ctx.addIssue({ code: "custom", path, message: `duplicate ${kind} name "${name}"` });
+      }
+      seen.add(key);
+    };
+    for (const [index, script] of (manifest.assets.scripts ?? []).entries()) {
+      checkName("script", script.name, ["assets", "scripts", index, "name"]);
+      scriptNames.add(script.name);
+    }
+    for (const [index, schedule] of (manifest.assets.schedules ?? []).entries()) {
+      checkName("schedule", schedule.name, ["assets", "schedules", index, "name"]);
+      if (!scriptNames.has(schedule.script)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["assets", "schedules", index, "script"],
+          message: `schedule script "${schedule.script}" is not declared in assets.scripts`,
+        });
+      }
+      if ((schedule.cronExpression === undefined) === (schedule.intervalMs === undefined)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["assets", "schedules", index],
+          message: "schedule needs exactly one of cronExpression or intervalMs",
+        });
+      }
+    }
+  })
+  .openapi("ExtensionManifest");
+const _manifestShapeGuard: import("./extensions/contract").ExtensionManifest = {} as z.infer<
+  typeof ExtensionManifestSchema
+>;
+const _manifestSchemaGuard: z.infer<typeof ExtensionManifestSchema> =
+  {} as import("./extensions/contract").ExtensionManifest;
+void _manifestShapeGuard;
+void _manifestSchemaGuard;
+export type ExtensionManifest = z.infer<typeof ExtensionManifestSchema>;
+
+export const ExtensionStatusSchema = z.enum(["disabled", "enabled", "error", "auto-disabled"]);
+export type ExtensionStatus = z.infer<typeof ExtensionStatusSchema>;
+
+export const ExtensionSchema = z
+  .object({
+    id: z.string(),
+    name: ExtensionNameSchema,
+    description: z.string(),
+    runtime: z.enum(["api", "worker"]),
+    manifestJson: z.string(),
+    contentHash: z.string(),
+    version: z.number().int().min(1),
+    activeVersion: z.number().int().min(1),
+    enabled: z.boolean(),
+    priority: z.number().int(),
+    configJson: z.string(),
+    status: ExtensionStatusSchema,
+    consecutiveFailures: z.number().int().min(0),
+    lastError: z.string().nullable(),
+    agentId: z.string().nullable(),
+    createdByAgentId: z.string().nullable(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  })
+  .openapi("Extension");
+export type Extension = z.infer<typeof ExtensionSchema>;
+
+export const ExtensionFileSchema = z
+  .object({
+    id: z.string(),
+    extensionId: z.string(),
+    path: z.string(),
+    content: z.string(),
+    contentHash: z.string(),
+  })
+  .openapi("ExtensionFile");
+export type ExtensionFile = z.infer<typeof ExtensionFileSchema>;
+
+export const ExtensionVersionSchema = z
+  .object({
+    id: z.string(),
+    extensionId: z.string(),
+    version: z.number().int().min(1),
+    manifestJson: z.string(),
+    filesJson: z.string(),
+    contentHash: z.string(),
+    changedByAgentId: z.string().nullable(),
+    changedAt: z.string(),
+    changeReason: z.string().nullable(),
+  })
+  .openapi("ExtensionVersion");
+export type ExtensionVersion = z.infer<typeof ExtensionVersionSchema>;
+
+export const ExtensionRunSchema = z
+  .object({
+    id: z.string(),
+    extensionId: z.string(),
+    version: z.number().int().min(1),
+    event: z.string(),
+    action: z.enum(["continue", "modify", "block", "error", "timeout", "load-error"]),
+    durationMs: z.number().int().nullable(),
+    message: z.string().nullable(),
+    agentId: z.string().nullable(),
+    subject: z.string().nullable(),
+    createdAt: z.string(),
+  })
+  .openapi("ExtensionRun");
+export type ExtensionRun = z.infer<typeof ExtensionRunSchema>;
+
+/**
+ * An extension install names exactly one source: a catalog `template`, or an inline
+ * `manifest` with its `files`. Shared by the HTTP body and the `extension-install` tool input.
+ */
+export function checkExtensionInstallSource(
+  body: { template?: unknown; manifest?: unknown; files?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  const inline = body.manifest !== undefined || body.files !== undefined;
+  if (body.template !== undefined && inline) {
+    ctx.addIssue({
+      code: "custom",
+      message: "template is mutually exclusive with manifest and files",
+    });
+  } else if (body.template === undefined && !inline) {
+    ctx.addIssue({ code: "custom", message: "provide either template, or manifest with files" });
+  } else if (inline && body.manifest === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["manifest"],
+      message: "manifest is required with files",
+    });
+  } else if (inline && body.files === undefined) {
+    ctx.addIssue({ code: "custom", path: ["files"], message: "files is required with manifest" });
+  }
+}
+
+export const ExtensionInstallBodySchema = z
+  .object({
+    template: ExtensionNameSchema.optional().describe(
+      "Name of a predefined extension in the catalog (`GET /api/extensions/catalog`). Mutually exclusive with `manifest` and `files`.",
+    ),
+    manifest: ExtensionManifestSchema.optional().describe(
+      "Inline bundle manifest. Requires `files`. Accepted only when `EXTENSION_ALLOW_INLINE_INSTALL` is on and the caller is a lead, operator, or dashboard user.",
+    ),
+    files: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe("Inline bundle files keyed by relative path. Requires `manifest`."),
+    priority: z.number().int().optional().describe("Handler priority. Lower values run first."),
+    config: z.record(z.string(), z.unknown()).optional().describe("Extension configuration."),
+  })
+  .strict()
+  .superRefine(checkExtensionInstallSource)
+  .openapi("ExtensionInstallBody");
+export type ExtensionInstallBody = z.infer<typeof ExtensionInstallBodySchema>;
 
 /** Lean projection served by `GET /api/scripts` — omits `source` (payload size) and raw JSON blobs. */
 export type ScriptListItem = Omit<
@@ -2896,6 +3464,13 @@ export const PricingProviderSchema = z.enum([
   "opencode",
   "devin",
   "gemini",
+  // No seeded rate rows: a generic ACP target owns its own billing and the
+  // adapter reports `totalCostUsd: 0`, so these rows settle at
+  // `costSource: 'unpriced'`. Accepted here so the row is recorded at all.
+  "acp",
+  "dsh",
+  "amp",
+  "cursor",
 ]);
 export type PricingProvider = z.infer<typeof PricingProviderSchema>;
 

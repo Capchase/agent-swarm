@@ -1,9 +1,17 @@
 import { join, normalize, sep } from "node:path";
 import { attachmentContentDisposition } from "../../../../src/utils/content-disposition.ts";
 import { DEFAULT_CONFIG_IDS } from "../../configs/index.ts";
-import { CONFIG_PRESETS } from "../../configs/presets.ts";
-import { getClaudeAliasMap, listOpenrouterModels } from "../cost/pricing.ts";
+import { CONFIG_PRESETS, presetRunDefaults } from "../../configs/presets.ts";
+import { SUITE_SCENARIO_VERSIONS } from "../../scenarios/suite.ts";
+import {
+  getCatalog,
+  getResolutionCatalog,
+  refreshCatalog,
+  startCatalogRefresh,
+} from "../cost/catalog.ts";
+import { getClaudeAliasMap, listHarnessModels, listOpenrouterModels } from "../cost/pricing.ts";
 import { getDb, initDb } from "../db/client.ts";
+import { listHarnessConfigs } from "../db/harness-configs.ts";
 import {
   createRun,
   getArtifact,
@@ -19,7 +27,7 @@ import {
 } from "../db/queries.ts";
 import { getJudgeLive } from "../judge/live-registry.ts";
 import { getAttemptProgress } from "../live/attempt-progress.ts";
-import { loadRegistry, serializeConfig, serializeScenario } from "../registry.ts";
+import { loadRegistry, serializeScenario } from "../registry.ts";
 import { summarizeRun } from "../results.ts";
 import {
   executeRun,
@@ -28,6 +36,8 @@ import {
   killRunStacks,
   reconcileOrphanedRuns,
 } from "../runner/index.ts";
+import { assertRunConfigsResolve, ensureRunConfigPins } from "../runner/run-configs.ts";
+import { parseEffortOverrides, planRunEfforts } from "../runner/run-efforts.ts";
 import { type SessionLogRow, SwarmClient } from "../swarm/client.ts";
 import { cleanVersion } from "../swarm/version.ts";
 import {
@@ -42,6 +52,34 @@ import {
   type SandboxInfo,
 } from "../types.ts";
 import { type AnalyticsSourceRow, buildAnalytics } from "./analytics.ts";
+import {
+  buildCell,
+  CELL_ATTEMPT_LIMIT,
+  CELL_ATTEMPTS_SQL,
+  parseCellQuery,
+} from "./analytics-cell.ts";
+import {
+  ANALYTICS_SQL,
+  mapAnalyticsRow,
+  numOrNull,
+  parseFilterCsv,
+  SUITE_ANALYTICS_SQL,
+  SUITES_SQL,
+} from "./analytics-source.ts";
+import { serveBenchmarkIndex, serveBenchmarkSnapshot } from "./benchmark-routes.ts";
+import {
+  createConfig,
+  effortLevelsFor,
+  initHarnessConfigs,
+  patchConfig,
+  serializeConfigResolved,
+} from "./configs-routes.ts";
+import {
+  mapSuitesResponse,
+  parseSuiteQuery,
+  runSuiteAnalytics,
+  type SuiteAnalyticsKind,
+} from "./suite-analytics-routes.ts";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
@@ -364,61 +402,6 @@ function computeRunVersions(attempts: AttemptRow[]): RunVersions {
 }
 
 /**
- * Analytics source query (v5 spec §1.1 + v7 §6.1 token columns). json_valid
- * guards keep malformed/empty JSON columns from failing the whole aggregation —
- * they degrade to NULL like every other missing field on old rows.
- *
- * worker_version reads BOTH sandboxJson shapes (v6 spec §0.3): legacy v1 blobs
- * store a flat `workerVersion`; v2 blobs store per-worker `workers[].version`
- * (worker 0 is representative — workers are homogeneous within an attempt).
- * Mirrors computeRunVersions() above.
- */
-export const ANALYTICS_SQL = `
-  SELECT a.run_id, a.scenario_id, a.config_id, a.status, a.score, a.cost_usd, a.cost_source,
-         a.judge_cost_usd, a.duration_ms,
-         CASE WHEN json_valid(a.tokens_json)
-              THEN json_extract(a.tokens_json, '$.model') END        AS token_model,
-         CASE WHEN json_valid(a.tokens_json)
-              THEN json_extract(a.tokens_json, '$.inputTokens') END  AS token_input,
-         CASE WHEN json_valid(a.tokens_json)
-              THEN json_extract(a.tokens_json, '$.outputTokens') END AS token_output,
-         CASE WHEN json_valid(a.tokens_json)
-              THEN json_extract(a.tokens_json, '$.cacheReadTokens') END  AS token_cache_read,
-         CASE WHEN json_valid(a.tokens_json)
-              THEN json_extract(a.tokens_json, '$.cacheWriteTokens') END AS token_cache_write,
-         CASE WHEN json_valid(a.sandbox_json)
-              THEN json_extract(a.sandbox_json, '$.apiVersion') END  AS api_version,
-         CASE WHEN json_valid(a.sandbox_json)
-              THEN COALESCE(
-                json_extract(a.sandbox_json, '$.workerVersion'),
-                json_extract(a.sandbox_json, '$.workers[0].version')
-              ) END AS worker_version,
-         r.name AS run_name, r.created_at AS run_created_at
-  FROM attempts a JOIN eval_runs r ON r.id = a.run_id
-  ORDER BY r.created_at ASC, a.attempt_index ASC`;
-
-/** Defensive numeric read off a SQL/JSON value — null instead of NaN, always. */
-function numOrNull(v: unknown): number | null {
-  if (v === null || v === undefined) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-/**
- * CSV filter query param (v7.6 §C3 — frozen wire rule): split on ",", trim,
- * drop empties, dedupe. Absent param → [] (no filter on that axis).
- */
-export function parseFilterCsv(value: string | null): string[] {
-  if (value === null) return [];
-  const out: string[] = [];
-  for (const part of value.split(",")) {
-    const trimmed = part.trim();
-    if (trimmed.length > 0 && !out.includes(trimmed)) out.push(trimmed);
-  }
-  return out;
-}
-
-/**
  * Attempt rows embedded in API responses always carry `workers` (v7 §10.2):
  * the per-member roster snapshot when captured, explicit null on pre-v7 rows
  * (the UI then falls back to the sandboxJson worker entries).
@@ -514,6 +497,7 @@ export async function startServer(
 ) {
   await initDb();
   const db = getDb();
+  await initHarnessConfigs(db);
   const reconcile = opts.reconcileOrphanedRuns ?? reconcileOrphanedRuns;
   const forceCancel = opts.forceCancelInactiveRun ?? forceCancelInactiveRun;
   const reconciled = await reconcile(db, (msg) => console.log(`[orphan-reconcile] ${msg}`));
@@ -521,6 +505,29 @@ export async function startServer(
     console.log(`[orphan-reconcile] reconciled ${reconciled} orphaned run(s)`);
   }
   warnIfApiOpen();
+  // Live models.dev catalog (6h revalidation). Off under `bun test` so suites stay offline.
+  if (process.env.NODE_ENV !== "test" && process.env.EVALS_MODEL_CATALOG_REFRESH !== "off") {
+    await startCatalogRefresh(db);
+  }
+
+  /**
+   * Suite analytics (Phase 4): one suite version per request (`?suite=`, default the
+   * code's current suite), read with a suite-scoped query and shaped by the pure
+   * aggregators in suite-analytics.ts. Bad query params answer 400.
+   */
+  const serveSuiteAnalytics = async (req: Request, kind: SuiteAnalyticsKind): Promise<Response> => {
+    if (!(await isAuthorized(req))) return unauthorized();
+    const parsed = parseSuiteQuery(kind, new URL(req.url).searchParams);
+    if (!parsed.ok) return json({ error: parsed.error }, 400);
+    const res = await db.execute({ sql: SUITE_ANALYTICS_SQL, args: [parsed.query.suiteVersion] });
+    return json(
+      runSuiteAnalytics(kind, parsed.query, {
+        rows: res.rows.map(mapAnalyticsRow),
+        registry: loadRegistry(),
+        aliasMap: await getClaudeAliasMap(),
+      }),
+    );
+  };
 
   const server = Bun.serve({
     port,
@@ -533,6 +540,16 @@ export async function startServer(
         }
         return new Response(index);
       },
+      // Public benchmark (Phase 10): the SPA page and its frozen snapshots, no auth.
+      "/benchmark": async () => {
+        const index = Bun.file(join(UI_DIST, "benchmark.html"));
+        if (!(await index.exists())) {
+          return json({ error: "UI not built — run `bun run ui:build` in evals/" }, 500);
+        }
+        return new Response(index);
+      },
+      "/api/public/benchmark": () => serveBenchmarkIndex(),
+      "/api/public/benchmark/:version": (req) => serveBenchmarkSnapshot(req.params.version),
       "/health": () => json({ ok: true }),
       "/api/runs": {
         GET: async (req) => {
@@ -561,28 +578,78 @@ export async function startServer(
             attemptsPerCell?: number;
             concurrency?: number;
             judgeModel?: string;
+            /** configId → reasoning effort (null = harness default), over the config default. */
+            efforts?: unknown;
+            /**
+             * A preset id (e.g. "nightly-canary"). Fills whatever the body leaves unset:
+             * configIds, attemptsPerCell, maxMeteredUsd, and scenarioIds (the whole suite).
+             */
+            preset?: string;
+            /** Hard cap on the run's metered spend, USD. */
+            maxMeteredUsd?: number;
           } | null;
-          if (!body?.scenarioIds?.length || !body?.configIds?.length) {
+          let planned: ReturnType<typeof presetRunDefaults> = {};
+          let presetConfigIds: string[] = [];
+          if (body?.preset !== undefined) {
+            const preset = CONFIG_PRESETS.find((p) => p.id === body.preset);
+            if (!preset) return json({ error: `unknown preset "${body.preset}"` }, 400);
+            planned = presetRunDefaults([preset.id]);
+            presetConfigIds = preset.configIds;
+          }
+          const scenarioIds = body?.scenarioIds?.length
+            ? body.scenarioIds
+            : body?.preset !== undefined
+              ? Object.keys(SUITE_SCENARIO_VERSIONS)
+              : [];
+          const configIds = body?.configIds?.length ? body.configIds : presetConfigIds;
+          if (!body || !scenarioIds.length || !configIds.length) {
             return json({ error: "scenarioIds and configIds are required" }, 400);
           }
+          const maxMeteredUsd = body.maxMeteredUsd ?? planned.maxMeteredUsd;
+          if (
+            maxMeteredUsd !== undefined &&
+            !(
+              typeof maxMeteredUsd === "number" &&
+              Number.isFinite(maxMeteredUsd) &&
+              maxMeteredUsd > 0
+            )
+          ) {
+            return json({ error: "maxMeteredUsd must be a positive number" }, 400);
+          }
           const registry = loadRegistry();
-          for (const id of body.scenarioIds) {
+          for (const id of scenarioIds) {
             if (!registry.scenarios.has(id))
               return json({ error: `unknown scenario "${id}"` }, 400);
           }
-          for (const id of body.configIds) {
+          for (const id of configIds) {
             if (!registry.configs.has(id)) return json({ error: `unknown config "${id}"` }, 400);
+          }
+          let efforts: Awaited<ReturnType<typeof planRunEfforts>>;
+          try {
+            await assertRunConfigsResolve(registry, scenarioIds, configIds);
+            efforts = planRunEfforts({
+              registry,
+              scenarioIds,
+              configIds,
+              overrides: parseEffortOverrides(body.efforts),
+              catalog: await getResolutionCatalog(),
+            });
+          } catch (err) {
+            return json({ error: err instanceof Error ? err.message : String(err) }, 400);
           }
           const runId = newRunId();
           await createRun(db, {
             id: runId,
             name: body.name,
-            scenarioIds: body.scenarioIds,
-            configIds: body.configIds,
-            attemptsPerCell: Math.max(1, body.attemptsPerCell ?? 1),
+            scenarioIds,
+            configIds,
+            attemptsPerCell: Math.max(1, body.attemptsPerCell ?? planned.attemptsPerCell ?? 1),
             concurrency: Math.max(1, body.concurrency ?? 2),
             judgeModel: body.judgeModel || undefined,
+            efforts,
+            maxMeteredUsd,
           });
+          await ensureRunConfigPins(db, runId, registry, scenarioIds, configIds);
           startRunExecution(db, runId);
           return json({ runId }, 201);
         },
@@ -790,15 +857,49 @@ export async function startServer(
         }
         return json({ scenario: serializeScenario(scenario), recentAttempts });
       },
-      "/api/configs": async (req) => {
+      /** Harness configs from the harness_configs table (code seeds + API-created rows). */
+      "/api/configs": {
+        GET: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const registry = loadRegistry();
+          const sources = new Map(
+            (await listHarnessConfigs(db)).map((r) => [r.config.id, r.source]),
+          );
+          const catalog = await getResolutionCatalog();
+          return json(
+            [...registry.configs.values()].map((c) => ({
+              ...serializeConfigResolved(c, catalog),
+              isDefault: DEFAULT_CONFIG_IDS.includes(c.id),
+              source: sources.get(c.id) ?? "seed",
+            })),
+          );
+        },
+        POST: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const result = await createConfig(db, await req.json().catch(() => null));
+          if (!result.ok) return json({ error: result.error }, result.status);
+          return json(
+            serializeConfigResolved(result.config, await getResolutionCatalog()),
+            result.status,
+          );
+        },
+      },
+      "/api/configs/:id": {
+        PATCH: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const result = await patchConfig(db, req.params.id, await req.json().catch(() => null));
+          if (!result.ok) return json({ error: result.error }, result.status);
+          return json(
+            serializeConfigResolved(result.config, await getResolutionCatalog()),
+            result.status,
+          );
+        },
+      },
+      /** Reasoning efforts a harness takes for a model or alias (config form + new-run dialog). */
+      "/api/effort-levels": async (req) => {
         if (!(await isAuthorized(req))) return unauthorized();
-        const registry = loadRegistry();
-        return json(
-          [...registry.configs.values()].map((c) => ({
-            ...serializeConfig(c),
-            isDefault: DEFAULT_CONFIG_IDS.includes(c.id),
-          })),
-        );
+        const result = effortLevelsFor(new URL(req.url).searchParams, await getResolutionCatalog());
+        return result.ok ? json(result.body) : json({ error: result.error }, result.status);
       },
       /** Quick-run config presets (v7.7 item 1) — static catalog data, validated by registry.test.ts. */
       "/api/presets": async (req) => {
@@ -807,11 +908,34 @@ export async function startServer(
       },
       "/api/models": async (req) => {
         if (!(await isAuthorized(req))) return unauthorized();
+        // The judge picker list: openrouter only.
         const models = await listOpenrouterModels();
+        // Display-only claude (anthropic) + codex (openai) entries, so the UI
+        // can name and price any config or attempt model id, not just openrouter's.
+        const harnessModels = await listHarnessModels();
         // v7 §8: frozen claude alias map (fable → claude-fable-5, …) so the UI
         // resolves bare aliases stored on historical rows at display time.
         const aliases = await getClaudeAliasMap();
-        return json({ defaultJudgeModel: DEFAULT_JUDGE_MODEL, models, aliases });
+        const { source, fetchedAt } = await getCatalog();
+        return json({
+          defaultJudgeModel: DEFAULT_JUDGE_MODEL,
+          models,
+          harnessModels,
+          aliases,
+          catalog: { source, fetchedAt },
+        });
+      },
+      /** Force a models.dev fetch now instead of waiting for the 6h revalidation. */
+      "/api/models/refresh": {
+        POST: async (req) => {
+          if (!(await isAuthorized(req))) return unauthorized();
+          const result = await refreshCatalog({ db });
+          const { source, fetchedAt } = await getCatalog();
+          return json(
+            { ...result, catalog: { source, fetchedAt } },
+            result.status === "error" ? 502 : 200,
+          );
+        },
       },
       /**
        * Pre-aggregated analytics (v5 spec §1 — frozen contract). One SQL pass
@@ -829,33 +953,38 @@ export async function startServer(
         const filter: AnalyticsFilter = {
           harnesses: parseFilterCsv(params.get("harnesses")),
           configIds: parseFilterCsv(params.get("configs")),
+          efforts: parseFilterCsv(params.get("efforts")),
         };
         const res = await db.execute(ANALYTICS_SQL);
-        const rows: AnalyticsSourceRow[] = res.rows.map((r) => ({
-          runId: r.run_id as string,
-          scenarioId: r.scenario_id as string,
-          configId: r.config_id as string,
-          status: r.status as string,
-          score: r.score === null ? null : Number(r.score),
-          costUsd: r.cost_usd === null ? null : Number(r.cost_usd),
-          costSource: (r.cost_source as string) ?? null,
-          judgeCostUsd: r.judge_cost_usd === null ? null : Number(r.judge_cost_usd),
-          durationMs: r.duration_ms === null ? null : Number(r.duration_ms),
-          tokenModel: (r.token_model as string) ?? null,
-          // v7 §6.1: token sums; numOrNull guards stored-JSON garbage (no NaN).
-          tokenInput: numOrNull(r.token_input),
-          tokenOutput: numOrNull(r.token_output),
-          tokenCacheRead: numOrNull(r.token_cache_read),
-          tokenCacheWrite: numOrNull(r.token_cache_write),
-          apiVersion: (r.api_version as string) ?? null,
-          workerVersion: (r.worker_version as string) ?? null,
-          runName: (r.run_name as string) ?? null,
-          runCreatedAt: r.run_created_at as string,
-        }));
+        const rows: AnalyticsSourceRow[] = res.rows.map(mapAnalyticsRow);
         // v7 §7.1/§8: historical bare-alias model keys group under the latest
         // concrete family id — same map the UI receives on /api/models.
         return json(buildAnalytics(rows, loadRegistry(), await getClaudeAliasMap(), filter));
       },
+      "/api/analytics/suites": async (req) => {
+        if (!(await isAuthorized(req))) return unauthorized();
+        return json(mapSuitesResponse((await db.execute(SUITES_SQL)).rows));
+      },
+      /**
+       * The attempts behind one heatmap cell (suite x scenario x config), newest
+       * run first, so a reader can open one and read its transcript.
+       */
+      "/api/analytics/cell": async (req) => {
+        if (!(await isAuthorized(req))) return unauthorized();
+        const parsed = parseCellQuery(new URL(req.url).searchParams);
+        if (!parsed.ok) return json({ error: parsed.error }, 400);
+        const { suiteVersion, scenarioId, configId } = parsed.query;
+        const res = await db.execute({
+          sql: CELL_ATTEMPTS_SQL,
+          args: [suiteVersion, scenarioId, configId, CELL_ATTEMPT_LIMIT + 1],
+        });
+        return json(buildCell(parsed.query, res.rows));
+      },
+      "/api/analytics/frontier": (req) => serveSuiteAnalytics(req, "frontier"),
+      "/api/analytics/leaderboard": (req) => serveSuiteAnalytics(req, "leaderboard"),
+      "/api/analytics/heatmap": (req) => serveSuiteAnalytics(req, "heatmap"),
+      "/api/analytics/reliability": (req) => serveSuiteAnalytics(req, "reliability"),
+      "/api/analytics/compare": (req) => serveSuiteAnalytics(req, "compare"),
       "/api/artifacts/:id": async (req) => {
         if (!(await isAuthorized(req))) return unauthorized();
         const artifact = await getArtifact(db, req.params.id);

@@ -16,6 +16,13 @@ export function generateEnv(state: OnboardState): string {
   lines.push(`MCP_BASE_URL=http://localhost:${port}`);
   lines.push("APP_URL=https://app.agent-swarm.dev");
 
+  // Image pin. Blank resolves to `latest`, which moves on every commit to main
+  // and is not a release. Left blank so a fresh install behaves as before;
+  // operators set a published release from
+  // https://github.com/desplega-ai/agent-swarm/releases before depending on it.
+  lines.push("# Pin a release, e.g. AGENT_SWARM_VERSION=1.150.0. Blank tracks `latest`.");
+  lines.push("AGENT_SWARM_VERSION=");
+
   // Install path — read by src/telemetry.ts at boot to attribute the
   // "which entry point produced this install" cohort. Boolean/enum only,
   // never an identifier. Installs that never ran the wizard (hand-written
@@ -28,13 +35,49 @@ export function generateEnv(state: OnboardState): string {
     lines.push(`INSTALL_PRESET=${state.presetId}`);
   }
 
+  lines.push("");
+  lines.push("# New-deployment memory preset: retrieval, citation ratings, self-rating hints.");
+  lines.push("# Set MEMORY_RATERS= to disable all raters; leave SKIP_SESSION_SUMMARY unset.");
+  lines.push("MEMORY_HYBRID_SEARCH=1");
+  lines.push("MEMORY_GRAPH_EXPANSION=1");
+  lines.push("MEMORY_RATERS=implicit-citation,explicit-self");
+  lines.push("MEMORY_DEMOTION_FLOOR=1.0");
+
   // ── Authentication ──
   lines.push("");
   lines.push("# === Authentication ===");
-  if (state.credentialType === "api_key") {
-    lines.push(`ANTHROPIC_API_KEY=${state.anthropicApiKey}`);
-  } else {
-    lines.push(`CLAUDE_CODE_OAUTH_TOKEN=${state.claudeOAuthToken}`);
+  lines.push(`HARNESS_PROVIDER=${state.harness}`);
+  switch (state.provider) {
+    case "claude":
+      if (state.credentialType === "api_key") {
+        lines.push(`ANTHROPIC_API_KEY=${state.anthropicApiKey}`);
+      } else {
+        lines.push(`CLAUDE_CODE_OAUTH_TOKEN=${state.claudeOAuthToken}`);
+      }
+      break;
+    case "openai":
+      lines.push(`OPENAI_API_KEY=${state.openaiApiKey}`);
+      break;
+    case "openrouter":
+      lines.push(`OPENROUTER_API_KEY=${state.openrouterApiKey}`);
+      lines.push(`MODEL_OVERRIDE=${state.modelOverride}`);
+      break;
+    case "bedrock":
+      lines.push("# AWS Bedrock (alpha)");
+      lines.push(
+        "# Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock.",
+      );
+      lines.push("BEDROCK_AUTH_MODE=sdk");
+      lines.push(`AWS_REGION=${state.awsRegion}`);
+      if (state.awsProfile) {
+        lines.push(`AWS_PROFILE=${state.awsProfile}`);
+      } else {
+        lines.push(`AWS_ACCESS_KEY_ID=${state.awsAccessKeyId}`);
+        lines.push(`AWS_SECRET_ACCESS_KEY=${state.awsSecretAccessKey}`);
+        if (state.awsSessionToken) lines.push(`AWS_SESSION_TOKEN=${state.awsSessionToken}`);
+      }
+      lines.push(`MODEL_OVERRIDE=${state.modelOverride}`);
+      break;
   }
 
   // ── Integrations ──
@@ -57,8 +100,13 @@ export function generateEnv(state: OnboardState): string {
   if (state.integrations.slack) {
     lines.push("");
     lines.push("# Slack");
+    lines.push(`SLACK_MODE=${state.slackMode}`);
     lines.push(`SLACK_BOT_TOKEN=${state.slackBotToken}`);
-    lines.push(`SLACK_APP_TOKEN=${state.slackAppToken}`);
+    if (state.slackMode === "http") {
+      lines.push(`SLACK_SIGNING_SECRET=${state.slackSigningSecret}`);
+    } else {
+      lines.push(`SLACK_APP_TOKEN=${state.slackAppToken}`);
+    }
     lines.push("SLACK_DISABLE=false");
   } else {
     lines.push("SLACK_DISABLE=true");

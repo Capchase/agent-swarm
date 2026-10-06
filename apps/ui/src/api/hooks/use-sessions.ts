@@ -13,6 +13,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { sessionRefetchInterval } from "@/lib/task-activity";
 import { api } from "../client";
 
 export interface UseSessionsOptions {
@@ -24,6 +25,8 @@ export interface UseSessionsOptions {
   q?: string;
   /** When set, restrict results to sessions owned by this user. */
   requestedByUserId?: string;
+  /** Root tasks whose `contextKey` starts with this prefix (≥1.157.1). */
+  contextKeyPrefix?: string;
   /** Disable the query entirely (e.g. when user identity is not yet resolved). */
   enabled?: boolean;
 }
@@ -34,10 +37,12 @@ export function useSessions(options?: UseSessionsOptions) {
   const source = options?.source;
   const q = options?.q;
   const requestedByUserId = options?.requestedByUserId;
+  const contextKeyPrefix = options?.contextKeyPrefix;
   const enabled = options?.enabled ?? true;
   return useQuery({
-    queryKey: ["sessions", { limit, offset, source, q, requestedByUserId }],
-    queryFn: () => api.listSessions({ limit, offset, source, q, requestedByUserId }),
+    queryKey: ["sessions", { limit, offset, source, q, requestedByUserId, contextKeyPrefix }],
+    queryFn: () =>
+      api.listSessions({ limit, offset, source, q, requestedByUserId, contextKeyPrefix }),
     enabled,
   });
 }
@@ -47,6 +52,9 @@ export function useSession(rootTaskId: string | undefined) {
     queryKey: ["session", rootTaskId],
     queryFn: () => api.getSession(rootTaskId!),
     enabled: !!rootTaskId,
+    // Replaces the app-wide 10s default: 4s while any task is active so live
+    // progress keeps up, back to 10s once the chain settles (never stops).
+    refetchInterval: (query) => sessionRefetchInterval(query.state.data),
   });
 }
 

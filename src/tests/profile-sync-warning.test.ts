@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { prependContextPreamble } from "../commands/context-preamble";
 import {
   contentSha256,
   fetchProfileSyncRejectionBanner,
@@ -71,21 +72,40 @@ describe("profile sync rejection session warning", () => {
       "ORIGINAL TASK PROMPT",
       {
         apiUrl: "https://api.example.test",
-        apiKey: "secret-key",
+        apiKey: "example-secret-key",
         agentId: "agent-1",
       },
       fetchImpl,
     );
 
-    expect(requests[0]?.url).toContain("event=system.profile_sync_rejected");
-    expect(requests[0]?.url).toContain("agentId=agent-1");
-    expect(requests[0]?.url).toContain("limit=1");
-    expect(requests[0]?.url).toContain("dataField=soulMd");
+    // This mock predates latestPerDataField: the batched request is not
+    // confirmed, so the per-field lookups follow it.
+    expect(requests[0]?.url).toContain("latestPerDataField=true");
     expect(requests[0]?.headers.get("X-Agent-ID")).toBe("agent-1");
+    expect(requests[1]?.url).toContain("event=system.profile_sync_rejected");
+    expect(requests[1]?.url).toContain("agentId=agent-1");
+    expect(requests[1]?.url).toContain("limit=1");
+    expect(requests[1]?.url).toContain("dataField=soulMd");
+    expect(requests[1]?.headers.get("X-Agent-ID")).toBe("agent-1");
     expect(requests.at(-1)?.url).toBe("https://api.example.test/me");
     expect(result.injected).toBeTrue();
     expect(result.prompt).toContain("PERSISTED PROFILE SYNC REJECTION");
     expect(result.prompt).toEndWith("ORIGINAL TASK PROMPT");
+
+    const context = "\n## Prior Conversation Context\nParent evidence\n\n";
+    const taskPrompt = "/work-on-task child-id\n\nTask: follow up";
+    const followUp = await prependProfileSyncRejectionBanner(
+      prependContextPreamble(taskPrompt, context),
+      { apiUrl: "https://api.example.test", apiKey: "example-secret-key", agentId: "agent-1" },
+      fetchImpl,
+    );
+    expect(followUp.prompt).toStartWith("/work-on-task child-id\n");
+    expect(followUp.prompt).toContain(context);
+    expect(followUp.prompt).toContain("PERSISTED PROFILE SYNC REJECTION");
+    expect(followUp.prompt).toEndWith("Task: follow up");
+    expect(followUp.prompt.indexOf("PERSISTED PROFILE SYNC REJECTION")).toBeLessThan(
+      followUp.prompt.indexOf("## Prior Conversation Context"),
+    );
   });
 
   test("stops warning after the stored field changes", async () => {
@@ -104,7 +124,7 @@ describe("profile sync rejection session warning", () => {
     const banner = await fetchProfileSyncRejectionBanner(
       {
         apiUrl: "https://api.example.test",
-        apiKey: "secret-key",
+        apiKey: "example-secret-key",
         agentId: "agent-1",
       },
       fetchImpl,
@@ -137,7 +157,7 @@ describe("profile sync rejection session warning", () => {
     const banner = await fetchProfileSyncRejectionBanner(
       {
         apiUrl: "https://api.example.test",
-        apiKey: "secret-key",
+        apiKey: "example-secret-key",
         agentId: "agent-1",
       },
       fetchImpl,
@@ -174,7 +194,7 @@ describe("profile sync rejection session warning", () => {
     const banner = await fetchProfileSyncRejectionBanner(
       {
         apiUrl: "https://api.example.test",
-        apiKey: "secret-key",
+        apiKey: "example-secret-key",
         agentId: "agent-1",
       },
       fetchImpl,
@@ -203,7 +223,7 @@ describe("profile sync rejection session warning", () => {
     }) as typeof fetch;
     const config = {
       apiUrl: "https://api.example.test",
-      apiKey: "secret-key",
+      apiKey: "example-secret-key",
       agentId: "agent-1",
       claudeMdPath: WORKSPACE_CLAUDE_MD_PATH,
     };
@@ -250,7 +270,7 @@ describe("profile sync rejection session warning", () => {
     const banner = await fetchProfileSyncRejectionBanner(
       {
         apiUrl: "https://api.example.test",
-        apiKey: "secret-key",
+        apiKey: "example-secret-key",
         agentId: "agent-1",
       },
       fetchImpl,
@@ -266,7 +286,7 @@ describe("profile sync rejection session warning", () => {
     const banner = await fetchProfileSyncRejectionBanner(
       {
         apiUrl: "https://api.example.test",
-        apiKey: "secret-key",
+        apiKey: "example-secret-key",
         agentId: "agent-1",
       },
       (async () => new Response("unavailable", { status: 503 })) as typeof fetch,

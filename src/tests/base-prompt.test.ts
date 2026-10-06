@@ -25,6 +25,8 @@ const ENV_KEYS = [
   "SLACK_DISABLE",
   "SLACK_BOT_TOKEN",
   "SLACK_APP_TOKEN",
+  "SLACK_MODE",
+  "SLACK_SIGNING_SECRET",
   "STEERING_ENABLED",
   "AGENT_FS_API_URL",
   "SCRIPTS_ONLY_MCP",
@@ -247,6 +249,13 @@ describe("getBasePrompt: composite selection", () => {
     const result = await getBasePrompt({ ...minimalArgs, traits: remoteTraits });
     expect(result).not.toContain("## Workspace");
     expect(result).not.toContain("## Secrets");
+  });
+
+  test("citation guidance reaches local agents only", async () => {
+    const local = await getBasePrompt({ ...minimalArgs, traits: localTraits });
+    const remote = await getBasePrompt({ ...minimalArgs, traits: remoteTraits });
+    expect(local).toContain("Skip citations on delegation, routing, acks, and status replies.");
+    expect(remote).not.toContain("citation");
   });
 
   test("a lead without MCP still gets the remote worker composite", async () => {
@@ -473,6 +482,9 @@ describe("getBasePrompt: outputs section", () => {
     const result = await getBasePrompt({ ...minimalArgs, traits: localTraits });
     expect(result).toContain("## Outputs");
     expect(result).toContain(AGENT_FS_LINE);
+    expect(result).toContain(
+      "For a file anyone outside the swarm opens, use an `agent-fs share-create` link; `AGENT_FS_LIVE_URL` links are for signed-in teammates.",
+    );
     expect(result).not.toContain(NO_AGENT_FS_LINE);
   });
 
@@ -561,6 +573,29 @@ describe("getBasePrompt: slack section", () => {
     expect(result).toContain(SLACK_HEADER);
   });
 
+  test("a tool capability alone does not bypass the default socket credential gate", async () => {
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      serverCapabilities: ["core", "slack"],
+    });
+    expect(result).not.toContain(SLACK_HEADER);
+  });
+
+  test("supports the HTTP prompt contract without distributing Slack secrets to the worker", async () => {
+    process.env.SLACK_MODE = "http";
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      serverCapabilities: ["core", "slack"],
+    });
+    expect(result).toContain(SLACK_HEADER);
+
+    const withoutCapability = await getBasePrompt({
+      ...minimalArgs,
+      serverCapabilities: ["core"],
+    });
+    expect(withoutCapability).not.toContain(SLACK_HEADER);
+  });
+
   test("a scripts-only worker with a Slack task gets the scripts-only variant only", async () => {
     enableSlack();
     const result = await getBasePrompt({
@@ -636,6 +671,7 @@ describe("getBasePrompt: steering section", () => {
   });
 
   test("excluded when steering is not enabled", async () => {
+    process.env.STEERING_ENABLED = "false";
     const result = await getBasePrompt({ ...minimalArgs, traits: steerableTraits });
     expect(result).not.toContain(STEERING_HEADER);
   });
@@ -714,10 +750,11 @@ describe("getBasePrompt: tools and skills section", () => {
     expect(result).not.toContain("skills directory");
   });
 
-  test("keeps the section with only the deferred-tools line when no skills are installed", async () => {
+  test("keeps the section with direct-tool guidance when no skills are installed", async () => {
     const result = await getBasePrompt({ ...minimalArgs, skillsSummary: [] });
     expect(result).toContain(HEADER);
-    expect(result).toContain(DEFERRED_LINE);
+    expect(result).toContain("Swarm tools are already in your tool list.");
+    expect(result).not.toContain(DEFERRED_LINE);
     expect(result).not.toContain("Installed skills.");
     expect(result).not.toContain(DISCOVERY_LINE);
   });
@@ -960,21 +997,21 @@ describe("truncateRepoClaudeMd", () => {
 // ---------------------------------------------------------------------------
 
 describe("getBasePrompt: size budget", () => {
-  // The v2 rewrite cut the static prompt from ~25k characters to ~4.2k. These
-  // ceilings are generous, so they only fire on a regression back to v1 size.
-  test("a fresh claude worker stays under 5,000 characters", async () => {
+  // Include task-output budget, exceptions, and the two citation-scoping lines (when to cite, when not to).
+  // Keep tight role-specific ceilings to catch unrelated prompt growth.
+  test("a fresh claude worker stays under 5,750 characters", async () => {
     const result = await getBasePrompt({ ...minimalArgs, name: "Ada", traits: localTraits });
-    expect(result.length).toBeLessThan(5_000);
+    expect(result.length).toBeLessThan(5_750);
   });
 
-  test("a fresh claude lead stays under 5,200 characters", async () => {
+  test("a fresh claude lead stays under 5,900 characters", async () => {
     const result = await getBasePrompt({
       ...minimalArgs,
       role: "lead",
       name: "Cora",
       traits: localTraits,
     });
-    expect(result.length).toBeLessThan(5_200);
+    expect(result.length).toBeLessThan(5_900);
   });
 
   test("Picateclas spawn-OOM hardening: the kitchen sink stays below MAX_ARG_STRLEN", async () => {
@@ -1066,4 +1103,54 @@ describe("getBasePrompt: output hygiene", () => {
       expect(result).not.toMatch(/\n{3,}/);
     });
   }
+});
+
+describe("getBasePrompt: harness tool discovery", () => {
+  const deferred =
+    "Most swarm tools are deferred. Load one with your harness tool search before the first call.";
+
+  test("claude with native ToolSearch gets deferred-tool guidance", async () => {
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      provider: "claude",
+      traits: { ...localTraits, hasToolSearch: true },
+    });
+    expect(result).toContain(deferred);
+    expect(result).not.toContain("Swarm tools are already in your tool list.");
+  });
+
+  test.each([
+    "pi",
+    "codex",
+    "claude-managed",
+    "opencode",
+    "acp",
+  ])("%s without tool search gets direct-tool guidance", async (provider) => {
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      provider,
+      traits: { ...localTraits, hasToolSearch: false },
+    });
+    expect(result).not.toContain(deferred);
+    expect(result).toContain("Swarm tools are already in your tool list.");
+  });
+
+  test("amp gets its own guidance: tool_search plus code_exec, underscored names", async () => {
+    const result = await getBasePrompt({
+      ...minimalArgs,
+      provider: "amp",
+      traits: { ...localTraits, hasToolSearch: true },
+    });
+    expect(result).not.toContain(deferred);
+    expect(result).not.toContain("Swarm tools are already in your tool list.");
+    expect(result).toContain("`tool_search` and `code_exec`");
+    expect(result).toContain("`store-progress` is `store_progress`");
+    expect(result).toContain('import { store_progress } from "agent-swarm"');
+  });
+
+  test("omitted tool-search capability defaults to direct tools", async () => {
+    const result = await getBasePrompt({ ...minimalArgs, traits: localTraits });
+    expect(result).not.toContain(deferred);
+    expect(result).toContain("Swarm tools are already in your tool list.");
+  });
 });

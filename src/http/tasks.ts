@@ -7,6 +7,7 @@ import {
   backfillSupersedeTaskResumeTaskId,
   cancelTask,
   completeTask,
+  ExtensionAgentAssignmentError,
   failTask,
   getAgentById,
   getAllTasks,
@@ -24,7 +25,10 @@ import {
   markSteeringDelivered,
   markSteeringHandled,
   pauseTask,
+  promoteDraftTask,
+  recordTaskProviderIfUnset,
   resumeTask,
+  settleSupersededTaskDependents,
   supersedeTask,
   updateAgentStatusFromCapacity,
   updateTaskClaudeSessionId,
@@ -32,14 +36,17 @@ import {
   updateTaskTitle,
   updateTaskVcs,
 } from "../be/db";
+import { explicitModelErrorForAgent } from "../be/model-validation";
 import {
   getTaskSteeringFields,
   markSteeringUndeliverable,
   requestSteering,
   SteeringRequestError,
 } from "../be/steering";
+import { getTaskCitations, TaskCitationSchema } from "../be/task-citations";
 import { findUserById } from "../be/users";
 import { can, type RbacPrincipal, type RbacResource } from "../rbac";
+import { TaskCreationBlockedError } from "../tasks/errors";
 import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { guardTerminalTaskResultWrite } from "../tasks/terminal-result-guard";
 import { createResumeFollowUp, createWorkerTaskFollowUp } from "../tasks/worker-follow-up";
@@ -58,6 +65,7 @@ import {
   ProviderNameSchema,
   ReasoningEffortSchema,
   ResumeReasonSchema,
+  RoutingReasonSchema,
   SteeringMessageSchema,
   SteeringSourceSchema,
   SteerModeSchema,
@@ -97,6 +105,9 @@ const AgentTaskSummarySchema = AgentTaskSchema.pick({
   scheduleId: true,
   model: true,
   modelTier: true,
+  resolvedModel: true,
+  modelSource: true,
+  modelAlias: true,
   effort: true,
   provider: true,
   requestedByUserId: true,
@@ -105,6 +116,21 @@ const AgentTaskSummarySchema = AgentTaskSchema.pick({
   lastUpdatedAt: true,
   finishedAt: true,
   peakContextPercent: true,
+  totalCostUsd: true,
+});
+
+/** `/api/tasks?fields=timeline` item — mirrors `AgentTaskTimelineItem` in ../types. */
+const AgentTaskTimelineItemSchema = AgentTaskSchema.pick({
+  id: true,
+  agentId: true,
+  parentTaskId: true,
+  task: true,
+  title: true,
+  status: true,
+  createdAt: true,
+  lastUpdatedAt: true,
+  finishedAt: true,
+  peakContextTokens: true,
   totalCostUsd: true,
 });
 
@@ -132,6 +158,7 @@ const GetTaskResponseSchema = AgentTaskSchema.extend({
   supportedSteerModes: z.array(SteerModeSchema),
   logs: z.array(AgentLogSchema),
   attachments: z.array(TaskAttachmentSchema),
+  citations: z.array(TaskCitationSchema),
 });
 
 const FinishTaskSuccessSchema = z.object({
@@ -167,7 +194,7 @@ const listTasks = route({
   pattern: ["api", "tasks"],
   summary: "List tasks with filters",
   description:
-    "Returns tasks with the full `task` text replaced by a bounded `taskPreview` and completion/integration blobs dropped by default — list views only need the preview. Pass `fields=full` to restore the full `AgentTask`. Fetch a single task in full via `GET /api/tasks/{id}`.",
+    "Returns tasks with the full `task` text replaced by a bounded `taskPreview` and completion/integration blobs dropped by default — list views only need the preview. Pass `fields=full` to restore the full `AgentTask`, or `fields=timeline` for the narrow shape the dashboard timeline draws. Fetch a single task in full via `GET /api/tasks/{id}`. `total` (the filtered row count, ignoring limit/offset) is computed only with `includeTotal=true`.",
   tags: ["Tasks"],
   query: z.object({
     /** Single status, or comma-separated list (e.g. "failed,cancelled"). */
@@ -194,15 +221,25 @@ const listTasks = route({
     orderBy: z.enum(["lastUpdatedAt", "createdAt"]).optional(),
     limit: z.coerce.number().int().optional(),
     offset: z.coerce.number().int().optional(),
-    /** `full` restores the legacy shape (full `task` text + all fields); default is slim. */
-    fields: z.enum(["full", "slim"]).optional(),
+    /**
+     * `full` restores the legacy shape (full `task` text + all fields);
+     * `timeline` is the dashboard timeline's narrow shape; default is slim.
+     */
+    fields: z.enum(["full", "slim", "timeline"]).optional(),
+    /** `true` adds `total`, a filtered COUNT(*) that pagers need. Omitted by default. */
+    includeTotal: z.enum(["true", "false"]).optional(),
   }),
   responses: {
     200: {
       description: "Paginated task list",
       schema: z.object({
-        tasks: z.union([z.array(AgentTaskSchema), z.array(AgentTaskSummarySchema)]),
-        total: z.number().int(),
+        tasks: z.union([
+          z.array(AgentTaskSchema),
+          z.array(AgentTaskSummarySchema),
+          z.array(AgentTaskTimelineItemSchema),
+        ]),
+        /** Present only when the request passed `includeTotal=true`. */
+        total: z.number().int().optional(),
       }),
     },
     400: { description: "Validation error (e.g. unknown status token)" },
@@ -215,28 +252,85 @@ const createTask = route({
   pattern: ["api", "tasks"],
   summary: "Create a new task",
   tags: ["Tasks"],
-  body: z.object({
-    task: z.string().min(1),
-    agentId: z.string().optional(),
-    taskType: z.string().optional(),
-    tags: z.array(z.string()).optional(),
-    priority: z.number().int().min(0).max(100).optional(),
-    dependsOn: z.array(z.string()).optional(),
-    offeredTo: z.string().optional(),
-    dir: z.string().optional(),
-    parentTaskId: z.string().optional(),
-    key: AssetKeySchema.optional(),
-    source: AgentTaskSourceSchema.optional(),
-    outputSchema: z.record(z.string(), z.unknown()).optional(),
-    contextKey: z.string().optional(),
-    requestedByUserId: z.string().optional(),
-    model: z.string().optional(),
-    modelTier: ModelTierSchema.optional(),
-    effort: ReasoningEffortSchema.optional(),
-  }),
+  body: z
+    .object({
+      task: z.string().min(1),
+      agentId: z.string().optional(),
+      routingReason: RoutingReasonSchema.optional(),
+      routingNote: z.string().max(200).optional(),
+      taskType: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      priority: z.number().int().min(0).max(100).optional(),
+      dependsOn: z.array(z.string()).optional(),
+      offeredTo: z.string().optional(),
+      dir: z.string().optional(),
+      parentTaskId: z.string().optional(),
+      key: AssetKeySchema.optional(),
+      source: AgentTaskSourceSchema.optional(),
+      outputSchema: z.record(z.string(), z.unknown()).optional(),
+      contextKey: z.string().optional(),
+      requestedByUserId: z.string().optional(),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          "Concrete model override for this task, interpreted by the assignee's harness/provider. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
+        ),
+      modelTier: ModelTierSchema.optional(),
+      /**
+       * Accept a `model` the catalog does not list. Without it an unknown id is a 400; with it
+       * the id is stored as given (a fresh launch, a private deployment).
+       */
+      allowCustomModel: z.boolean().optional(),
+      effort: ReasoningEffortSchema.optional(),
+      /**
+       * Create in `draft` status instead of the normal pending/unassigned/offered
+       * status (#1240) — the task exists and is visible to its owner, but is not
+       * dispatch-eligible. Used by the UI composer while attachments are still
+       * uploading; the caller MUST promote it via `POST /api/tasks/{id}/promote-draft`
+       * once the upload batch settles (or it self-promotes on a timeout).
+       */
+      draft: z.boolean().optional(),
+    })
+    .superRefine((body, ctx) => {
+      if ((body.agentId !== undefined || body.offeredTo !== undefined) && !body.routingReason) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "routingReason is required when agentId or offeredTo is supplied.",
+          path: ["routingReason"],
+        });
+      }
+    }),
   responses: {
     201: { description: "Task created", schema: AgentTaskSchema },
-    400: { description: "Validation error" },
+    400: {
+      description:
+        "Validation error, an unknown `model` (set `allowCustomModel` to store a custom id), or agentId/offeredTo targets an extension identity",
+    },
+    422: {
+      description: "Task creation blocked by an extension",
+      schema: z.object({
+        error: z.string(),
+        extension: z.object({ id: z.string(), name: z.string() }),
+      }),
+    },
+  },
+});
+
+const promoteDraftTaskRoute = route({
+  method: "post",
+  path: "/api/tasks/{id}/promote-draft",
+  pattern: ["api", "tasks", null, "promote-draft"],
+  summary: "Promote a draft task out of the pre-dispatch draft state",
+  description:
+    "Transitions a `draft` task (#1240 — created with attachments still uploading) to its normal dispatch-eligible status: `offered` if it was offered to an agent, `pending` if it has an owning agent (the common case — UI-composer tasks default to Lead), otherwise `unassigned`. Called by the UI composer once its attachment upload batch settles, whether every file uploaded, some failed, or all failed — a draft must never be stranded by an upload error. Idempotent: calling it on a task that already left `draft` returns the current task unchanged rather than erroring, so a retried request is safe.",
+  tags: ["Tasks"],
+  params: z.object({ id: z.string() }),
+  rbac: { permission: "task.action.own" },
+  responses: {
+    200: { description: "Task promoted (or already out of draft)", schema: AgentTaskSchema },
+    403: { description: "Caller does not own this task" },
+    404: { description: "Task not found" },
   },
 });
 
@@ -262,7 +356,7 @@ const updateSession = route({
       claudeSessionId: z.string().min(1),
       provider: ProviderNameSchema.exclude(["devin"]).optional(),
       model: z.string().optional(),
-      providerMeta: z.object({}).optional(),
+      providerMeta: z.object({ transport: z.enum(["cli", "sdk"]).optional() }).optional(),
       harnessVariant: z.string().optional(),
       harnessVariantMeta: z.record(z.string(), z.unknown()).optional(),
     }),
@@ -283,6 +377,7 @@ const cancelTaskRoute = route({
   responses: {
     200: { description: "Task cancelled", schema: TaskActionResultSchema },
     400: { description: "Cannot cancel terminal task" },
+    403: { description: "Agent caller is neither a lead nor the task creator" },
     404: { description: "Task not found" },
   },
 });
@@ -448,7 +543,11 @@ const updateTaskProgressRoute = route({
   params: z.object({ id: z.string() }),
   body: z.object({ progress: z.string().min(1) }),
   responses: {
-    200: { description: "Progress updated", schema: z.object({ success: z.literal(true) }) },
+    200: {
+      description: "Progress updated; a no-op once the task is terminal",
+      schema: z.object({ success: z.literal(true) }),
+    },
+    403: { description: "Task is assigned to another agent" },
     404: { description: "Task not found" },
   },
 });
@@ -465,6 +564,8 @@ const finishTask = route({
     output: z.string().optional(),
     failureReason: z.string().optional(),
     force: z.boolean().optional(),
+    /** Harness that ran the task. Recorded only when no session reported one (spawn failure). */
+    provider: ProviderNameSchema.optional(),
   }),
   auth: { apiKey: true, agentId: true },
   responses: {
@@ -489,7 +590,9 @@ const listPausedTasks = route({
   responses: {
     200: {
       description: "Paused task list",
-      schema: z.object({ tasks: z.array(AgentTaskSchema) }),
+      schema: z.object({
+        tasks: z.array(AgentTaskSchema.extend({ attachments: z.array(TaskAttachmentSchema) })),
+      }),
     },
   },
 });
@@ -554,7 +657,7 @@ const updateTaskVcsRoute = route({
   tags: ["Tasks"],
   params: z.object({ id: z.string() }),
   body: z.object({
-    vcsProvider: z.enum(["github", "gitlab"]),
+    vcsProvider: z.enum(["github", "gitlab", "azure-devops"]),
     vcsRepo: z.string(),
     vcsNumber: z.number().int().positive(),
     vcsUrl: z.string().url(),
@@ -619,6 +722,60 @@ async function canSteerTask(
   }
 
   return can({ principal, verb, resource, source: "http" }).allow;
+}
+
+/**
+ * Ownership gate for `task.action.own` — single verb, no `.any` counterpart:
+ * the underlying `requester-owns-task` policy already lets any non-user
+ * principal (agent/operator) through, so agent-side callers never need a
+ * separate escalated verb. User principals must match the task's
+ * `requestedByUserId`. Used by `POST /api/tasks/{id}/promote-draft`.
+ */
+async function canActOnOwnTask(
+  req: IncomingMessage,
+  myAgentId: string | undefined,
+  task: AgentTask,
+): Promise<boolean> {
+  const resource: RbacResource = {
+    kind: "task",
+    taskId: task.id,
+    requestedByUserId: task.requestedByUserId,
+    creatorAgentId: task.creatorAgentId,
+    agentId: task.agentId,
+  };
+  let principal: RbacPrincipal;
+
+  const auth = getRequestAuth(req);
+  if (auth?.kind === "operator") {
+    principal = { kind: "operator" };
+  } else if (auth?.kind === "user") {
+    principal = { kind: "user", userId: auth.userId };
+  } else {
+    if (!myAgentId) return false;
+    const agent = await getAgentById(myAgentId);
+    if (!agent) return false;
+    principal = { kind: "agent", agentId: myAgentId, isLead: agent.isLead };
+  }
+
+  return can({ principal, verb: "task.action.own", resource, source: "http" }).allow;
+}
+
+/**
+ * Principal for task writes (progress, cancel). Workers share the swarm API
+ * key, so on an operator bearer the X-Agent-ID header is the caller's
+ * identity, as in POST /api/tasks/{id}/finish. A keyed call without it (the
+ * runner wrapper, the dashboard) stays the operator.
+ */
+async function resolveTaskWritePrincipal(
+  req: IncomingMessage,
+  myAgentId: string | undefined,
+): Promise<RbacPrincipal> {
+  const auth = getRequestAuth(req);
+  if (auth?.kind === "user") return { kind: "user", userId: auth.userId };
+  const agentId = auth?.kind === "agent" ? auth.agentId : myAgentId;
+  if (!agentId) return { kind: "operator" };
+  const agent = await getAgentById(agentId);
+  return { kind: "agent", agentId, isLead: agent?.isLead === true };
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -697,9 +854,16 @@ export async function handleTasks(
     const tasks =
       parsed.query.fields === "full"
         ? await getAllTasks(filters)
-        : await getAllTasks(filters, { slim: true });
-    const total = await getTasksCount(filters);
-    listTasks.respond(res, 200, { tasks, total });
+        : parsed.query.fields === "timeline"
+          ? await getAllTasks(filters, { fields: "timeline" })
+          : await getAllTasks(filters, { slim: true });
+    // The COUNT(*) re-scans every matching row, so only pagers pay for it.
+    if (parsed.query.includeTotal === "true") {
+      const total = await getTasksCount(filters);
+      listTasks.respond(res, 200, { tasks, total });
+    } else {
+      listTasks.respond(res, 200, { tasks });
+    }
     return true;
   }
 
@@ -724,7 +888,15 @@ export async function handleTasks(
     let requestedByUserId = trustedUserId ?? undefined;
     const trustBodyRequestedByUserId = process.env.TRUST_BODY_REQUESTED_BY_USER_ID !== "false";
     if (trustBodyRequestedByUserId && !requestedByUserId && parsed.body.requestedByUserId) {
-      const candidate = await findUserById(parsed.body.requestedByUserId);
+      // A worker on the shared key is not the operator: its X-Agent-ID names it, so the body
+      // hint is dropped like it is when the worker has a requester of its own.
+      const mayAssign = can({
+        principal: await resolveTaskWritePrincipal(req, myAgentId),
+        verb: "task.requester.assign",
+        resource: { kind: "none" },
+        source: "http",
+      }).allow;
+      const candidate = mayAssign ? await findUserById(parsed.body.requestedByUserId) : null;
       if (candidate) requestedByUserId = candidate.id;
     }
 
@@ -740,11 +912,23 @@ export async function handleTasks(
       if (lead) defaultAgentId = lead.id;
     }
 
+    const modelError = await explicitModelErrorForAgent({
+      model: splitLegacyModelAlias({ model: parsed.body.model, modelTier: parsed.body.modelTier })
+        .model,
+      allowCustomModel: parsed.body.allowCustomModel,
+      agentId: defaultAgentId,
+    });
+    if (modelError) {
+      jsonError(res, modelError, 400);
+      return true;
+    }
+
+    const parentTask = parsed.body.parentTaskId
+      ? await getTaskById(parsed.body.parentTaskId)
+      : null;
     let assetKey: string | undefined;
     try {
-      const inheritedKey = parsed.body.parentTaskId
-        ? (await getTaskById(parsed.body.parentTaskId))?.key
-        : undefined;
+      const inheritedKey = parentTask?.key;
       const requestedKey = parsed.body.key ?? inheritedKey;
       assetKey = requestedKey
         ? await authorizeAssetKeyWrite(requestedKey, trustedUserId)
@@ -758,27 +942,45 @@ export async function handleTasks(
     }
 
     try {
-      const task = await createTaskWithSiblingAwareness(parsed.body.task, {
-        key: assetKey,
-        agentId: defaultAgentId,
-        creatorAgentId: myAgentId || undefined,
-        taskType: parsed.body.taskType || undefined,
-        tags: parsed.body.tags || undefined,
-        priority: parsed.body.priority,
-        dependsOn: parsed.body.dependsOn || undefined,
-        offeredTo: parsed.body.offeredTo || undefined,
-        dir: parsed.body.dir || undefined,
-        parentTaskId: parsed.body.parentTaskId || undefined,
-        source: parsed.body.source || "api",
-        outputSchema: parsed.body.outputSchema || undefined,
-        contextKey: parsed.body.contextKey || undefined,
-        requestedByUserId,
-        ...splitLegacyModelAlias({
-          model: parsed.body.model,
-          modelTier: parsed.body.modelTier,
-        }),
-        effort: parsed.body.effort,
-      });
+      const task = await createTaskWithSiblingAwareness(
+        parsed.body.task,
+        {
+          key: assetKey,
+          agentId: defaultAgentId,
+          routingReason:
+            parsed.body.routingReason ??
+            (defaultAgentId
+              ? parentTask?.agentId === defaultAgentId
+                ? "continuity"
+                : "skill"
+              : undefined),
+          routingSource: parsed.body.routingReason
+            ? "declared"
+            : defaultAgentId
+              ? "engine_default"
+              : undefined,
+          routingNote: parsed.body.routingNote,
+          creatorAgentId: myAgentId || undefined,
+          taskType: parsed.body.taskType || undefined,
+          tags: parsed.body.tags || undefined,
+          priority: parsed.body.priority,
+          dependsOn: parsed.body.dependsOn || undefined,
+          offeredTo: parsed.body.offeredTo || undefined,
+          dir: parsed.body.dir || undefined,
+          parentTaskId: parsed.body.parentTaskId || undefined,
+          source: parsed.body.source || "api",
+          outputSchema: parsed.body.outputSchema || undefined,
+          contextKey: parsed.body.contextKey || undefined,
+          requestedByUserId,
+          status: parsed.body.draft ? "draft" : undefined,
+          ...splitLegacyModelAlias({
+            model: parsed.body.model,
+            modelTier: parsed.body.modelTier,
+          }),
+          effort: parsed.body.effort,
+        },
+        { origin: "rest", allowCustomModel: parsed.body.allowCustomModel },
+      );
 
       ensure({
         id: "created",
@@ -798,9 +1000,47 @@ export async function handleTasks(
 
       createTask.respond(res, 201, task);
     } catch (error) {
+      if (error instanceof TaskCreationBlockedError) {
+        createTask.respond(res, 422, { error: error.reason, extension: error.extension });
+        return true;
+      }
+      if (error instanceof ExtensionAgentAssignmentError) {
+        jsonError(res, error.message, 400);
+        return true;
+      }
       console.error("[HTTP] Failed to create task:", error);
       jsonError(res, "Failed to create task", 500);
     }
+    return true;
+  }
+
+  if (promoteDraftTaskRoute.match(req.method, pathSegments)) {
+    const parsed = await promoteDraftTaskRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+
+    const existingTask = await getTaskById(parsed.params.id);
+    if (!existingTask) {
+      jsonError(res, "Task not found", 404);
+      return true;
+    }
+
+    const allowed = await canActOnOwnTask(req, myAgentId, existingTask);
+    if (!allowed) {
+      jsonError(res, "Not authorized to act on this task", 403);
+      return true;
+    }
+
+    // Idempotent: a task already out of `draft` (already promoted, or a
+    // retried request) is returned as-is rather than erroring — the UI calls
+    // this exactly once per upload batch but must stay safe under retry.
+    const promoted =
+      existingTask.status === "draft" ? await promoteDraftTask(parsed.params.id) : existingTask;
+    if (!promoted) {
+      jsonError(res, "Task not found", 404);
+      return true;
+    }
+
+    promoteDraftTaskRoute.respond(res, 200, promoted);
     return true;
   }
 
@@ -831,6 +1071,22 @@ export async function handleTasks(
 
     if (!task) {
       jsonError(res, "Task not found", 404);
+      return true;
+    }
+
+    // Humans may cancel any task. Agents get the MCP cancel-task policy:
+    // lead or task creator.
+    const principal = await resolveTaskWritePrincipal(req, myAgentId);
+    if (
+      principal.kind === "agent" &&
+      !can({
+        principal,
+        verb: "task.cancel.any",
+        resource: { kind: "task", taskId: task.id, creatorAgentId: task.creatorAgentId },
+        source: "http",
+      }).allow
+    ) {
+      jsonError(res, "Only the lead or task creator can cancel tasks.", 403);
       return true;
     }
 
@@ -1160,6 +1416,7 @@ export async function handleTasks(
       ...(await getTaskSteeringFields(task)),
       logs,
       attachments,
+      citations: await getTaskCitations(task.id),
     });
     return true;
   }
@@ -1167,14 +1424,35 @@ export async function handleTasks(
   if (updateTaskProgressRoute.match(req.method, pathSegments)) {
     const parsed = await updateTaskProgressRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const task = await getTaskById(parsed.params.id);
+    const principal = await resolveTaskWritePrincipal(req, myAgentId);
 
-    if (!task) {
+    // Check and write in one transaction so a reassignment cannot slip between.
+    const status = await getDbClient().transaction(async (): Promise<200 | 403 | 404> => {
+      const task = await getTaskById(parsed.params.id);
+      if (!task) return 404;
+      const decision = can({
+        principal,
+        verb: "task.progress.write",
+        resource: { kind: "task", taskId: task.id, agentId: task.agentId },
+        source: "http",
+      });
+      if (!decision.allow) return 403;
+      // A harness keeps streaming after the agent finishes the task; its
+      // late progress must not overwrite a terminal task's last line.
+      if (!isTerminalTaskStatus(task.status)) {
+        await updateTaskProgress(parsed.params.id, parsed.body.progress);
+      }
+      return 200;
+    });
+
+    if (status === 404) {
       jsonError(res, "Task not found", 404);
       return true;
     }
-
-    await updateTaskProgress(parsed.params.id, parsed.body.progress);
+    if (status === 403) {
+      jsonError(res, "Task is assigned to another agent", 403);
+      return true;
+    }
     updateTaskProgressRoute.respond(res, 200, { success: true });
     return true;
   }
@@ -1255,6 +1533,10 @@ export async function handleTasks(
         }
 
         const wasPaused = task.wasPaused;
+
+        if (parsed.body.provider && !task.provider) {
+          await recordTaskProviderIfUnset(parsed.params.id, parsed.body.provider);
+        }
 
         let updatedTask: typeof task;
         if (parsed.body.status === "completed") {
@@ -1356,7 +1638,13 @@ export async function handleTasks(
       return true;
     }
     const pausedTasks = await getPausedTasksForAgent(myAgentId);
-    listPausedTasks.respond(res, 200, { tasks: pausedTasks });
+    const tasks = await Promise.all(
+      pausedTasks.map(async (task) => ({
+        ...task,
+        attachments: await getTaskAttachments(task.id),
+      })),
+    );
+    listPausedTasks.respond(res, 200, { tasks });
     return true;
   }
 
@@ -1566,6 +1854,7 @@ export async function handleTasks(
     // `skipped` covers parent_not_found / lead_not_found edge cases — the
     // supersede already landed, so log + roll forward without a resume task.
     if (followUp.kind !== "created") {
+      await settleSupersededTaskDependents(parsed.params.id, null);
       console.warn(
         `[Supersede] Task ${parsed.params.id.slice(0, 8)} superseded but resume creation skipped (${
           followUp.kind === "skipped" ? followUp.reason : followUp.kind

@@ -7,6 +7,7 @@ import {
   countScriptRuns,
   createScriptRun,
   createTaskExtended,
+  ExtensionAgentAssignmentError,
   getAgentById,
   getDbClient,
   getLatestScriptRunStepTaskByContextKey,
@@ -18,8 +19,10 @@ import {
   listScriptRuns,
   updateScriptRun,
   updateScriptRunIfNotTerminal,
+  updateScriptRunIfRunning,
   upsertScriptRunJournalStep,
 } from "../be/db";
+import { explicitModelErrorForAgent } from "../be/model-validation";
 import { lintWorkflowLabels } from "../script-workflows/label-lint";
 import { scriptRunMaxAgentTasks, scriptRunMaxSteps } from "../script-workflows/limits";
 import {
@@ -29,6 +32,7 @@ import {
 } from "../script-workflows/supervisor";
 import {
   AgentTaskStatusSchema,
+  RoutingReasonSchema,
   ScriptRunJournalEntrySchema,
   ScriptRunListItemSchema,
   ScriptRunSchema,
@@ -91,12 +95,16 @@ const agentTaskBodySchema = z.object({
   template: z.string().optional(),
   task: z.string().optional(),
   agentId: z.string().optional(),
+  routingReason: RoutingReasonSchema.optional(),
+  routingNote: z.string().max(200).optional(),
   tags: z.array(z.string()).optional(),
   priority: z.number().int().min(0).max(100).optional(),
   offerMode: z.boolean().optional(),
   dir: z.string().min(1).optional(),
   vcsRepo: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
+  /** Accept a `model` the catalog does not list (same escape hatch as POST /api/tasks). */
+  allowCustomModel: z.boolean().optional(),
   parentTaskId: z.string().uuid().optional(),
   requestedByUserId: z.string().optional(),
   outputSchema: z.record(z.string(), z.unknown()).optional(),
@@ -137,7 +145,7 @@ const createScriptRunRoute = route({
   // Matches the inline `POST /api/scripts/run` route and the `launch-script-run`
   // MCP tool (src/tools/script-runs.ts, UNGATED_TOOL_FILES pin): open to every
   // authenticated agent by design, not a permission gate. Execution safety comes
-  // from the shared sandbox (ulimits, clean env, bearer over stdin — see
+  // from the shared sandbox (ulimits, clean env, brokered capabilities — see
   // buildSandboxedCommand / LocalProcessScriptExecutor.start), not from
   // restricting who may launch a run.
   rbac: {
@@ -571,15 +579,14 @@ export async function handleScriptRuns(
       jsonError(res, "Script run not found", 404);
       return true;
     }
-    if (TERMINAL_SCRIPT_RUN_STATUSES.some((status) => status === run.status)) {
+    if (run.status !== "running") {
       res.writeHead(204);
       res.end();
       return true;
     }
-    // Terminal-guarded write: the guard above ran before this handler's own
-    // awaits, so an operator DELETE cancelling the run in that window would
-    // otherwise be overwritten by this status.
-    await updateScriptRunIfNotTerminal(parsed.params.runId, {
+    // Running-guarded write: a pause is resumable rather than terminal, but it
+    // must still win over a delayed subprocess callback after SIGTERM.
+    await updateScriptRunIfRunning(parsed.params.runId, {
       status: parsed.body.status,
       pid: null,
       finishedAt: parsed.body.status === "paused" ? null : new Date().toISOString(),
@@ -615,24 +622,49 @@ export async function handleScriptRuns(
     const contextKey = `script-run:${run.id}:${parsed.body.stepKey}`;
     let task = await getLatestScriptRunStepTaskByContextKey(contextKey);
     if (!task) {
-      task = await createTaskExtended(
-        parsed.body.template ?? parsed.body.task ?? parsed.body.stepKey,
-        {
-          agentId: parsed.body.agentId,
-          tags: parsed.body.tags,
-          priority: parsed.body.priority,
-          offeredTo: parsed.body.offerMode ? parsed.body.agentId : undefined,
-          taskType: "script-run-step",
-          source: "mcp",
-          dir: parsed.body.dir,
-          vcsRepo: parsed.body.vcsRepo,
-          model: parsed.body.model,
-          parentTaskId: parsed.body.parentTaskId,
-          requestedByUserId: parsed.body.requestedByUserId ?? run.requestedByUserId,
-          outputSchema: parsed.body.outputSchema,
-          contextKey,
-        },
-      );
+      const modelError = await explicitModelErrorForAgent({
+        model: parsed.body.model,
+        allowCustomModel: parsed.body.allowCustomModel,
+        agentId: parsed.body.agentId,
+      });
+      if (modelError) {
+        jsonError(res, modelError, 400);
+        return true;
+      }
+      try {
+        task = await createTaskExtended(
+          parsed.body.template ?? parsed.body.task ?? parsed.body.stepKey,
+          {
+            agentId: parsed.body.agentId,
+            routingReason:
+              parsed.body.routingReason ?? (parsed.body.agentId ? "human_pinned" : undefined),
+            routingNote: parsed.body.routingNote,
+            routingSource: parsed.body.routingReason
+              ? "declared"
+              : parsed.body.agentId
+                ? "engine_default"
+                : undefined,
+            tags: parsed.body.tags,
+            priority: parsed.body.priority,
+            offeredTo: parsed.body.offerMode ? parsed.body.agentId : undefined,
+            taskType: "script-run-step",
+            source: "mcp",
+            dir: parsed.body.dir,
+            vcsRepo: parsed.body.vcsRepo,
+            model: parsed.body.model,
+            parentTaskId: parsed.body.parentTaskId,
+            requestedByUserId: parsed.body.requestedByUserId ?? run.requestedByUserId,
+            outputSchema: parsed.body.outputSchema,
+            contextKey,
+          },
+        );
+      } catch (error) {
+        if (error instanceof ExtensionAgentAssignmentError) {
+          jsonError(res, error.message, 400);
+          return true;
+        }
+        throw error;
+      }
     }
 
     const deadline = Date.now() + 30_000;

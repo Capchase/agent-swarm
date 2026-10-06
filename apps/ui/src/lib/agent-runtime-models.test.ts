@@ -1,0 +1,311 @@
+import { describe, expect, test } from "bun:test";
+import {
+  effortAfterChange,
+  effortLevelsFor,
+  findKnownModel,
+  type LiveModelsCatalog,
+  modelGroupsForHarness,
+  modelGroupsForSchedule,
+} from "./agent-runtime-models";
+import { getAgentModelPresentation } from "./agents-list-model-display";
+import { modelVendor } from "./model-vendor";
+
+/** A live catalog holding only the given sections. */
+function live(sections: Record<string, Record<string, object>>): LiveModelsCatalog {
+  return Object.fromEntries(
+    Object.entries(sections).map(([id, models]) => [
+      id,
+      {
+        id,
+        models: Object.fromEntries(
+          Object.entries(models).map(([modelId, model]) => [modelId, { id: modelId, ...model }]),
+        ),
+      },
+    ]),
+  ) as unknown as LiveModelsCatalog;
+}
+
+const effort = (values: string[]) => [{ type: "effort", values }];
+
+describe("effortLevelsFor: what a harness and model accept", () => {
+  test("Claude: an adaptive model has no off; a budget-token model gains it", () => {
+    // Opus 5.5 lists effort levels; `max` is codex-only, so it is dropped.
+    expect(effortLevelsFor("claude", "claude-opus-5-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    // Haiku 4.5 has a thinking budget and no effort levels: off plus the shared subset.
+    expect(effortLevelsFor("claude", "claude-haiku-4-5")).toEqual(["off", "low", "medium", "high"]);
+  });
+
+  test("Claude CLI shortnames resolve to the newest model of their family", () => {
+    expect(effortLevelsFor("claude", "opus")).toEqual(effortLevelsFor("claude", "claude-opus-5-5"));
+    expect(effortLevelsFor("claude", "haiku")).toEqual(["off", "low", "medium", "high"]);
+    expect(effortLevelsFor("claude", "sonnet").length).toBeGreaterThan(0);
+    // The live catalog decides which model a shortname means (a model with no
+    // release date is just launched, so it ranks newest: the id breaks the tie).
+    const catalog = live({
+      anthropic: {
+        "claude-opus-9-9": {
+          reasoning: true,
+          reasoning_options: effort(["low", "high"]),
+        },
+      },
+    });
+    expect(effortLevelsFor("claude", "opus", catalog)).toEqual(["low", "high"]);
+  });
+
+  test("Codex: a GPT-5.6 model takes max", () => {
+    expect(effortLevelsFor("codex", "gpt-5.6-sol")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("Pi and Opencode read <provider>/<id>, the id may hold more slashes", () => {
+    const openrouter = "openrouter/deepseek/deepseek-v4.1-flash";
+    expect(effortLevelsFor("pi", openrouter)).toEqual(["low", "high"]);
+    expect(effortLevelsFor("opencode", openrouter)).toEqual(["low", "high"]);
+    // `max` is codex-only whichever provider the model comes from.
+    expect(effortLevelsFor("pi", "openrouter/anthropic/claude-opus-5.5")).not.toContain("max");
+    // A bare id names no provider: unknown.
+    expect(effortLevelsFor("pi", "deepseek-v4-flash")).toEqual([]);
+  });
+
+  test("a custom or unlisted model takes no effort: the API rejects one", () => {
+    expect(effortLevelsFor("claude", "my-custom-model")).toEqual([]);
+    expect(effortLevelsFor("codex", "gpt-nope")).toEqual([]);
+    expect(effortLevelsFor("pi", "openrouter/nope/nothing")).toEqual([]);
+    expect(effortLevelsFor("pi", "nosuchprovider/x")).toEqual([]);
+    expect(effortLevelsFor("claude", "")).toEqual([]);
+    expect(effortLevelsFor("claude", null)).toEqual([]);
+    // A prototype member is not a provider.
+    expect(effortLevelsFor("pi", "constructor/toString")).toEqual([]);
+  });
+
+  test("a harness without effort control takes none, whatever the model", () => {
+    for (const harness of ["acp", "devin", "claude-managed", "nope"]) {
+      expect(effortLevelsFor(harness, "claude-opus-5-5")).toEqual([]);
+      expect(effortLevelsFor(harness, "openrouter/deepseek/deepseek-v4.1-flash")).toEqual([]);
+    }
+  });
+
+  test("dsh reads OpenRouter ids and bare DeepSeek ids from their own sections", () => {
+    expect(effortLevelsFor("dsh", "openrouter/deepseek/deepseek-v4.1-flash")).toEqual([
+      "low",
+      "high",
+      "max",
+    ]);
+    expect(effortLevelsFor("dsh", "deepseek-v4-pro")).toEqual(["off", "high", "max"]);
+    // dsh's own id for V4.1 Flash is not in the catalog: no level is claimed for it.
+    expect(effortLevelsFor("dsh", "deepseek-flash")).toEqual([]);
+  });
+
+  test("amp: a mode names no model, so only a pinned provider/model takes effort", () => {
+    for (const mode of ["low", "medium", "high", "ultra"]) {
+      expect(effortLevelsFor("amp", mode)).toEqual([]);
+    }
+    // Same catalog rule as pi and opencode: a provider/model pin, `max` dropped.
+    expect(effortLevelsFor("amp", "anthropic/claude-opus-5-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(effortLevelsFor("amp", "openai/gpt-5-nano")).toEqual(
+      effortLevelsFor("pi", "openai/gpt-5-nano"),
+    );
+  });
+
+  test("a model that does not reason takes none", () => {
+    const catalog = live({ anthropic: { "claude-plain-1": { reasoning: false } } });
+    expect(effortLevelsFor("claude", "claude-plain-1", catalog)).toEqual([]);
+  });
+
+  test("the live catalog wins per model id, the snapshot fills the rest", () => {
+    const catalog = live({
+      openai: { "gpt-5.6-sol": { reasoning: true, reasoning_options: effort(["low", "medium"]) } },
+    });
+    expect(effortLevelsFor("codex", "gpt-5.6-sol", catalog)).toEqual(["low", "medium"]);
+    // Not in the live section: the bundled snapshot still knows it.
+    expect(effortLevelsFor("codex", "gpt-5.6-luna", catalog)).toContain("max");
+  });
+
+  test("ModelOption.reasoningLevels agrees with effortLevelsFor", () => {
+    for (const harness of ["claude", "codex", "pi"] as const) {
+      const models = modelGroupsForHarness(harness, undefined, undefined).flatMap((g) => g.models);
+      for (const model of models.slice(0, 40)) {
+        expect(model.reasoningLevels).toEqual(effortLevelsFor(harness, model.id));
+      }
+    }
+  });
+});
+
+describe("effortAfterChange: switching harness or model", () => {
+  test("keeps an effort the new pair takes, resets one it cannot to Auto", () => {
+    expect(effortAfterChange("xhigh", "claude", "claude-opus-5-5")).toBe("xhigh");
+    // Haiku 4.5 has no xhigh.
+    expect(effortAfterChange("xhigh", "claude", "claude-haiku-4-5")).toBe("");
+    // Codex takes max, Claude does not.
+    expect(effortAfterChange("max", "codex", "gpt-5.6-sol")).toBe("max");
+    expect(effortAfterChange("max", "claude", "claude-opus-5-5")).toBe("");
+    // Off is a Haiku level, not an Opus 5.5 one.
+    expect(effortAfterChange("off", "claude", "claude-haiku-4-5")).toBe("off");
+    expect(effortAfterChange("off", "claude", "opus")).toBe("");
+  });
+
+  test("resets on a custom model, an unknown one, and a harness with no control", () => {
+    expect(effortAfterChange("high", "claude", "my-custom-model")).toBe("");
+    expect(effortAfterChange("high", "claude", "")).toBe("");
+    expect(effortAfterChange("high", "acp", "claude-opus-5-5")).toBe("");
+  });
+
+  test("Auto stays Auto", () => {
+    expect(effortAfterChange("", "claude", "claude-opus-5-5")).toBe("");
+  });
+});
+
+describe('model labels drop models.dev\'s "(latest)" suffix', () => {
+  const catalog = live({
+    anthropic: {
+      "claude-haiku-9": {
+        name: "Claude Haiku 9 (latest)",
+        release_date: "2030-01-01",
+        reasoning: true,
+      },
+    },
+    openrouter: { "acme/thing": { name: "Acme Thing (latest)" } },
+    openai: { "gpt-9": { name: "GPT-9 (latest)", release_date: "2030-01-01" } },
+  });
+
+  test("the harness picker options", () => {
+    const [claude] = modelGroupsForHarness("claude", undefined, undefined, null, catalog);
+    expect(claude.models[0].label).toBe("Claude Haiku 9");
+    const [codex] = modelGroupsForHarness("codex", undefined, undefined, null, catalog);
+    expect(codex.models[0].label).toBe("GPT-9");
+    const openrouter = modelGroupsForHarness("pi", undefined, undefined, null, catalog).find(
+      (g) => g.provider === "OpenRouter",
+    );
+    expect(openrouter?.models.map((m) => m.label)).toEqual(["Acme Thing"]);
+  });
+
+  test("the bundled snapshot names Claude Haiku 4.5 without the suffix", () => {
+    const [claude] = modelGroupsForHarness("claude", undefined, undefined);
+    expect(claude.models.find((m) => m.id === "claude-haiku-4-5")?.label).toBe("Claude Haiku 4.5");
+    expect(findKnownModel("claude-haiku-4-5")?.label).toBe("Claude Haiku 4.5");
+  });
+
+  test("read-only lookups, the schedule aliases, and a reported label", () => {
+    expect(findKnownModel("claude-haiku-9", catalog)?.label).toBe("Claude Haiku 9");
+    expect(findKnownModel("openrouter/acme/thing", catalog)?.label).toBe("Acme Thing");
+    const [aliases] = modelGroupsForSchedule(catalog);
+    expect(aliases.models.find((m) => m.id === "haiku")?.label).toBe("Haiku (Claude Haiku 9)");
+    // A harness that reports the clean name still finds the model.
+    expect(findKnownModel("Acme Thing", catalog)?.id).toBe("openrouter/acme/thing");
+  });
+
+  test("a name without the suffix is untouched", () => {
+    const plain = live({ anthropic: { "claude-plain-1": { name: "Claude Plain (beta)" } } });
+    expect(findKnownModel("claude-plain-1", plain)?.label).toBe("Claude Plain (beta)");
+  });
+});
+
+describe("modelGroupsForHarness: amp", () => {
+  const keyed = [{ key: "AMP_API_KEY", value: "set" }] as never;
+
+  test("offers the four modes first, then pinnable Anthropic and OpenAI models", () => {
+    const groups = modelGroupsForHarness("amp", keyed, undefined);
+    expect(groups.map((g) => g.provider)).toEqual([
+      "Amp modes",
+      "Anthropic (pinned)",
+      "OpenAI (pinned)",
+    ]);
+    expect(groups[0]?.models.map((m) => m.id)).toEqual(["low", "medium", "high", "ultra"]);
+    expect(groups[0]?.models[0]?.label).toBe("Low (cheapest)");
+    expect(groups.every((g) => g.requiredKey === "AMP_API_KEY")).toBe(true);
+    const pins = groups.slice(1).flatMap((g) => g.models.map((m) => m.id));
+    expect(pins.length).toBeGreaterThan(10);
+    expect(pins.every((id) => /^(anthropic|openai)\//.test(id))).toBe(true);
+  });
+
+  test("every group is disabled until AMP_API_KEY is configured", () => {
+    expect(modelGroupsForHarness("amp", [], undefined).some((g) => g.enabled)).toBe(false);
+    expect(modelGroupsForHarness("amp", keyed, undefined).every((g) => g.enabled)).toBe(true);
+    expect(modelGroupsForHarness("amp", [], { AMP_API_KEY: true }).every((g) => g.enabled)).toBe(
+      true,
+    );
+  });
+
+  test("a pinned model lists the effort levels the API would accept", () => {
+    const groups = modelGroupsForHarness("amp", keyed, undefined);
+    const opus = groups.flatMap((g) => g.models).find((m) => m.id === "anthropic/claude-opus-5-5");
+    expect(opus?.reasoningLevels).toEqual(effortLevelsFor("amp", "anthropic/claude-opus-5-5"));
+    expect(groups[0]?.models.every((m) => m.reasoningLevels?.length === 0)).toBe(true);
+  });
+
+  test("a mode carries Amp's mark everywhere a model is shown", () => {
+    const groups = modelGroupsForHarness("amp", keyed, undefined);
+    expect(groups[0]?.models.every((m) => m.providerId === "amp")).toBe(true);
+    expect(getAgentModelPresentation("medium")).toMatchObject({
+      label: "Medium",
+      provider: "Amp modes",
+      providerId: "amp",
+    });
+    expect(modelVendor("ultra")).toBe("amp");
+    // A pin keeps its maker's mark, and a word that only contains a mode name is not a mode.
+    expect(getAgentModelPresentation("anthropic/claude-opus-5-5")?.providerId).toBe("anthropic");
+    expect(modelVendor("anthropic/claude-opus-5-5")).toBe("anthropic");
+    expect(modelVendor("gemini-high")).toBe("google");
+    expect(modelVendor("highway")).toBeNull();
+  });
+});
+
+describe("cursor harness models", () => {
+  const catalog = live({
+    openai: {
+      "gpt-5.4-nano": {
+        name: "GPT-5.4 nano",
+        reasoning: true,
+        reasoning_options: effort(["none", "low", "high"]),
+      },
+    },
+    anthropic: {
+      "claude-opus-5-5": {
+        name: "Claude Opus 5.5",
+        reasoning: true,
+        reasoning_options: effort(["low", "max"]),
+      },
+    },
+  });
+
+  test("one Cursor group behind CURSOR_API_KEY, labelled from the vendor catalog", () => {
+    const [group, ...rest] = modelGroupsForHarness(
+      "cursor",
+      [],
+      { CURSOR_API_KEY: true },
+      null,
+      catalog,
+    );
+    expect(rest).toEqual([]);
+    expect(group?.provider).toBe("Cursor");
+    expect(group?.requiredKey).toBe("CURSOR_API_KEY");
+    expect(group?.enabled).toBe(true);
+    const nano = group?.models.find((m) => m.id === "gpt-5.4-nano");
+    expect(nano?.label).toBe("GPT-5.4 nano");
+    expect(nano?.reasoningLevels).toEqual(["off", "low", "high"]);
+    // Cursor-only models have no catalog row and take no effort.
+    expect(group?.models.find((m) => m.id === "composer-2.5")?.reasoningLevels).toEqual([]);
+    expect(modelGroupsForHarness("cursor", [], {}, null, catalog)[0]?.enabled).toBe(false);
+  });
+
+  test("effort reads the vendor section; cursor keeps max", () => {
+    expect(effortLevelsFor("cursor", "claude-opus-5-5", catalog)).toEqual(["low", "max"]);
+    expect(effortLevelsFor("cursor", "composer-2.5", catalog)).toEqual([]);
+  });
+});

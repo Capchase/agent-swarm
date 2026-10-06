@@ -19,8 +19,8 @@ import { handleSessionData } from "../http/session-data";
 import { getPathSegments, parseQueryParams } from "../http/utils";
 import { listenOnFreePort } from "./test-net";
 
-const TEST_DB_PATH = "./test-model-key-normalize.sqlite";
-const API_KEY = "test-model-key-normalize";
+const TEST_DB_PATH = "./example-test-model-key-normalize.sqlite";
+const API_KEY = "example-test-model-key-normalize";
 
 async function removeDbFiles(path: string): Promise<void> {
   for (const suffix of ["", "-wal", "-shm"]) {
@@ -131,9 +131,13 @@ describe("normalizeModelKey()", () => {
 
   test("is a no-op for canonical claude ids", () => {
     expect(normalizeModelKey("claude", "claude-opus-4-7")).toBe("claude-opus-4-7");
+    expect(normalizeModelKey("claude", "claude-fable-5-1")).toBe("claude-fable-5-1");
+    expect(normalizeModelKey("claude", "claude-mythos-5-1")).toBe("claude-mythos-5-1");
+    expect(normalizeModelKey("claude", "claude-opus-5-5")).toBe("claude-opus-5-5");
     expect(normalizeModelKey("claude", "claude-opus-5")).toBe("claude-opus-5");
     expect(normalizeModelKey("claude", "claude-fable-5")).toBe("claude-fable-5");
     expect(normalizeModelKey("claude", "claude-mythos-5")).toBe("claude-mythos-5");
+    expect(normalizeModelKey("claude", "claude-sonnet-5-5")).toBe("claude-sonnet-5-5");
     expect(normalizeModelKey("claude", "claude-sonnet-5")).toBe("claude-sonnet-5");
   });
 

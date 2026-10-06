@@ -1,11 +1,14 @@
 import { z } from "zod";
+import { explicitModelErrorForAgent } from "../../be/model-validation";
+import { applyPreTaskCreate } from "../../extensions/apply-task-create";
 import { workflowContextKey } from "../../tasks/context-key";
-import { withSiblingAwareness } from "../../tasks/sibling-awareness";
+import { TaskCreationBlockedError } from "../../tasks/errors";
 import type { ExecutorMeta } from "../../types";
 import {
   FollowUpConfigSchema,
   ModelTierSchema,
   ReasoningEffortSchema,
+  RoutingReasonSchema,
   splitLegacyModelAlias,
 } from "../../types";
 import type { ExecutorResult } from "./base";
@@ -13,11 +16,13 @@ import { BaseExecutor } from "./base";
 
 // ─── Config / Output Schemas ────────────────────────────────
 
-const AgentTaskConfigSchema = z.object({
+export const AgentTaskConfigSchema = z.object({
   template: z.string(),
   // Plain string, NOT .uuid(): agents may join with custom IDs (AGENT_ID env /
   // join-swarm agentId), so a UUID filter would reject legitimate agents.
   agentId: z.string().optional(),
+  routingReason: RoutingReasonSchema.optional(),
+  routingNote: z.string().max(200).optional(),
   tags: z.array(z.string()).optional(),
   priority: z.number().int().min(0).max(100).optional(),
   offerMode: z.boolean().optional(),
@@ -25,6 +30,8 @@ const AgentTaskConfigSchema = z.object({
   vcsRepo: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
   modelTier: ModelTierSchema.optional(),
+  /** Accept a `model` the catalog does not list (a custom id). Without it an unknown id fails the node. */
+  allowCustomModel: z.boolean().optional(),
   effort: ReasoningEffortSchema.optional(),
   parentTaskId: z.string().uuid().optional(),
   requestedByUserId: z.string().optional(),
@@ -93,11 +100,25 @@ export class AgentTaskExecutor extends BaseExecutor<
     }
 
     // 3. Create the task (config is already deep-interpolated by the engine)
-    const { description: taskDescription, options: taskOptions } = await withSiblingAwareness(
-      config.template,
-      {
+    const modelError = await explicitModelErrorForAgent({
+      model: splitLegacyModelAlias({ model: config.model, modelTier: config.modelTier }).model,
+      allowCustomModel: config.allowCustomModel,
+      agentId: config.agentId,
+    });
+    if (modelError) return { status: "failed", error: modelError };
+    const preCreate = await applyPreTaskCreate({
+      description: config.template,
+      options: {
         key: effectiveKey,
         agentId: config.agentId ?? null,
+        // A configured workflow target is an author pin, including existing definitions.
+        routingReason: config.routingReason ?? (config.agentId ? "human_pinned" : undefined),
+        routingNote: config.routingNote,
+        routingSource: config.routingReason
+          ? "declared"
+          : config.agentId
+            ? "engine_default"
+            : undefined,
         source: "workflow",
         tags: config.tags,
         priority: config.priority,
@@ -114,8 +135,18 @@ export class AgentTaskExecutor extends BaseExecutor<
         followUpConfig: config.followUpConfig,
         contextKey: workflowContextKey({ workflowRunId: meta.runId }),
       },
-    );
-    const task = await db.createTaskExtended(taskDescription, taskOptions);
+      origin: "workflow",
+      allowCustomModel: config.allowCustomModel,
+    });
+    if (preCreate.kind === "blocked") {
+      throw new TaskCreationBlockedError(preCreate.reason, preCreate.extension);
+    }
+    // No sibling awareness: every task of a run shares this contextKey, so its
+    // siblings are the engine's own parallel steps, not new user input. The
+    // block handed each child its siblings' task ids, and one child completed
+    // a sibling's task with its own report. It would also wire parentTaskId to
+    // a concurrent same-agent sibling's session.
+    const task = await db.createTaskExtended(preCreate.description, preCreate.options);
 
     // 4. Return async result — engine will pause the workflow
     return {

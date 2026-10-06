@@ -1,13 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import pkg from "../package.json";
+import { ensurePricingSeeded, ensureRbacSeeded } from "./be/boot-seeds";
 import { initDb } from "./be/db";
 import { startPricingRefreshLoop } from "./be/pricing-refresh";
-import { ensureRbacSeedsSynced } from "./be/rbac-roles";
-import { seedPricingFromModelsDev } from "./be/seed-pricing";
 import { isSteeringEnabled } from "./be/steering";
 import { registerGithubTaskReactions } from "./github/task-reactions";
 import { loadGlobalConfigsIntoEnv } from "./http/core";
+import { resolveTemplate } from "./prompts/resolver";
 import { isRbacEnabled } from "./rbac";
+import { getSlackConfiguration } from "./slack/config";
 import { registerAcceptSteerTool } from "./tools/accept-steer";
 import { registerAppDiffTool } from "./tools/app-diff";
 import { registerAppGetTool } from "./tools/app-get";
@@ -18,6 +19,7 @@ import { registerAppQueryTool } from "./tools/app-query";
 import { registerAppRollbackTool } from "./tools/app-rollback";
 import { registerAppSyncTool } from "./tools/app-sync";
 import { registerAppUpsertTool } from "./tools/app-upsert";
+import { registerCancelApprovalRequestTool } from "./tools/cancel-approval-request";
 import { registerCancelTaskTool } from "./tools/cancel-task";
 import { registerContextDiffTool } from "./tools/context-diff";
 import { registerContextHistoryTool } from "./tools/context-history";
@@ -26,8 +28,16 @@ import { registerCreateMetricTool } from "./tools/create-metric";
 import { registerCreatePageTool } from "./tools/create-page";
 import { registerCredentialBindingsTool } from "./tools/credential-bindings";
 import { registerDbQueryTool } from "./tools/db-query";
+import { registerDeferTaskTool } from "./tools/defer-task";
 import { registerDeleteChannelTool } from "./tools/delete-channel";
 import { registerDeletePageTool } from "./tools/delete-page";
+import { registerExtensionActivateVersionTool } from "./tools/extension-activate-version";
+import { registerExtensionCatalogTool } from "./tools/extension-catalog";
+import { registerExtensionDeleteTool } from "./tools/extension-delete";
+import { registerExtensionDisableTool } from "./tools/extension-disable";
+import { registerExtensionEnableTool } from "./tools/extension-enable";
+import { registerExtensionInstallTool } from "./tools/extension-install";
+import { registerExtensionListTool } from "./tools/extension-list";
 import { registerGetMetricsTool } from "./tools/get-metrics";
 import { registerGetSwarmTool } from "./tools/get-swarm";
 import { registerGetTaskDetailsTool } from "./tools/get-task-details";
@@ -63,6 +73,10 @@ import { registerMemoryGetTool } from "./tools/memory-get";
 import { registerMemoryRateTool } from "./tools/memory-rate";
 import { registerMemorySearchTool } from "./tools/memory-search";
 import { registerMemoryStoreTool } from "./tools/memory-store";
+import {
+  registerModelCatalogOverlayUpsertTool,
+  registerModelCatalogRefreshTool,
+} from "./tools/model-catalog";
 import { registerMyAgentInfoTool } from "./tools/my-agent-info";
 import { registerGetOauthAccessTokenTool } from "./tools/oauth-access-token";
 import { registerPollTaskTool } from "./tools/poll-task";
@@ -87,6 +101,12 @@ import { registerRegisterServiceTool } from "./tools/register-service";
 import { registerGetReposTool, registerUpdateRepoTool } from "./tools/repos";
 import { registerRequestHumanInputTool } from "./tools/request-human-input";
 import { registerResolveUserTool } from "./tools/resolve-user";
+import {
+  registerRoomChangeTool,
+  registerRoomDecodeTool,
+  registerRoomGetTool,
+  registerRoomResetTool,
+} from "./tools/rooms";
 // Scheduling capability
 import {
   registerCreateScheduleTool,
@@ -156,6 +176,7 @@ import { registerUnregisterServiceTool } from "./tools/unregister-service";
 // Profiles capability
 import { registerUpdateProfileTool } from "./tools/update-profile";
 import { registerUpdateServiceStatusTool } from "./tools/update-service-status";
+import { setPreloadedTools } from "./tools/utils";
 import {
   registerReplyWhatsappMessageTool,
   registerSendWhatsappMessageTool,
@@ -253,7 +274,12 @@ export function hasCapability(cap: CAPABILITIES_T): boolean {
 }
 
 export function getEnabledCapabilities(): CAPABILITIES_T[] {
-  return Array.from(getCapabilities());
+  const capabilities = Array.from(getCapabilities());
+  // Phase 1 has no HTTP receiver. Do not advertise usable Slack tools to
+  // workers when HTTP (or an invalid transport) was selected.
+  return getSlackConfiguration().mode === "socket"
+    ? capabilities
+    : capabilities.filter((capability) => capability !== "slack");
 }
 
 /**
@@ -267,7 +293,9 @@ export function isScriptsOnlyMcp(): boolean {
   return resolveScriptsOnlyMode({ env: process.env.SCRIPTS_ONLY_MCP });
 }
 
-export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: boolean } = {}) {
+export async function createServer(
+  opts: { scriptsOnly?: boolean; fullSurface?: boolean; preloadedTools?: readonly string[] } = {},
+) {
   // Reload env
   await loadGlobalConfigsIntoEnv(true);
 
@@ -283,14 +311,18 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
   initDb(process.env.DATABASE_PATH);
 
   // Phase 2: project the vendored models.dev snapshot into the pricing table.
-  // Idempotent (INSERT OR IGNORE keyed on PK with effective_from=0); safe to
-  // call on every boot. See src/be/seed-pricing.ts for the projection logic
-  // and the manual-override constants for runtime-fee / ACU pricing.
-  seedPricingFromModelsDev();
+  // Idempotent (INSERT OR IGNORE keyed on PK with effective_from=0). This runs
+  // once per database handle, not once per MCP session: the seed is a
+  // synchronous 8.6 MB parse plus a write transaction, and createServer() runs
+  // on every `POST /mcp` session init. The HTTP boot path seeds first, so
+  // sessions normally skip it; standalone callers (stdio, tests) seed here.
+  // See src/be/seed-pricing.ts for the projection logic and the
+  // manual-override constants for runtime-fee / ACU pricing.
+  ensurePricingSeeded();
   startPricingRefreshLoop();
 
   try {
-    ensureRbacSeedsSynced();
+    ensureRbacSeeded();
   } catch (err) {
     console.error("[startup] Failed to sync RBAC seed rows:", err);
     // RBAC flag-on must fail closed; flag-off deployments should not be bricked
@@ -309,11 +341,16 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
       description: pkg.description,
     },
     {
+      ...(opts.preloadedTools?.length
+        ? { instructions: resolveTemplate("system.agent.tool_preload", {}).text }
+        : {}),
       capabilities: {
         logging: {},
       },
     },
   );
+
+  if (opts.preloadedTools?.length) setPreloadedTools(server, opts.preloadedTools);
 
   // Scripts-only surface (experimental code-mode): register just the script
   // catalog tools and stop. script-connections / script-apis stay out — they
@@ -322,6 +359,13 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerScriptSearchTool(server);
     registerScriptRunTool(server);
     registerScriptUpsertTool(server);
+    registerExtensionDeleteTool(server);
+    registerExtensionEnableTool(server);
+    registerExtensionDisableTool(server);
+    registerExtensionActivateVersionTool(server);
+    registerExtensionCatalogTool(server);
+    registerExtensionInstallTool(server);
+    registerExtensionListTool(server);
     registerScriptDeleteTool(server);
     registerScriptQueryTypesTool(server);
     registerScriptRunsTools(server);
@@ -373,6 +417,8 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerListConfigTool(server);
     registerDeleteConfigTool(server);
     registerCredentialBindingsTool(server);
+    registerModelCatalogRefreshTool(server);
+    registerModelCatalogOverlayUpsertTool(server);
   }
 
   // Scripts capability - reusable script catalog (HTTP MCP only in v1)
@@ -382,6 +428,13 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerScriptApisTool(server);
     registerScriptRunTool(server);
     registerScriptUpsertTool(server);
+    registerExtensionDeleteTool(server);
+    registerExtensionEnableTool(server);
+    registerExtensionDisableTool(server);
+    registerExtensionActivateVersionTool(server);
+    registerExtensionCatalogTool(server);
+    registerExtensionInstallTool(server);
+    registerExtensionListTool(server);
     registerScriptDeleteTool(server);
     registerScriptQueryTypesTool(server);
     registerScriptRunsTools(server);
@@ -415,6 +468,7 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
   if (hasCapability("scheduling")) {
     registerListSchedulesTool(server);
     registerCreateScheduleTool(server);
+    registerDeferTaskTool(server);
     registerUpdateScheduleTool(server);
     registerPatchScheduleTool(server);
     registerDeleteScheduleTool(server);
@@ -456,6 +510,7 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerRetryWorkflowRunTool(server);
     registerCancelWorkflowRunTool(server);
     registerRequestHumanInputTool(server);
+    registerCancelApprovalRequestTool(server);
   }
 
   // Skills capability - installable skill packages (create, search, install, publish)
@@ -501,6 +556,10 @@ export async function createServer(opts: { scriptsOnly?: boolean; fullSurface?: 
     registerKvDeleteTool(server);
     registerKvIncrTool(server);
     registerKvListTool(server);
+    registerRoomGetTool(server);
+    registerRoomChangeTool(server);
+    registerRoomResetTool(server);
+    registerRoomDecodeTool(server);
   }
 
   // Slack capability - Slack integration tools (no-op if Slack is not configured)

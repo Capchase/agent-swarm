@@ -37,15 +37,17 @@ import type {
   TriggerConfig,
   WebhookVerification,
   WorkflowNode,
-  WorkflowRun,
   WorkflowRunStatus,
+  WorkflowRunSummary,
   WorkflowVersion,
 } from "@/api/types";
+import { AutomationParamsFields } from "@/components/automations/automation-params-fields";
 import { AgentLink } from "@/components/shared/agent-link";
 import { CollapsibleDescription } from "@/components/shared/collapsible-description";
 import { CopyableField, CopyIconButton, SecretField } from "@/components/shared/copyable-fields";
 import { DataGrid } from "@/components/shared/data-grid";
 import { FavoriteButton } from "@/components/shared/favorite-button";
+import { ListPager, resolveListPage } from "@/components/shared/list-pager";
 import { StatusBadge } from "@/components/shared/status-badge";
 import {
   AlertDialog,
@@ -59,6 +61,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -68,24 +71,56 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { JsonTree } from "@/components/workflows/json-tree";
 import { WorkflowGraph } from "@/components/workflows/workflow-graph";
 import { useTheme } from "@/hooks/use-theme";
-import { readBooleanParam, readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
+import {
+  readBooleanParam,
+  readNumberParam,
+  readStringParam,
+  useUrlSearchState,
+} from "@/hooks/use-url-search-state";
+import { isAutomationSetupError } from "@/lib/automation-setup";
 import { getConfig } from "@/lib/config";
 import { modelTierLabel } from "@/lib/model-tiers";
 import { monacoDarkTheme, monacoLightTheme } from "@/lib/monaco-themes";
 import { formatElapsed, formatSmartTime } from "@/lib/utils";
 
+const RUNS_PAGE_SIZE_OPTIONS = [20, 50, 100] as const;
+const DEFAULT_RUNS_PAGE_SIZE = 20;
+
 export default function WorkflowDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { searchParams, setParam } = useUrlSearchState();
+  const runsPage = readNumberParam(searchParams, "workflowRunsPage", 0, { min: 0 });
+  const runsPageSize = readNumberParam(
+    searchParams,
+    "workflowRunsPageSize",
+    DEFAULT_RUNS_PAGE_SIZE,
+    {
+      allowed: RUNS_PAGE_SIZE_OPTIONS,
+    },
+  );
   const { data: workflow, isLoading } = useWorkflow(id!);
-  const { data: runs, isLoading: runsLoading } = useWorkflowRuns(id!);
+  const { data: runsData, isLoading: runsLoading } = useWorkflowRuns(id!, {
+    limit: runsPageSize,
+    offset: runsPage * runsPageSize,
+  });
+  // A stale or hand-edited ?workflowRunsPage= past the last page moves back to
+  // the last one once the total is known.
+  const { page: runsListPage, stale: runsPageStale } = resolveListPage(
+    runsPage,
+    runsPageSize,
+    runsData?.page.total,
+  );
+  useEffect(() => {
+    if (runsPageStale) setParam("workflowRunsPage", runsListPage, { defaultValue: "0" });
+  }, [runsListPage, runsPageStale, setParam]);
   const updateWorkflow = useUpdateWorkflow();
   const deleteWorkflow = useDeleteWorkflow();
   const triggerWorkflow = useTriggerWorkflow();
   const favoriteToggle = useFavoriteToggle("workflow");
-  const { searchParams, setParam } = useUrlSearchState();
   const activeTab = readStringParam(searchParams, "tab", "definition");
   const selectedNodeId = readStringParam(searchParams, "node") || null;
+  const focusedParam = readStringParam(searchParams, "param") || undefined;
   const graphMaximized = readBooleanParam(searchParams, "graph");
   const setActiveTab = useCallback(
     (tab: string) => setParam("tab", tab, { defaultValue: "definition" }),
@@ -123,15 +158,29 @@ export default function WorkflowDetailPage() {
     }
   }, [selectedNodeId, setSelectedNodeId, workflow]);
 
-  const runColumns = useMemo<ColDef<WorkflowRun>[]>(
+  useEffect(() => {
+    if (!focusedParam || !workflow?.requiredParams?.includes(focusedParam)) return;
+    if (activeTab !== "setup") setActiveTab("setup");
+  }, [activeTab, focusedParam, setActiveTab, workflow?.requiredParams]);
+
+  const runColumns = useMemo<ColDef<WorkflowRunSummary>[]>(
     () => [
       {
         field: "status",
         headerName: "Status",
         width: 130,
-        cellRenderer: (params: { value: WorkflowRunStatus }) => (
-          <StatusBadge status={params.value} />
-        ),
+        cellRenderer: (params: { value: WorkflowRunStatus; data?: WorkflowRunSummary }) =>
+          isAutomationSetupError(params.data?.error) ? (
+            <Badge
+              variant="outline"
+              size="tag"
+              className="border-status-pending/30 text-status-pending-strong"
+            >
+              Needs setup
+            </Badge>
+          ) : (
+            <StatusBadge status={params.value} />
+          ),
       },
       {
         field: "startedAt",
@@ -161,7 +210,7 @@ export default function WorkflowDetailPage() {
   );
 
   const onRunRowClicked = useCallback(
-    (event: RowClickedEvent<WorkflowRun>) => {
+    (event: RowClickedEvent<WorkflowRunSummary>) => {
       if (event.data) void navigate(`/workflow-runs/${event.data.id}`);
     },
     [navigate],
@@ -198,7 +247,10 @@ export default function WorkflowDetailPage() {
             <Switch
               checked={workflow.enabled}
               onCheckedChange={(checked) =>
-                updateWorkflow.mutate({ id: workflow.id, data: { enabled: checked } })
+                updateWorkflow.mutate({
+                  id: workflow.id,
+                  data: { enabled: checked },
+                })
               }
             />
             <span className="text-xs text-muted-foreground">
@@ -216,7 +268,10 @@ export default function WorkflowDetailPage() {
               favorite={workflow.favorite}
               disabled={favoriteToggle.isPending}
               onToggle={() =>
-                favoriteToggle.mutate({ itemId: workflow.id, favorite: !workflow.favorite })
+                favoriteToggle.mutate({
+                  itemId: workflow.id,
+                  favorite: !workflow.favorite,
+                })
               }
             />
             <TopBarTriggerButton
@@ -271,8 +326,9 @@ export default function WorkflowDetailPage() {
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col flex-1 min-h-0">
         <TabsList className="shrink-0">
           <TabsTrigger value="definition">Definition</TabsTrigger>
+          <TabsTrigger value="setup">Setup ({workflow.requiredParams?.length ?? 0})</TabsTrigger>
           <TabsTrigger value="triggers">Triggers ({workflow.triggers.length})</TabsTrigger>
-          <TabsTrigger value="runs">Runs ({runs?.length ?? 0})</TabsTrigger>
+          <TabsTrigger value="runs">Runs ({runsData?.page.total ?? 0})</TabsTrigger>
           <TabsTrigger value="versions">Versions</TabsTrigger>
         </TabsList>
 
@@ -342,6 +398,10 @@ export default function WorkflowDetailPage() {
           </div>
         </TabsContent>
 
+        <TabsContent value="setup" className="flex flex-col flex-1 min-h-0">
+          <WorkflowSetupPanel workflow={workflow} focusParam={focusedParam} />
+        </TabsContent>
+
         {/* Triggers tab */}
         <TabsContent value="triggers" className="flex flex-col flex-1 min-h-0">
           <TriggersDetailPanel
@@ -354,14 +414,29 @@ export default function WorkflowDetailPage() {
         </TabsContent>
 
         {/* Runs tab */}
-        <TabsContent value="runs" className="flex flex-col flex-1 min-h-0">
+        <TabsContent value="runs" className="flex flex-col flex-1 min-h-0 gap-3">
           <DataGrid
-            rowData={runs ?? []}
+            rowData={runsData?.runs ?? []}
             columnDefs={runColumns}
             onRowClicked={onRunRowClicked}
-            loading={runsLoading}
+            loading={runsLoading || runsPageStale}
             emptyMessage="No runs yet"
-            paginationQueryKey="workflowRuns"
+            getRowId={(p) => p.data.id}
+            pagination={false}
+          />
+          <ListPager
+            page={runsListPage}
+            pageSize={runsPageSize}
+            total={runsData?.page.total ?? 0}
+            pageSizeOptions={RUNS_PAGE_SIZE_OPTIONS}
+            onPageChange={(next) => setParam("workflowRunsPage", next, { defaultValue: "0" })}
+            onPageSizeChange={(size) =>
+              setParam("workflowRunsPageSize", String(size), {
+                defaultValue: String(DEFAULT_RUNS_PAGE_SIZE),
+                reset: ["workflowRunsPage"],
+              })
+            }
+            emptyLabel="0 runs"
           />
         </TabsContent>
 
@@ -414,6 +489,67 @@ export default function WorkflowDetailPage() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+function WorkflowSetupPanel({
+  workflow,
+  focusParam,
+}: {
+  workflow: {
+    id: string;
+    requiredParams?: string[];
+    params?: Record<string, unknown>;
+  };
+  focusParam?: string;
+}) {
+  const updateWorkflow = useUpdateWorkflow();
+  const [params, setParams] = useState<Record<string, unknown>>(workflow.params ?? {});
+
+  useEffect(() => setParams(workflow.params ?? {}), [workflow.params]);
+
+  return (
+    <Card className="max-w-2xl">
+      <CardHeader>
+        <CardTitle>Automation setup</CardTitle>
+        <CardDescription>
+          These values are required before this workflow can create a run.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <AutomationParamsFields
+          requiredParams={workflow.requiredParams}
+          params={params}
+          focusParam={focusParam}
+          onChange={setParams}
+        />
+        {workflow.requiredParams?.length ? (
+          <Button
+            type="button"
+            size="sm"
+            disabled={updateWorkflow.isPending}
+            onClick={() =>
+              updateWorkflow.mutate(
+                { id: workflow.id, data: { params } },
+                {
+                  onSuccess: () => toast.success("Workflow parameters saved"),
+                  onError: (error) =>
+                    toast.error(
+                      error instanceof Error ? error.message : "Failed to save parameters",
+                    ),
+                },
+              )
+            }
+          >
+            Save parameters
+          </Button>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            This workflow does not require setup parameters.
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -898,7 +1034,11 @@ function channelIcon(channel: string | null): React.ElementType | null {
 
 function PropertyMatchConfig({ config }: { config: Record<string, unknown> }) {
   const conditions = Array.isArray(config.conditions)
-    ? (config.conditions as Array<{ field?: string; op?: string; value?: unknown }>)
+    ? (config.conditions as Array<{
+        field?: string;
+        op?: string;
+        value?: unknown;
+      }>)
     : null;
   const mode = typeof config.mode === "string" ? config.mode : "all";
 
@@ -1142,7 +1282,10 @@ function TopBarTriggerButton({
  * own `triggers[].scheduleId` bindings, which a schedule doesn't know about).
  */
 function LinkedSchedulesSection({ workflowId }: { workflowId: string }) {
-  const { data: schedules } = useScheduledTasks({ targetType: "workflow", workflowId });
+  const { data: schedules } = useScheduledTasks({
+    targetType: "workflow",
+    workflowId,
+  });
 
   if (!schedules || schedules.length === 0) return null;
 
@@ -1420,7 +1563,10 @@ function TriggerSchemaSection({
     }
     setParseError(null);
     updateWorkflow.mutate(
-      { id: workflowId, data: { triggerSchema: parsed as Record<string, unknown> } },
+      {
+        id: workflowId,
+        data: { triggerSchema: parsed as Record<string, unknown> },
+      },
       {
         onSuccess: () => {
           toast.success("Trigger schema saved");
@@ -1819,9 +1965,32 @@ function getWebhookVerificationDisplay(trigger: TriggerConfig): {
           Sign <code className="font-mono">&lt;timestamp&gt;.&lt;raw body&gt;</code> with
           HMAC-SHA256, then send{" "}
           <code className="font-mono">
-            {verification.header}: {timestampKey}=&lt;timestamp&gt;,{signatureKey}=&lt;hex&gt;
+            {verification.header}: {timestampKey}=&lt;timestamp&gt;,
+            {signatureKey}=&lt;hex&gt;
           </code>
           .
+        </>
+      ),
+    };
+  }
+
+  if (verification.format === "standard-webhooks") {
+    return {
+      formatLabel: "standard-webhooks",
+      header: "webhook-signature",
+      toleranceSeconds: verification.toleranceSeconds ?? 300,
+      secretLabel: "Signing secret",
+      hint: (
+        <>
+          Standard Webhooks sender: sign{" "}
+          <code className="font-mono">
+            &lt;webhook-id&gt;.&lt;webhook-timestamp&gt;.&lt;raw body&gt;
+          </code>{" "}
+          with HMAC-SHA256 keyed by the base64 secret (<code className="font-mono">whsec_</code>{" "}
+          prefix optional), then send{" "}
+          <code className="font-mono">webhook-signature: v1,&lt;base64&gt;</code> with the{" "}
+          <code className="font-mono">webhook-id</code> and{" "}
+          <code className="font-mono">webhook-timestamp</code> headers.
         </>
       ),
     };

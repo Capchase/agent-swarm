@@ -1,3 +1,4 @@
+import { type ToolUse, toolUseMatches } from "../src/judge/session-log-parse.ts";
 import type {
   CheckResult,
   DeterministicCheck,
@@ -7,7 +8,7 @@ import type {
 } from "../src/types.ts";
 import {
   fetchSessionLogs,
-  hasTool,
+  safeStringify,
   scoreResult,
   taskToolUses,
   workerTasks,
@@ -16,18 +17,24 @@ import {
 const LEAD_WORKER = 3;
 const REPORT_FILE = "/workspace/delegation-chain/final-report.md";
 
+/**
+ * Answer key (mirror of `fixtures/generate-delegation-chain-history.ts` output):
+ *   phase-one   completed count = 10
+ *   phase-two   top completed   = "Cut over the ledger service to the new region"
+ *   phase-three anomaly         = "Roll out the new pricing engine to EU customers"
+ */
 const FACTS = [
   {
     label: "phase-1-completed-count",
-    pattern: /completed[^\n]{0,40}\b21\b|\b21\b[^\n]{0,40}completed/i,
+    pattern: /completed[^\n]{0,40}\b10\b|\b10\b[^\n]{0,40}completed/i,
   },
   {
     label: "phase-2-top-task",
-    pattern: /rotate[\s\S]{0,60}payments[\s\S]{0,60}api[\s\S]{0,60}keys/i,
+    pattern: /ledger[\s\S]{0,60}(new )?region/i,
   },
   {
     label: "phase-3-anomaly",
-    pattern: /checkout[\s\S]{0,80}production|production[\s\S]{0,80}checkout/i,
+    pattern: /pricing engine[\s\S]{0,80}\bEU\b|\bEU\b[\s\S]{0,80}pricing engine/i,
   },
 ];
 
@@ -35,20 +42,84 @@ function leadAgent(ctx: JudgeContext): string | undefined {
   return ctx.workers.find((w) => w.isLead)?.agentId;
 }
 
+/** Every lead task's result joined. A lead that defers finishes in a later
+ * wake-up task, so the first lead task alone holds only the defer summary. */
+function leadResults(ctx: JudgeContext): string {
+  const leadId = leadAgent(ctx);
+  return ctx.tasks
+    .filter((t) => t.agentId === leadId && typeof t.result === "string")
+    .map((t) => t.result as string)
+    .join("\n");
+}
+
+/** Statuses the seeded history carries (fixtures/generate-delegation-chain-history.ts). */
+const SEEDED_STATUSES = new Set(["completed", "failed", "cancelled"]);
+/** get-tasks args that narrow the list away from the seeded history. */
+const NARROWING_ARGS = [
+  "tags",
+  "search",
+  "mineOnly",
+  "unassigned",
+  "offeredToMe",
+  "readyOnly",
+  "taskType",
+  "key",
+  "keyPrefix",
+  "scheduleId",
+];
+
+/** Tool args, unwrapping the `{server, tool, arguments}` envelope some harnesses log. */
+function toolArgs(input: unknown): Record<string, unknown> {
+  const obj = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  const inner = obj.arguments;
+  return inner && typeof inner === "object" ? (inner as Record<string, unknown>) : obj;
+}
+
+/**
+ * True when a lead tool call reads the seeded audit history instead of
+ * delegating: any db-query, or a get-tasks/list-tasks call that is unfiltered
+ * or lists a terminal status without a narrowing filter. Polling active work
+ * (`status: "in_progress"`, `tags`, `search`, ...) is normal lead behavior.
+ */
+function readsSeededHistory(use: ToolUse): boolean {
+  if (toolUseMatches(use.toolName, ["db-query", "db_query"])) return true;
+  if (!toolUseMatches(use.toolName, ["get-tasks", "get_tasks", "list-tasks", "list_tasks"]))
+    return false;
+  const args = toolArgs(use.input);
+  const narrowed = NARROWING_ARGS.some((k) => args[k] !== undefined && args[k] !== false);
+  if (narrowed) return false;
+  const status = typeof args.status === "string" ? args.status : undefined;
+  return status === undefined || SEEDED_STATUSES.has(status);
+}
+
 function dependsOnChild(child: SwarmTask, children: SwarmTask[]): boolean {
   const deps = Array.isArray(child.dependsOn) ? (child.dependsOn as string[]) : [];
   return deps.some((dep) => children.some((candidate) => candidate.id === dep));
 }
 
+/**
+ * Children in chain order: by dependency depth (how many dependsOn hops sit
+ * between a child and a root), ties broken by id. Independent of the order the
+ * API lists tasks in (it lists newest first, so a correct 1 -> 2 -> 3 chain
+ * arrives as 3, 2, 1). The old pairwise comparator returned "after" for BOTH
+ * (b, c) and (c, b) of a chain, so 3 of the 6 listing orders scored a correct
+ * chain as out of order.
+ */
 function childOrder(children: SwarmTask[]): SwarmTask[] {
   const byId = new Map(children.map((c) => [c.id, c]));
-  return [...children].sort((a, b) => {
-    const aDeps = Array.isArray(a.dependsOn) ? (a.dependsOn as string[]) : [];
-    const bDeps = Array.isArray(b.dependsOn) ? (b.dependsOn as string[]) : [];
-    if (aDeps.some((id) => id === b.id || byId.has(id))) return 1;
-    if (bDeps.some((id) => id === a.id || byId.has(id))) return -1;
-    return a.id.localeCompare(b.id);
-  });
+  const depth = (child: SwarmTask, path: ReadonlySet<string>): number => {
+    if (path.has(child.id)) return 0; // dependency cycle: stop, never loop
+    const deps = (Array.isArray(child.dependsOn) ? (child.dependsOn as string[]) : [])
+      .map((id) => byId.get(id))
+      .filter((d): d is SwarmTask => d !== undefined);
+    if (deps.length === 0) return 0;
+    const next = new Set(path).add(child.id);
+    return 1 + Math.max(...deps.map((d) => depth(d, next)));
+  };
+  return [...children]
+    .map((child) => ({ child, depth: depth(child, new Set()) }))
+    .sort((a, b) => a.depth - b.depth || a.child.id.localeCompare(b.child.id))
+    .map((entry) => entry.child);
 }
 
 const chainStructureCheck: DeterministicCheck = {
@@ -59,11 +130,12 @@ const chainStructureCheck: DeterministicCheck = {
       (t) => t.agentId === leadId && (t.parentTaskId ?? null) == null,
     );
     const leadTools = await taskToolUses(ctx, leadTask);
-    if (hasTool(leadTools, ["get-tasks", "list-tasks", "db-query", "db_query"])) {
+    const historyReads = leadTools.filter(readsSeededHistory);
+    if (historyReads.length > 0) {
       return {
         pass: false,
         score: 0,
-        detail: "lead queried task history directly — chain dimension zeroed",
+        detail: `lead queried task history directly (${historyReads[0]?.toolName} ${safeStringify(toolArgs(historyReads[0]?.input))}) — chain dimension zeroed`,
       };
     }
 
@@ -82,7 +154,7 @@ const chainStructureCheck: DeterministicCheck = {
         const text = `${child.description}\n${child.result ?? ""}`;
         if (index === 0) return /completed/i.test(text);
         if (index === 1) return /completed|top|priority/i.test(text);
-        return /anomal|checkout|production/i.test(text);
+        return /anomal|pricing|contradict/i.test(text);
       })
       .filter(Boolean).length;
 
@@ -128,7 +200,7 @@ const PHASE_NAMES = ["phase-one", "phase-two", "phase-three"];
 const PHASE_TOPICS: RegExp[] = [
   /completed/i,
   /top|priority|highest/i,
-  /anomal|checkout|production/i,
+  /anomal|contradict|mismatch|claims? success/i,
 ];
 
 /** A single strict linear chain: child[0] has no internal dep, child[i] depends
@@ -204,7 +276,7 @@ const chainCorrectnessCheck: DeterministicCheck = {
   fn: async (ctx): Promise<CheckResult> => {
     const lead = ctx.workers[LEAD_WORKER];
     const report = lead ? await lead.readFile(REPORT_FILE) : null;
-    const text = report ?? ctx.tasks.find((t) => t.agentId === leadAgent(ctx))?.result ?? "";
+    const text = report ?? leadResults(ctx);
     const matched = FACTS.filter((f) => f.pattern.test(text)).length;
     return {
       pass: matched === FACTS.length,
@@ -219,9 +291,8 @@ const finalReportGate: DeterministicCheck = {
   fn: async (ctx) => {
     const lead = ctx.workers[LEAD_WORKER];
     const report = lead ? await lead.readFile(REPORT_FILE) : null;
-    const leadOutput = ctx.tasks.find((t) => t.agentId === leadAgent(ctx))?.result;
     return {
-      pass: Boolean(report?.trim() || (typeof leadOutput === "string" && leadOutput.trim())),
+      pass: Boolean(report?.trim() || leadResults(ctx).trim()),
       detail: "final report file or lead output present",
     };
   },
@@ -229,12 +300,13 @@ const finalReportGate: DeterministicCheck = {
 
 export const delegationChain: Scenario = {
   id: "delegation-chain",
+  version: 2,
   name: "Delegation chain",
   description:
     "Lead-driven sequential delegation with dependsOn links, grading the child-task paper trail instead of raw audit ability.",
   workers: [{ name: "phase-one" }, { name: "phase-two" }, { name: "phase-three" }],
   lead: { name: "Lead", template: "lead" },
-  seed: { sqlDump: "sql-audit-history.sql" },
+  seed: { sqlDump: "delegation-chain-history.sql" },
   tasks: [
     {
       title: "Run a three-phase chained audit through workers",
@@ -255,9 +327,11 @@ export const delegationChain: Scenario = {
     ],
   },
   timeoutMs: 16 * 60_000,
+  awaitSpawnedTasks: true,
 };
 
 export const __test__ = {
+  childOrder,
   chainStructureCheck,
   dispatchStructureCheck,
   chainCorrectnessCheck,
@@ -267,4 +341,5 @@ export const __test__ = {
   PHASE_TOPICS,
   REPORT_FILE,
   LEAD_WORKER,
+  readsSeededHistory,
 };

@@ -3,6 +3,8 @@ title: Deployment Guide
 description: Deploy Agent Swarm to production with Docker Compose — volumes, networking, secrets, and persistent storage
 ---
 
+For Kubernetes, see [Kubernetes and Helm](/docs/guides/kubernetes) for installation, API ingress, dashboard access, and CORS diagnostics.
+
 ## Docker Compose (Recommended)
 
 The easiest way to deploy a full swarm with API, workers, and lead agent. You can go from zero to a running swarm in under 5 minutes.
@@ -11,7 +13,7 @@ The easiest way to deploy a full swarm with API, workers, and lead agent. You ca
 
 Before you start, make sure you have:
 
-- **Docker & Docker Compose** installed ([install guide](https://docs.docker.com/get-docker/))
+- **Docker & Docker Compose** installed ([install guide](https://docs.docker.com/get-docker/)). Rootless Podman with a Compose provider also works; see [Rootless Podman](/docs/guides/podman-rootless).
 - **A Claude Code OAuth token** — run `claude setup-token` in your terminal to get one
 - **An API key** — any secret string you choose (all services share this key for authentication)
 
@@ -37,9 +39,13 @@ Create a `.env` file in the same directory as `docker-compose.yml`:
 API_KEY=your-secret-api-key
 CLAUDE_CODE_OAUTH_TOKEN=your-oauth-token   # Run `claude setup-token` to get this
 SECRETS_ENCRYPTION_KEY=                     # Run `openssl rand -base64 32` and paste here. See "Encryption Key" below.
+AGENT_SWARM_VERSION=                        # Pin a release here. Blank tracks `latest`. See "Pinning the Image Version" below.
 
-# Stable agent IDs — run `uuidgen` once for each value and paste it here.
-# Keep every value unique and stable across restarts.
+# Docker Compose agent IDs (optional overrides)
+# Leave blank to generate a UUID on first boot and reuse it across restarts.
+# Each service stores its ID in /workspace/personal/.agent-id on its own volume.
+# Explicit IDs take precedence and are persisted; keep them to retain identity.
+# Removing personal volumes also removes generated IDs.
 LEAD_AGENT_ID=
 WORKER_1_AGENT_ID=
 WORKER_2_AGENT_ID=
@@ -48,6 +54,10 @@ CONTENT_REVIEWER_AGENT_ID=
 CONTENT_STRATEGIST_AGENT_ID=
 UX_PRINCIPLES_AGENT_ID=
 DISCOVERABILITY_AGENT_ID=
+RESEARCHER_AGENT_ID=
+REVIEWER_AGENT_ID=
+TESTER_AGENT_ID=
+FORWARD_DEPLOYED_ENGINEER_AGENT_ID=
 
 # ---- Optional ----
 GITHUB_TOKEN=ghp_xxxx                      # For git operations inside agents
@@ -61,23 +71,53 @@ You can pass multiple OAuth tokens for load balancing: `CLAUDE_CODE_OAUTH_TOKEN=
 </Callout>
 
 <Callout type="info">
-If you leave `SECRETS_ENCRYPTION_KEY` blank on a brand-new deploy, the API will auto-generate one and write it to the `swarm_api` volume at `.encryption-key`. For production, set it explicitly so you control where it lives and can back it up alongside your other secrets. See [Encryption Key](#encryption-key).
+If you leave `SECRETS_ENCRYPTION_KEY` blank on a brand-new deploy, the API will auto-generate one and write it to the `swarm_api_data` volume at `.encryption-key`. For production, set it explicitly so you control where it lives and can back it up alongside your other secrets. See [Encryption Key](#encryption-key).
 </Callout>
 
-### Step 3: Generate Stable Agent IDs
+### Step 3: Choose Optional Agent ID Overrides
 
 Each agent needs a stable UUID that persists across restarts. This is critical for task resume — if an agent restarts, it uses its `AGENT_ID` to pick up paused tasks.
 
-The example compose file reads the named values from `.env` and stops with a clear error if one is missing. Generate one unique UUID per agent and paste the output into the corresponding variable above:
+All twelve Compose agent ID variables are optional. Leave them blank to generate a UUID on first boot. Each service saves its ID to `/workspace/personal/.agent-id` on its own personal volume and reuses it across restarts. An explicit `.env` value takes precedence and is persisted to that file; keep existing overrides to retain identity. Removing personal volumes discards generated IDs.
+
+If you want explicit overrides, generate one unique UUID per agent and paste the output into the corresponding variables above:
 
 ```bash
-# Generate all required `*_AGENT_ID=value` lines, then paste them into .env.
-for name in LEAD_AGENT_ID WORKER_1_AGENT_ID WORKER_2_AGENT_ID CONTENT_WRITER_AGENT_ID CONTENT_REVIEWER_AGENT_ID CONTENT_STRATEGIST_AGENT_ID UX_PRINCIPLES_AGENT_ID DISCOVERABILITY_AGENT_ID; do
+# Optional: generate `*_AGENT_ID=value` overrides, then paste them into .env.
+for name in LEAD_AGENT_ID WORKER_1_AGENT_ID WORKER_2_AGENT_ID CONTENT_WRITER_AGENT_ID CONTENT_REVIEWER_AGENT_ID CONTENT_STRATEGIST_AGENT_ID UX_PRINCIPLES_AGENT_ID DISCOVERABILITY_AGENT_ID RESEARCHER_AGENT_ID REVIEWER_AGENT_ID TESTER_AGENT_ID FORWARD_DEPLOYED_ENGINEER_AGENT_ID; do
   printf '%s=%s\n' "$name" "$(uuidgen)"
 done
 ```
 
-### Step 4: Start the Swarm
+### Step 4: Pin the Image Version
+
+The API and every agent service resolve their tag from a single `.env` variable:
+
+```bash title=".env"
+AGENT_SWARM_VERSION=1.150.0
+```
+
+Pick a version from [releases](https://github.com/desplega-ai/agent-swarm/releases). Confirm every service resolved the same tag:
+
+```bash
+docker compose config | grep -E 'image: .*(agent-swarm|agent-swarm-worker):'
+```
+
+<Callout type="warn">
+**Leaving `AGENT_SWARM_VERSION` blank tracks `:latest`, which is not a release.** `:latest` is rebuilt and moved on every commit to `main`; a version tag is published only when the release version changes. The compose example sets `pull_policy: always`, so an unpinned deployment can move to a newer build on any `up -d` or restart — including one you did not intend as an upgrade. Pin anything you depend on.
+</Callout>
+
+Changing this value later is an upgrade, not a restart. Migrations are forward-only, so re-pinning to an older tag does **not** roll back a schema change — a database backup taken before the upgrade does. Back up first ([Backing Up the Database](#backing-up-the-database) and [Backing up the key](#backing-up-the-key)), then:
+
+```bash
+docker compose pull      # explicit: a moved tag is not re-pulled unless pull_policy is always
+docker compose up -d
+docker compose images    # confirm what is actually running
+```
+
+Verify with `/health` **and** a completed task, not `/health` alone. On Kubernetes, the chart pins images through its `appVersion`; pass `--version` to `helm upgrade` or it moves to the newest published chart. See [Kubernetes and Helm](/docs/guides/kubernetes).
+
+### Step 5: Start the Swarm
 
 ```bash
 docker compose up -d
@@ -85,7 +125,7 @@ docker compose up -d
 
 The API service starts first. Workers and lead wait until the API health check passes before starting (via `depends_on: condition: service_healthy`).
 
-### Step 5: Verify It's Running
+### Step 6: Verify It's Running
 
 ```bash
 # Check all services are up
@@ -102,8 +142,34 @@ curl -s -H "Authorization: Bearer YOUR_API_KEY" \
 You should see the lead and workers listed with `status: "idle"`.
 
 <Callout type="info">
-The bundled worker image already includes the Ubuntu runtime libraries required by Playwright's Chromium binary. Browser-driven tasks such as `qa-use`, Playwright smoke tests, and screenshot workflows no longer need a per-agent `apt install` workaround just to launch the bundled browser.
+The bundled worker image already includes the Ubuntu runtime libraries required by Playwright's Chromium binary. Browser-driven tasks such as `agent-browser` sessions, Playwright smoke tests, and screenshot workflows no longer need a per-agent `apt install` workaround just to launch the bundled browser.
 </Callout>
+
+### Step 7: HTTPS with Caddy (optional, needed for the hosted dashboard)
+
+The dashboard at [app.agent-swarm.dev](https://app.agent-swarm.dev) is served over HTTPS, so browsers block a plain-HTTP API. OAuth callbacks, webhooks, and page links also need a public HTTPS origin. The Compose example ships an optional Caddy reverse proxy that obtains Let's Encrypt certificates automatically.
+
+1. Point DNS for an API domain and an agent-fs domain at this host, and open ports 80 and 443.
+2. Add to `.env`:
+
+```bash
+SWARM_API_DOMAIN=swarm-api.example.com
+AGENT_FS_DOMAIN=swarm-files.example.com
+PUBLIC_MCP_BASE_URL=https://swarm-api.example.com
+```
+
+3. Start with the `tls` profile:
+
+```bash
+docker compose --profile tls up -d
+curl -fsS https://swarm-api.example.com/health
+```
+
+Caddy proxies the API domain to `api:3013`. On the agent-fs domain, `/agentfs/*` goes to `minio:9000` for signed image/PDF/video previews and downloads; all other paths go to `agent-fs:7433`. The bucket path and `Host` header are preserved for S3 signature validation, so previews use the existing file domain without another DNS record. Once it runs, stop exposing ports 3013 and 7433 on a public interface (firewall them or remove the `ports` entries). Certificates persist in the `caddy_data` volume. Requires Docker Compose v2.23.1 or newer for the inline Caddyfile. Caddy publishes host ports 80/443 by default; set `CADDY_HTTP_PORT` / `CADDY_HTTPS_PORT` to remap them, for example under [rootless Podman](/docs/guides/podman-rootless#tls-profile-and-privileged-ports).
+
+Signed URLs default to `https://${AGENT_FS_DOMAIN}` when `AGENT_FS_DOMAIN` is set, or `http://localhost:9000` otherwise. A non-empty `AGENT_FS_S3_PUBLIC_ENDPOINT` overrides either default and must be an origin browsers can reach over HTTPS for TLS deployments.
+
+If you already run a reverse proxy (Caddy, nginx, Traefik, Cloudflare Tunnel), skip the profile and set `PUBLIC_MCP_BASE_URL` to the HTTPS API origin that proxy serves. For file previews, set `AGENT_FS_DOMAIN` and configure the same `/agentfs/*` MinIO route without stripping the bucket prefix or rewriting `Host`, or set `AGENT_FS_S3_PUBLIC_ENDPOINT` to a separate browser-reachable HTTPS S3 origin. When self-hosting the dashboard on your own domain, also set `CORS_ALLOWED_ORIGINS` to that origin.
 
 ### Startup-script privilege boundary
 
@@ -131,11 +197,21 @@ The example `docker-compose.yml` sets up:
 | **lead** | Coordinator agent | `3020` | `official/lead` |
 | **worker-1** | Task executor | `3021` | `official/coder` |
 | **worker-2** | Task executor | `3022` | `official/coder` |
+| **worker-researcher** | Researcher | `3031` | `official/researcher` |
+| **worker-reviewer** | Reviewer | `3032` | `official/reviewer` |
+| **worker-tester** | Tester | `3033` | `official/tester` |
+| **worker-forward-deployed-engineer** | Forward-deployed engineer | `3034` | `official/forward-deployed-engineer` |
 | **worker-content-writer** | Content specialist | `3026` | `official/content-writer` |
 | **worker-content-reviewer** | Content reviewer | `3027` | `official/content-reviewer` |
 | **worker-content-strategist** | Content strategist | `3028` | `official/content-strategist` |
+| **worker-ux-principles** | UX analysis | `3029` | `official/ux-principles` |
+| **worker-discoverability-optimizer** | SEO / discoverability | `3030` | `official/discoverability-optimizer` |
+| **minio** | S3-compatible object storage for agent-fs | `9000` (API), `9001` (console) | — |
+| **minio-init** | One-shot job that creates the `agentfs` bucket | — | — |
+| **agent-fs** | Shared file storage service | `7433` | — |
+| **caddy** | TLS reverse proxy, only started with the `tls` profile | `80`, `443` | — |
 
-The content agents are optional — remove them from `docker-compose.yml` if you don't need content workflows.
+The specialist workers are optional — remove any you don't need from `docker-compose.yml`.
 
 <Callout type="info">
 The example Compose files also include a co-deployed MinIO + agent-fs stack for persistent shared files and dashboard task attachments. See [agent-fs Co-deployment](/docs/guides/agent-fs-co-deployment) for Helm and Compose configuration, migration notes, and verification commands.
@@ -152,7 +228,7 @@ The swarm uses Docker named volumes to persist data across restarts and upgrades
 ```
 Docker Volume            → Container Path        → What It Stores
 ─────────────────────────────────────────────────────────────────────
-swarm_api                → /app                  → SQLite DB (all swarm state)
+swarm_api_data           → /app/data             → SQLite DB (all swarm state)
 swarm_logs               → /logs                 → Session logs (all agents)
 swarm_shared             → /workspace/shared     → Shared workspace (all agents)
 swarm_lead               → /workspace/personal   → Lead's private workspace
@@ -164,7 +240,7 @@ swarm_worker_2           → /workspace/personal   → Worker 2's private worksp
 
 | Volume | Critical? | Backup? | Description |
 |--------|-----------|---------|-------------|
-| `swarm_api` | **Yes** | **Yes** | Contains the SQLite database (`agent-swarm-db.sqlite`) with all tasks, agents, schedules, and configuration. Losing this = losing all swarm state. |
+| `swarm_api_data` | **Yes** | **Yes** | Contains the SQLite database (`agent-swarm-db.sqlite`) with all tasks, agents, schedules, and configuration. Losing this = losing all swarm state. Mounted at `/app/data` — see [Migrating from the `/app` mount](#migrating-from-the-app-mount). |
 | `swarm_logs` | No | Optional | Session logs from all agents. Useful for debugging. Can be recreated. |
 | `swarm_shared` | Moderate | Recommended | Shared workspace. Agents store research, plans, and memory under `/workspace/shared/{thoughts,memory,downloads,misc}/$AGENT_ID`. All agents can read each other's files. |
 | `swarm_<agent>` | Low | No | Personal workspace per agent (`/workspace/personal`). Isolated — only that agent can see it. Contains cloned repos, working files, and agent-specific state. |
@@ -177,23 +253,64 @@ Each agent container has two workspace directories:
 
 - **`/workspace/personal`** — Mounted from a per-agent volume (e.g., `swarm_worker_1`). Only that agent can see this. Used for cloned git repos, working files, and private state.
 
+<h3 id="migrating-from-the-app-mount">Migrating from the `/app` mount</h3>
+
+Installs created before this change mount `swarm_api` at `/app` instead of `swarm_api_data` at `/app/data`.
+
+<Callout type="error">
+**Fix this — it silently breaks upgrades.** A Docker named volume copies image content only on *first* population, then shadows that path forever. Mounting `/app` freezes everything the image ships there — `migrations/`, `package.json`, `extensions/`, `scripts-runtime/`, `script-types/`, `typescript-lib/`, `vendored-openapi/` — at install time. The compiled binary lives outside `/app` (`/usr/local/bin/agent-swarm-api`), so **the code upgrades while its migrations do not**. The API then queries columns and tables no migration in its frozen directory created, and every affected write fails with `SQLiteError: table … has no column named …`.
+</Callout>
+
+It is undetectable from the outside: `/health` reads the stale `/app/package.json`, so it reports the **old** version and stays green while newer code runs. Pinning the image version does not prevent this — a pinned install breaks the same way on its next upgrade. The two fixes are complementary.
+
+Compare the running container against its own image:
+
+```bash
+docker compose exec api sh -c 'ls /app/migrations | wc -l; grep \"version\" /app/package.json'
+docker run --rm --entrypoint sh ghcr.io/desplega-ai/agent-swarm:<your tag> \
+  -c 'ls /app/migrations | wc -l; grep \"version\" /app/package.json'
+```
+
+Differing counts or versions confirm the shadowing. Migrate with a one-time copy — only `/app/data` needs to persist:
+
+```bash
+docker compose down
+docker run --rm -v swarm_api:/old -v swarm_api_data:/new alpine \
+  sh -c 'cp -a /old/data/. /new/ && ls -la /new'   # expect agent-swarm-db.sqlite
+docker compose up -d
+```
+
+Keep the old `swarm_api` volume until the upgraded install is verified, then delete it. Worker volumes are unaffected — they mount `/workspace/*` and `/logs`, which is intended agent state.
+
 ### Backing Up the Database
 
 <Callout type="warn">
-The `swarm_api` volume contains your SQLite database — the single source of truth for all swarm state. Back it up regularly.
+The `swarm_api_data` volume contains your SQLite database — the single source of truth for all swarm state. Back it up regularly.
 </Callout>
 
 ```bash
-# Back up the database
-docker run --rm -v swarm_api:/app -v $(pwd):/backup alpine \
-  cp /app/agent-swarm-db.sqlite /backup/agent-swarm-db-backup.sqlite
+# Back up the database, its WAL sidecars, and .page-session-secret
+docker run --rm -v swarm_api_data:/data -v $(pwd):/backup alpine \
+  sh -c 'cp -a /data/. /backup/swarm-api-data-backup/'
 
 # Restore from backup
 docker compose down
-docker run --rm -v swarm_api:/app -v $(pwd):/backup alpine \
-  cp /backup/agent-swarm-db-backup.sqlite /app/agent-swarm-db.sqlite
+docker run --rm -v swarm_api_data:/data -v $(pwd):/backup alpine \
+  sh -c 'cp -a /backup/swarm-api-data-backup/. /data/'
 docker compose up -d
 ```
+
+<h3 id="database-retention">Database retention</h3>
+
+`SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, and `CONTEXT_VERSIONS_KEEP_LATEST` are disabled until you set them. Each `*_RETENTION_DAYS` value permanently deletes rows older than its window. `CONTEXT_VERSIONS_KEEP_LATEST` is a count, not a window: it keeps that many newest `context_versions` rows per agent and field and deletes older profile history, never the newest version. Start with `DB_RETENTION_DRY_RUN=true`, confirm the exact would-delete count via the `agentswarm.db.retention.backlog` metric and `GET /api/metrics`, then enable one table at a time. See the [database-retention runbook](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/db-retention.md) before activation.
+
+Three settings tune the sweep itself, all read fresh on every tick with no restart required:
+
+- `DB_RETENTION_TICK_BUDGET_MS` (default `30000`, accepts `1000`–`300000`) — wall-clock budget for one sweep tick, shared evenly across enabled tables.
+- `DB_RETENTION_CATCHUP_INTERVAL_MS` (default `60000`, accepts `5000`–`3600000`) — delay before the next tick when a table is still undrained. The normal cadence stays hourly once every enabled table is drained.
+- `DB_RETENTION_MAX_STATEMENT_MS` (default `250`, accepts `25`–`5000`) — target ceiling for one DELETE statement, measured as driver execution time; the adaptive batch sizer tunes its batch size against this.
+
+Each range is enforced in both directions. A value outside it is rejected by the config API, and a value set directly in the environment falls back to the default rather than taking effect.
 
 <Callout type="warn">
 A database backup is useless without the matching [encryption key](#encryption-key). Back up both together.
@@ -234,9 +351,9 @@ The encryption key is **just as critical as your database backup**. Losing the k
 
 ```bash
 # Back up DB and key in one shot (Docker Compose deployment)
-docker run --rm -v swarm_api:/app -v $(pwd):/backup alpine sh -c '
-  cp /app/agent-swarm-db.sqlite /backup/agent-swarm-db-backup.sqlite &&
-  cp /app/.encryption-key /backup/encryption-key-backup 2>/dev/null || true
+docker run --rm -v swarm_api_data:/data -v $(pwd):/backup alpine sh -c '
+  cp -a /data/. /backup/swarm-api-data-backup/ &&
+  cp /data/.encryption-key /backup/encryption-key-backup 2>/dev/null || true
 '
 ```
 
@@ -291,7 +408,8 @@ These are the key variables for Docker Compose deployment. For the complete refe
 | `GITHUB_EMAIL` | Git commit email |
 | `GITHUB_NAME` | Git commit name |
 | `SWARM_URL` | Base domain for service discovery (default: `localhost`) |
-| `SLACK_BOT_TOKEN` | Enable Slack integration (also needs `SLACK_APP_TOKEN`) |
+| `SLACK_MODE` | Slack transport: `socket` (default) or `http`; HTTP remains unavailable until its receiver is installed |
+| `SLACK_BOT_TOKEN` | Enable Slack integration; also needs `SLACK_APP_TOKEN` in socket mode or `SLACK_SIGNING_SECRET` in HTTP mode |
 | `SLACK_DISABLE` | Set to `true` to disable Slack (default: `false`) |
 
 ### Secrets Encryption
@@ -317,14 +435,15 @@ The compose file mounts this as a Docker secret at `/run/secrets/encryption_key`
 To scale the swarm, copy an existing worker block in `docker-compose.yml`:
 
 1. Give it a new service name (e.g., `worker-3`)
-2. Generate a new `AGENT_ID` UUID: `uuidgen`
+2. Reuse `entrypoint: *agent-entrypoint` from the example compose file. Leave `WORKER_3_AGENT_ID` blank for a generated, persisted ID, or set it in `.env` to a unique UUID from `uuidgen` as an optional override
 3. Pick a new host port (e.g., `3023:3000`)
 4. Add a new personal volume (e.g., `swarm_worker_3:/workspace/personal`)
 5. Declare the new volume at the bottom of the file under `volumes:`
 
 ```yaml title="docker-compose.yml (add a new worker)"
   worker-3:
-    image: "ghcr.io/desplega-ai/agent-swarm-worker:latest"
+    entrypoint: *agent-entrypoint
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-latest}"
     platform: linux/amd64
     pull_policy: always
     stop_grace_period: 60s
@@ -334,7 +453,7 @@ To scale the swarm, copy an existing worker block in `docker-compose.yml`:
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
       - API_KEY=${API_KEY}
-      - AGENT_ID=YOUR-NEW-UUID-HERE
+      - AGENT_ID=${WORKER_3_AGENT_ID:-}
       - AGENT_ROLE=worker
       - TEMPLATE_ID=official/coder
       - MCP_BASE_URL=http://api:3013
@@ -392,6 +511,21 @@ SHUTDOWN_TIMEOUT=30000
 stop_grace_period: 60s
 ```
 
+### API drain
+
+Off by default. Set `API_DRAIN_MAX_MS` (for example `30000`) to turn it on. With it on, the API does not close the moment it gets SIGTERM. It first drains:
+
+1. It keeps serving, but dispatches no new work: HTTP `/api/poll`, MCP `poll-task`, and `task-action` claim and accept all refuse. Creating tasks still works.
+2. It adds `X-Swarm-Draining: 1` to every response.
+3. A worker that sees the header supersedes each in-flight task right away (reason `graceful_shutdown`, the same resume follow-up as the worker's SIGTERM handoff) and takes no new work. It still exits on its own SIGTERM.
+4. The API closes when every task it saw in flight on a live worker has left `in_progress`, or after `API_DRAIN_MAX_MS` (default `0`, which means no drain; max `120000`). With nothing in flight it closes at once.
+
+Orchestrators such as Docker Compose stop the API and the workers together, so a worker's SIGTERM handoff can run after the API is gone and the task falls through to the heartbeat sweep. The drain makes the handoff happen while the API is still up.
+
+Enable it where the API and the workers are stopped together. It also applies to an API-only restart: while it is on, every live worker supersedes its in-flight tasks when the API gets SIGTERM, tasks that would otherwise have kept running. Leave it off for local dev and for API-only rolls.
+
+Keep the API's `stop_grace_period` above `API_DRAIN_MAX_MS` plus the time the API needs to close (a few seconds). Workers older than this feature do not hand off on the header, so the API waits the full cap when they hold tasks.
+
 ### Resume Behavior
 
 When a worker starts, it:
@@ -414,7 +548,8 @@ Run individual Claude workers in containers without Compose.
 ### Pull from Registry
 
 ```bash
-docker pull ghcr.io/desplega-ai/agent-swarm-worker:latest
+# Pin a release. `:latest` moves on every commit to `main` and is not a release.
+docker pull ghcr.io/desplega-ai/agent-swarm-worker:1.150.0
 ```
 
 ### Build Locally
@@ -422,21 +557,23 @@ docker pull ghcr.io/desplega-ai/agent-swarm-worker:latest
 ```bash
 docker build -f Dockerfile.worker -t agent-swarm-worker .
 
-# Override the pinned Claude Code version (default: 2.1.235)
+# Override the pinned Claude Code version (default: 2.1.246)
 docker build -f Dockerfile.worker --build-arg CLAUDE_CODE_VERSION=2.2.0 -t agent-swarm-worker .
 ```
 
 Current worker-image defaults in `Dockerfile.worker`:
 
-- `CLAUDE_CODE_VERSION=2.1.235`
-- `PI_CODING_AGENT_VERSION=0.84.2`
-- `CODEX_VERSION=0.148.0`
-- `OPENCODE_VERSION=1.18.18`
-- `OPENCODE_SDK_VERSION=1.18.18`
+- `CLAUDE_CODE_VERSION=2.1.246`
+- `PI_CODING_AGENT_VERSION=0.84.3`
+- `CODEX_VERSION=0.153.4`
+- `OPENCODE_VERSION=1.18.23`
+- `OPENCODE_SDK_VERSION=1.18.23`
 
 The image also sets `DISABLE_AUTOUPDATER=1` so Claude Code stays on the pinned version instead of self-updating at runtime.
 
 The worker image also includes PostgreSQL 16 server binaries for local test setups. Nothing auto-starts unless you set `SWARM_DEP_POSTGRES_ENABLED=true`; in that case the root-stage entrypoint runs [`scripts/init-local-postgres.sh`](https://github.com/desplega-ai/agent-swarm/blob/main/scripts/init-local-postgres.sh) before the worker privilege drop, then starts the cluster as the `worker` user on `localhost:5433` by default. Override with `LOCAL_POSTGRES_DATA_DIR`, `LOCAL_POSTGRES_PORT`, `LOCAL_POSTGRES_USER`, `LOCAL_POSTGRES_PASSWORD`, and `LOCAL_POSTGRES_DB` as needed.
+
+Set a non-empty `LOCAL_POSTGRES_PASSWORD` in the worker environment before enabling PostgreSQL. The helper has no password default and reapplies the supplied value to existing clusters on every invocation. Configure password-using clients with that value; loopback binding and local trust authentication are unchanged.
 
 For local Redis, set `SWARM_DEP_REDIS_ENABLED=true`; the root-stage entrypoint runs [`scripts/init-local-redis.sh`](https://github.com/desplega-ai/agent-swarm/blob/main/scripts/init-local-redis.sh) before privilege drop and starts `redis-server` as the `worker` user.
 

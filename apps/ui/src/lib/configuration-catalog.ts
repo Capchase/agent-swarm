@@ -19,6 +19,7 @@ import {
   Cpu,
   Database,
   HeartPulse,
+  Layers,
   type LucideIcon,
   Palette,
   Plug,
@@ -26,9 +27,19 @@ import {
   Workflow,
 } from "lucide-react";
 
+import type { ModelTierPreview } from "@/api/types";
+import type { DurationUnit } from "./configuration-values";
+
 const DOCS = "https://docs.agent-swarm.dev/docs/";
 
-export type ConfigCatalogKind = "boolean" | "enum" | "number" | "string";
+export type ConfigCatalogKind =
+  | "boolean"
+  | "enum"
+  | "number"
+  | "string"
+  | "multiselect"
+  | "json"
+  | "color";
 
 export interface ConfigCatalogEntry {
   /** swarm_config key — also the env var name (e.g. "STEERING_ENABLED"). */
@@ -36,7 +47,9 @@ export interface ConfigCatalogEntry {
   label: string;
   description: string;
   kind: ConfigCatalogKind;
-  /** Allowed values for `kind: "enum"`. */
+  /** Native storage unit for numeric durations. Never inferred by the renderer. */
+  unit?: DurationUnit;
+  /** Allowed values for enum and comma-separated multiselect controls. */
   options?: string[];
   /**
    * Effective value when neither an env var nor a DB row is present. Rendered
@@ -47,6 +60,17 @@ export interface ConfigCatalogEntry {
   /** Read once at boot — saving is not enough, the server must restart. */
   restartRequired?: boolean;
   placeholder?: string;
+  /**
+   * Model tier rows only: what the value resolves to on the server right now
+   * (from `GET /api/models-catalog/tiers`), shown under the description.
+   */
+  resolvesTo?: {
+    model: string | null;
+    alias: string | null;
+    source: "tier-config" | "tier-default";
+    /** A configured value resolved to nothing, so the built-in default applies. */
+    fellBack?: boolean;
+  };
 }
 
 export interface ConfigCatalogGroup {
@@ -55,6 +79,56 @@ export interface ConfigCatalogGroup {
   description: string;
   icon: LucideIcon;
   entries: ConfigCatalogEntry[];
+}
+
+/**
+ * The Model tiers group is not in `CONFIGURATION_GROUPS`: its rows (one per
+ * provider and tier), their defaults and what they resolve to come from
+ * `GET /api/models-catalog/tiers`, so the dashboard has no copy of the
+ * server's tier defaults. Merged into the page by `withModelTierGroup`.
+ */
+export function modelTierConfigGroup(tiers: ModelTierPreview[]): ConfigCatalogGroup | null {
+  if (tiers.length === 0) return null;
+  return {
+    id: "model-tiers",
+    title: "Model tiers",
+    description:
+      "Which model a modelTier task runs on each harness provider. Values are a model id, a CLI alias, or a latest: alias; the resolved model below is what the API picks from the live catalog today. A task's explicit model and a worker's own MODEL_TIER_* env still win.",
+    icon: Layers,
+    entries: tiers.map((row) => ({
+      key: row.key,
+      label: `${row.provider} ${row.tier} tier model`,
+      description: `Model a ${row.provider} worker runs for modelTier=${row.tier} tasks. A model id, a CLI alias, or latest:<anthropic|openai|openrouter>/<target>[@stable|@any].`,
+      kind: "string" as const,
+      placeholder: row.defaultValue,
+      defaultValue: row.defaultValue,
+      docsUrl: `${DOCS}ui/configuration`,
+      // Only worth a line when it adds something: an alias moved to a concrete
+      // id, or a value the catalog cannot resolve. A plain id or CLI alias that
+      // resolves to itself is already shown as the value / Default.
+      resolvesTo:
+        row.alias || row.resolvedModel !== (row.configured ?? row.defaultValue)
+          ? {
+              model: row.resolvedModel,
+              alias: row.alias,
+              source: row.source,
+              fellBack: row.configured !== null && row.source === "tier-default",
+            }
+          : undefined,
+    })),
+  };
+}
+
+/** Insert the live Model tiers group right after the Harness group. */
+export function withModelTierGroup(
+  groups: ConfigCatalogGroup[],
+  tiers: ModelTierPreview[] | undefined,
+): ConfigCatalogGroup[] {
+  const tierGroup = tiers ? modelTierConfigGroup(tiers) : null;
+  if (!tierGroup) return groups;
+  const at = groups.findIndex((group) => group.id === "harness");
+  if (at === -1) return [...groups, tierGroup];
+  return [...groups.slice(0, at + 1), tierGroup, ...groups.slice(at + 1)];
 }
 
 export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
@@ -69,18 +143,19 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "STEERING_ENABLED",
         label: "Enable steering",
         description:
-          "Master switch for mid-run task steering across harness providers. Off by default — every other steering setting is inert until this is on.",
+          "Master switch for mid-run task steering across harness providers. Enabled by default; turn off to disable new steering requests and worker delivery.",
         kind: "boolean",
-        defaultValue: "false",
+        defaultValue: "true",
         docsUrl: `${DOCS}guides/task-steering`,
       },
       {
         key: "SLACK_THREAD_STEERING",
         label: "Slack thread steering",
         description:
-          "Who may steer a running task by replying in its Slack thread — only the task's lead, or anyone in the thread.",
+          "Target the latest running lead task, the latest active task of any role, or disable thread steering.",
         kind: "enum",
-        options: ["lead", "all"],
+        options: ["off", "lead", "all"],
+        defaultValue: "lead",
         docsUrl: `${DOCS}guides/task-steering`,
       },
       {
@@ -131,11 +206,12 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "MEMORY_RECENCY_HALF_LIFE_DAYS",
-        label: "Recency half-life (days)",
+        label: "Recency half-life",
         description:
           "Global override for the recency-decay half-life. Leave unset to keep the per-memory-type defaults.",
         kind: "number",
-        defaultValue: "per-type (180/14/7)",
+        unit: "days",
+        defaultValue: "per-type (180/14/7 days)",
         placeholder: "180",
         docsUrl: `${DOCS}architecture/memory`,
       },
@@ -173,8 +249,10 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "MEMORY_RATERS",
         label: "Active memory raters",
         description:
-          "Comma-separated list of memory raters to run — the main lever on memory scoring. Unknown names are skipped; leave unset to run no raters.",
-        kind: "string",
+          "Comma-separated list of memory raters to run — the main lever on memory scoring. Unknown names are skipped; unset enables implicit-citation,explicit-self, while an explicitly empty value disables all raters.",
+        kind: "multiselect",
+        options: ["explicit-self", "implicit-citation", "llm", "noop"],
+        defaultValue: "implicit-citation,explicit-self",
         placeholder: "e.g. implicit-citation",
         docsUrl: `${DOCS}architecture/memory`,
       },
@@ -198,45 +276,60 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "HEARTBEAT_INTERVAL_MS",
-        label: "Sweep interval (ms)",
+        label: "Sweep interval",
         description: "How long the server waits between heartbeat sweeps.",
         kind: "number",
+        unit: "ms",
         defaultValue: "90000",
         placeholder: "90000",
         restartRequired: true,
       },
       {
+        key: "API_DRAIN_MAX_MS",
+        label: "Shutdown drain cap",
+        description:
+          "When the API is stopped it keeps serving, dispatches no new work, and waits this long for workers to hand off their in-flight tasks before it closes. Off by default (0): set it for deploys that stop the API and the workers together. While it is on, any API restart makes live workers hand off their in-flight tasks. Keep the API's stop grace period above this value. Accepts 0 to 120000.",
+        kind: "number",
+        unit: "ms",
+        defaultValue: "0",
+        placeholder: "0",
+      },
+      {
         key: "HEARTBEAT_STALL_THRESHOLD_MIN",
-        label: "Stall threshold (min)",
+        label: "Stall threshold",
         description: "Minutes without any task update before a task is classified as stalled.",
         kind: "number",
+        unit: "min",
         defaultValue: "30",
         placeholder: "30",
       },
       {
         key: "RUNTIME_STALE_THRESHOLD_MIN",
-        label: "Runtime stale threshold (min)",
+        label: "Runtime stale threshold",
         description:
           "Minutes without a worker ping before that worker process stops counting as serving its agent. Only applies when multiple runtimes per agent is enabled; an agent whose last live worker expires is marked offline.",
         kind: "number",
+        unit: "min",
         defaultValue: "5",
         placeholder: "5",
         docsUrl: `${DOCS}ui/configuration`,
       },
       {
         key: "HEARTBEAT_STALL_NO_SESSION_MIN",
-        label: "No-session threshold (min)",
+        label: "No-session threshold",
         description:
           "Minutes a claimed task may go without a live session before its worker is presumed dead.",
         kind: "number",
+        unit: "min",
         defaultValue: "5",
         placeholder: "5",
       },
       {
         key: "HEARTBEAT_STALL_STALE_HB_MIN",
-        label: "Stale-heartbeat threshold (min)",
+        label: "Stale-heartbeat threshold",
         description: "Minutes of stale heartbeat that hand a task to the stall classifier.",
         kind: "number",
+        unit: "min",
         defaultValue: "15",
         placeholder: "15",
       },
@@ -247,6 +340,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "number",
         defaultValue: "5",
         placeholder: "5",
+      },
+      {
+        key: "APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS",
+        label: "Approval request auto-cancellation (days)",
+        description:
+          "Pending approval requests with no explicit timeout are cancelled after this many days. Requests with an explicit timeout are never auto-cancelled. 0 disables auto-cancellation.",
+        kind: "number",
+        unit: "days",
+        defaultValue: "7",
+        placeholder: "7",
       },
       {
         key: "HEARTBEAT_MAX_RESUME_GENERATIONS",
@@ -279,7 +382,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
     id: "harness",
     title: "Harness & tools",
     description:
-      "The tool surface exposed to workers. Provider and model selection are configured per agent, not here — anything set globally would become the default for EVERY agent, so those knobs are deliberately left to each agent's own configuration.",
+      "The tool surface exposed to workers, plus the model gateway they route through. Provider and model selection are configured per agent, not here — anything set globally would become the default for EVERY agent, so those knobs are deliberately left to each agent's own configuration. The gateway base URL is the exception: it is a deployment-wide routing endpoint, not a model choice.",
     icon: Cpu,
     entries: [
       {
@@ -290,6 +393,79 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "boolean",
         defaultValue: "true",
         restartRequired: false,
+        docsUrl: `${DOCS}guides/harness-providers`,
+      },
+      {
+        key: "SWARM_DEV_MODE",
+        label: "Dev mode",
+        description:
+          "Bypass dashboard version checks for deployments that follow main. Keep the API current with the dashboard. Shows a DEV badge.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}ui/configuration#dev-mode`,
+      },
+      {
+        key: "CLAUDE_TRANSPORT",
+        label: "Default Claude transport",
+        description:
+          "Choose the default Claude execution transport. Agent runtime settings can override it. Existing agents inherit CLI unless you change this value.",
+        kind: "enum",
+        options: ["cli", "sdk"],
+        defaultValue: "cli",
+        docsUrl: `${DOCS}guides/harness-providers`,
+      },
+      {
+        key: "TASK_TOOL_PRELOAD_ENABLED",
+        label: "Preload task tools (proposal)",
+        description:
+          "Load selected swarm tools without a tool search in Claude sessions. Uses the task type or schedule in Task tool manifests. Takes effect on new MCP sessions.",
+        kind: "boolean",
+        defaultValue: "true",
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "TASK_TOOL_MANIFESTS",
+        label: "Task tool manifests",
+        description:
+          "JSON maps named taskTypes and schedules to arrays of up to 16 swarm tool names. A schedule entry overrides its task type. Requires Preload task tools; other tools remain searchable.",
+        kind: "json",
+        defaultValue: "{}",
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "PI_TOOL_DEFERRAL",
+        label: "Defer pi swarm tools (pilot)",
+        description:
+          "pi workers only. Keep the core lifecycle tools and any task-manifest tools in the tool list, and load the rest through pi's tool_search. Cuts the tool schema sent with every pi session. Off by default: pilot it on one agent first and compare cost and cache hits. Takes effect on the worker's next task.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}guides/harness-providers`,
+      },
+      {
+        key: "PI_CODEMODE",
+        label: "pi codemode (pilot)",
+        description:
+          "pi workers only. Add pi's codemode tool, a JavaScript sandbox in the worker whose scripts call tools, so one call can fan out many tool calls. Declared tools stay declared. Applies to every pi session when on. Off by default. Takes effect on the worker's next task.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}guides/harness-providers`,
+      },
+      {
+        key: "CURSOR_NATIVE_SYSTEM_PROMPT",
+        label: "Cursor native system prompt",
+        description:
+          "cursor workers only. Pass the swarm prompt as Cursor's systemPrompt, replacing Cursor's own. Cursor enables this per account; when it rejects the option, the session falls back to carrying the prompt in the first message. Off by default (first-message path). Takes effect on the worker's next task.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}guides/harness-providers`,
+      },
+      {
+        key: "PI_CODEMODE_MODELS",
+        label: "pi codemode model access (pilot)",
+        description:
+          "pi workers only. Let codemode scripts call pi's models API: classifiers and image generation. Does nothing unless pi codemode is on. Model usage from scripts counts toward the session cost. Off by default. Takes effect on the worker's next task.",
+        kind: "boolean",
+        defaultValue: "false",
         docsUrl: `${DOCS}guides/harness-providers`,
       },
       {
@@ -305,9 +481,9 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "MULTI_RUNTIME_ENABLED",
         label: "Multiple runtimes per agent",
         description:
-          "Let several worker processes serve one agent. Each process is tracked separately with its own capacity and liveness, and the agent's task limit moves to its AGENT_MAX_TASKS setting instead of being overwritten by whichever worker registered last. Leave off for one worker per agent.",
+          "Let several worker processes serve one agent. Each process is tracked separately with its own capacity and liveness, and the agent's task limit moves to its AGENT_MAX_TASKS setting instead of being overwritten by whichever worker registered last. Enabled by default; turn off for legacy single-worker registration.",
         kind: "boolean",
-        defaultValue: "false",
+        defaultValue: "true",
         docsUrl: `${DOCS}ui/configuration`,
       },
       {
@@ -319,25 +495,159 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         placeholder: "core,tasks,scripts,memory,workflows",
       },
       {
+        key: "OPENROUTER_BASE_URL",
+        label: "OpenAI-compatible model gateway",
+        description:
+          "Base URL every OpenRouter consumer calls — the OpenCode and pi-mono harness sessions, model refreshes, and the internal summarizers. Point it at any gateway that serves OpenRouter-compatible GET /models and POST /chat/completions (OpenRouter itself, OrcaRouter, or a self-hosted proxy) to route model traffic through it. This is a deployment-wide routing endpoint, not a per-agent model choice: it changes where requests go, not which model is selected. The gateway's credential stays in OPENROUTER_API_KEY on the Secrets page. Leave blank for openrouter.ai. Takes effect on each worker's next task; no restart.",
+        kind: "string",
+        defaultValue: "https://openrouter.ai/api/v1",
+        placeholder: "https://openrouter.ai/api/v1",
+        docsUrl: `${DOCS}guides/provider-auth/model-gateways`,
+      },
+      {
         key: "WORKER_API_READY_TIMEOUT_SECONDS",
         label: "API readiness timeout (s)",
         description:
           "How long docker-entrypoint.sh waits for the control-plane API's /health endpoint before exiting the worker/lead container non-zero. This is a bootstrap-only setting read from the container's environment before the API is reachable — saving a value here documents and validates the intended deployment env var, it cannot affect a container that is already waiting.",
         kind: "number",
+        unit: "s",
         defaultValue: "90",
         placeholder: "90",
         restartRequired: true,
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "CONTEXT_PREAMBLE_MAX_TOKENS",
+        label: "Context preamble cap (tokens)",
+        description:
+          "Token budget for the follow-up context preamble prepended to a child task's prompt, at ~4 chars/token. Bounds how much parent/ancestor task context (and prior tool-call summary) a follow-up task sees, uniformly across every harness provider. Raising it lets a follow-up carry more prior context at the cost of a larger prompt; keep it well below the target model's context window to avoid the SIGTERM-143 context-saturation failure mode. Read once at process start.",
+        kind: "number",
+        defaultValue: "2000",
+        placeholder: "2000",
+        restartRequired: true,
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "MODEL_WINDOW_EXHAUSTED_POLICY",
+        label: "Model window exhausted policy",
+        description:
+          "What a worker does when every Claude key has exhausted the weekly window of the task model. fail: fail the task with the reset time. fallback: pick a key at random, legacy behaviour.",
+        kind: "enum",
+        options: ["fail", "fallback"],
+        defaultValue: "fail",
+        restartRequired: false,
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "MODEL_LATEST_SOAK_DAYS",
+        label: "latest: alias soak",
+        description:
+          "A `latest:...@stable` tier value skips models released fewer than this many days ago. 0 disables the soak. Preview ids and unpriced models are always skipped on @stable.",
+        kind: "number",
+        unit: "days",
+        defaultValue: "2",
+        placeholder: "2",
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "MODEL_AUTO_UPGRADE",
+        label: "Auto-upgrade latest: aliases",
+        description:
+          "When off, every `latest:` alias stays on the model it last resolved to, even after a newer model lands in the catalog. Turn back on to let aliases move again.",
+        kind: "boolean",
+        defaultValue: "true",
         docsUrl: `${DOCS}ui/configuration`,
       },
     ],
   },
   {
     id: "database",
-    title: "Database queries",
+    title: "Database",
     description:
-      "Safety controls for the shared db-query path (HTTP debug route and the MCP tool) — the bounded child-process kill switch and its per-path timeout/row budgets.",
+      "Safety controls for database queries and opt-in retention of non-critical log tables.",
     icon: Database,
     entries: [
+      {
+        key: "SESSION_LOG_RETENTION_DAYS",
+        label: "Session log retention",
+        description:
+          "Delete session_logs rows older than this many days. Leave unset to disable this table's sweep. Deletion permanently removes session transcripts.",
+        kind: "number",
+        unit: "days",
+        placeholder: "30",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "AGENT_LOG_RETENTION_DAYS",
+        label: "Agent log retention",
+        description:
+          "Delete agent_log rows older than this many days. Leave unset to disable this table's sweep. Deletion permanently removes task and agent history.",
+        kind: "number",
+        unit: "days",
+        placeholder: "30",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "EVENTS_RETENTION_DAYS",
+        label: "Event retention",
+        description:
+          "Delete events rows older than this many days. Leave unset to disable this table's sweep. Aggregate event totals become retention-window totals.",
+        kind: "number",
+        unit: "days",
+        placeholder: "30",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "CONTEXT_VERSIONS_KEEP_LATEST",
+        label: "Context version retention",
+        description:
+          "Keep only this many newest context_versions rows per agent and field. The newest version is never deleted. Leave unset to disable this table's sweep. Deletion permanently removes older profile history.",
+        kind: "number",
+        placeholder: "100",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "DB_RETENTION_DRY_RUN",
+        label: "Database retention dry run",
+        description:
+          "Count rows that enabled retention policies would delete, without deleting them. Use this before the first production activation.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "DB_RETENTION_TICK_BUDGET_MS",
+        label: "Retention tick budget",
+        description:
+          "Wall-clock budget for one retention sweep tick, shared evenly across enabled tables. Accepts 1000 to 300000.",
+        kind: "number",
+        unit: "ms",
+        defaultValue: "30000",
+        placeholder: "30000",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "DB_RETENTION_CATCHUP_INTERVAL_MS",
+        label: "Retention catch-up interval",
+        description:
+          "Delay before the next retention tick when a table is still undrained. The normal cadence stays hourly once every enabled table is drained. Accepts 5000 to 3600000.",
+        kind: "number",
+        unit: "ms",
+        defaultValue: "60000",
+        placeholder: "60000",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
+      {
+        key: "DB_RETENTION_MAX_STATEMENT_MS",
+        label: "Retention statement target",
+        description:
+          "Target ceiling for one retention DELETE statement, measured as driver execution time. The adaptive batch sizer tunes its batch size against this. Accepts 25 to 5000.",
+        kind: "number",
+        unit: "ms",
+        defaultValue: "250",
+        placeholder: "250",
+        docsUrl: `${DOCS}guides/deployment#database-retention`,
+      },
       {
         key: "DB_QUERY_BOUNDED_ENABLED",
         label: "Bounded query execution",
@@ -348,10 +658,11 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "DB_QUERY_HTTP_BUDGET_MS",
-        label: "HTTP query budget (ms)",
+        label: "HTTP query budget",
         description:
           "Wall-clock budget for a /api/db-query request before its child process is killed. Only applies while bounded execution is on.",
         kind: "number",
+        unit: "ms",
         defaultValue: "10000",
         placeholder: "10000",
       },
@@ -366,10 +677,11 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "DB_QUERY_MCP_BUDGET_MS",
-        label: "MCP query budget (ms)",
+        label: "MCP query budget",
         description:
           "Wall-clock budget for the MCP db-query tool before its child process is killed. Only applies while bounded execution is on.",
         kind: "number",
+        unit: "ms",
         defaultValue: "5000",
         placeholder: "5000",
       },
@@ -401,13 +713,23 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
     icon: Plug,
     entries: [
       {
+        key: "SLACK_MODE",
+        label: "Slack transport",
+        description:
+          "Choose Socket Mode or signed HTTP delivery. HTTP remains unavailable until the HTTP receiver is installed; selecting it never falls back to a socket.",
+        kind: "enum",
+        options: ["socket", "http"],
+        defaultValue: "socket",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
         key: "SLACK_DISABLE",
         label: "Disable Slack",
         description:
           "Stop the Slack handler from starting. Credentials stay untouched — manage them on the Integrations page.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/slack-integration`,
+        docsUrl: `${DOCS}integrations/slack`,
       },
       {
         key: "SLACK_ALLOW_DEV_SOCKET_MODE",
@@ -416,16 +738,112 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Explicitly allow a development API process to open a Slack Socket Mode connection. Keep this off unless the development process must consume events from the configured Slack app.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/slack-integration`,
+        docsUrl: `${DOCS}integrations/slack`,
       },
       {
         key: "SLACK_RENDER_V2",
         label: "Slack thread renderer v2",
         description:
-          "Opt in to preview one editable task tree per thread and immutable streamed outcome cards. Leave off to use the legacy per-task message renderer.",
+          "Show one editable task tree per thread and immutable streamed outcome cards by default. Turn off to use the legacy per-task message renderer.",
+        kind: "boolean",
+        defaultValue: "true",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
+        key: "SLACK_RENDER_V2_DELEGATION",
+        label: "Slack delegated-result delivery",
+        description:
+          "Master switch for deferred ask conclusion, child result cards, and the closure-based reaction gate. Requires SLACK_RENDER_V2. Off reverts to the legacy per-ask outcome card on the next tick.",
         kind: "boolean",
         defaultValue: "false",
         docsUrl: `${DOCS}guides/slack-integration`,
+      },
+      {
+        key: "SLACK_CONCLUSION_SETTLE_SEC",
+        label: "Conclusion settle window",
+        description:
+          "Quiet seconds after every member of an ask's closure goes terminal before the conclusion card posts. Absorbs the gap between a child's terminal write and its follow-up task.",
+        kind: "number",
+        unit: "s",
+        defaultValue: "10",
+        placeholder: "10",
+        docsUrl: `${DOCS}guides/slack-integration`,
+      },
+      {
+        key: "SLACK_CONCLUSION_TIMEOUT_MIN",
+        label: "Conclusion timeout",
+        description:
+          "Idle minutes before an ask's closure concludes with unfinished work, posting a timeout card and a warning reaction. Last-resort backstop behind heartbeat stall remediation.",
+        kind: "number",
+        unit: "min",
+        defaultValue: "240",
+        placeholder: "240",
+        docsUrl: `${DOCS}guides/slack-integration`,
+      },
+      {
+        key: "SLACK_TREE_STALL_MIN",
+        label: "Tree stall threshold",
+        description:
+          "Minutes without a task update before the thread tree shows a stalled glyph for that task.",
+        kind: "number",
+        unit: "min",
+        defaultValue: "15",
+        placeholder: "15",
+        docsUrl: `${DOCS}guides/slack-integration`,
+      },
+      {
+        key: "SLACK_REACTION_ACCEPTED",
+        label: "Accepted-message reaction",
+        description:
+          "Slack emoji shortcode the bot adds when a task is accepted from a channel mention, thread reply, follow-up or assistant DM. Bare name or :name:. Lowercase letters, digits, _ + ' -. Custom workspace emoji work by name.",
+        kind: "string",
+        defaultValue: "eyes",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
+        key: "SLACK_REACTION_BUFFERED",
+        label: "Buffered-message reaction",
+        description:
+          "Slack emoji shortcode the bot adds when message 2 and later arrive in an additive buffer window. Bare name or :name:. Lowercase letters, digits, _ + ' -. Custom workspace emoji work by name.",
+        kind: "string",
+        defaultValue: "heavy_plus_sign",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
+        key: "SLACK_REACTION_NOW",
+        label: "Instant-flush reaction",
+        description:
+          "Slack emoji shortcode the bot adds when the !now command flushes the buffer. Bare name or :name:. Lowercase letters, digits, _ + ' -. Custom workspace emoji work by name.",
+        kind: "string",
+        defaultValue: "zap",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
+        key: "SLACK_REACTION_STEERED",
+        label: "Steering-accepted reaction",
+        description:
+          "Slack emoji shortcode the bot adds when a thread message is accepted as steering for a running task. Bare name or :name:. Lowercase letters, digits, _ + ' -. Custom workspace emoji work by name.",
+        kind: "string",
+        defaultValue: "speech_balloon",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
+        key: "SLACK_REACTION_COMPLETED",
+        label: "Completed-task reaction",
+        description:
+          "Slack emoji shortcode the bot adds when every task linked to the trigger message reached status completed. Bare name or :name:. Lowercase letters, digits, _ + ' -. Custom workspace emoji work by name. Change this when another tool in the workspace acts on the default emoji.",
+        kind: "string",
+        defaultValue: "white_check_mark",
+        docsUrl: `${DOCS}integrations/slack`,
+      },
+      {
+        key: "SLACK_REACTION_FAILED",
+        label: "Failed-task reaction",
+        description:
+          "Slack emoji shortcode the bot adds when any linked task reached failed, cancelled or superseded. Bare name or :name:. Lowercase letters, digits, _ + ' -. Custom workspace emoji work by name.",
+        kind: "string",
+        defaultValue: "x",
+        docsUrl: `${DOCS}integrations/slack`,
       },
       {
         key: "GITHUB_DISABLE",
@@ -434,7 +852,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Stop the GitHub handler from starting. Credentials stay untouched — manage them on the Integrations page.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/github-integration`,
+        docsUrl: `${DOCS}integrations/github`,
       },
       {
         key: "GITLAB_DISABLE",
@@ -443,7 +861,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Stop the GitLab handler from starting. Credentials stay untouched — manage them on the Integrations page.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/gitlab-integration`,
+        docsUrl: `${DOCS}integrations/gitlab`,
       },
       {
         key: "LINEAR_DISABLE",
@@ -461,7 +879,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Stop the Jira handler from starting. Credentials stay untouched — manage them on the Integrations page.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/jira-integration`,
+        docsUrl: `${DOCS}integrations/jira`,
       },
       {
         key: "AGENTMAIL_DISABLE",
@@ -470,7 +888,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Stop the AgentMail handler from starting. Credentials stay untouched — manage them on the Integrations page.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/agentmail-integration`,
+        docsUrl: `${DOCS}integrations/agentmail`,
       },
       {
         key: "ADDITIVE_SLACK",
@@ -479,7 +897,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Batch consecutive messages in a Slack thread into a single task update instead of one per message.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/slack-integration`,
+        docsUrl: `${DOCS}integrations/slack`,
       },
       {
         key: "SLACK_ALERTS_CHANNEL",
@@ -488,7 +906,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Channel operational alerts are posted to. Accepts a channel ID or name; leave unset to disable alerting.",
         kind: "string",
         placeholder: "e.g. C0123456789",
-        docsUrl: `${DOCS}guides/slack-integration`,
+        docsUrl: `${DOCS}integrations/slack`,
       },
       {
         key: "SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION",
@@ -497,14 +915,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Only treat a Slack thread reply as a follow-up when the bot is @-mentioned. Off means every reply in the thread is picked up.",
         kind: "boolean",
         defaultValue: "false",
-        docsUrl: `${DOCS}guides/slack-integration`,
+        docsUrl: `${DOCS}integrations/slack`,
       },
       {
         key: "LINEAR_ALLOWED_STATES",
         label: "Linear pickup states",
         description:
           "Comma-separated Linear workflow state types eligible for swarm pickup. Leave unset for the default `unstarted,started,completed,canceled` — which excludes `triage` and `backlog`.",
-        kind: "string",
+        kind: "multiselect",
+        options: ["triage", "backlog", "unstarted", "started", "completed", "canceled"],
         defaultValue: "unstarted,started,completed,canceled",
         placeholder: "unstarted,started,completed,canceled",
         docsUrl: `${DOCS}integrations/linear`,
@@ -520,13 +939,31 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "AGENT_FS_REQUEST_TIMEOUT_MS",
-        label: "agent-fs request timeout (ms)",
+        label: "agent-fs request timeout",
         description:
           "Deadline in milliseconds for each agent-fs data-plane request (upload, delete, list). Uploads get extra time proportional to size. A stalled provider fails the attachment with 504 after this long.",
         kind: "number",
+        unit: "ms",
         defaultValue: "20000",
         placeholder: "20000",
         docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "COMB_ENABLED",
+        label: "Comb (beta)",
+        description: "Show the agent-fs review space in the dashboard. Needs agent-fs.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}ui/comb`,
+      },
+      {
+        key: "AGENT_FS_PUBLIC_URL",
+        label: "agent-fs public URL",
+        description:
+          "agent-fs URL that browsers use. Defaults to AGENT_FS_API_URL. Set it when the API reaches agent-fs on an internal hostname.",
+        kind: "string",
+        placeholder: "https://agent-fs.example.com",
+        docsUrl: `${DOCS}ui/comb#turn-on-comb`,
       },
     ],
   },
@@ -542,7 +979,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         description:
           "Enforce role-based access control on the API and MCP surfaces. Off means every authenticated caller is granted all permissions.",
         kind: "boolean",
-        defaultValue: "false",
+        defaultValue: "true",
       },
       {
         key: "RBAC_AUDIT_DISABLED",
@@ -554,9 +991,10 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "RBAC_AUDIT_RETENTION_DAYS",
-        label: "Audit retention (days)",
+        label: "Audit retention",
         description: "How long RBAC audit log entries are kept before being pruned.",
         kind: "number",
+        unit: "days",
         defaultValue: "30",
         placeholder: "30",
       },
@@ -576,12 +1014,33 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "boolean",
         defaultValue: "false",
       },
+      {
+        key: "EXTENSION_ALLOW_INLINE_INSTALL",
+        label: "Allow inline extension install",
+        description:
+          "Let lead agents, the operator, and dashboard users install an extension from a manifest and files sent in the request instead of the predefined catalog. Workers stay catalog-only. An enabled extension runs as trusted code in the API process, so leave this off unless you accept that. New installs arrive disabled and still need an explicit enable.",
+        kind: "boolean",
+        defaultValue: "false",
+        docsUrl: `${DOCS}guides/extensions`,
+      },
+      {
+        key: "CORS_ALLOWED_ORIGINS",
+        label: "Credentialed CORS allowlist",
+        description:
+          "Comma-separated exact origins or wildcard patterns such as https://*.agent-swarm.dev. Wildcards match one or more subdomain labels, never the apex; hosts ignore case, schemes and ports must match exactly. Bare * and https://* are ignored. Unset or blank uses the hosted/dev defaults shown below. Custom values replace defaults. The deployment-only CORS_ALLOW_ANY_ORIGIN environment variable overrides this list when enabled.",
+        kind: "string",
+        defaultValue:
+          "https://*.agent-swarm.dev,https://*.agent-swarm.cloud,http://localhost:5274,http://127.0.0.1:5274,http://[::1]:5274,https://ui.swarm.localhost:1355",
+        placeholder: "https://app.example.com,https://dashboard.example.com",
+        docsUrl:
+          "https://github.com/desplega-ai/agent-swarm/blob/main/DEPLOYMENT.md#built-in-api-cors",
+      },
     ],
   },
   {
     id: "workflows",
     title: "Workflows & scheduler",
-    description: "Execution limits for workflow runs and the cadence of the scheduler loop.",
+    description: "Execution limits for workflows, extensions, and the scheduler loop.",
     icon: Workflow,
     entries: [
       {
@@ -603,9 +1062,10 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
       },
       {
         key: "SCHEDULER_INTERVAL_MS",
-        label: "Scheduler tick (ms)",
+        label: "Scheduler tick",
         description: "How often the scheduler wakes up to evaluate due schedules.",
         kind: "number",
+        unit: "ms",
         defaultValue: "10000",
         placeholder: "10000",
         restartRequired: true,
@@ -618,6 +1078,33 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "number",
         defaultValue: "10",
         placeholder: "10",
+      },
+      {
+        key: "SEED_AUTOMATIONS_ENABLED",
+        label: "Auto-enable zero-config seeded automations",
+        description:
+          "Let seeded workflows and schedules that need no integration or param arrive already enabled at boot, instead of disabled-but-inventoried. A template that recommends staying off, or needs an integration or param this install doesn't have, is unaffected.",
+        kind: "boolean",
+        defaultValue: "true",
+        restartRequired: true,
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "EXTENSION_HANDLER_TIMEOUT_MS",
+        label: "Extension handler timeout",
+        description: "Maximum time for one extension handler before execution continues.",
+        kind: "number",
+        unit: "ms",
+        defaultValue: "5000",
+        placeholder: "5000",
+      },
+      {
+        key: "EXTENSION_MAX_CONSECUTIVE_FAILURES",
+        label: "Extension failure limit",
+        description: "Consecutive handler failures that automatically disable an extension.",
+        kind: "number",
+        defaultValue: "5",
+        placeholder: "5",
       },
     ],
   },
@@ -659,6 +1146,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}guides/observability-opentelemetry`,
       },
       {
+        key: "OTEL_EXPORT_API_LOGS",
+        label: "Export API logs",
+        description:
+          "Also send the API server's console output to the OTLP endpoint as log records, scrubbed of secrets. Requires the OTLP endpoint.",
+        kind: "boolean",
+        defaultValue: "false",
+        restartRequired: true,
+        docsUrl: `${DOCS}guides/observability-opentelemetry`,
+      },
+      {
         key: "ANONYMIZED_TELEMETRY",
         label: "Anonymized telemetry",
         description:
@@ -689,7 +1186,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         label: "Brand accent color",
         description:
           "Accent color used for branded surfaces. Hex notation, including the leading hash.",
-        kind: "string",
+        kind: "color",
         placeholder: "#RRGGBB",
         docsUrl: `${DOCS}guides/personalization`,
       },

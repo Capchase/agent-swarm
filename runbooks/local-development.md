@@ -17,16 +17,16 @@ Bun auto-loads `.env`. Don't use `dotenv`.
 | Var | Default | Notes |
 |---|---|---|
 | `AGENT_SWARM_API_KEY` (preferred) / `API_KEY` (legacy) | `123123` | Auth header `Authorization: Bearer …`. `AGENT_SWARM_API_KEY` wins when both are set — prefer it when exporting in your shell profile so the CLI works from any cwd without colliding with other tools' `API_KEY`. |
-| `RBAC_ENABLED` | unset (off) | Set `=true` to gate REST calls authenticated with `aswt_` user tokens at HTTP admission against the user's RBAC role grants. Operator key and agent calls are unaffected. |
+| `RBAC_ENABLED` | `true` | Gates REST calls authenticated with `aswt_` user tokens at HTTP admission against the user's RBAC role grants. Operator key and agent calls are unaffected. |
 | `MCP_BASE_URL` | `http://localhost:3013` | Internal/worker-facing API base the workers/UI hit |
 | `PUBLIC_MCP_BASE_URL` | falls back to `MCP_BASE_URL` | Public origin for OAuth redirect URIs + webhook URLs. No action needed locally — leave unset and it defaults to `MCP_BASE_URL`. Only relevant in split deploys where `MCP_BASE_URL` is an internal/cluster address. |
 | `APP_URL` | `http://localhost:5274` | Dashboard URL |
 | `SLACK_DISABLE` / `GITHUB_DISABLE` / `JIRA_DISABLE` / `LINEAR_DISABLE` | unset | Set `=true` to disable each integration |
 | `SLACK_ALLOW_DEV_SOCKET_MODE` | unset (off) | Explicitly allow a `NODE_ENV=development` API process to open Slack Socket Mode. `start:http` is blocked by default even when ambient Slack tokens exist. |
-| `SLACK_THREAD_STEERING` | unset (off) | Opt-in Slack thread steering: `lead` targets the latest in-progress lead task; `all` targets the latest active task. Other values preserve follow-up task routing. |
+| `SLACK_THREAD_STEERING` | `lead` | Slack thread steering: `lead` targets the latest in-progress lead task; `all` targets the latest active task. Other values preserve follow-up task routing. |
 | `SLACK_THREAD_STEERING_MODE` | `queue` | `steer` requests interrupt semantics; every other value queues and unsupported interrupts degrade. |
 | `CLAUDE_QUEUE_STEERING` | unset (probe) | Raw Claude queue steering gate. Unset probes for stock Claude Code `>=2.1.205`; `0\|false\|off\|no` forces the legacy `-p` path; `1\|true\|on\|yes` forces stream-json input. |
-| `STEERING_ENABLED` | unset (disabled) | Set to `true` or `1` (on the API **and** worker containers) to enable task steering globally — its MCP/UI surfaces and worker delivery polling only exist when this is on. Read-only message history, worker delivery callbacks already in flight, and terminal-status promotion work regardless so existing rows remain auditable and drain safely. Can also be set as a global `swarm_config` entry. |
+| `STEERING_ENABLED` | `true` | Task steering is enabled globally; set `false` or `0` on the API **and** worker containers to opt out — its MCP/UI surfaces and worker delivery polling only exist when this is on. Read-only message history, worker delivery callbacks already in flight, and terminal-status promotion work regardless so existing rows remain auditable and drain safely. Can also be set as a global `swarm_config` entry. |
 | `HEARTBEAT_STEERING_GRACE_MIN` | `5` | Minutes a fresh pending steering message defers heartbeat stall remediation before normal crash recovery resumes. |
 | `SCRIPTS_ONLY_MCP` | unset (full surface) | Set `=true` on the API **and** agent containers as a global override to trim the external MCP surface to the 8 script tools ("code-mode") — all other swarm ops go through `script-run` + the scripts SDK. Per-agent `swarm_config` rows can enable the mode without setting this environment variable. See [docs-site guide "Scripts-only mode"](../docs-site/content/docs/(documentation)/guides/scripts-only-mode.mdx). |
 | `TRUST_BODY_REQUESTED_BY_USER_ID` | unset (ON) | When on (default), `POST /api/tasks` may attribute a task to a body-supplied `requestedByUserId` (validated against a real user row) when no authenticated/owned-task identity is available — this is what lets the UI attribute tasks under a shared operator key. **Set `=false` in deployments where holders of the shared/operator API key are not all equally trusted** — with it on, any such caller can attribute a task to any user by choosing that body value (PR #939's anti-spoofing behavior). |
@@ -62,8 +62,8 @@ Jira webhook registration requires `MCP_BASE_URL` to be HTTPS — point at ngrok
 Both providers store `cloudId`/`siteUrl`/`webhookIds` in `oauth_apps.metadata`. v1 is single-workspace per install (first OAuth connect picks the cloudId).
 
 Full guides:
-- [docs-site/.../guides/jira-integration.mdx](../docs-site/content/docs/(documentation)/guides/jira-integration.mdx)
-- [docs-site/.../guides/linear-integration.mdx](../docs-site/content/docs/(documentation)/guides/linear-integration.mdx)
+- [docs-site/.../integrations/jira.mdx](../docs-site/content/docs/(documentation)/integrations/jira.mdx)
+- [docs-site/.../integrations/linear.mdx](../docs-site/content/docs/(documentation)/integrations/linear.mdx)
 
 OAuth token refresh behavior and local smoke testing: [runbooks/oauth-tokens.md](./oauth-tokens.md).
 
@@ -146,6 +146,30 @@ Non-portless fallback: `bun run start:http`.
 curl -H "Authorization: Bearer 123123" http://localhost:3013/api/agents
 curl -H "Authorization: Bearer 123123" -H "X-Agent-ID: <uuid>" http://localhost:3013/mcp
 ```
+
+## Helper credentials
+
+`scripts/e2e-workflow-test.sh` and `scripts/seed-api-keys.sh` require the running
+server's key through exported `AGENT_SWARM_API_KEY` (preferred) or `API_KEY`.
+The seed helper also accepts the key as its second argument, which takes precedence.
+These Bash helpers do not load `.env` themselves. Missing or empty credentials fail
+before any API request.
+
+`scripts/scripts-api-smoke.sh` requires the same explicit key when `SWARM_BASE_URL`
+points to an existing server. Without `SWARM_BASE_URL`, it starts its own server
+and generates a random per-run key when none is supplied, passing that key to both
+the server and every authenticated client request.
+
+The optional worker PostgreSQL helper requires a non-empty exported
+`LOCAL_POSTGRES_PASSWORD` whenever `SWARM_DEP_POSTGRES_ENABLED=true`, or when
+running `scripts/init-local-postgres.sh` manually as root. Set it in the worker's
+environment before startup, for example `export LOCAL_POSTGRES_PASSWORD="$(openssl rand -hex 24)"`.
+Configure password-using clients with that same value. Each invocation applies it
+to the configured role, including existing clusters, so a previous default is
+replaced and a changed value rotates the password. Missing credentials fail before
+initialization or startup. The helper still binds to `127.0.0.1` (port `5433` by
+default) and retains local socket and loopback trust authentication; local clients
+can continue connecting without a password.
 
 ## Docker Compose
 

@@ -9,9 +9,12 @@ import {
   postRatings,
   type RetrievalRow,
 } from "../be/memory/raters/llm";
+import { materializeClaudeMd, stopClaudeMd } from "../commands/claude-md-session";
 import {
   buildIndependentIdentityPayloads,
   contentSha256,
+  fetchWithSyncTimeout,
+  type ProfilePayload,
   readIdentityBaselines,
   warnProfileFileTooLarge,
 } from "../commands/profile-sync";
@@ -20,13 +23,10 @@ import { getApiKey } from "../utils/api-key";
 import { getMcpBaseUrl, MAX_PROFILE_FILE_LENGTH } from "../utils/constants";
 import { summarizeSession as runSummarize } from "../utils/internal-ai";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { guardGhPrBody } from "./pr-body-guard";
 import { checkToolLoop, clearToolHistory } from "./tool-loop-detection";
 
 const SERVER_NAME = pkg.config?.name ?? "agent-swarm";
-
-// CLAUDE.md file paths
-const CLAUDE_MD_PATH = `${process.env.HOME}/.claude/CLAUDE.md`;
-const CLAUDE_MD_BACKUP_PATH = `${process.env.HOME}/.claude/CLAUDE.md.bak`;
 
 // Identity and workspace file paths
 const SOUL_MD_PATH = "/workspace/SOUL.md";
@@ -42,6 +42,26 @@ type McpServerConfig = {
     "X-Agent-ID": string;
   };
 };
+
+export async function loadHookMcpConfig(
+  projectDir: string,
+  workspaceDir = "/workspace",
+): Promise<McpServerConfig | undefined> {
+  for (const configDir of new Set([projectDir, workspaceDir])) {
+    try {
+      const mcpFile = Bun.file(`${configDir}/.mcp.json`);
+      if (!(await mcpFile.exists())) continue;
+
+      const config = await mcpFile.json();
+      const serverConfig = config?.mcpServers?.[SERVER_NAME] as McpServerConfig | undefined;
+      if (serverConfig) return serverConfig;
+    } catch {
+      // Try the next config location.
+    }
+  }
+
+  return undefined;
+}
 
 interface HookMessage {
   hook_event_name: string;
@@ -120,7 +140,7 @@ export async function postHookProfileUpdate({
 }: {
   url: string;
   headers: Record<string, string>;
-  body: Record<string, string>;
+  body: ProfilePayload["body"];
   label: string;
   fetchImpl?: typeof fetch;
 }): Promise<void> {
@@ -201,47 +221,6 @@ async function fetchTaskDetails(
     return (await response.json()) as { id: string; task: string; progress?: string };
   } catch {
     return null;
-  }
-}
-
-/**
- * Backup existing CLAUDE.md file if it exists
- */
-async function backupExistingClaudeMd(): Promise<void> {
-  const file = Bun.file(CLAUDE_MD_PATH);
-  if (await file.exists()) {
-    const content = await file.text();
-    await Bun.write(CLAUDE_MD_BACKUP_PATH, content);
-  }
-}
-
-/**
- * Write agent's CLAUDE.md content to ~/.claude/CLAUDE.md
- */
-async function writeAgentClaudeMd(content: string): Promise<void> {
-  // Ensure ~/.claude directory exists
-  const dir = `${process.env.HOME}/.claude`;
-  try {
-    await Bun.$`mkdir -p ${dir}`.quiet();
-  } catch {
-    // Directory may already exist
-  }
-  await Bun.write(CLAUDE_MD_PATH, content);
-}
-
-/**
- * Restore CLAUDE.md from backup or remove it if no backup exists
- */
-async function restoreClaudeMdBackup(): Promise<void> {
-  const backupFile = Bun.file(CLAUDE_MD_BACKUP_PATH);
-  if (await backupFile.exists()) {
-    const content = await backupFile.text();
-    await Bun.write(CLAUDE_MD_PATH, content);
-    // Remove backup file
-    await Bun.$`rm -f ${CLAUDE_MD_BACKUP_PATH}`.quiet();
-  } else {
-    // No backup existed, remove the agent's CLAUDE.md
-    await Bun.$`rm -f ${CLAUDE_MD_PATH}`.quiet();
   }
 }
 
@@ -448,7 +427,7 @@ export async function runStopHookSessionSummary(
     }
     if (llmRaterEnabled && taskId && ratings.length > 0) {
       try {
-        const events = _buildRatings(ratings, retrievals);
+        const events = _buildRatings(ratings, retrievals, result.model);
         if (events.length > 0) {
           await _postRatings({
             apiUrl,
@@ -535,18 +514,7 @@ export async function runSessionSummaryFromStdin(): Promise<void> {
  */
 export async function handleHook(): Promise<void> {
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-
-  let mcpConfig: McpServerConfig | undefined;
-
-  try {
-    const mcpFile = Bun.file(`${projectDir}/.mcp.json`);
-    if (await mcpFile.exists()) {
-      const config = await mcpFile.json();
-      mcpConfig = config?.mcpServers?.[SERVER_NAME] as McpServerConfig;
-    }
-  } catch {
-    // No config found, proceed without MCP
-  }
+  const mcpConfig = await loadHookMcpConfig(projectDir);
 
   let msg: HookMessage;
   try {
@@ -663,22 +631,21 @@ export async function handleHook(): Promise<void> {
   };
 
   /**
-   * Sync CLAUDE.md content back to the server
+   * Stop's CLAUDE.md step: sync an agent's edit (never content a hook wrote, and
+   * as a compare-and-set against its base), then restore the `.bak` — all under
+   * the CLAUDE.md lock (see `claude-md-session.ts`). The POST is bounded
+   * (CLAUDE_MD_SYNC_TIMEOUT_MS) so the lock is never held for long.
    */
-  const syncClaudeMdToServer = async (agentId: string): Promise<void> => {
-    if (!mcpConfig) return;
-
-    const file = Bun.file(CLAUDE_MD_PATH);
-    if (!(await file.exists())) return;
-
-    const content = await file.text();
-
-    if (!content.trim()) return;
-    await postHookProfileUpdate({
-      url: `${getBaseUrl()}/api/agents/${agentId}/profile`,
-      headers: mcpConfig.headers,
-      body: { claudeMd: content, changeSource: "session_sync" },
-      label: "claudeMd",
+  const syncAndRestoreClaudeMd = async (agentId: string): Promise<void> => {
+    await stopClaudeMd(async (body) => {
+      if (!mcpConfig) return;
+      await postHookProfileUpdate({
+        url: `${getBaseUrl()}/api/agents/${agentId}/profile`,
+        headers: mcpConfig.headers,
+        body,
+        label: "claudeMd",
+        fetchImpl: fetchWithSyncTimeout(),
+      });
     });
   };
 
@@ -1055,9 +1022,12 @@ export async function handleHook(): Promise<void> {
       // Write agent's CLAUDE.md if available
       if (agentInfo.claudeMd) {
         try {
-          await backupExistingClaudeMd();
-          await writeAgentClaudeMd(agentInfo.claudeMd);
-          console.log("Loaded your personal CLAUDE.md configuration.");
+          const outcome = await materializeClaudeMd(agentInfo.claudeMd);
+          console.log(
+            outcome === "busy" || outcome === "error"
+              ? "CLAUDE.md is being updated by another session; keeping the current copy."
+              : "Loaded your personal CLAUDE.md configuration.",
+          );
         } catch (error) {
           console.log(`Warning: Could not load CLAUDE.md: ${(error as Error).message}`);
         }
@@ -1157,6 +1127,18 @@ export async function handleHook(): Promise<void> {
       if (agentInfo && !agentInfo.isLead && agentInfo.status === "busy") {
         if (await checkAndBlockIfCancelled(true)) {
           return; // Exit early - don't process other hooks
+        }
+      }
+
+      // Block `gh pr create|edit` when the body for a public repo leaks internal
+      // identifiers. Exit code 2 blocks the call even though the status line
+      // above already went to stdout, and stderr reaches the model.
+      if (msg.tool_name === "Bash") {
+        const prBodyBlock = await guardGhPrBody(msg.tool_input, msg.cwd ?? process.cwd());
+        if (prBodyBlock) {
+          console.error(prBodyBlock);
+          process.exitCode = 2;
+          return;
         }
       }
 
@@ -1334,13 +1316,12 @@ export async function handleHook(): Promise<void> {
         // PM2 not available or no processes - silently ignore
       }
 
-      // Sync CLAUDE.md, identity files, and setup script back to database, then restore backup
+      // Sync CLAUDE.md (then restore its backup), identity files, and setup script back to database
       if (agentInfo?.id) {
         try {
-          await syncClaudeMdToServer(agentInfo.id);
+          await syncAndRestoreClaudeMd(agentInfo.id);
           await syncIdentityFilesToServer(agentInfo.id);
           await syncSetupScriptToServer(agentInfo.id);
-          await restoreClaudeMdBackup();
         } catch {
           // Silently fail - don't block shutdown
         }

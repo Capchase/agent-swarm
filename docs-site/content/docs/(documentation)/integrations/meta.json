@@ -1,4 +1,19 @@
 {
   "title": "Integrations",
-  "pages": ["index", "linear", "kapso", "composio", "salesforce"]
+  "pages": [
+    "index",
+    "slack",
+    "github",
+    "gitlab",
+    "azure-devops",
+    "linear",
+    "jira",
+    "sentry",
+    "agentmail",
+    "kapso",
+    "composio",
+    "salesforce",
+    "microsoft-graph",
+    "serply"
+  ]
 }

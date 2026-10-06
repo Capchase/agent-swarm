@@ -82,7 +82,8 @@ const DENY = {
   leadOrTaskCreator: "requires lead agent or task creator",
   leadOrResourceOwner: "requires lead agent or resource owner",
   leadOrOwnNamespace: "requires lead agent or your own task:agent: namespace",
-  memoryOwnerOrLeadSwarm: "requires memory owner, or lead agent for swarm-scoped memories",
+  memoryDelete:
+    "requires operator or user, the lead for swarm-scoped memories, or the owner for agent-scoped memories",
 } as const;
 
 const skillMd = (name: string, description: string) =>
@@ -119,6 +120,39 @@ afterAll(async () => {
 });
 
 describe("MCP gate matrix", () => {
+  test("worker MCP installs retain ownership and lifecycle calls remain lead-only", async () => {
+    // The server subprocess serves the bundled catalog (templates/extensions), not test fixtures.
+    const installed = await mcpCall(base, WORKER_A, sidA, "extension-install", {
+      template: "require-verification-note",
+    });
+    expect(installed.structuredContent).toMatchObject({ success: true });
+    expect(installed.structuredContent).toMatchObject({
+      createdByAgentId: WORKER_A,
+      enabled: false,
+      status: "disabled",
+    });
+    expectRow({ type: "agent", id: WORKER_A }, "extension.write", "allow", null, "http");
+    const id = installed.structuredContent.id;
+    const listed = await mcpCall(base, WORKER_A, sidA, "extension-list", {});
+    expect(listed.structuredContent.extensions).toContainEqual(
+      expect.objectContaining({ id, createdByAgentId: WORKER_A }),
+    );
+    for (const tool of ["extension-enable", "extension-disable", "extension-activate-version"]) {
+      const denied = await mcpCall(base, WORKER_A, sidA, tool, {
+        id,
+        ...(tool === "extension-activate-version" ? { version: 1 } : {}),
+      });
+      expect(denied.structuredContent.success).toBe(false);
+      expectRow(
+        { type: "agent", id: WORKER_A },
+        "extension.activate",
+        "deny",
+        "requires operator/user authentication, or a lead with EXTENSION_ALLOW_LEAD_ACTIVATION enabled",
+        "http",
+      );
+    }
+  });
+
   test("config: set/delete lead-gated; includeSecrets masks for non-lead (DES-445 follow-up)", async () => {
     // set-config (non-credential key): worker denied, lead allowed.
     const setWorker = await mcpCall(base, WORKER_A, sidA, "set-config", {
@@ -296,7 +330,7 @@ describe("MCP gate matrix", () => {
       { type: "agent", id: WORKER_B },
       "memory.delete.any",
       "deny",
-      DENY.memoryOwnerOrLeadSwarm,
+      DENY.memoryDelete,
       "mcp",
     );
 
@@ -309,13 +343,7 @@ describe("MCP gate matrix", () => {
       memoryId: m3,
     });
     expect(leadOnAgentScoped.structuredContent.success).toBe(false);
-    expectRow(
-      { type: "agent", id: LEAD },
-      "memory.delete.any",
-      "deny",
-      DENY.memoryOwnerOrLeadSwarm,
-      "mcp",
-    );
+    expectRow({ type: "agent", id: LEAD }, "memory.delete.any", "deny", DENY.memoryDelete, "mcp");
 
     const leadOnSwarmScoped = await mcpCall(base, LEAD, sidLead, "memory-delete", {
       memoryId: m2,
@@ -370,7 +398,7 @@ describe("MCP gate matrix", () => {
     const create = async () => {
       const res = await api(base, "POST", "/api/tasks", {
         agentId: WORKER_A, // X-Agent-ID of the create request records creatorAgentId
-        body: { task: "e2e cancel target", agentId: WORKER_B },
+        body: { task: "e2e cancel target", routingReason: "human_pinned", agentId: WORKER_B },
       });
       expect([200, 201]).toContain(res.status);
       return (res.body.id ?? res.body.task?.id) as string;
@@ -522,7 +550,7 @@ describe("HTTP gates", () => {
   test("fs mutate: operator and user allowed; invalid bearer dies at auth layer", async () => {
     const created = await api(base, "POST", "/api/tasks", {
       agentId: WORKER_A,
-      body: { task: "e2e fs target", agentId: WORKER_B },
+      body: { task: "e2e fs target", routingReason: "human_pinned", agentId: WORKER_B },
     });
     const taskId = (created.body.id ?? created.body.task?.id) as string;
 

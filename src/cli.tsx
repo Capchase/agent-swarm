@@ -37,6 +37,9 @@ interface ParsedArgs {
   systemPromptFile: string;
   additionalArgs: string[];
   preset: string;
+  maxConcurrentTasks: string | undefined;
+  pullPolicy: string | undefined;
+  containerEngine: string | undefined;
   open: boolean;
   showHelp: boolean;
   dbPath: string;
@@ -56,6 +59,9 @@ function parseArgs(args: string[]): ParsedArgs {
   let systemPromptFile = "";
   let additionalArgs: string[] = [];
   let preset = "";
+  let maxConcurrentTasks: string | undefined;
+  let pullPolicy: string | undefined;
+  let containerEngine: string | undefined;
   let open = false;
   let showHelp = false;
   let dbPath = "";
@@ -97,6 +103,24 @@ function parseArgs(args: string[]): ParsedArgs {
       i++;
     } else if (arg?.startsWith("--preset=")) {
       preset = arg.slice("--preset=".length);
+    } else if (arg === "--max-concurrent-tasks") {
+      const value = mainArgs[i + 1];
+      maxConcurrentTasks = value && !value.startsWith("-") ? value : "";
+      if (value && !value.startsWith("-")) i++;
+    } else if (arg?.startsWith("--max-concurrent-tasks=")) {
+      maxConcurrentTasks = arg.slice("--max-concurrent-tasks=".length);
+    } else if (arg === "--pull-policy") {
+      const value = mainArgs[i + 1];
+      pullPolicy = value && !value.startsWith("-") ? value : "";
+      if (value && !value.startsWith("-")) i++;
+    } else if (arg?.startsWith("--pull-policy=")) {
+      pullPolicy = arg.slice("--pull-policy=".length);
+    } else if (arg === "--container-engine") {
+      const value = mainArgs[i + 1];
+      containerEngine = value && !value.startsWith("-") ? value : "";
+      if (value && !value.startsWith("-")) i++;
+    } else if (arg?.startsWith("--container-engine=")) {
+      containerEngine = arg.slice("--container-engine=".length);
     } else if (arg === "--open") {
       open = true;
     } else if (arg === "--help" || arg === "-h") {
@@ -121,6 +145,9 @@ function parseArgs(args: string[]): ParsedArgs {
     systemPromptFile,
     additionalArgs,
     preset,
+    maxConcurrentTasks,
+    pullPolicy,
+    containerEngine,
     open,
     showHelp,
     dbPath,
@@ -136,17 +163,22 @@ const COMMAND_HELP: Record<
   onboard: {
     usage: `${binName} onboard [options]`,
     description:
-      "Set up a new swarm from scratch using Docker Compose.\nInteractive wizard that collects credentials, generates docker-compose.yml + .env,\nstarts the stack, and verifies health.",
+      "Set up a new swarm from scratch using Docker Compose (or Podman with a Compose provider).\nInteractive wizard that collects credentials, generates docker-compose.yml + .env,\nstarts the stack, and verifies health.",
     options: [
       "  --dry-run              Preview what would be generated without writing",
       "  -y, --yes              Non-interactive mode (reads from env vars)",
-      "  --preset <name>        Preset: dev, content, research, solo",
+      "  --preset <name>        Preset: full, dev, content, research, solo (required with --yes)",
+      "  --max-concurrent-tasks <n>  Tasks per agent (1-100; default: lead 2, worker 1)",
+      "  --pull-policy <policy> Pull policy: always, missing, never (default: always)",
+      "  --container-engine <engine>  auto, docker, podman (default: $AGENT_SWARM_CONTAINER_ENGINE, else auto; auto prefers Docker)",
       "  -h, --help             Show this help",
     ].join("\n"),
     examples: [
       `  ${binName} onboard`,
       `  ${binName} onboard --dry-run`,
+      `  ${binName} onboard --yes --preset=full`,
       `  ${binName} onboard --yes --preset=dev`,
+      `  ${binName} onboard --container-engine=podman`,
       `  ANTHROPIC_API_KEY=sk-... ${binName} onboard --yes --preset=solo`,
     ].join("\n"),
   },
@@ -247,7 +279,7 @@ const COMMAND_HELP: Record<
   "codex-hook": {
     usage: `${binName} codex-hook`,
     description:
-      "Handle Codex CLI hook events from stdin (steering delivery).\nUsed internally by the codex hooks registered in the worker image.",
+      "Handle Codex CLI hook events from stdin (steering delivery, PR body leak guard).\nUsed internally by the codex hooks registered in the worker image.",
     options: "  -h, --help             Show this help",
     examples: `  ${binName} codex-hook`,
   },
@@ -624,12 +656,25 @@ function App({ args }: { args: ParsedArgs }) {
     systemPromptFile,
     additionalArgs,
     preset,
+    maxConcurrentTasks,
+    pullPolicy,
+    containerEngine,
   } = args;
 
   switch (command) {
     case "onboard":
       return (
-        <LazyComponent load={loadOnboard} props={{ dryRun, yes, preset: preset || undefined }} />
+        <LazyComponent
+          load={loadOnboard}
+          props={{
+            dryRun,
+            yes,
+            preset: preset || undefined,
+            maxConcurrentTasks,
+            pullPolicy,
+            containerEngine,
+          }}
+        />
       );
     case "connect":
       return <LazyComponent load={loadConnect} props={{ dryRun, restore, yes }} />;
@@ -672,6 +717,16 @@ if (args.showHelp || args.command === "help" || args.command === undefined) {
 } else if (args.command === "version") {
   console.log(`${binName} v${pkg.version}`);
   process.exit(0);
+} else if (args.command === "onboard" && !process.versions.bun) {
+  // The published bin uses Node, but the onboarding wizard requires Bun APIs.
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("bun", process.argv.slice(1), { stdio: "inherit" });
+  if (result.error) {
+    console.error(
+      "Onboarding requires Bun. Install Bun from https://bun.sh, then retry this command.",
+    );
+  }
+  process.exit(result.status ?? 1);
 } else if (args.command === "docs") {
   const docsUrl = "https://docs.agent-swarm.dev";
   console.log(`\n${binName} docs — v${pkg.version}\n`);
@@ -690,7 +745,8 @@ if (args.showHelp || args.command === "help" || args.command === undefined) {
 } else if (args.command === "codex-hook") {
   const { handleCodexHook } = await import("./hooks/codex-hook.ts");
   await handleCodexHook();
-  process.exit(0);
+  // Exit code 2 from the PreToolUse guard blocks the tool call.
+  process.exit(process.exitCode ?? 0);
 } else if (args.command === "session-summary-stdin") {
   const { runSessionSummaryFromStdin } = await import("./hooks/hook.ts");
   await runSessionSummaryFromStdin();

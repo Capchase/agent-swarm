@@ -1,6 +1,9 @@
+import { REASONING_EFFORT_LEVELS, type ReasoningEffortLevel } from "@desplega/model-catalog";
+import type { TaskCitation } from "../../../../src/utils/task-citations";
 // Backend types (mirrored from agent-swarm backend)
 export type AgentStatus = "idle" | "busy" | "offline" | "waiting_for_credentials";
 export type AgentTaskStatus =
+  | "draft"
   | "backlog"
   | "unassigned"
   | "offered"
@@ -24,12 +27,97 @@ export type AgentTaskSource =
   | "schedule"
   | "workflow"
   | "linear"
-  | "jira";
+  | "jira"
+  | "comb";
+export type RoutingReason = "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
 export type ChannelType = "public" | "dm";
 export type ModelTier = "smol" | "regular" | "smart" | "ultra";
-/** Mirrors `REASONING_EFFORT_LEVELS` in `src/providers/reasoning-effort.ts` (backend). */
-export const REASONING_EFFORT_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"] as const;
-export type ReasoningEffortLevel = (typeof REASONING_EFFORT_LEVELS)[number];
+/** Mirrors `ModelSource` in `src/be/model-tier-resolution.ts` (backend). */
+export type ModelSource =
+  | "model"
+  | "worker-env"
+  | "tier-config"
+  | "tier-default"
+  | "fallback:cli-unsupported";
+/** One row of `GET /api/models-catalog/tiers`: what a tier resolves to for a provider. */
+export interface ModelTierPreview {
+  provider: string;
+  tier: ModelTier;
+  /** swarm_config / env key that overrides the tier globally. */
+  key: string;
+  /** The built-in default for the tier. */
+  defaultValue: string;
+  /** The stored `key` value, or null when unset. */
+  configured: string | null;
+  /** Layer that wins today. */
+  source: "tier-config" | "tier-default";
+  /** Concrete model that layer resolves to now (`latest:` aliases resolved). */
+  resolvedModel: string | null;
+  alias: string | null;
+}
+/** The effort enum, one definition shared with the API (`@desplega/model-catalog`). */
+export { REASONING_EFFORT_LEVELS };
+export type { ReasoningEffortLevel };
+
+export type AcpTarget = "opencode" | "custom";
+
+export type ClaudeTransport = "cli" | "sdk";
+
+export interface ClaudeRuntimeConfig {
+  /** `null` clears the agent override. Omission leaves it unchanged. */
+  transport?: ClaudeTransport | null;
+}
+
+export interface AgentRuntimeResponse {
+  claude: {
+    /** The agent-scoped override. `null` means inherit. */
+    transport: ClaudeTransport | null;
+    effectiveTransport: ClaudeTransport;
+    inheritedTransport: ClaudeTransport;
+    bridgeEffective: boolean;
+  };
+}
+
+export interface AcpRuntimeConfig {
+  target: AcpTarget;
+  command?: string | null;
+  args?: string[];
+  envKeys?: string[];
+  modelEnvKey?: string | null;
+  options?: Record<string, string | boolean>;
+}
+
+export type AcpSessionConfigOption =
+  | {
+      type: "select";
+      id: string;
+      name: string;
+      description?: string | null;
+      category?: string | null;
+      currentValue: string;
+      options: Array<
+        | { value: string; name: string; description?: string | null }
+        | {
+            group: string;
+            name: string;
+            options: Array<{ value: string; name: string; description?: string | null }>;
+          }
+      >;
+    }
+  | {
+      type: "boolean";
+      id: string;
+      name: string;
+      description?: string | null;
+      category?: string | null;
+      currentValue: boolean;
+    };
+
+export interface AgentAcpStatus {
+  target: AcpTarget;
+  configOptions: AcpSessionConfigOption[];
+  reportedAt: number;
+}
 
 /** Mirrors `AgentAvatarSchema` (backend `src/types.ts`). Discriminated union so
  * future avatar types (emoji, image, ...) can be added with no migration —
@@ -78,6 +166,14 @@ export interface Agent {
    * worker hasn't booted yet, or `CRED_CHECK_DISABLE=1` opted it out.
    */
   credStatus?: AgentCredStatus | null;
+  /**
+   * Effective `CLAUDE_TRANSPORT` (global → agent precedence) for Claude
+   * agents. Absent for other harnesses. Reflects the next session, not
+   * necessarily the last one that ran.
+   */
+  claudeTransport?: ClaudeTransport;
+  /** Last heartbeat or activity (ISO). "Alive" in `/status` = within 5 min and not offline. */
+  lastActivityAt?: string;
   createdAt: string;
   lastUpdatedAt: string;
 }
@@ -132,6 +228,8 @@ export interface AgentCredStatus {
   reportKind?: "boot" | "post_task";
   /** Pi-mono Bedrock enumeration block. Null when not in Bedrock mode. */
   bedrock?: AgentBedrockStatus | null;
+  /** ACP session options most recently advertised by the target. */
+  acp?: AgentAcpStatus | null;
 }
 
 export interface AgentLatestModel {
@@ -153,6 +251,9 @@ export interface AgentTask {
   title?: string;
   status: AgentTaskStatus;
   source: AgentTaskSource;
+  routingReason?: RoutingReason;
+  routingSource?: "declared" | "engine_default";
+  routingNote?: string;
   taskType?: string;
   tags: string[];
   priority: number;
@@ -172,6 +273,12 @@ export interface AgentTask {
   progress?: string;
   model?: string;
   modelTier?: ModelTier;
+  /** Concrete model the server resolved when a worker claimed the task. */
+  resolvedModel?: string;
+  /** Which layer chose `resolvedModel`. */
+  modelSource?: ModelSource;
+  /** The `latest:` alias `resolvedModel` came from, when any. */
+  modelAlias?: string;
   effort?: ReasoningEffortLevel;
   scheduleId?: string;
   parentTaskId?: string;
@@ -189,7 +296,7 @@ export interface AgentTask {
   credentialKeyType?: string;
   swarmVersion?: string;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
   harnessVariant?: string;
   harnessVariantMeta?: { version?: string; failureArtifact?: string };
   peakContextPercent?: number;
@@ -203,6 +310,7 @@ export interface AgentTask {
   contextKey?: string;
   /** Pointer-based artifacts attached to the task, when included by the API response. */
   attachments?: TaskAttachment[];
+  citations?: TaskCitation[];
   /**
    * Steering (≥1.122.1), derived server-side: true when the assigned agent is
    * the Lead. Only present on task *read* responses (`GET /api/tasks/:id`,
@@ -218,11 +326,31 @@ export interface AgentTask {
   supportedSteerModes?: SteerMode[];
 }
 
-export type ProviderName = "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode";
+/** Mirrors `ProviderNameSchema` in `src/types.ts`. The single list runtime provider checks derive from. */
+export const PROVIDER_NAMES = [
+  "claude",
+  "codex",
+  "pi",
+  "devin",
+  "claude-managed",
+  "opencode",
+  "acp",
+  "dsh",
+  "amp",
+  "cursor",
+] as const;
+export type ProviderName = (typeof PROVIDER_NAMES)[number];
+export function isProviderName(value: string | null | undefined): value is ProviderName {
+  return (PROVIDER_NAMES as readonly (string | null | undefined)[]).includes(value);
+}
 export type DevinProviderMeta = {
   sessionUrl: string;
   maxAcuLimit?: number;
   acuCostUsd?: number;
+};
+/** Persisted by the worker at session init (`providerMeta.transport`). */
+export type ClaudeProviderMeta = {
+  transport?: ClaudeTransport;
 };
 
 // ============================================================================
@@ -248,6 +376,7 @@ export interface SteeringMessage {
   /** Mode the worker actually delivered in — may differ from `mode` after a degrade. */
   deliveredMode?: SteerMode;
   source: SteeringSource;
+  senderLabel?: string;
   createdByKind: "user" | "agent" | "system";
   createdByUserId?: string;
   createdByAgentId?: string;
@@ -514,7 +643,8 @@ export type InboxItemType =
   | "credential_missing"
   | "broken_task"
   | "to_read"
-  | "to_start_template";
+  | "to_start_template"
+  | "notification";
 
 export type InboxItemStatus = "open" | "snoozed" | "dismissed" | "done";
 
@@ -527,6 +657,8 @@ export interface InboxItemState {
   snoozeUntil?: string;
   dismissedAt?: string;
   doneAt?: string;
+  /** First-viewed timestamp, set once on first notification panel open. */
+  readAt?: string;
   createdAt: string;
   lastUpdatedAt: string;
 }
@@ -539,7 +671,7 @@ export interface InboxStateUpsertResponse {
   item: InboxItemState;
 }
 
-export type FavoriteItemType = "page" | "workflow" | "schedule";
+export type FavoriteItemType = "page" | "workflow" | "schedule" | "agent-fs-path";
 
 export interface UserFavorite {
   id: string;
@@ -704,6 +836,8 @@ export interface DashboardStats {
    * Optional for compatibility with older API servers.
    */
   steeringEnabled?: boolean;
+  /** Dev deployments can bypass UI version checks. Absent on older APIs. */
+  devMode?: boolean;
 }
 
 export type TaskStatus = AgentTaskStatus;
@@ -715,7 +849,8 @@ export interface AgentsResponse {
 
 export interface TasksResponse {
   tasks: AgentTask[];
-  total: number;
+  /** Present only when the request set `includeTotal`. */
+  total?: number;
 }
 
 export interface LogsResponse {
@@ -805,8 +940,9 @@ export interface ServicesResponse {
  *  - 'harness'        — value reported by the harness as-is.
  *  - 'pricing-table'  — value recomputed by the API from `pricing` rows.
  *  - 'unpriced'       — recompute attempted but no matching pricing rows.
+ *  - 'estimated'      — fallback token counts priced at an assumed model.
  */
-export type SessionCostSource = "harness" | "pricing-table" | "unpriced";
+export type SessionCostSource = "harness" | "pricing-table" | "unpriced" | "estimated";
 
 export interface SessionCostModelBreakdown {
   model: string;
@@ -872,6 +1008,8 @@ export interface UsageSummaryTotals {
   excludedCostUsd?: number;
   /** Distinct tasks behind `excludedCostUsd` — name the exclusion, don't just show a percentage. */
   excludedTaskCount?: number;
+  /** API-priced cost of sessions on subscription credentials (Claude OAuth, Codex OAuth). Older API servers omit it. */
+  subscriptionCostUsd?: number;
 }
 
 /**
@@ -899,6 +1037,44 @@ export interface UsageSummaryDailyRow {
   inputTokens: number;
   outputTokens: number;
   sessions: number;
+  /** Part of `costUsd` on subscription credentials. Older API servers omit it. */
+  subscriptionCostUsd?: number;
+}
+
+/** Spend per credential in the window (`groupBy=both` only). */
+export interface UsageSummaryByCredentialRow {
+  /** `null` when the task recorded no credential. */
+  keyType: string | null;
+  keySuffix: string | null;
+  /** Label set on the API Keys page. */
+  name: string | null;
+  /** Billed as a flat subscription (Claude OAuth, Codex OAuth) rather than per token. */
+  subscription: boolean;
+  /** Plan id from `GET /api/keys/plans`, or null when unknown. */
+  plan: string | null;
+  /** `estimated` = Claude plan guessed from rate-limit utilization. The server applies the precedence. */
+  planSource: "detected" | "manual" | "estimated" | null;
+  /** API-priced cost of the sessions. */
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+  firstSessionAt: string;
+  lastSessionAt: string;
+}
+
+export interface SubscriptionPlan {
+  id: string;
+  label: string;
+  keyType: string;
+  /** Monthly list price in USD. */
+  monthlyUsd: number;
+}
+
+export interface SubscriptionPlansResponse {
+  /** Date the list prices were checked. */
+  checkedAt: string;
+  plans: SubscriptionPlan[];
 }
 
 export interface UsageSummaryByAgentRow {
@@ -925,6 +1101,8 @@ export interface UsageSummaryResponse {
   daily: UsageSummaryDailyRow[];
   byAgent: UsageSummaryByAgentRow[];
   byUser?: UsageSummaryByUserRow[];
+  /** Spend per credential (`groupBy=both` only). Older API servers omit it. */
+  byCredential?: UsageSummaryByCredentialRow[];
 }
 
 export interface DashboardCostResponse {
@@ -960,6 +1138,14 @@ export interface AgentUsageSummary {
 }
 
 export type ScheduledTaskTargetType = "agent-task" | "workflow" | "script";
+export type AutomationIntegrationId =
+  | "slack"
+  | "github"
+  | "linear"
+  | "jira"
+  | "gsc"
+  | "agentmail"
+  | "agentfs";
 
 export interface ScheduledTask {
   id: string;
@@ -985,13 +1171,28 @@ export interface ScheduledTask {
   workflowId?: string;
   scriptName?: string;
   scriptArgs?: Record<string, unknown>;
+  /** Setup values injected into the automation template at run time. */
+  params?: Record<string, unknown>;
+  /** Parameter names which must be set before the automation can run. */
+  requiredParams?: string[];
+  /** Integrations that must be verified before the automation can run. */
+  requires?: AutomationIntegrationId[];
   createdAt: string;
   lastUpdatedAt: string;
   favorite?: boolean;
 }
 
+/**
+ * `/api/scheduled-tasks?fields=slim` list row: the full `taskTemplate` is
+ * swapped for a bounded `taskTemplatePreview`. Read the template from
+ * `GET /api/schedules/{id}`.
+ */
+export type ScheduledTaskSummary = Omit<ScheduledTask, "taskTemplate"> & {
+  taskTemplatePreview?: string;
+};
+
 export interface ScheduledTasksResponse {
-  scheduledTasks: ScheduledTask[];
+  scheduledTasks: ScheduledTaskSummary[];
 }
 
 export type SwarmConfigScope = "global" | "agent" | "repo";
@@ -1106,6 +1307,10 @@ export type WebhookVerification =
   | {
       format: "token-equality";
       header: string;
+    }
+  | {
+      format: "standard-webhooks";
+      toleranceSeconds?: number;
     };
 
 export interface TriggerConfig {
@@ -1139,6 +1344,12 @@ export interface Workflow {
   createdAt: string;
   lastUpdatedAt: string;
   favorite?: boolean;
+  /** Setup values injected into the workflow at trigger time. */
+  params?: Record<string, unknown>;
+  /** Parameter names which must be set before the workflow can run. */
+  requiredParams?: string[];
+  /** Integrations that must be verified before the workflow can run. */
+  requires?: AutomationIntegrationId[];
 }
 
 export type WorkflowRunStatus = "running" | "waiting" | "completed" | "failed" | "skipped";
@@ -1221,8 +1432,19 @@ export interface WorkflowsResponse {
   workflows: WorkflowSummary[];
 }
 
-export interface WorkflowRunsResponse {
-  runs: WorkflowRun[];
+/** List row of a run: no `context`, which `GET /api/workflow-runs/{id}` serves. */
+export type WorkflowRunSummary = Omit<WorkflowRun, "context">;
+
+/** One page of `GET /api/workflows/{id}/runs`, newest first. */
+export interface WorkflowRunsPage {
+  runs: WorkflowRunSummary[];
+  page: {
+    limit: number;
+    offset: number;
+    total: number;
+    hasMore: boolean;
+    nextOffset?: number;
+  };
 }
 
 export type ScriptRunStatus =
@@ -1342,6 +1564,173 @@ export interface ScriptTypeDefs {
 
 export interface ScriptsResponse {
   scripts: ScriptListItem[];
+}
+
+// Extensions (`extensions` table — mirrors Extension/ExtensionVersion/ExtensionRun in src/types.ts)
+
+export type ExtensionRuntime = "api" | "worker";
+
+export type ExtensionStatus = "disabled" | "enabled" | "error" | "auto-disabled";
+
+/** A global script a bundle ships — mirrors `ExtensionScriptAssetSchema` in src/types.ts. */
+export interface ExtensionScriptAsset {
+  /** Global script name; starts with `<extension name>-`. */
+  name: string;
+  /** Bundle path of the script source. */
+  file: string;
+  description: string;
+  intent?: string;
+}
+
+/** A schedule a bundle ships — mirrors `ExtensionScheduleAssetSchema` in src/types.ts. */
+export interface ExtensionScheduleAsset {
+  /** Schedule name; starts with `<extension name>-`. */
+  name: string;
+  description?: string;
+  /** Name of a script declared in `assets.scripts`. */
+  script: string;
+  cronExpression?: string;
+  intervalMs?: number;
+  timezone?: string;
+  args?: Record<string, unknown>;
+}
+
+/** Bundle manifest — mirrors `ExtensionManifestSchema` in src/types.ts. */
+export interface ExtensionManifest {
+  $schema?: string;
+  name: string;
+  description: string;
+  version: string;
+  runtime: ExtensionRuntime;
+  assets: {
+    hooks: string;
+    scripts?: ExtensionScriptAsset[];
+    schedules?: ExtensionScheduleAsset[];
+    /** Each skill ships as a directory holding SKILL.md and optional files/. */
+    skills?: Array<{ dir: string }>;
+    /** Each workflow ships as a YAML or JSON file. */
+    workflows?: Array<{ file: string }>;
+  };
+  homepage?: string;
+  author?: string;
+}
+
+/** Row served by `GET /api/extensions/catalog` — a predefined bundle from `templates/extensions/`. */
+export interface ExtensionCatalogItem {
+  name: string;
+  description: string;
+  /** Semver of the catalog manifest. */
+  version: string;
+  /** `manifest.yaml`, `manifest.yml`, or `manifest.json`. */
+  manifestFile: string;
+  /** Declared asset counts by kind (`scripts`, `schedules`, `skills`, `workflows`); hooks are not counted. */
+  assets: Record<string, number>;
+  /** README markdown, when the template ships one. */
+  readme: string | null;
+  installed: { id: string; version: number; enabled: boolean } | null;
+}
+
+export interface Extension {
+  id: string;
+  name: string;
+  description: string;
+  runtime: ExtensionRuntime;
+  manifestJson: string;
+  contentHash: string;
+  version: number;
+  activeVersion: number;
+  enabled: boolean;
+  priority: number;
+  /** Scrubbed server-side on every read path — never round-trip it back into a PATCH. */
+  configJson: string;
+  status: ExtensionStatus;
+  consecutiveFailures: number;
+  lastError: string | null;
+  agentId: string | null;
+  createdByAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Row served by `GET /api/extensions/{id}/versions`. */
+export interface ExtensionVersion {
+  id: string;
+  extensionId: string;
+  version: number;
+  manifestJson: string;
+  filesJson: string;
+  contentHash: string;
+  changedByAgentId: string | null;
+  changedAt: string;
+  changeReason: string | null;
+}
+
+export type ExtensionRunAction =
+  | "continue"
+  | "modify"
+  | "block"
+  | "error"
+  | "timeout"
+  | "load-error";
+
+/** Row served by `GET /api/extensions/{id}/runs`. */
+export interface ExtensionRun {
+  id: string;
+  extensionId: string;
+  version: number;
+  event: string;
+  action: ExtensionRunAction;
+  durationMs: number | null;
+  message: string | null;
+  agentId: string | null;
+  subject: string | null;
+  createdAt: string;
+}
+
+/** `GET /api/extensions/{id}` — the stored record plus its parsed manifest and files. */
+export interface ExtensionBundle {
+  extension: Extension;
+  manifest: ExtensionManifest;
+  files: Record<string, string>;
+}
+
+/**
+ * `POST /api/extensions/install` body as the dashboard sends it: a catalog template.
+ * The API also takes an inline `manifest` + `files` bundle when
+ * `EXTENSION_ALLOW_INLINE_INSTALL` is on; the dashboard does not send one.
+ */
+export interface ExtensionInstallInput {
+  /** Catalog name from `GET /api/extensions/catalog`. */
+  template: string;
+  priority?: number;
+  config?: Record<string, unknown>;
+}
+
+/** Global assets the install reconciled, by name. */
+export interface ExtensionInstallAssets {
+  created: string[];
+  updated: string[];
+  skipped: string[];
+}
+
+export interface ExtensionInstallResult {
+  extension: Extension;
+  manifest: ExtensionManifest;
+  /** True when the template matched the stored content, so no new version was staged. */
+  contentDeduped: boolean;
+  assets?: ExtensionInstallAssets;
+}
+
+/** `DELETE /api/extensions/{id}` response. */
+export interface ExtensionDeleteResult {
+  deleted: true;
+  assets?: { deleted: string[]; detached: string[] };
+}
+
+export interface ExtensionPatchInput {
+  priority?: number;
+  config?: Record<string, unknown>;
+  description?: string;
 }
 
 // Script connections (`ctx.api.<slug>` / `ctx.mcp.<slug>`)
@@ -1824,7 +2213,7 @@ export interface RenderResponse {
 
 // Approval Requests
 
-export type ApprovalRequestStatus = "pending" | "approved" | "rejected" | "timeout";
+export type ApprovalRequestStatus = "pending" | "approved" | "rejected" | "timeout" | "cancelled";
 
 export interface ApprovalQuestion {
   id: string;
@@ -1840,6 +2229,24 @@ export interface ApprovalQuestion {
   defaultValue?: boolean;
 }
 
+/** One accepted answer. The server takes `responder` from the credential, never from the body. */
+export interface ApprovalVote {
+  /** A user id, or `operator` for the shared key. */
+  responder: string;
+  approved: boolean;
+  responses: Record<string, unknown>;
+  /** The `respondedBy` the client sent. Unverified; display only. */
+  claimedRespondedBy?: string;
+  respondedAt: string;
+}
+
+export interface ApprovalProgress {
+  /** Approvals that count toward the policy so far. */
+  approved: number;
+  /** Approvals the policy needs before the request resolves. */
+  required: number;
+}
+
 export interface ApprovalRequest {
   id: string;
   title: string;
@@ -1851,8 +2258,14 @@ export interface ApprovalRequest {
   };
   status: ApprovalRequestStatus;
   responses: Record<string, unknown> | null;
+  /** Every accepted answer, in order. `all` / `{ min: N }` requests collect several before resolving. */
+  approvals?: ApprovalVote[] | null;
+  /** Quorum progress while pending; null once resolved. */
+  approvalProgress?: ApprovalProgress | null;
+  /** From the credential: a user id, `operator` for the shared key, or an agent id for a cancellation. */
   resolvedBy: string | null;
   resolvedAt: string | null;
+  resolutionReason: string | null;
   workflowRunId: string | null;
   workflowRunStepId: string | null;
   sourceTaskId: string | null;
@@ -1865,6 +2278,25 @@ export interface ApprovalRequest {
 
 export interface ApprovalRequestsResponse {
   approvalRequests: ApprovalRequest[];
+}
+
+/**
+ * `/api/approval-requests?fields=slim` list row: question bodies, answers,
+ * approvers and notification targets are dropped; `questionCount` is added.
+ * Read the full request from `GET /api/approval-requests/{id}`.
+ */
+export type ApprovalRequestSummary = Omit<
+  ApprovalRequest,
+  | "questions"
+  | "approvers"
+  | "responses"
+  | "approvals"
+  | "resolutionReason"
+  | "notificationChannels"
+> & { questionCount: number };
+
+export interface ApprovalRequestSummariesResponse {
+  approvalRequests: ApprovalRequestSummary[];
 }
 
 // Skills
@@ -2086,6 +2518,9 @@ export interface ApiKeyStatus {
   provider: string;
   /** Optional human-friendly label set from the dashboard. */
   name: string | null;
+  /** Subscription plan id (see `GET /api/keys/plans`), when known. */
+  plan: string | null;
+  planSource: "manual" | "detected" | "estimated" | null;
   rateLimitWindows: Record<
     string,
     {
@@ -2097,6 +2532,14 @@ export interface ApiKeyStatus {
       lastSeenAt: string;
     }
   >;
+  /** Derived, readable view of any rejected model-scoped window (Fable/Opus/Sonnet) on this key. */
+  modelLimits: Array<{
+    model: string;
+    window: string;
+    resetsAt: number;
+    resetsAtIso: string;
+    active: boolean;
+  }>;
   createdAt: string;
   updatedAt: string;
 }
@@ -2220,6 +2663,86 @@ export interface MemoryEntry {
   chunkIndex: number;
   totalChunks: number;
   tags: string[];
+  /** Absent on API servers older than the memory browser. */
+  key?: string | null;
+  updatedAt?: string | null;
+  /** Usefulness posterior mean alpha / (alpha + beta); 0.5 = no signal yet. */
+  rating?: number;
+}
+
+/** One keyed memory from `GET /api/memory/keys`, aggregated over its chunk rows. */
+export interface MemoryKeySummary {
+  key: string;
+  scope: MemoryScope;
+  agentId: string | null;
+  memoryId: string;
+  name: string;
+  source: MemorySource;
+  chunkRows: number;
+  totalChunks: number;
+  complete: boolean;
+  chars: number;
+  estTokens: number;
+  accessCount: number;
+  lastAccessedAt: string | null;
+  rating: number;
+  alpha: number;
+  beta: number;
+  usefulRatings: number;
+  notUsefulRatings: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryKeysResponse {
+  prefix: string;
+  keys: MemoryKeySummary[];
+  truncated: boolean;
+}
+
+export interface MemoryChunk {
+  id: string;
+  agentId: string | null;
+  scope: MemoryScope;
+  key: string | null;
+  name: string;
+  content: string;
+  source: MemorySource;
+  sourceTaskId: string | null;
+  sourcePath: string | null;
+  chunkIndex: number;
+  totalChunks: number;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string | null;
+  accessedAt: string;
+  expiresAt: string | null;
+  accessCount: number;
+  embeddingModel: string | null;
+  rating: number;
+  alpha: number;
+  beta: number;
+  version: number;
+  estTokens: number;
+}
+
+/** `GET /api/memory/chunks`: every chunk row of one memory, in chunkIndex order. */
+export interface MemoryChunksResponse {
+  key: string | null;
+  scope: MemoryScope;
+  agentId: string | null;
+  chunks: MemoryChunk[];
+  estTokens: number;
+  integrity: {
+    ok: boolean;
+    expectedChunks: number;
+    presentIndexes: number[];
+    missingIndexes: number[];
+    duplicateIndexes: number[];
+    conflictingTotals: number[];
+    outOfRangeIds: string[];
+    issues: string[];
+  };
 }
 
 export interface MemoryListResponse {
@@ -2286,10 +2809,14 @@ export type SetupMilestoneState = "unverified" | "configured" | "verified";
 
 export type MilestoneId =
   | "harness"
+  | "embeddings"
   | "slack"
   | "github"
   | "linear"
   | "jira"
+  | "gsc"
+  | "agentmail"
+  | "agentfs"
   | "workers"
   | "first_task";
 
@@ -2318,10 +2845,81 @@ export interface StatusIdentity {
   org_id: string | null;
 }
 
+/** Effective telemetry opt-out state (`ANONYMIZED_TELEMETRY`) as reported by the API. */
+export interface StatusTelemetry {
+  enabled: boolean;
+}
+
+export interface FeedbackInput {
+  submission_id: string;
+  user_id: string;
+  install_id: string | null;
+  installed_at: string | null;
+  org_name: string;
+  swarm_version: string;
+  name?: string;
+  email?: string;
+  newsletter_consent: boolean;
+  nps?: 1 | 2 | 3 | 4 | 5;
+  message?: string;
+  submitted_at: string;
+}
+
 export interface StatusActivity {
   agents_online: number;
   leads_online: number;
   recent_tasks_count: number;
+}
+
+/** Comb, the agent-fs review space in the dashboard (`/file`). */
+export interface StatusComb {
+  /** `COMB_ENABLED` is on and `AGENT_FS_API_URL` is set. */
+  enabled: boolean;
+  /** Browser-facing agent-fs URL (`AGENT_FS_PUBLIC_URL`, else `AGENT_FS_API_URL`). */
+  api_url: string | null;
+  /** agent-fs live UI host, for "Open in agent-fs" links. */
+  live_url: string;
+  /** The swarm's shared agent-fs org and drive. */
+  org_id: string | null;
+  drive_id: string | null;
+  /**
+   * agent-fs user id of the swarm service account, which writes the
+   * "[comb:sent ...]" replies. Null when unknown. Absent on older APIs.
+   */
+  service_user_id?: string | null;
+}
+
+/** Why "Send to swarm" left a comment out (`POST /api/comb/review-batches`). */
+export type CombSkipReason = "not-found" | "reply" | "resolved" | "already-sent";
+
+export interface CombSkippedComment {
+  id: string;
+  reason: CombSkipReason;
+  /** The task an "already-sent" comment went to, when known. */
+  taskId?: string;
+}
+
+/** A comment of an earlier send whose missing "sent" reply this send posted. */
+export interface CombRepairedComment {
+  id: string;
+  taskId: string;
+}
+
+export interface CombReviewBatchInput {
+  orgId: string;
+  driveId: string;
+  /** agent-fs root comment ids, 1 to 50. */
+  commentIds: string[];
+  /** The file or folder the batch is sent from ("/docs/a.md", "/docs/"). */
+  scopePath: string;
+}
+
+export interface CombReviewBatchResult {
+  /** The new task. Null when the send only posted missing "sent" replies again (HTTP 200). */
+  taskId: string | null;
+  sent: string[];
+  skipped: CombSkippedComment[];
+  repaired: CombRepairedComment[];
 }
 
 export interface StatusAgentFs {
@@ -2329,6 +2927,23 @@ export interface StatusAgentFs {
   base_url: string | null;
   provider_id: string;
   capabilities: Record<string, unknown>;
+  /** Absent when the dashboard talks to an API that predates Comb. */
+  comb?: StatusComb;
+}
+
+export interface StatusAutomation {
+  id: string;
+  name: string;
+  kind: "schedule" | "workflow";
+  state: "running" | "needs_setup";
+  missing: {
+    params: string[];
+    integrations: string[];
+  };
+  fixes: Array<
+    { type: "param"; key: string; url: string } | { type: "integration"; key: string; url: string }
+  >;
+  fixUrl: string;
 }
 
 /**
@@ -2342,8 +2957,15 @@ export interface StatusResponse {
   setup: SetupMilestone[];
   activity: StatusActivity;
   agent_fs: StatusAgentFs;
+  /**
+   * Added in v1.142.0 (#1330). Absent when the dashboard talks to an older API,
+   * so every consumer must treat it as optional.
+   */
+  automations?: StatusAutomation[];
   /** Phase 2: rolled-up health for the always-on header badge. */
   health: StatusHealth;
+  /** Absent when the dashboard talks to an older API; treat absence as enabled. */
+  telemetry?: StatusTelemetry;
 }
 
 export interface TestConnectionResponse {
@@ -2761,3 +3383,145 @@ export type AppRow = Record<string, unknown> & {
   createdAt: string;
   updatedAt: string;
 };
+
+// ─── Onboarding (GET/PUT /api/onboarding) ────────────────────────────────────
+// Contract: thoughts/taras/plans-yolo/2026-09-24-ui-onboarding.md § API contract.
+
+export type OnboardingStepId =
+  | "connect"
+  | "name"
+  | "ai"
+  | "agents"
+  | "memory"
+  | "integrations"
+  | "first_task";
+
+export type OnboardingStepStatus = "todo" | "done" | "skipped" | "failed";
+
+export type OnboardingErrorClass =
+  | "auth"
+  | "network"
+  | "timeout"
+  | "dimension"
+  | "model"
+  | "endpoint"
+  | "not_enabled"
+  | "expired"
+  | "unknown";
+
+export type OnboardingAiMethod =
+  | "claude_setup_token"
+  | "claude_api_key"
+  | "codex_device"
+  | "codex_cli"
+  | "openrouter"
+  | "openai_gateway"
+  | "deepseek"
+  | "devin";
+
+/** The dial level every agent got, or `mixed` (different levels or a custom model). */
+export type OnboardingAgentsMethod = "cheap" | "optimal" | "max" | "mixed";
+
+export type OnboardingMemoryPreset =
+  | "openai"
+  | "openrouter"
+  | "vercel"
+  | "azure"
+  | "custom"
+  | "existing";
+
+export type OnboardingIntegrationMethod =
+  | "slack"
+  | "github"
+  | "gitlab"
+  | "linear_oauth"
+  | "jira_oauth";
+
+export interface OnboardingStepState {
+  status: OnboardingStepStatus;
+  at: string | null;
+  method: string | null;
+  errorClass: OnboardingErrorClass | null;
+}
+
+export interface OnboardingState {
+  version: 1;
+  startedAt: string;
+  currentStep: OnboardingStepId;
+  minimizedAt: string | null;
+  dismissedAt: string | null;
+  completedAt: string | null;
+  autoCompleted: boolean;
+  firstTaskId: string | null;
+  steps: Record<OnboardingStepId, OnboardingStepState>;
+}
+
+export interface OnboardingProviderSignal {
+  provider: ProviderName;
+  state: "unverified" | "configured" | "verified";
+  workers: number;
+  verifiedWorkers: number;
+}
+
+export interface OnboardingSignals {
+  providers: OnboardingProviderSignal[];
+  embeddings: { configured: boolean; dimensions: number };
+  integrations: {
+    slack: boolean;
+    github: boolean;
+    gitlab: boolean;
+    linear: boolean;
+    jira: boolean;
+  };
+  agents: { leadsOnline: number; workersOnline: number };
+  firstTask: { id: string; status: string } | null;
+}
+
+export interface OnboardingResponse {
+  state: OnboardingState;
+  signals: OnboardingSignals;
+}
+
+export type OnboardingAction =
+  | { action: "view"; step: OnboardingStepId }
+  | { action: "complete"; step: "connect"; method: "api_key" }
+  | { action: "complete"; step: "name"; method: "custom_name" | "default_name" }
+  | { action: "complete"; step: "ai"; method: OnboardingAiMethod }
+  | { action: "complete"; step: "agents"; method: OnboardingAgentsMethod }
+  | { action: "complete"; step: "integrations"; method: OnboardingIntegrationMethod }
+  | { action: "skip"; step: Exclude<OnboardingStepId, "connect"> }
+  | { action: "fail"; step: OnboardingStepId; errorClass: OnboardingErrorClass }
+  | { action: "first_task"; taskId: string; method: "suggestion" | "free_form" }
+  | { action: "minimize" }
+  | { action: "resume" }
+  | { action: "dismiss" };
+
+export interface OnboardingMemoryTestRequest {
+  preset: OnboardingMemoryPreset;
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+  reuseKey?: "OPENAI_API_KEY" | "OPENROUTER_API_KEY";
+}
+
+export interface OnboardingMemoryTestResponse {
+  ok: boolean;
+  dimensions?: number;
+  latencyMs: number;
+  error?: string;
+  errorClass?: OnboardingErrorClass;
+}
+
+export interface CodexDeviceStartResponse {
+  flowId: string;
+  userCode: string;
+  verificationUrl: string;
+  intervalSeconds: number;
+  expiresAt: string;
+}
+
+export interface CodexDevicePollResponse {
+  status: "pending" | "complete" | "failed" | "expired";
+  slot?: number;
+  error?: string;
+}

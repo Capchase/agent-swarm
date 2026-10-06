@@ -16,6 +16,11 @@ export interface RunJson {
   attemptsPerCell: number;
   concurrency: number;
   judgeModel: string | null;
+  /**
+   * Reasoning effort each config ran at, snapshotted at run creation (configs
+   * at the harness default are absent). Null/absent on runs from before efforts.
+   */
+  efforts?: Record<string, string> | null;
   createdAt: string;
   finishedAt: string | null;
 }
@@ -134,6 +139,10 @@ export interface WorkerRosterEntryJson {
   /** Effective member config (v7 §12); null = ran the cell config exactly. */
   configId: string | null;
   model: string | null;
+  /** Effort the member launched with (null = harness default). Absent on older rosters. */
+  reasoningEffort?: string | null;
+  /** Effort the member's harness reported applying; null = none reported. */
+  appliedReasoningEffort?: string | null;
   version: string | null;
   taskIds: string[];
   costUsd: number | null;
@@ -298,6 +307,10 @@ export interface AttemptJson {
   error: string | null;
   costUsd: number | null;
   costSource: string | null;
+  /** Effort the attempt's worker launched with; null = harness default. Absent on older servers. */
+  reasoningEffort?: string | null;
+  /** Effort its harness reported applying; differs from `reasoningEffort` when the harness ignored it. */
+  appliedReasoningEffort?: string | null;
   /** Aggregate judge LLM cost (harness overhead) — NEVER included in costUsd. */
   judgeCostUsd: number | null;
   tokens: TokenTotalsJson | null;
@@ -446,16 +459,41 @@ export interface WorkerSpecJson {
 }
 
 /** Mirrors SerializedScenario v4 (v6 §0.10 + v7 §9 `workerSpecs` + §12 `lead`). */
+/** Plain-English scenario card (mirrors evals/scenarios/cards.ts). */
+export interface ScenarioCardJson {
+  /** What the scenario claims to test, in one sentence. */
+  summary: string;
+  /** What the agent is asked to do. */
+  agentDoes: string;
+  /** What earns points and what gates a pass. */
+  scoredBy: string;
+  tags: {
+    topology: "single-agent" | "swarm";
+    flow: "parallel" | "sequential";
+    kind: "regression" | "capability";
+  };
+  /** Oldest first, one line per scenario version. */
+  changelog: { version: number; note: string }[];
+}
+
 export interface ScenarioJson {
   id: string;
+  /** Scenario version; bumped on any prompt, fixture or check change. */
+  version?: number;
   name: string;
   description: string | null;
+  /** Card text and tags; null/absent on older servers or an unregistered card. */
+  card?: ScenarioCardJson | null;
+  /** `swarm-evals@1.0` when this scenario version belongs to the frozen suite. */
+  suite?: string | null;
   /** Worker COUNT booted per attempt (default 1) — either workers shape. */
   workers: number;
   /** v7 §9: per-worker specs; null/absent = homogeneous numeric shape. */
   workerSpecs?: WorkerSpecJson[] | null;
   /** v7 §12: optional lead member; null/absent = no lead. */
   lead?: WorkerSpecJson | null;
+  /** Swarm scenario id this single-agent baseline pairs with; null/absent otherwise. */
+  baselineOf?: string | null;
   tasks: { title: string; description: string; worker: number | "lead"; dependsOn: number[] }[];
   seed: { exec: string[]; sqlDump: string | null; memories: string[] } | null;
   timeoutMs: number;
@@ -506,9 +544,22 @@ export interface ConfigJson {
   label: string | null;
   provider: string;
   model: string | null;
+  /** Moving alias (`latest:anthropic/opus`); resolved per run at creation. */
+  modelAlias?: string | null;
+  /**
+   * What `modelAlias` resolves to in the reviewed catalog right now (the id a
+   * run created today would pin); null for pinned configs and unmatched aliases.
+   */
+  resolvedModel?: string | null;
   modelTier: string | null;
+  /** The config's default reasoning effort; null = harness default. */
+  reasoningEffort?: string | null;
+  /** Efforts the harness takes for the config's model, low → high; empty = none. */
+  effortLevels?: string[];
   envKeys: string[];
   isDefault: boolean;
+  /** "seed" = follows configs/index.ts; "user" = created or edited through the API. */
+  source?: "seed" | "user";
   /** v7.6 item D: AA benchmark block; null/absent = unmatched config (render nothing). */
   aa?: AaBenchmarkJson | null;
 }
@@ -539,15 +590,40 @@ export interface ModelJson {
   cacheWritePerM: number | null;
 }
 
+/** Where the server's models.dev catalog came from (GET /api/models `catalog`). */
+export interface CatalogInfo {
+  source: "live" | "db" | "snapshot";
+  /** ISO time of the last successful models.dev fetch; null while on the snapshot. */
+  fetchedAt: string | null;
+}
+
+/** POST /api/models/refresh body (502 with `status: "error"` on failure). */
+export interface CatalogRefreshResponse {
+  status: "updated" | "not-modified" | "error";
+  fetchedAt?: string;
+  modelCount?: number;
+  error?: string;
+  catalog: CatalogInfo;
+}
+
 export interface ModelsResponse {
   defaultJudgeModel: string;
+  /** The judge picker list (openrouter section only). */
   models: ModelJson[];
+  /**
+   * Display-only claude (anthropic) + codex (openai) entries so `resolve()` can
+   * name and price non-openrouter ids. Never a picker source. Absent on older
+   * servers — resolution then covers openrouter ids only.
+   */
+  harnessModels?: ModelJson[];
   /**
    * v7 §8: frozen claude bare-alias map ("fable" → "claude-fable-5", …),
    * computed server-side from the models.dev anthropic section. Absent on
    * pre-v7 servers — resolution then degrades to the raw id (old behavior).
    */
   aliases?: Record<string, string>;
+  /** Catalog freshness. Absent on older servers. */
+  catalog?: CatalogInfo;
 }
 
 export interface CreateRunBody {
@@ -557,6 +633,8 @@ export interface CreateRunBody {
   attemptsPerCell?: number;
   concurrency?: number;
   judgeModel?: string;
+  /** configId → effort for this run (null = the harness default), over each config's default. */
+  efforts?: Record<string, string | null>;
 }
 
 // ---- analytics v2 additions (round 7 — v7 spec §6/§7/§11, FROZEN) ----
@@ -670,6 +748,8 @@ export interface AnalyticsModel {
   maxCostUsd?: number | null;
   /** v7 §7: model vendor (anthropic/openai/…); "(unknown)" fallback. */
   vendor?: string;
+  /** Efforts the model's attempts ran at, low → high; `default` = the harness default. */
+  efforts?: string[];
   /** v7 §11: token sums over the model's token-bearing attempts. */
   tokens?: AnalyticsTokenSums | null;
 }
@@ -724,12 +804,16 @@ export interface AnalyticsSeries {
 export interface AnalyticsFilter {
   harnesses: string[];
   configIds: string[];
+  /** Effort keys (`default` = attempts at the harness default). Empty/absent = no filter. */
+  efforts?: string[];
 }
 
 /** Pre-filter option lists for the global filter bar (v7.6 §C3). */
 export interface AnalyticsFilterOptions {
   harnesses: string[];
   configIds: string[];
+  /** Distinct effort keys, low → high with `default` last. */
+  efforts?: string[];
 }
 
 export interface AnalyticsResponse {
@@ -743,6 +827,8 @@ export interface AnalyticsResponse {
   harnesses?: AnalyticsGroupRollup[];
   /** v7 §7: rollups by model vendor, sorted by attempts desc. */
   vendors?: AnalyticsGroupRollup[];
+  /** Rollups by reasoning effort (`default` = harness default), sorted by attempts desc. */
+  efforts?: AnalyticsGroupRollup[];
   /** v7 §7/§11: one point per model key (scatter: accuracy vs tokens). */
   scatter?: AnalyticsScatterPoint[];
   /** v7.6 §C3: distinct harness/config options over ALL rows (pre-filter). Absent on old cached payloads. */

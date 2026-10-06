@@ -6,6 +6,9 @@ export interface ServiceEntry {
   isLead?: boolean;
 }
 
+/** Match the conservative role defaults used by the worker runtime. */
+export const DEFAULT_MAX_CONCURRENT_TASKS = { lead: 2, worker: 1 } as const;
+
 export interface ComposeConfig {
   services: ServiceEntry[];
   apiImage: string;
@@ -95,6 +98,10 @@ export function generateCompose(config: ComposeConfig): string {
   lines.push("      - API_KEY=${API_KEY}");
   lines.push("      - MCP_BASE_URL=${MCP_BASE_URL}");
   lines.push("      - APP_URL=${APP_URL}");
+  lines.push("      - MEMORY_HYBRID_SEARCH=${MEMORY_HYBRID_SEARCH-1}");
+  lines.push("      - MEMORY_GRAPH_EXPANSION=${MEMORY_GRAPH_EXPANSION-1}");
+  lines.push("      - MEMORY_RATERS=${MEMORY_RATERS-implicit-citation,explicit-self}");
+  lines.push("      - MEMORY_DEMOTION_FLOOR=${MEMORY_DEMOTION_FLOOR-1.0}");
 
   if (config.integrations.slack) {
     lines.push("      - SLACK_DISABLE=${SLACK_DISABLE:-false}");
@@ -133,6 +140,7 @@ export function generateCompose(config: ComposeConfig): string {
     lines.push("    environment:");
     lines.push("      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}");
     lines.push("      - API_KEY=${API_KEY}");
+    lines.push("      - MEMORY_RATERS=${MEMORY_RATERS-implicit-citation,explicit-self}");
     lines.push(`      - AGENT_ID=${svc.agentId}`);
     lines.push(`      - AGENT_NAME=${svc.agentName}`);
     lines.push(`      - AGENT_ROLE=${svc.agentRole}`);
@@ -140,6 +148,9 @@ export function generateCompose(config: ComposeConfig): string {
     lines.push("      - MCP_BASE_URL=http://api:3013");
     lines.push("      - YOLO=true");
     lines.push("      - SWARM_URL=${SWARM_URL:-localhost}");
+    lines.push(
+      `      - MAX_CONCURRENT_TASKS=${svc.isLead ? DEFAULT_MAX_CONCURRENT_TASKS.lead : DEFAULT_MAX_CONCURRENT_TASKS.worker}`,
+    );
 
     if (config.integrations.github) {
       lines.push("      - GITHUB_TOKEN=${GITHUB_TOKEN:-}");
@@ -193,6 +204,14 @@ export function generateEnv(config: ComposeConfig): string {
   lines.push("MCP_BASE_URL=http://localhost:3013");
   lines.push("APP_URL=http://localhost:5274");
   lines.push("");
+  lines.push("# New-deployment memory preset: retrieval, citation ratings, self-rating hints.");
+  lines.push("# Set MEMORY_RATERS= to disable all raters; leave SKIP_SESSION_SUMMARY unset.");
+  lines.push("MEMORY_HYBRID_SEARCH=1");
+  lines.push("MEMORY_GRAPH_EXPANSION=1");
+  lines.push("MEMORY_RATERS=implicit-citation,explicit-self");
+  lines.push("MEMORY_DEMOTION_FLOOR=1.0");
+  lines.push("");
+
   lines.push("# Claude Authentication");
   lines.push("CLAUDE_CODE_OAUTH_TOKEN=your-oauth-token-here");
   lines.push("");

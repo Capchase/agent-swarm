@@ -46,11 +46,22 @@ export interface CostData {
    * for every provider with seeded pricing rows, so every adapter should
    * populate this field.
    */
-  provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin";
+  provider?:
+    | "claude"
+    | "claude-managed"
+    | "codex"
+    | "pi"
+    | "opencode"
+    | "devin"
+    | "acp"
+    | "dsh"
+    | "cursor"
+    | "amp";
 }
 
 import type { ProviderName, SteerMode } from "../types";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
+import type { ModelFamily } from "../utils/model-rate-limit-windows";
 import type { ReasoningEffort } from "./reasoning-effort";
 
 /** Normalized event emitted by any provider adapter. */
@@ -63,7 +74,12 @@ export type ProviderEvent =
       harnessVariant?: string;
       harnessVariantMeta?: Record<string, unknown>;
     }
-  | { type: "message"; role: "assistant" | "user"; content: string }
+  | {
+      type: "message";
+      role: "assistant" | "user";
+      content: string;
+      messageId?: string;
+    }
   | { type: "tool_start"; toolCallId: string; toolName: string; args: unknown }
   | { type: "tool_end"; toolCallId: string; toolName: string; result: unknown }
   | { type: "result"; cost: CostData; output?: string; isError: boolean; errorCategory?: string }
@@ -185,7 +201,8 @@ export interface ProviderResult {
    * `rate_limit_event` line in the Claude CLI stream. Only set by the Claude
    * adapter when a `status: "rejected"` event is present. Already clamped to
    * [now+60s, now+7d] at the source. The runner uses this as tier-1 of the
-   * three-tier cooldown resolver.
+   * three-tier cooldown resolver. A model-scoped rejection (Fable/Opus/Sonnet
+   * weekly window) never sets this field — see `modelRateLimit` below.
    */
   rateLimitResetAt?: string;
   /**
@@ -194,6 +211,20 @@ export interface ProviderResult {
    * Best-effort and informational; consumers must tolerate it being absent.
    */
   rateLimitWindows?: RateLimitWindowTelemetry;
+  /**
+   * A rejected model-scoped weekly window (`seven_day_opus`, `seven_day_sonnet`,
+   * `seven_day_overage_included` — the Fable window) observed in this session.
+   * Set instead of `rateLimitResetAt`: a model-scoped rejection blocks only that
+   * model family on this key, not the whole key. `observedAt` is when the
+   * rejection event arrived; it orders the report against other workers'.
+   */
+  modelRateLimit?: { window: string; model: ModelFamily; resetAt: string; observedAt?: string };
+  /**
+   * Set when the Claude CLI sent a rejected `rate_limit_event` with
+   * `errorCode: "credits_required"`: the key's seat cannot run the model. Not
+   * a rate limit, so `rateLimitResetAt` is never set from that event.
+   */
+  creditsRequired?: { observedAt: string; overageDisabledReason?: string };
   /**
    * Reasoning/effort level the adapter actually applied (Phase 4). `null`
    * means `applyReasoningEffort()` returned `noop` (capability rejected the
@@ -207,6 +238,8 @@ export interface ProviderResult {
 export interface ProviderTraits {
   /** Provider can call MCP tools (store-progress, task-action, skills, slack-reply, etc.) */
   hasMcp: boolean;
+  /** Provider hides MCP tools behind a native tool search. Defaults to false. */
+  hasToolSearch?: boolean;
   /**
    * Provider discovers installed skills on its own — it reads the local skills
    * tree and ambient-injects each skill's name + description into the session

@@ -20,6 +20,8 @@ const EM_DASH = "\u2014";
 /** The prompt v2 block set. Every entry is registered under category "system". */
 const SYSTEM_TEMPLATES = [
   "system.agent.communication",
+  "system.agent.communication.remote",
+  "system.agent.cursor.first_message",
   "system.agent.lead",
   "system.agent.memory",
   "system.agent.memory.remote",
@@ -33,6 +35,10 @@ const SYSTEM_TEMPLATES = [
   "system.agent.slack",
   "system.agent.steering",
   "system.agent.steering.delivery",
+  "system.agent.tool_preload",
+  "system.agent.tool_discovery.search",
+  "system.agent.tool_discovery.amp",
+  "system.agent.tool_discovery.direct",
   "system.agent.tools_skills",
   "system.agent.worker",
   "system.agent.worker.remote",
@@ -110,11 +116,11 @@ describe("Session templates: registration", () => {
     expect(sessionSystemEventTypes("session")).toEqual([...SESSION_TEMPLATES].sort());
   });
 
-  test("registers 24 system and session templates in total", () => {
+  test("registers 30 system and session templates in total", () => {
     const all = getAllTemplateDefinitions();
     const sessionSystem = all.filter((d) => d.category === "system" || d.category === "session");
-    // 19 system blocks + 5 session composites.
-    expect(sessionSystem.length).toBe(24);
+    // 25 system blocks + 5 session composites.
+    expect(sessionSystem.length).toBe(30);
   });
 
   test("drops the v1 blocks that prompt v2 deleted", () => {
@@ -215,11 +221,27 @@ describe("Session templates: MUST pointers", () => {
     );
   });
 
-  test("the lead contract names the renamed desplega commands", () => {
+  test("the worker contract names the four task endings", () => {
+    const result = resolveTemplate("system.agent.worker", {});
+    expect(result.text).toContain("The task has four endings.");
+    for (const ending of ["`completed`", "`defer-task`", "`request-human-input`", "`failed`"]) {
+      expect(result.text).toContain(ending);
+    }
+  });
+
+  test("the lead contract names the delegation tools", () => {
     const result = resolveTemplate("system.agent.lead", {});
-    expect(result.text).toContain("/researching");
-    expect(result.text).toContain("/planning");
-    expect(result.text).toContain("/implementing");
+    expect(result.text).toContain(
+      "`send-task`: include `routingReason` and `routingNote` (at least 10 characters after trim, maximum 200) with `agentId`. Read results via `get-task-details`.",
+    );
+  });
+
+  test("the lead contract names the desplega skills, not slash commands", () => {
+    const result = resolveTemplate("system.agent.lead", {});
+    expect(result.text).toContain("`researching` skill");
+    expect(result.text).toContain("`planning` skill");
+    expect(result.text).toContain("`implementing` skill");
+    expect(result.text).not.toContain("/researching");
   });
 });
 
@@ -247,6 +269,45 @@ describe("Session templates: composite resolution", () => {
       expect(result.text).not.toContain("{{@template[");
       expect(result.text).toContain("You are Ada,");
       expect(result.text).toContain("composite-agent-001");
+      // Bind the budget to task output in the shared writing block itself,
+      // so a budget elsewhere in the composite cannot mask a reply-only rule.
+      const writingBlock = result.text.split("## How you write\n")[1]?.split("\n## ")[0];
+      expect(writingBlock).toContain("task output (`output` or a remote final message)");
+      expect(writingBlock).toContain(
+        "Routine replies and free-text task output: under 120 words by default",
+      );
+      expect(writingBlock).toContain("requested depth, enumerated results, essential evidence");
+      expect(writingBlock).toContain("longer output required by the task's `outputSchema`");
+      expect(writingBlock).toContain("Preserve investigation and required artifacts");
+      expect(writingBlock).toContain(
+        "Schema exemptions apply to `outputSchema`-constrained completions",
+      );
+      expect(writingBlock).toContain("free-text `output` follows the target");
+      expect(writingBlock).toContain("link documents instead of inlining them");
+      expect(writingBlock).not.toContain("schema-defined output");
+      expect(result.text).toContain("Simple replies: one to three sentences");
+      expect(result.text).toContain("Use the `comms` skill when available");
+      expect(result.text).toContain("Follow the current request and Requester Profile");
+      expect(result.text).toContain("Output schemas and channel delivery rules");
+    });
+  }
+
+  for (const eventType of ["system.agent.worker", "system.agent.worker.remote"]) {
+    test(`${eventType} pairs completion requirements with the output budget`, () => {
+      const { text } = resolveTemplate(eventType, {});
+      expect(text).toContain("under 120 words by default");
+      expect(text).toContain("Link documents instead of inlining them; omit process narration");
+      expect(text).toContain("under 120 words by default, with the exceptions in How you write");
+    });
+  }
+
+  for (const eventType of ["system.agent.slack", "system.agent.scripts_only_mode.slack"]) {
+    test(`${eventType} applies the output budget to the engine-owned card`, () => {
+      const { text } = resolveTemplate(eventType, { slackChannelId: "C123", slackThreadTs: "1.2" });
+      expect(text).toContain("The outcome card publishes your `output` verbatim");
+      expect(text).toContain(
+        "Keep free-text `output` under 120 words by default, with the exceptions in How you write",
+      );
     });
   }
 

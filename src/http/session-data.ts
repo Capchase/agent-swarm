@@ -13,13 +13,20 @@ import {
   getSessionCostsFiltered,
   getSessionLogsByTaskId,
   getTaskById,
+  refreshActiveSessionOnActivity,
 } from "../be/db";
 import { recordSessionCost } from "../otel";
 import { incrementServerSessionsProcessed } from "../server-runtime-counters";
 import type { SessionCost } from "../types";
-import { SessionCostModelBreakdownSchema, SessionCostSchema, SessionLogSchema } from "../types";
+import {
+  PricingProviderSchema,
+  SessionCostModelBreakdownSchema,
+  SessionCostSchema,
+  SessionLogSchema,
+} from "../types";
 import { route } from "./route-def";
 import { recomputeSessionCost } from "./session-cost-recompute";
+import { cachedUsageReport } from "./usage-cache";
 import { jsonError } from "./utils";
 
 // ─── Response Schemas ────────────────────────────────────────────────────────
@@ -38,6 +45,7 @@ const SessionCostSummaryTotalsSchema = z.object({
   attributableCostUsd: z.number(),
   excludedCostUsd: z.number(),
   excludedTaskCount: z.number().int(),
+  subscriptionCostUsd: z.number(),
 });
 
 /** Mirrors `SessionCostDailyRow` in src/be/db.ts. */
@@ -47,6 +55,7 @@ const SessionCostDailyRowSchema = z.object({
   inputTokens: z.number().int(),
   outputTokens: z.number().int(),
   sessions: z.number().int(),
+  subscriptionCostUsd: z.number(),
 });
 
 /** Mirrors `SessionCostByAgentRow` in src/be/db.ts. */
@@ -69,12 +78,30 @@ const SessionCostByUserRowSchema = z.object({
   durationMs: z.number().int(),
 });
 
+/** Mirrors `SessionCostByCredentialRow` in src/be/db.ts. */
+const SessionCostByCredentialRowSchema = z.object({
+  keyType: z.string().nullable(),
+  keySuffix: z.string().nullable(),
+  name: z.string().nullable(),
+  subscription: z.boolean(),
+  plan: z.string().nullable(),
+  planSource: z.enum(["manual", "detected", "estimated"]).nullable(),
+  costUsd: z.number(),
+  inputTokens: z.number().int(),
+  outputTokens: z.number().int(),
+  sessions: z.number().int(),
+  firstSessionAt: z.string(),
+  lastSessionAt: z.string(),
+});
+
 /** Mirrors the return type of `getSessionCostSummary` in src/be/db.ts. */
 const SessionCostSummarySchema = z.object({
   totals: SessionCostSummaryTotalsSchema,
   daily: z.array(SessionCostDailyRowSchema),
   byAgent: z.array(SessionCostByAgentRowSchema),
   byUser: z.array(SessionCostByUserRowSchema),
+  /** Filled for `groupBy=both` only. */
+  byCredential: z.array(SessionCostByCredentialRowSchema),
 });
 
 /** Mirrors `DashboardCostSummary` in src/be/db.ts. */
@@ -179,9 +206,13 @@ const createSessionCostRoute = route({
      * Phase 6 (extended migration 063): drives the API recompute path. After
      * Phase 2 every provider with seeded pricing rows participates.
      */
-    provider: z
-      .enum(["claude", "claude-managed", "codex", "pi", "opencode", "devin", "gemini"])
-      .optional(),
+    // `acp` has no seeded pricing rows by design — a generic ACP target owns
+    // its own billing and the adapter reports `totalCostUsd: 0`, so the row
+    // lands as `costSource: 'unpriced'`. It still has to be accepted here or
+    // every ACP session's cost POST 400s and the row is silently dropped.
+    // Reuses PricingProviderSchema so this list can't drift from it again
+    // (#1636: it previously forgot `dsh`).
+    provider: PricingProviderSchema.optional(),
     /**
      * Phase 6: epoch-ms timestamp used as the "active price at time T" lookup
      * basis. Defaults to `Date.now()` when omitted. Including it lets
@@ -289,6 +320,16 @@ export async function handleSessionData(
         cli: parsed.body.cli || "claude",
         lines: parsed.body.lines,
       });
+      // Every harness streams its output through this endpoint, so a task that
+      // is producing output keeps its session alive here instead of per
+      // provider. Best-effort: a liveness write must never fail log storage.
+      if (parsed.body.taskId) {
+        try {
+          await refreshActiveSessionOnActivity(parsed.body.taskId);
+        } catch (error) {
+          console.warn("[HTTP] Failed to refresh session liveness from session logs:", error);
+        }
+      }
       createSessionLogsRoute.respond(res, 201, {
         success: true,
         count: parsed.body.lines.length,
@@ -346,13 +387,15 @@ export async function handleSessionData(
         : (parsed.body.cacheWriteTokens ?? 0);
 
       // Keep the adapter's report even when the pricing-table branch replaces
-      // totalCostUsd with the server's canonical recomputation.
-      const harnessCostUsd = parsed.body.totalCostUsd;
+      // totalCostUsd with the server's canonical recomputation. Harnesses that
+      // report tokens but no money (dsh, acp) post 0; storing that as their
+      // cost would make every recomputed row read as a 100% drift.
+      const harnessCostUsd = parsed.body.totalCostUsd > 0 ? parsed.body.totalCostUsd : null;
       const recomputed = await recomputeSessionCost(
         {
           provider: parsed.body.provider,
           model,
-          harnessCostUsd,
+          harnessCostUsd: parsed.body.totalCostUsd,
           inputTokens,
           outputTokens,
           cacheReadTokens: cachedInputTokens,
@@ -393,7 +436,7 @@ export async function handleSessionData(
       });
       recordSessionCost({
         totalCostUsd,
-        harnessCostUsd,
+        harnessCostUsd: harnessCostUsd ?? undefined,
         harness: parsed.body.provider ?? "unknown",
         model,
         costSource,
@@ -419,13 +462,16 @@ export async function handleSessionData(
   if (getSessionCostSummaryRoute.match(req.method, pathSegments)) {
     const parsed = await getSessionCostSummaryRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const summary = await getSessionCostSummary({
+    const opts = {
       startDate: parsed.query.startDate || undefined,
       endDate: parsed.query.endDate || undefined,
       agentId: parsed.query.agentId || undefined,
       userId: parsed.query.userId || undefined,
       groupBy: parsed.query.groupBy || "both",
-    });
+    } as const;
+    const summary = await cachedUsageReport(`summary:${JSON.stringify(opts)}`, () =>
+      getSessionCostSummary(opts),
+    );
     getSessionCostSummaryRoute.respond(res, 200, summary);
     return true;
   }
@@ -439,10 +485,13 @@ export async function handleSessionData(
   if (getAttributionByPersonRoute.match(req.method, pathSegments)) {
     const parsed = await getAttributionByPersonRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const rows = await getAttributionByPerson({
+    const opts = {
       startDate: parsed.query.startDate || undefined,
       endDate: parsed.query.endDate || undefined,
-    });
+    };
+    const rows = await cachedUsageReport(`attribution:${JSON.stringify(opts)}`, () =>
+      getAttributionByPerson(opts),
+    );
     getAttributionByPersonRoute.respond(res, 200, { rows });
     return true;
   }

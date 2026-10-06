@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import { toast } from "sonner";
 import { useConfigs } from "@/api/hooks/use-config-api";
 import { useEnvPresence, useReloadConfig } from "@/api/hooks/use-integrations-meta";
+import { useModelTiers } from "@/api/hooks/use-model-tiers";
 import { ConfigurationGroupCard } from "@/components/configuration/configuration-group-card";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageSkeleton } from "@/components/shared/page-skeleton";
@@ -10,16 +11,15 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
-import { useConfig } from "@/hooks/use-config";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import {
   CONFIGURATION_GROUPS,
   CONFIGURATION_KEYS,
   type ConfigCatalogEntry,
   type ConfigCatalogGroup,
+  withModelTierGroup,
 } from "@/lib/configuration-catalog";
 import { cn } from "@/lib/utils";
-import { WelcomeCard } from "@/pages/config/components/welcome-card";
 
 interface VisibleGroup {
   group: ConfigCatalogGroup;
@@ -36,12 +36,19 @@ interface VisibleGroup {
  * "Restart required" are read once at process start.
  */
 export default function ConfigurationPage() {
-  const { isConfigured } = useConfig();
   // Rendered rows own their own reads/writes via `useSwarmConfig`; this query
   // exists so the page can show a skeleton and surface a load error once,
   // rather than 50 times. It shares react-query's cache with the rows.
   const { isLoading, error } = useConfigs({ scope: "global" });
-  const { data: envPresence } = useEnvPresence(CONFIGURATION_KEYS);
+  // The Model tiers rows come from the API (defaults, configured value and the
+  // resolved model per provider and tier), not from the static catalog.
+  const { data: tiers } = useModelTiers();
+  const groups = useMemo(() => withModelTierGroup(CONFIGURATION_GROUPS, tiers), [tiers]);
+  const envKeys = useMemo(
+    () => [...CONFIGURATION_KEYS, ...(tiers ?? []).map((tier) => tier.key)],
+    [tiers],
+  );
+  const { data: envPresence } = useEnvPresence(envKeys);
   const reloadConfig = useReloadConfig();
   const { searchParams, setParam } = useUrlSearchState();
   const search = readStringParam(searchParams, "search");
@@ -49,7 +56,7 @@ export default function ConfigurationPage() {
   const visibleGroups = useMemo<VisibleGroup[]>(() => {
     const q = search.trim().toLowerCase();
     const result: VisibleGroup[] = [];
-    for (const group of CONFIGURATION_GROUPS) {
+    for (const group of groups) {
       const entries = q
         ? group.entries.filter(
             (e) =>
@@ -61,11 +68,7 @@ export default function ConfigurationPage() {
       if (entries.length > 0) result.push({ group, entries });
     }
     return result;
-  }, [search]);
-
-  if (!isConfigured) {
-    return <WelcomeCard />;
-  }
+  }, [search, groups]);
 
   if (isLoading) {
     return <PageSkeleton />;
@@ -162,9 +165,8 @@ export default function ConfigurationPage() {
       )}
 
       <p className="text-xs text-muted-foreground pb-2">
-        Values set as environment variables take precedence at boot; values saved here are stored in
-        the swarm config and applied on reload. Settings marked Restart required need a server
-        restart.
+        Values saved here are stored in the swarm config and take precedence over environment
+        variables, at boot and on reload. Settings marked Restart required need a server restart.
       </p>
     </div>
   );

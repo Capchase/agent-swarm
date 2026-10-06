@@ -8,8 +8,8 @@ set -euo pipefail
 # Mocks Slack/GitHub/AgentMail by firing events through the REST API.
 #
 # Usage:
-#   ./scripts/e2e-workflow-test.sh                    # Uses defaults from .env
-#   PORT=3014 API_KEY=123123 ./scripts/e2e-workflow-test.sh  # Explicit config
+#   export AGENT_SWARM_API_KEY  # Set to the running server's key first
+#   PORT=3014 ./scripts/e2e-workflow-test.sh
 #
 # Prerequisites:
 #   - API server running: bun run start:http
@@ -17,7 +17,8 @@ set -euo pipefail
 # ===========================================================================
 
 PORT="${PORT:-3014}"
-API_KEY="${API_KEY:-123123}"
+API_KEY="${AGENT_SWARM_API_KEY:-${API_KEY:-}}"
+: "${API_KEY:?Set AGENT_SWARM_API_KEY or API_KEY to the running server key}"
 BASE_URL="http://localhost:${PORT}"
 AGENT_ID="e2e-test-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo test-agent)"
 
@@ -160,7 +161,7 @@ fi
 
 # List runs
 RUNS_JSON=$(api GET "/api/workflows/${WF_ID}/runs")
-RUN_IN_LIST=$(echo "$RUNS_JSON" | jq "[.[] | select(.id == \"$RUN_ID\")] | length")
+RUN_IN_LIST=$(echo "$RUNS_JSON" | jq "[.runs[] | select(.id == \"$RUN_ID\")] | length")
 if [ "$RUN_IN_LIST" = "1" ]; then pass "List runs contains our run"; else fail "List runs" "run not found"; fi
 
 # ===========================================================================

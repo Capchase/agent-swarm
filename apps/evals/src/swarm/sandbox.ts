@@ -25,7 +25,14 @@ import {
   waitForHttpOk,
 } from "../../../../src/e2b/dispatch";
 import { redactWithEnv } from "../../../../src/e2b/env";
+import type { Billing } from "../cost/billing.ts";
 import { defaultMemberIdentity, type HarnessConfig, type WorkerSpec } from "../types.ts";
+import {
+  type CodexSubscriptionAuth,
+  codexOAuthSource,
+  installAuthJsonCommand,
+  resolveCodexSubscriptionAuth,
+} from "./codex-auth.ts";
 import { cleanVersion } from "./version.ts";
 
 const API_PORT = 3013;
@@ -71,6 +78,8 @@ export interface WorkerHandle {
   agentId: string;
   /** `agent-swarm version` output inside this worker's sandbox; null = capture failed. */
   version: string | null;
+  /** How the credential this member actually received bills (see {@link memberBilling}). */
+  billing: Billing;
 }
 
 export interface SqlSeedResult {
@@ -136,6 +145,10 @@ function e2bApiBase(): string | undefined {
  * configured harness actually needs — notably, never leak CLAUDE_CODE_OAUTH_TOKEN
  * into pi/opencode workers (claude creds present in env win over the configured
  * provider).
+ *
+ * Codex with a subscription source (see src/swarm/codex-auth.ts) gets no env
+ * credential at all: bootStack installs a chatgpt-mode auth.json instead, and
+ * OPENAI_API_KEY is withheld so the member can never bill per token.
  */
 export function credentialsForConfig(config: HarnessConfig): Record<string, string> {
   const out: Record<string, string> = {};
@@ -156,7 +169,7 @@ export function credentialsForConfig(config: HarnessConfig): Record<string, stri
       break;
     }
     case "codex": {
-      need("OPENAI_API_KEY");
+      if (!codexOAuthSource()) need("OPENAI_API_KEY");
       break;
     }
     case "pi":
@@ -171,6 +184,21 @@ export function credentialsForConfig(config: HarnessConfig): Record<string, stri
     }
   }
   return out;
+}
+
+/**
+ * Billing of what a member actually received: an OAuth credential (claude
+ * token, codex chatgpt auth.json) is a flat subscription; any API key bills
+ * per token.
+ */
+export function memberBilling(
+  provider: HarnessConfig["provider"],
+  env: Record<string, string>,
+  codexAuthInstalled: boolean,
+): Billing {
+  if (provider === "claude") return env.CLAUDE_CODE_OAUTH_TOKEN ? "subscription" : "metered";
+  if (provider === "codex") return codexAuthInstalled ? "subscription" : "metered";
+  return "metered";
 }
 
 /** Exported for tests. */
@@ -215,7 +243,8 @@ export function apiRuntimeEnv(swarmKey: string): Record<string, string> {
  * Per-member sandbox env (exported for tests). Built from the member's
  * EFFECTIVE config; frozen merge order (v7 §9.3, later wins):
  *   1. base runtime env (AGENT_ROLE = member role; MAX_CONCURRENT_TASKS "1"
- *      for workers / "2" for the lead — the worker entrypoint's lead default);
+ *      for workers / "2" for the lead — the worker entrypoint's lead default;
+ *      MODEL_OVERRIDE and REASONING_EFFORT_OVERRIDE from the effective config);
  *   2. credentialsForConfig(effectiveConfig) — per-member credential isolation;
  *   3. effectiveConfig.env ?? {};
  *   4. identity envs via defaultMemberIdentity(role, index, spec) (v7.5
@@ -254,6 +283,10 @@ export function workerRuntimeEnv(opts: {
     AGENT_ID: opts.agentId,
     HARNESS_PROVIDER: config.provider,
     ...(config.model ? { MODEL_OVERRIDE: config.model } : {}),
+    // The worker reads this per task (runner.ts: task effort → REASONING_EFFORT_OVERRIDE)
+    // and applies it through its harness adapter; a level the model does not take is a
+    // no-op there, which the attempt's applied-effort capture surfaces.
+    ...(config.reasoningEffort ? { REASONING_EFFORT_OVERRIDE: config.reasoningEffort } : {}),
     YOLO: "true",
     MAX_CONCURRENT_TASKS: role === "lead" ? "2" : "1",
     WORKER_LOG_DIR: "/logs",
@@ -510,6 +543,9 @@ export async function bootStack(opts: {
     // the catch below kills everything created so far (sandboxes are pushed
     // into `created` synchronously right after creation).
     const allWorkerEnvs: Record<string, string>[] = [];
+    // One ChatGPT token fetch per attempt, shared by every codex member.
+    const codexSource = codexOAuthSource();
+    let codexAuth: Promise<CodexSubscriptionAuth> | null = null;
     const bootMember = async (member: BootMember, position: number): Promise<WorkerHandle> => {
       const agentId = memberAgentIds[position] as string;
       const config = member.config;
@@ -528,6 +564,13 @@ export async function bootStack(opts: {
         spec: member.spec,
       });
       allWorkerEnvs.push(workerEnv);
+      let auth: CodexSubscriptionAuth | null = null;
+      if (config.provider === "codex" && codexSource) {
+        codexAuth ??= resolveCodexSubscriptionAuth(codexSource);
+        auth = await codexAuth;
+        allWorkerEnvs.push({ CODEX_OAUTH_ACCESS_TOKEN: auth.accessToken });
+      }
+      opts.signal?.throwIfAborted();
       const workerSandbox = await createSandbox({
         apiKey: e2bKey,
         apiBase,
@@ -548,6 +591,21 @@ export async function bootStack(opts: {
       });
       created.push(workerSandbox);
       opts.signal?.throwIfAborted();
+      if (auth) {
+        // Before the entrypoint: it keeps an existing chatgpt-mode auth.json.
+        const res = await sandboxExec(
+          workerSandbox.sandboxID,
+          installAuthJsonCommand(auth.authJson),
+        );
+        if (res.exitCode !== 0) {
+          throw new Error(
+            `codex auth.json install failed (exit ${res.exitCode}): ${res.stderr.slice(0, 500)}`,
+          );
+        }
+        log(
+          `${member.role} ${member.index}: codex on ChatGPT subscription (codex_oauth_${auth.slot}, access token only, expires ${auth.expiresAt})`,
+        );
+      }
       await startDetachedProcess({
         sandbox: workerSandbox,
         apiKey: e2bKey,
@@ -583,7 +641,14 @@ export async function bootStack(opts: {
       } catch {
         // best-effort version capture
       }
-      return { index: member.index, member, sandbox: workerSandbox, agentId, version };
+      return {
+        index: member.index,
+        member,
+        sandbox: workerSandbox,
+        agentId,
+        version,
+        billing: memberBilling(config.provider, workerEnv, auth !== null),
+      };
     };
     const workers = await Promise.all(members.map((m, i) => bootMember(m, i)));
     opts.signal?.throwIfAborted();

@@ -13,13 +13,12 @@ import { join } from "node:path";
 import {
   api,
   makeScratchDir,
-  readAuditRows,
   registerAgent,
   removeScratchDir,
   type SwarmServer,
   spawnSwarmServer,
   WORKER_A,
-  waitForAuditCount,
+  waitForAuditRows,
 } from "./rbac-e2e-helpers";
 
 setDefaultTimeout(120_000);
@@ -358,8 +357,40 @@ describe("RBAC admission over real HTTP", () => {
     });
     expect(operatorCreate.status).toBe(201);
 
-    expect(await waitForAuditCount(dbPath, 2)).toBeGreaterThanOrEqual(2);
-    const userHttpRows = readAuditRows(dbPath).filter(
+    const userHttpRows = (
+      await waitForAuditRows(dbPath, (rows) => {
+        const userRows = rows.filter(
+          (row) =>
+            row.principalType === "user" &&
+            row.principalId === userId &&
+            row.source === "http" &&
+            row.resourceType === "http-route",
+        );
+        return (
+          [
+            "GET /api/agents/{id}/mcp-servers",
+            "GET /api/scripts/{id}/apis/{endpointId}/secret",
+            "PATCH /api/assets/app/{id}/key",
+            "POST /api/scripts/{id}/apis",
+            "POST /api/tasks",
+          ].every((resourceId) =>
+            userRows.some((row) => row.resourceId === resourceId && row.decision === "deny"),
+          ) &&
+          userRows.some(
+            (row) =>
+              row.resourceId === "PUT /api/favorites" &&
+              row.verb === "favorite.write.own" &&
+              row.decision === "allow",
+          ) &&
+          userRows.some(
+            (row) =>
+              row.resourceId === "PATCH /api/assets/app/{id}/key" &&
+              row.verb === "app.manage" &&
+              row.decision === "allow",
+          )
+        );
+      })
+    ).filter(
       (row) =>
         row.principalType === "user" &&
         row.principalId === userId &&
@@ -451,4 +482,56 @@ describe("RBAC admission over real HTTP", () => {
       CONFIG_SECRET_VALUE,
     );
   });
+});
+
+test.each(["true", "false"])("worker extension ownership with RBAC_ENABLED=%s", async (enabled) => {
+  const scratch = await makeScratchDir();
+  const instance = await spawnSwarmServer({
+    dbPath: join(scratch, "extension-admission.sqlite"),
+    logPath: join(scratch, "extension-admission.log"),
+    env: { RBAC_ENABLED: enabled },
+  });
+  try {
+    await registerAgent(instance.base, WORKER_A, "extension-owner", false);
+    // The server subprocess serves the bundled catalog (templates/extensions), not test fixtures.
+    const installed = await api(instance.base, "POST", "/api/extensions/install", {
+      agentId: WORKER_A,
+      body: { template: "require-ticket-ref" },
+    });
+    expect(installed.status).toBe(200);
+    expect(installed.body.extension).toMatchObject({
+      createdByAgentId: WORKER_A,
+      enabled: false,
+      status: "disabled",
+    });
+    const path = `/api/extensions/${installed.body.extension.id}`;
+    for (const operation of ["enable", "disable", "activate-version"]) {
+      expect(
+        (
+          await api(instance.base, "POST", `${path}/${operation}`, {
+            agentId: WORKER_A,
+            body: { version: 1 },
+          })
+        ).status,
+      ).toBe(403);
+    }
+    const operator = await api(instance.base, "POST", "/api/extensions/install", {
+      body: { template: "notify-on-complete" },
+    });
+    expect(operator.status).toBe(200);
+    expect(operator.body.extension.createdByAgentId).toBeNull();
+    for (const method of ["PATCH", "DELETE"]) {
+      expect(
+        (
+          await api(instance.base, method, `/api/extensions/${operator.body.extension.id}`, {
+            agentId: WORKER_A,
+            ...(method === "PATCH" ? { body: { priority: 1 } } : {}),
+          })
+        ).status,
+      ).toBe(403);
+    }
+  } finally {
+    await instance.stop();
+    await removeScratchDir(scratch);
+  }
 });

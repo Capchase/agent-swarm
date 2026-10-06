@@ -5,11 +5,13 @@ import { useNavigate } from "react-router-dom";
 import { useAgents } from "@/api/hooks/use-agents";
 import { useConfigs } from "@/api/hooks/use-config-api";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
+import { useModelsCatalog } from "@/api/hooks/use-models-catalog";
 import type { AgentStatus, AgentWithTasks } from "@/api/types";
 import { AgentAvatar } from "@/components/shared/agent-avatar";
 import { AgentModelCell } from "@/components/shared/agent-model-cell";
 import { DataGrid } from "@/components/shared/data-grid";
-import { HarnessCell } from "@/components/shared/harness-cell";
+import { HarnessCell, harnessLabel } from "@/components/shared/harness-cell";
+import { MobileList, MobileListRow } from "@/components/shared/mobile-list";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
@@ -20,8 +22,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
 import { getAgentModelDisplay, getAgentModelPresentation } from "@/lib/agents-list-model-display";
+import { agentSearchText, matchesSearchTerms } from "@/lib/list-search";
 import { formatSmartTime } from "@/lib/utils";
 
 export default function AgentsPage() {
@@ -29,10 +33,12 @@ export default function AgentsPage() {
   const { searchParams, setParam } = useUrlSearchState();
   const { data: agents, isLoading } = useAgents();
   const { data: agentConfigs } = useConfigs({ scope: "agent" });
+  const { data: modelsCatalog } = useModelsCatalog();
   const search = readStringParam(searchParams, "search");
   const statusFilter = readStringParam(searchParams, "status", "all");
 
   const modelColumnGate = useFeatureGate("1.77.2");
+  const isMobile = useIsMobile();
 
   const filteredAgents = useMemo(() => {
     if (!agents) return [];
@@ -58,30 +64,27 @@ export default function AgentsPage() {
     return modelByAgentId;
   }, [agentConfigs, filteredAgents]);
 
+  const modelSearchText = useCallback(
+    (agent: AgentWithTasks) => {
+      const display = getAgentModelDisplay(
+        configuredModelByAgentId.get(agent.id),
+        agent.credStatus?.latestModel?.model,
+        agent.credStatus?.latestModel?.reasoningEffort,
+      );
+      const primary = getAgentModelPresentation(display.primary, modelsCatalog?.providers);
+      return [primary?.label, primary?.raw, primary?.provider, display.configured, display.lastUsed]
+        .filter(Boolean)
+        .join(" ");
+    },
+    [configuredModelByAgentId, modelsCatalog?.providers],
+  );
+
   const columnDefs = useMemo<ColDef<AgentWithTasks>[]>(() => {
     const modelColumn: ColDef<AgentWithTasks> = {
       headerName: "Model",
       width: 320,
       minWidth: 260,
-      valueGetter: (params) => {
-        const agent = params.data;
-        if (!agent) return "";
-        const display = getAgentModelDisplay(
-          configuredModelByAgentId.get(agent.id),
-          agent.credStatus?.latestModel?.model,
-          agent.credStatus?.latestModel?.reasoningEffort,
-        );
-        const primary = getAgentModelPresentation(display.primary);
-        return [
-          primary?.label,
-          primary?.raw,
-          primary?.provider,
-          display.configured,
-          display.lastUsed,
-        ]
-          .filter(Boolean)
-          .join(" ");
-      },
+      valueGetter: (params) => (params.data ? modelSearchText(params.data) : ""),
       cellRenderer: (params: { data: AgentWithTasks | undefined }) => {
         const agent = params.data;
         if (!agent) return null;
@@ -90,7 +93,7 @@ export default function AgentsPage() {
           agent.credStatus?.latestModel?.model,
           agent.credStatus?.latestModel?.reasoningEffort,
         );
-        return <AgentModelCell display={display} />;
+        return <AgentModelCell display={display} liveCatalog={modelsCatalog?.providers} />;
       },
     };
     return [
@@ -120,6 +123,7 @@ export default function AgentsPage() {
           <HarnessCell
             harnessProvider={params.data?.harnessProvider}
             credStatus={params.data?.credStatus}
+            claudeTransport={params.data?.claudeTransport}
           />
         ),
       },
@@ -169,7 +173,26 @@ export default function AgentsPage() {
         valueFormatter: (params) => (params.value ? formatSmartTime(params.value) : ""),
       },
     ];
-  }, [configuredModelByAgentId, modelColumnGate.supported]);
+  }, [
+    configuredModelByAgentId,
+    modelColumnGate.supported,
+    modelSearchText,
+    modelsCatalog?.providers,
+  ]);
+
+  // One search for both widths, so a phone finds the same agents as the grid.
+  const searchedAgents = useMemo(() => {
+    if (!search.trim()) return filteredAgents;
+    return filteredAgents.filter((agent) =>
+      matchesSearchTerms(
+        agentSearchText(agent, [
+          agent.harnessProvider ? harnessLabel(agent.harnessProvider) : null,
+          modelColumnGate.supported ? modelSearchText(agent) : null,
+        ]),
+        search,
+      ),
+    );
+  }, [filteredAgents, modelColumnGate.supported, modelSearchText, search]);
 
   const onRowClicked = useCallback(
     (event: RowClickedEvent<AgentWithTasks>) => {
@@ -211,15 +234,43 @@ export default function AgentsPage() {
         </Select>
       </div>
 
-      <DataGrid
-        rowData={filteredAgents}
-        columnDefs={columnDefs}
-        quickFilterText={search}
-        onRowClicked={onRowClicked}
-        loading={isLoading}
-        emptyMessage="No agents found"
-        paginationQueryKey="agents"
-      />
+      {isMobile ? (
+        <MobileList label="Agents" loading={isLoading} emptyMessage="No agents found">
+          {searchedAgents.map((agent) => {
+            const model = getAgentModelPresentation(
+              getAgentModelDisplay(
+                configuredModelByAgentId.get(agent.id),
+                agent.credStatus?.latestModel?.model,
+              ).primary,
+              modelsCatalog?.providers,
+            );
+            return (
+              <MobileListRow
+                key={agent.id}
+                to={`/agents/${agent.id}`}
+                live={agent.status === "busy"}
+                leading={<AgentAvatar agentId={agent.id} agentName={agent.name} size="sm" />}
+                title={agent.name}
+                status={<StatusBadge status={agent.status} />}
+                meta={[
+                  agent.role,
+                  agent.harnessProvider ? harnessLabel(agent.harnessProvider) : null,
+                  model?.label,
+                ]}
+              />
+            );
+          })}
+        </MobileList>
+      ) : (
+        <DataGrid
+          rowData={searchedAgents}
+          columnDefs={columnDefs}
+          onRowClicked={onRowClicked}
+          loading={isLoading}
+          emptyMessage="No agents found"
+          paginationQueryKey="agents"
+        />
+      )}
     </div>
   );
 }

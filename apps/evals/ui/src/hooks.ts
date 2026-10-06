@@ -1,22 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getModels, listConfigs } from "./api.ts";
-import type { ConfigJson, ModelJson, ModelsResponse } from "./types.ts";
+import { getModels, listConfigs, refreshModelCatalog } from "./api.ts";
+import { buildModelResolver } from "./lib/model-resolve.ts";
+import type { CatalogInfo, ConfigJson, ModelJson, ModelsResponse } from "./types.ts";
 
 export interface Route {
-  /** "#/runs/a/attempts/b" → ["runs", "a", "attempts", "b"] */
+  /** "#/runs/a/attempts/b?x=1" → ["runs", "a", "attempts", "b"] (the query is not a part). */
   parts: string[];
   /** The full hash path, e.g. "#/runs/a/attempts/b". */
   path: string;
+  /** The hash's `?key=value` pairs, e.g. "#/runs?config=x" → config=x. */
+  query: URLSearchParams;
 }
 
 function parseHash(): Route {
   const raw = window.location.hash || "#/";
-  const path = raw.startsWith("#") ? raw.slice(1) : raw;
+  const withoutHash = raw.startsWith("#") ? raw.slice(1) : raw;
+  const queryAt = withoutHash.indexOf("?");
+  const path = queryAt === -1 ? withoutHash : withoutHash.slice(0, queryAt);
+  const query = new URLSearchParams(queryAt === -1 ? "" : withoutHash.slice(queryAt + 1));
   const parts = path
     .split("/")
     .filter(Boolean)
     .map((p) => decodeURIComponent(p));
-  return { parts, path: raw };
+  return { parts, path: raw, query };
 }
 
 export function useHashRoute(): Route {
@@ -32,6 +38,25 @@ export function useHashRoute(): Route {
 /** path starts with "#/". */
 export function navigate(path: string): void {
   window.location.hash = path;
+}
+
+/**
+ * Rewrite the hash's query in place (no history entry, no route change), so a
+ * page can keep its view state (`#/leaderboard?suite=1.0&x=time`) shareable.
+ * A key set to null or "" is removed.
+ */
+export function replaceHashQuery(values: Record<string, string | null>): void {
+  const raw = window.location.hash || "#/";
+  const withoutHash = raw.startsWith("#") ? raw.slice(1) : raw;
+  const queryAt = withoutHash.indexOf("?");
+  const path = queryAt === -1 ? withoutHash : withoutHash.slice(0, queryAt);
+  const query = new URLSearchParams(queryAt === -1 ? "" : withoutHash.slice(queryAt + 1));
+  for (const [key, value] of Object.entries(values)) {
+    if (value === null || value === "") query.delete(key);
+    else query.set(key, value);
+  }
+  const qs = query.toString();
+  window.history.replaceState(null, "", `#${path}${qs ? `?${qs}` : ""}`);
 }
 
 export function usePoll<T>(
@@ -101,24 +126,15 @@ let modelsFetchedAt = 0;
 const modelsSubscribers = new Set<(data: ModelsResponse) => void>();
 
 export interface ModelLookup {
+  /** The judge picker list (openrouter entries only). */
   models: ModelJson[];
   defaultJudgeModel: string | null;
   /** Resolve any observed model-id shape to a catalog entry (null when unknown). */
   resolve: (id: string | null) => ModelJson | null;
+  /** Server catalog source + last fetch time; null until loaded (or on older servers). */
+  catalog: CatalogInfo | null;
   /** False while the first fetch is still in flight. */
   loaded: boolean;
-}
-
-/** Candidate catalog ids for an observed model id (config override, harness output, …). */
-function modelIdCandidates(id: string): string[] {
-  const out = [id];
-  const unprefixed = id.startsWith("openrouter/") ? id.slice("openrouter/".length) : id;
-  if (unprefixed !== id) out.push(unprefixed);
-  const dateless = unprefixed.replace(/-\d{8}$/, ""); // claude-haiku-4-5-20251001 → claude-haiku-4-5
-  if (dateless !== unprefixed) out.push(dateless);
-  const dotted = dateless.replace(/-(\d+)-(\d+)$/, "-$1.$2"); // claude-haiku-4-5 → claude-haiku-4.5
-  if (dotted !== dateless) out.push(dotted);
-  return out;
 }
 
 function refreshModelsCache(): Promise<ModelsResponse> {
@@ -166,32 +182,31 @@ export function useModels(): ModelLookup {
 
   return useMemo<ModelLookup>(() => {
     const models = data?.models ?? [];
-    const aliases = data?.aliases ?? {};
-    const byId = new Map(models.map((m) => [m.id, m]));
-    const resolve = (id: string | null): ModelJson | null => {
-      if (id === null || id.length === 0 || models.length === 0) return null;
-      // v7 §8: bare claude aliases ("fable") resolve to the latest family
-      // member ("claude-fable-5") via the server-computed frozen map FIRST,
-      // then go through the normal candidate chain (dotted/suffix matching).
-      const target = aliases[id.trim().toLowerCase()] ?? id;
-      for (const candidate of modelIdCandidates(target)) {
-        const hit = byId.get(candidate);
-        if (hit) return hit;
-      }
-      // last resort: suffix match ("deepseek-v4-flash" → "deepseek/deepseek-v4-flash")
-      for (const candidate of modelIdCandidates(target)) {
-        const hit = models.find((m) => m.id.endsWith(`/${candidate}`));
-        if (hit) return hit;
-      }
-      return null;
-    };
+    const resolve = buildModelResolver({
+      models,
+      harnessModels: data?.harnessModels,
+      aliases: data?.aliases,
+    });
     return {
       models,
       defaultJudgeModel: data?.defaultJudgeModel ?? null,
       resolve,
+      catalog: data?.catalog ?? null,
       loaded: data !== null,
     };
   }, [data]);
+}
+
+/**
+ * Ask the server to refetch models.dev now, then reload the model and config
+ * caches (alias configs may resolve to a newer model). Rejects with the
+ * server's error message when the fetch fails; the caches are left as they were.
+ */
+export async function refreshCatalogNow(): Promise<void> {
+  await refreshModelCatalog();
+  await modelsPromise?.catch(() => {}); // let an in-flight fetch finish so ours is not coalesced into it
+  await refreshModelsCache();
+  invalidateConfigsCache();
 }
 
 // ---- config catalog (stale-while-revalidate cache, shared by every ConfigChip) ----
@@ -221,6 +236,12 @@ function refreshConfigsCache(): Promise<ConfigJson[]> {
       configsPromise = null;
     });
   return configsPromise;
+}
+
+/** Drop the configs cache after a mutation so every useConfigs() consumer refetches. */
+export function invalidateConfigsCache(): void {
+  configsFetchedAt = 0;
+  void refreshConfigsCache().catch(() => {});
 }
 
 function revalidateConfigsCache(): void {

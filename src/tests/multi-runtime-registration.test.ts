@@ -3,7 +3,7 @@
  * handlers on both sides of MULTI_RUNTIME_ENABLED.
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import {
@@ -15,6 +15,7 @@ import {
   getActiveTaskCount,
   getAgentById,
   getDbClient,
+  getIdleWorkersWithCapacity,
   getSwarmConfigs,
   getTaskById,
   hasCapacity,
@@ -22,6 +23,7 @@ import {
   releaseStaleOfferedTasksForOfflineAgents,
   startTask,
   updateAgentStatus,
+  updateAgentStatusFromCapacity,
   upsertSwarmConfig,
 } from "../be/db";
 import {
@@ -32,8 +34,16 @@ import {
   getRuntimeInstanceById,
   hasReadyLiveRuntime,
 } from "../be/multi-runtime";
+import {
+  CREDENTIAL_RETRY_INTERVAL_MS,
+  type CredentialRefreshState,
+  refreshCredentialStatus,
+} from "../commands/credential-refresh";
 import { retryBootStep } from "../commands/credential-wait";
-import { sendCredStatusReport } from "../commands/provider-credentials";
+import {
+  CREDENTIAL_PROVIDER_CHECKERS,
+  sendCredStatusReport,
+} from "../commands/provider-credentials";
 import { runHeartbeatSweep } from "../heartbeat/heartbeat";
 import { handleActiveSessions } from "../http/active-sessions";
 import { handleAgentRegister, handleAgentsRest } from "../http/agents";
@@ -49,7 +59,7 @@ import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-multi-runtime-registration.sqlite";
 let baseUrl = "";
-const API_KEY = "test-multi-runtime-key";
+const API_KEY = "example-test-multi-runtime-key";
 
 const LEAD_ID = "44444444-4444-4444-4444-444444444444";
 
@@ -295,7 +305,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  delete process.env.MULTI_RUNTIME_ENABLED;
+  process.env.MULTI_RUNTIME_ENABLED = "false";
   await getDbClient().run("DELETE FROM runtime_instances");
   await getDbClient().run("DELETE FROM active_sessions");
   // Pool sweeps cap how many tasks they assign per tick, so leftovers from an
@@ -532,7 +542,7 @@ describe("disable / legacy restoration", () => {
     expect((await getAgentById(id))?.maxTasks).toBe(3);
     expect((await getAgentMaxTasksConfig(id))?.value).toBe("3");
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     const { status } = await register(id, { maxTasks: 8 });
     expect(status).toBe(200);
     expect((await getAgentById(id))?.maxTasks).toBe(8);
@@ -794,7 +804,7 @@ describe("GET /api/agents/{id}/runtime-instances", () => {
 
     await listRuntimes(id);
     // Rows written while the flag was on stay readable after a rollback.
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     const { status, body } = await listRuntimes(id);
     expect(status).toBe(200);
     expect(body.runtimeInstances).toHaveLength(1);
@@ -859,7 +869,7 @@ describe("runtime-aware close", () => {
     const rA = crypto.randomUUID();
     await register(id, { maxTasks: 1, runtimeInstanceId: rA });
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     expect(await closeRuntime(id, rA)).toBe(204);
     // Runtime rows stay inert while the flag is off.
     expect((await getAgentById(id))?.status).toBe("offline");
@@ -980,7 +990,7 @@ describe("runtime liveness via ping", () => {
     await register(id, { maxTasks: 1, runtimeInstanceId: rA });
     const before = await getRuntimeInstanceById(rA);
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await Bun.sleep(10);
     expect(await pingAgent(id, rA)).toBe(204);
     expect((await getRuntimeInstanceById(rA))?.lastSeenAt).toBe(before?.lastSeenAt ?? "");
@@ -1181,7 +1191,7 @@ describe("stale runtime liveness", () => {
     await register(id, { maxTasks: 1, runtimeInstanceId: rA });
 
     // Flag off: close takes the legacy path and leaves the row active.
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await closeRuntime(id, rA);
     expect((await getRuntimeInstanceById(rA))?.status).toBe("active");
     expect((await getAgentById(id))?.status).toBe("offline");
@@ -1376,7 +1386,7 @@ describe("rollback to legacy mode", () => {
     await register(id, { maxTasks: 1, runtimeInstanceId: rA });
 
     // Operator rolls back; workers stop refreshing their rows.
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rA);
 
     const result = await expireStaleRuntimeInstances();
@@ -1392,7 +1402,7 @@ describe("rollback to legacy mode", () => {
     const rA = crypto.randomUUID();
     await register(id, { maxTasks: 1, runtimeInstanceId: rA });
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rA);
     await expireStaleRuntimeInstances();
     expect((await getAgentById(id))?.status).toBe("idle");
@@ -1459,7 +1469,7 @@ describe("flag re-enable cycle preserves live sessions", () => {
 
     // Operator disables the flag: nothing refreshes runtime rows, but the
     // worker keeps executing and heartbeating its session.
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rt);
 
     // Re-enable past the stale window; the first sweep runs expiry.
@@ -1487,7 +1497,7 @@ describe("flag re-enable cycle preserves live sessions", () => {
     await startTask(task.id);
     await startSessionFor(id, task.id, rt);
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rt);
     // Sessions heartbeat on tool activity only: a long model call or shell
     // command can be quiet past the runtime cutoff while the worker is fine.
@@ -1516,7 +1526,7 @@ describe("flag re-enable cycle preserves live sessions", () => {
     await startTask(task.id);
     await startSessionFor(id, task.id, rt);
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rt);
     await makeSessionStale(task.id, 20);
     // The task itself progressed recently (store-progress traffic).
@@ -1541,7 +1551,7 @@ describe("flag re-enable cycle preserves live sessions", () => {
     await startTask(task.id);
     await startSessionFor(id, task.id, rt);
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rt);
     // The process died: session heartbeat AND task progress both went stale.
     await makeSessionStale(task.id, 30);
@@ -1568,7 +1578,7 @@ describe("flag re-enable cycle preserves live sessions", () => {
     await startTask(task.id);
     await startSessionFor(id, task.id, rt);
 
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rt);
 
     const result = await expireStaleRuntimeInstances();
@@ -1762,7 +1772,7 @@ describe("sweep coverage and rollback inertness", () => {
     await register(id, { maxTasks: 1, runtimeInstanceId: rt });
 
     // Rolled back; the legacy worker stops refreshing its retained row.
-    delete process.env.MULTI_RUNTIME_ENABLED;
+    process.env.MULTI_RUNTIME_ENABLED = "false";
     await makeRuntimeStale(rt);
     const task = await createTaskExtended("pool-work-legacy");
 
@@ -2839,4 +2849,88 @@ describe("MCP task-action accept requires a live runtime", () => {
     expect((await getTaskById(task.id))?.status).toBe("pending");
     expect((await getTaskById(task.id))?.agentId).toBe(id);
   });
+});
+
+describe("post-task credential recovery without a restart", () => {
+  for (const multiRuntime of [false, true]) {
+    test(`parked worker recovers with multi-runtime ${multiRuntime ? "on" : "off"}`, async () => {
+      process.env.MULTI_RUNTIME_ENABLED = String(multiRuntime);
+      const id = await makeAgent(1);
+      const runtimeInstanceId = crypto.randomUUID();
+      await register(id, { maxTasks: 1, runtimeInstanceId });
+      const api = { apiUrl: baseUrl, apiKey: API_KEY, agentId: id, runtimeInstanceId };
+      const refresh: CredentialRefreshState = {
+        harnessProvider: "acp",
+        ready: true,
+        lastRefreshAt: 0,
+        inFlight: false,
+      };
+      const check = spyOn(CREDENTIAL_PROVIDER_CHECKERS, "claude");
+      const originalOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      // The real Claude checker and live-test use OAuth presence, no upstream I/O.
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-credential-recovery";
+      try {
+        // A live provider swap produces a real not-ready post-task snapshot.
+        await refreshCredentialStatus(api, refresh, "claude", {}, 1);
+        expect((await getAgentById(id))?.status).toBe("waiting_for_credentials");
+        expect((await getAgentById(id))?.credStatus?.reportKind).toBe("post_task");
+        expect((await getIdleWorkersWithCapacity()).some((agent) => agent.id === id)).toBe(false);
+        if (multiRuntime) {
+          expect((await getRuntimeInstanceById(runtimeInstanceId))?.credentialReady).toBe(false);
+        }
+
+        // Ping and completion/capacity reconciliation cannot recover it.
+        await pingAgent(id, runtimeInstanceId);
+        await updateAgentStatusFromCapacity(id);
+        expect((await getAgentById(id))?.status).toBe("waiting_for_credentials");
+        await refreshCredentialStatus(api, refresh, "claude", {}, CREDENTIAL_RETRY_INTERVAL_MS);
+        expect(check).toHaveBeenCalledTimes(1);
+
+        // A still-missing snapshot stays parked, and starts a new throttle window.
+        await refreshCredentialStatus(api, refresh, "claude", {}, CREDENTIAL_RETRY_INTERVAL_MS + 1);
+        expect(check).toHaveBeenCalledTimes(2);
+        expect((await getAgentById(id))?.status).toBe("waiting_for_credentials");
+        const env = { CLAUDE_CODE_OAUTH_TOKEN: "test-credential-recovery" };
+        await refreshCredentialStatus(
+          api,
+          refresh,
+          "claude",
+          env,
+          2 * CREDENTIAL_RETRY_INTERVAL_MS,
+        );
+        expect(check).toHaveBeenCalledTimes(2);
+        expect((await getAgentById(id))?.status).toBe("waiting_for_credentials");
+
+        // Credentials resolve. Same runner state, provider, and runtime identity.
+        await refreshCredentialStatus(
+          api,
+          refresh,
+          "claude",
+          env,
+          2 * CREDENTIAL_RETRY_INTERVAL_MS + 1,
+        );
+        expect(check).toHaveBeenCalledTimes(3);
+        expect((await getAgentById(id))?.status).toBe("idle");
+        expect((await getAgentById(id))?.credStatus?.ready).toBe(true);
+        expect((await getAgentById(id))?.credentialMissing).toBeNull();
+        expect((await getIdleWorkersWithCapacity()).some((agent) => agent.id === id)).toBe(true);
+        if (multiRuntime) {
+          expect((await getRuntimeInstanceById(runtimeInstanceId))?.credentialReady).toBe(true);
+          expect(await countActiveRuntimeInstancesForAgent(id)).toBe(1);
+        }
+        await refreshCredentialStatus(
+          api,
+          refresh,
+          "claude",
+          env,
+          10 * CREDENTIAL_RETRY_INTERVAL_MS,
+        );
+        expect(check).toHaveBeenCalledTimes(3);
+      } finally {
+        check.mockRestore();
+        if (originalOAuth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        else process.env.CLAUDE_CODE_OAUTH_TOKEN = originalOAuth;
+      }
+    });
+  }
 });

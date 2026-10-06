@@ -15,7 +15,7 @@ import "../http/trackers/linear";
 import "../http/workflows";
 import { listenOnFreePort } from "./test-net";
 
-const API_KEY = "test-secret-key";
+const API_KEY = "example-test-secret-key";
 
 function createTestServer(apiKey: string): Server {
   return createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -78,6 +78,13 @@ describe("handleCore auth middleware (route() auth.apiKey=false is honored)", ()
 
   test("GitLab webhook is still public", async () => {
     const res = await fetch(`http://localhost:${port}/api/gitlab/webhook`, { method: "POST" });
+    expect(res.status).not.toBe(401);
+  });
+
+  test("Azure DevOps webhook is still public", async () => {
+    const res = await fetch(`http://localhost:${port}/api/azure-devops/webhook`, {
+      method: "POST",
+    });
     expect(res.status).not.toBe(401);
   });
 

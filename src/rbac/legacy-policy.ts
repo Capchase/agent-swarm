@@ -10,6 +10,9 @@
  * Compile-time exhaustiveness: `LEGACY_POLICY` must cover every
  * `PermissionVerb` (enforced via `satisfies`).
  */
+
+import { isEnvFlagEnabled } from "../utils/env-flag";
+import { hasLeadEquivalence } from "./elevated-agents";
 import type { PermissionVerb } from "./permissions";
 import type { RbacPrincipal, RbacResource } from "./types";
 
@@ -24,10 +27,79 @@ export type LegacyRule = {
 
 // ── Named rules (research §3 Rule column) ────────────────────────────────────
 
+/** Lead agents, plus extension system agents registered as lead-equivalent. */
+function actsAsLead(principal: RbacPrincipal): boolean {
+  return principal.kind === "agent" && (principal.isLead || hasLeadEquivalence(principal.agentId));
+}
+
 const leadOnly: LegacyRule = {
   name: "lead-only",
   denyReason: "requires lead agent",
-  evaluate: (principal) => principal.kind === "agent" && principal.isLead,
+  evaluate: (principal) => actsAsLead(principal),
+};
+
+/**
+ * Human principals: the shared API key (operator) and dashboard session users.
+ * Dashboard users carry no admin flag today, so they are treated like the
+ * operator, matching the config routes (`src/http/config.ts`).
+ */
+const operatorOrUser: LegacyRule = {
+  name: "operator-or-user",
+  denyReason: "requires operator or user authentication",
+  evaluate: (principal) => principal.kind === "operator" || principal.kind === "user",
+};
+
+const leadOrOperatorOrUser: LegacyRule = {
+  name: "lead-or-operator-or-user",
+  denyReason: "requires lead agent, operator, or user authentication",
+  evaluate: (principal) =>
+    principal.kind === "operator" || principal.kind === "user" || actsAsLead(principal),
+};
+
+/**
+ * Lead agents and the operator (shared API key with no agent identity). Plain dashboard users are
+ * left out: nothing in the UI writes through a verb with this rule yet.
+ */
+const leadOrOperator: LegacyRule = {
+  name: "lead-or-operator",
+  denyReason: "requires lead agent or operator authentication",
+  evaluate: (principal) => principal.kind === "operator" || actsAsLead(principal),
+};
+
+/**
+ * Registered agents and the operator. Dashboard users are left out: a support row is a worker's
+ * report about its own CLI (or an operator correction), and no UI writes one.
+ */
+const agentOrOperator: LegacyRule = {
+  name: "agent-or-operator",
+  denyReason: "requires a registered agent or operator authentication",
+  evaluate: (principal) =>
+    principal.kind === "operator" || (principal.kind === "agent" && principal.agentId !== ""),
+};
+
+const extensionWrite: LegacyRule = {
+  name: "extension-owner-or-elevated",
+  denyReason: "requires extension owner, lead agent, operator, or user authentication",
+  evaluate: (principal, resource) => {
+    if (leadOrOperatorOrUser.evaluate(principal, resource)) return true;
+    return (
+      principal.kind === "agent" &&
+      principal.agentId !== "" &&
+      resource?.kind === "extension" &&
+      (resource.extensionId === undefined || resource.createdByAgentId === principal.agentId)
+    );
+  },
+};
+
+// Deployment-only: agents cannot reset this through swarm_config.
+const extensionActivation: LegacyRule = {
+  name: "extension-activation",
+  denyReason:
+    "requires operator/user authentication, or a lead with EXTENSION_ALLOW_LEAD_ACTIVATION enabled",
+  evaluate: (principal) =>
+    principal.kind === "operator" ||
+    principal.kind === "user" ||
+    (actsAsLead(principal) && isEnvFlagEnabled("EXTENSION_ALLOW_LEAD_ACTIVATION", true)),
 };
 
 const leadOrTaskCreator: LegacyRule = {
@@ -35,7 +107,7 @@ const leadOrTaskCreator: LegacyRule = {
   denyReason: "requires lead agent or task creator",
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent") return false;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     return (
       resource?.kind === "task" &&
       resource.creatorAgentId != null &&
@@ -49,7 +121,21 @@ const leadOrResourceOwner: LegacyRule = {
   denyReason: "requires lead agent or resource owner",
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent") return false;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
+    return (
+      resource?.kind === "owned" &&
+      resource.ownerAgentId != null &&
+      resource.ownerAgentId === principal.agentId
+    );
+  },
+};
+
+const humanOrLeadOrResourceOwner: LegacyRule = {
+  name: "human-or-lead-or-resource-owner",
+  denyReason: "requires a human, the operator, a lead agent, or the resource owner",
+  evaluate: (principal, resource) => {
+    if (principal.kind === "operator" || principal.kind === "user") return true;
+    if (actsAsLead(principal)) return true;
     return (
       resource?.kind === "owned" &&
       resource.ownerAgentId != null &&
@@ -63,7 +149,7 @@ const leadOrOwnNamespace: LegacyRule = {
   denyReason: "requires lead agent or your own task:agent: namespace",
   evaluate: (principal, resource) => {
     if (principal.kind !== "agent") return false;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     // A blank agent id can never own a namespace — the pre-migration guards
     // used truthiness (`if (info.agentId && ...)`), so `X-Agent-ID: ""` plus
     // the literal namespace `task:agent:` must stay denied.
@@ -98,14 +184,24 @@ const requesterOwnsTask: LegacyRule = {
 
 // ── Composites (verified against HEAD) ───────────────────────────────────────
 
-/** memory.delete.any — owner OR (lead AND scope=swarm) (src/tools/memory-delete.ts:54-56). */
-const memoryOwnerOrLeadSwarm: LegacyRule = {
-  name: "memory-owner-or-lead-swarm",
-  denyReason: "requires memory owner, or lead agent for swarm-scoped memories",
+/**
+ * memory.delete.any — operator or user; the lead for its own or swarm-scoped
+ * memories; any other agent for its own agent-scoped memories only. Swarm-scoped
+ * memories are shared, so a worker cannot remove one, even one it wrote.
+ */
+const memoryDelete: LegacyRule = {
+  name: "memory-delete",
+  denyReason:
+    "requires operator or user, the lead for swarm-scoped memories, or the owner for agent-scoped memories",
   evaluate: (principal, resource) => {
-    if (principal.kind !== "agent" || resource?.kind !== "owned") return false;
-    if (resource.ownerAgentId != null && resource.ownerAgentId === principal.agentId) return true;
-    return principal.isLead && resource.scope === "swarm";
+    if (principal.kind === "operator" || principal.kind === "user") return true;
+    if (resource?.kind !== "owned") return false;
+    const isOwner =
+      principal.agentId !== "" &&
+      resource.ownerAgentId != null &&
+      resource.ownerAgentId === principal.agentId;
+    if (actsAsLead(principal)) return isOwner || resource.scope === "swarm";
+    return isOwner && resource.scope === "agent";
   },
 };
 
@@ -121,7 +217,7 @@ const taskFsMutate: LegacyRule = {
   denyReason: "requires operator, user, lead agent, task assignee, or task creator",
   evaluate: (principal, resource) => {
     if (principal.kind === "operator" || principal.kind === "user") return true;
-    if (principal.isLead) return true;
+    if (actsAsLead(principal)) return true;
     if (resource?.kind !== "task") return false;
     return (
       (resource.agentId != null && resource.agentId === principal.agentId) ||
@@ -130,11 +226,33 @@ const taskFsMutate: LegacyRule = {
   },
 };
 
+/**
+ * task.progress.write — operator OR user OR lead OR task-assignee OR unassigned
+ * task (store-progress, POST /api/tasks/{id}/progress). A worker once completed
+ * a workflow sibling's task with its own report; the creator gets no write
+ * here, unlike task.fs.mutate. Leads may write, unlike HTTP finish.
+ */
+const taskProgressWrite: LegacyRule = {
+  name: "operator-or-user-or-lead-or-task-assignee",
+  denyReason: "requires operator, user, lead agent, or task assignee",
+  evaluate: (principal, resource) => {
+    if (principal.kind === "operator" || principal.kind === "user") return true;
+    if (actsAsLead(principal)) return true;
+    if (resource?.kind !== "task") return false;
+    return resource.agentId == null || resource.agentId === principal.agentId;
+  },
+};
+
 /** All named (non-composite) rule kinds, keyed by identifier. */
 export const LEGACY_RULES = {
+  "operator-or-user": operatorOrUser,
+  "lead-or-operator-or-user": leadOrOperatorOrUser,
+  "lead-or-operator": leadOrOperator,
+  "agent-or-operator": agentOrOperator,
   "lead-only": leadOnly,
   "lead-or-task-creator": leadOrTaskCreator,
   "lead-or-resource-owner": leadOrResourceOwner,
+  "human-or-lead-or-resource-owner": humanOrLeadOrResourceOwner,
   "lead-or-own-namespace": leadOrOwnNamespace,
   "any-authenticated": anyAuthenticated,
   "requester-owns-task": requesterOwnsTask,
@@ -147,17 +265,25 @@ export const LEGACY_POLICY = {
   "agent.profile.update.any": leadOnly,
   "agent.context.read.any": leadOnly,
   "task.cancel.any": leadOrTaskCreator,
+  "approval.cancel.any": humanOrLeadOrResourceOwner,
+  "approval.respond": operatorOrUser,
   "task.steer.any": leadOrTaskCreator,
   "task.create.own": anyAuthenticated,
+  "task.requester.assign": leadOrOperatorOrUser,
   "task.read.own": requesterOwnsTask,
   "task.cancel.own": requesterOwnsTask,
   "task.steer.own": requesterOwnsTask,
   "task.action.own": requesterOwnsTask,
   "task.fs.mutate": taskFsMutate,
+  "task.progress.write": taskProgressWrite,
   "favorite.write.own": anyAuthenticated,
   "memory.learning.inject": leadOnly,
-  "memory.delete.any": memoryOwnerOrLeadSwarm,
+  "memory.edit.any": leadOrResourceOwner,
+  "memory.write.consolidated": leadOnly,
+  "memory.read.any": leadOrOperatorOrUser,
+  "memory.delete.any": memoryDelete,
   "channel.delete": leadOnly,
+  "repo.merge-policy.write": leadOrOperatorOrUser,
   "integration.kapso.manage": leadOnly,
   "integration.slack.post": leadOnly,
   "integration.slack.read": leadOnly,
@@ -176,6 +302,8 @@ export const LEGACY_POLICY = {
   "config.write.any": leadOnly,
   "config.delete.any": leadOnly,
   "config.read.secrets": leadOnly,
+  "models.catalog.write": leadOrOperator,
+  "models.harness-support.write": agentOrOperator,
   "skill.create.swarm": leadOnly,
   "skill.install.any": leadOnly,
   "skill.install.global": leadOnly,
@@ -188,9 +316,11 @@ export const LEGACY_POLICY = {
   "mcp-server.uninstall.any": leadOnly,
   "mcp-server.delete.any": leadOrResourceOwner,
   "mcp-server.update.any": leadOrResourceOwner,
+  "mcp-server.stdio.write": leadOrOperatorOrUser,
   "mcp-server.read.secrets": leadOnly,
   "mcp-oauth.authorize.any": anyAuthenticated,
   "kv.write.any": leadOrOwnNamespace,
+  "comb.presence": operatorOrUser,
   "page.delete.any": leadOrResourceOwner,
   "app.manage": anyAuthenticated,
   "app.use": anyAuthenticated,
@@ -202,4 +332,7 @@ export const LEGACY_POLICY = {
   "script.api.update": leadOnly,
   "script.api.rotate": leadOnly,
   "script.api.delete": leadOnly,
+  "extension.write": extensionWrite,
+  "extension.activate": extensionActivation,
+  "extension.install.inline": leadOrOperatorOrUser,
 } as const satisfies Record<PermissionVerb, LegacyRule>;

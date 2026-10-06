@@ -6,6 +6,12 @@ React + Vite + shadcn/ui + Tailwind + AG Grid + react-query dashboard for the Ag
 
 Strategic design context lives in [PRODUCT.md](./PRODUCT.md) (register, users, positioning, brand personality, design principles) and the visual system in [DESIGN.md](./DESIGN.md) (tokens, typography, elevation, component doctrine). Read them before designing or restyling any UI surface.
 
+<important if="you are building or changing UI in apps/ui">
+
+Load the `dashboard-ui` maintainer skill ([.claude/internal-skills/dashboard-ui/SKILL.md](../../.claude/internal-skills/dashboard-ui/SKILL.md)): more primitives (`SegmentedControl`, `SecretInput`, `StatusIcon`, ...), autosave, motion and layout recipes, interaction rules, and the verification checklist.
+
+</important>
+
 <important if="you are running the ui dev server, building it, or setting up ui locally">
 
 ## Quick start
@@ -47,6 +53,7 @@ Dev server proxies `/api/*` and `/health` to `http://localhost:3013`.
 ## Data tables (AG Grid)
 
 - **Always use `DataGrid`** from `@/components/shared/data-grid`. **Never** use HTML `<Table>` components for data lists — this is a hard rule.
+- **Phone exception (below `md`):** list pages render `MobileList` + `MobileListRow` from `@/components/shared/mobile-list` instead of the grid, gated with `useIsMobile()`. Keep the `DataGrid` from `md` up, and share filtering and search logic between both so a phone finds the same rows as the grid.
 - Page wrapper for grid pages in the main layout: `flex flex-col flex-1 min-h-0 gap-4` (DataGrid fills remaining height).
 - For config-style pages that scroll, set `domLayout="autoHeight"` on the DataGrid.
 - Sizing: `width` for fixed columns, `flex: 1 + minWidth` for stretch. `DataGrid` calls `sizeColumnsToFit()` on grid ready.
@@ -288,8 +295,12 @@ A handful of detail pages are exempt because their identity is an editor or spli
 
 <important if="you are preparing a PR that touches ui/, or running automated UI tests against ui">
 
-## qa-use & PR screenshot requirement
+## agent-browser & PR screenshot and recording requirement
 
-Use `qa-use` for browser automation: `/qa-use:test-run`, `/qa-use:verify`, `/qa-use:explore`. Any PR touching `ui/` MUST include a `qa-use` session with screenshots of the changes running locally — enforced by the merge gate. Port-conflict handling: [../LOCAL_TESTING.md § Dashboard UI](../LOCAL_TESTING.md#dashboard-ui).
+Use the `agent-browser` skill for browser automation commands. Never `qa-use` unless explicitly asked. Any PR touching `ui/` MUST include screenshots of the changes running locally (including static/layout changes) and a recording for interaction/flow changes (navigation, form, modal, drag, animation, or multi-step flow), uploaded to agent-fs with signed URLs in the PR body. This is a reviewer convention; no CI job enforces it. Recipe: [LOCAL_TESTING.md § When you need to verify a UI change](../../LOCAL_TESTING.md#when-you-need-to-verify-a-ui-change). Port-conflict handling: [LOCAL_TESTING.md § Dashboard UI](../../LOCAL_TESTING.md#dashboard-ui).
+
+## UI E2E
+
+`bun run e2e:ui` (repo root) runs the Playwright suite in `packages/ui-e2e` against a seeded API per worker. Package layout, fixtures, and the seed manifest: [../../packages/ui-e2e/README.md](../../packages/ui-e2e/README.md). Selectors use roles, accessible names, and link or row text (`getByRole`, `getByText`). Tasks, Pages, and Settings carry no `data-testid`; add one only on purpose, never as a shortcut. When a change moves a sidebar route or renames a control, update `packages/ui-e2e/specs/routes.ts` or the flow spec in the same PR.
 
 </important>

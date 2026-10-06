@@ -13,6 +13,8 @@ const registry: Registry = {
     ["claude-tier", { id: "claude-tier", provider: "claude", modelTier: "regular" }],
     // Bare-alias config model (the real claude-haiku catalog entry shape).
     ["claude-haiku", { id: "claude-haiku", provider: "claude", model: "haiku" }],
+    // Moving-alias config (the converted claude-opus entry shape).
+    ["claude-opus", { id: "claude-opus", provider: "claude", modelAlias: "latest:anthropic/opus" }],
   ]),
 };
 
@@ -497,6 +499,23 @@ describe("buildAnalytics — claude alias resolution (v7 §8)", () => {
     expect(res.vendors!.map((v) => v.group)).toEqual(["anthropic"]);
   });
 
+  test("resolved_model and the run pin win; old alias-config rows fall back to the alias map", () => {
+    const res = buildAnalytics(
+      [
+        row({ configId: "claude-opus", resolvedModel: "claude-opus-5-5", tokenModel: "opus" }),
+        row({ configId: "claude-opus", pinnedModel: "claude-opus-5-5" }),
+        row({ configId: "claude-opus" }), // pre-pinning row → "opus" → alias map
+      ],
+      registry,
+      ALIASES,
+    );
+    expect(res.models.map((m) => [m.model, m.attempts]).sort()).toEqual([
+      ["claude-opus-4-8", 1],
+      ["claude-opus-5-5", 2],
+    ]);
+    expect(res.matrix[0]?.models).toEqual(["claude-opus-4-8", "claude-opus-5-5"]);
+  });
+
   test("no alias map (pre-v7 callers) degrades to raw keys", () => {
     const res = buildAnalytics([row({ tokenModel: "fable" })], registry);
     expect(res.models[0]!.model).toBe("fable");
@@ -661,6 +680,7 @@ describe("buildAnalytics — global filter (v7.6 §C3)", () => {
       expect(res.filterOptions).toEqual({
         harnesses: ["pi", "claude", "ghost"],
         configIds: ["pi-deepseek", "claude-haiku", "ghost-config"],
+        efforts: ["default"],
       });
     }
   });
@@ -751,6 +771,7 @@ describe("buildAnalytics — global filter (v7.6 §C3)", () => {
     expect(res.filterOptions).toEqual({
       harnesses: ["pi", "claude", "ghost"],
       configIds: ["pi-deepseek", "claude-haiku", "ghost-config"],
+      efforts: ["default"],
     });
   });
 
@@ -786,5 +807,137 @@ describe("buildAnalytics — no NaN/Infinity anywhere (hard rule)", () => {
       ALIASES,
     );
     expect(nonFinitePaths(res)).toEqual([]);
+  });
+});
+
+describe("buildAnalytics — reasoning effort", () => {
+  const rows = [
+    row({ configId: "claude-haiku", reasoningEffort: "high", score: 1, status: "passed" }),
+    row({ configId: "claude-haiku", reasoningEffort: "high", score: 0.5, status: "failed" }),
+    row({ configId: "claude-haiku", reasoningEffort: "low", score: 0.25, status: "failed" }),
+    row({ configId: "pi-deepseek", reasoningEffort: null, score: 0.75, status: "passed" }),
+    row({ configId: "pi-deepseek", reasoningEffort: "xhigh", score: 1, status: "passed" }),
+  ];
+
+  test("rolls attempts up by effort; attempts without one group as default", () => {
+    const res = buildAnalytics(rows, registry, ALIASES);
+    expect(res.efforts?.map((g) => [g.group, g.attempts])).toEqual([
+      ["high", 2],
+      ["default", 1],
+      ["low", 1],
+      ["xhigh", 1],
+    ]);
+    const high = res.efforts?.find((g) => g.group === "high");
+    expect(high?.configIds).toEqual(["claude-haiku"]);
+    expect(high?.avgScore).toBeCloseTo(0.75);
+    expect(high?.passRate).toBeCloseTo(0.5);
+  });
+
+  test("filter options list efforts low to high with the default last", () => {
+    const res = buildAnalytics(rows, registry, ALIASES);
+    expect(res.filterOptions?.efforts).toEqual(["low", "high", "xhigh", "default"]);
+  });
+
+  test("effort filter re-aggregates every section over the kept rows", () => {
+    const filter = { harnesses: [], configIds: [], efforts: ["high", "default"] };
+    const res = buildAnalytics(rows, registry, ALIASES, filter);
+    expect(res.appliedFilter).toEqual(filter);
+    expect(res.matrix.reduce((acc, c) => acc + c.attempts, 0)).toBe(3);
+    expect(res.efforts?.map((g) => g.group).sort()).toEqual(["default", "high"]);
+    // the option list keeps every effort visible while filtering
+    expect(res.filterOptions?.efforts).toEqual(["low", "high", "xhigh", "default"]);
+  });
+
+  test("model rollups list the efforts their attempts ran at", () => {
+    const res = buildAnalytics(rows, registry, ALIASES);
+    const byEffort = res.models.flatMap((m) => m.efforts ?? []);
+    expect(new Set(byEffort)).toEqual(new Set(["low", "high", "xhigh", "default"]));
+    const haiku = res.models.find((m) => m.configIds.includes("claude-haiku"));
+    expect(haiku?.efforts).toEqual(["low", "high"]);
+  });
+
+  test("an empty efforts filter is no filter", () => {
+    const res = buildAnalytics(rows, registry, ALIASES, {
+      harnesses: [],
+      configIds: [],
+      efforts: [],
+    });
+    expect(res.appliedFilter).toBeNull();
+    expect(res.matrix.reduce((acc, c) => acc + c.attempts, 0)).toBe(5);
+  });
+});
+
+describe("buildAnalytics — agent time (Phase 3)", () => {
+  test("agent time averages and medians over attempts that recorded it; duration stays the total", () => {
+    const res = buildAnalytics(
+      [
+        // boot + seed + judging dominate the total; agent time is the tasks phase only.
+        row({ durationMs: 300_000, agentMs: 60_000 }),
+        row({ durationMs: 200_000, agentMs: 90_000 }),
+        row({ durationMs: 100_000, agentMs: 300_000 }),
+        row({ durationMs: 500_000 }), // old row: no timings -> no agent time, not 0
+      ],
+      registry,
+    );
+    const cell = res.matrix[0]!;
+    expect(cell.avgDurationMs).toBe(275_000);
+    expect(cell.avgAgentMs).toBe(150_000);
+    expect(cell.medianAgentMs).toBe(90_000);
+    const model = res.models[0]!;
+    expect(model.avgAgentMs).toBe(150_000);
+    expect(model.medianAgentMs).toBe(90_000);
+  });
+
+  test("median of an even count is the mean of the middle pair; empty is null, never NaN", () => {
+    const even = buildAnalytics(
+      [row({ agentMs: 10 }), row({ agentMs: 20 }), row({ agentMs: 40 }), row({ agentMs: 1000 })],
+      registry,
+    );
+    expect(even.matrix[0]!.medianAgentMs).toBe(30);
+    const none = buildAnalytics([row({ durationMs: 5 })], registry);
+    expect(none.matrix[0]!.avgAgentMs).toBeNull();
+    expect(none.matrix[0]!.medianAgentMs).toBeNull();
+    expect(nonFinitePaths(none)).toEqual([]);
+  });
+});
+
+describe("buildAnalytics — excluded attempts (Phase 3)", () => {
+  test("a cancelled attempt is not an attempt: not counted, not an error, never graded", () => {
+    const res = buildAnalytics(
+      [
+        row({ status: "passed", score: 1 }),
+        row({ status: "failed", score: 0 }),
+        row({ status: "error", exclusion: "cancelled" }),
+        row({ status: "error", exclusion: "cancelled" }),
+      ],
+      registry,
+    );
+    const cell = res.matrix[0]!;
+    expect(cell.attempts).toBe(2);
+    expect(cell.errors).toBe(0);
+    expect(cell.passRate).toBe(0.5);
+  });
+
+  test("a harness crash stays visible as an error but is excluded from the pass rate and the mean score", () => {
+    const res = buildAnalytics(
+      [
+        row({ status: "passed", score: 1 }),
+        row({ status: "failed", score: 0 }),
+        row({ status: "error", exclusion: "harness-error" }),
+      ],
+      registry,
+    );
+    const cell = res.matrix[0]!;
+    expect(cell.attempts).toBe(3);
+    expect(cell.errors).toBe(1);
+    expect(cell.graded).toBe(2);
+    expect(cell.passRate).toBe(0.5);
+    expect(cell.avgScore).toBe(0.5);
+  });
+
+  test("a config whose every attempt was cancelled leaves the matrix entirely", () => {
+    const res = buildAnalytics([row({ status: "error", exclusion: "cancelled" })], registry);
+    expect(res.matrix).toEqual([]);
+    expect(res.configIds).toEqual([]);
   });
 });

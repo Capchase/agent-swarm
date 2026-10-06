@@ -1,7 +1,10 @@
 import {
+  normalizeAcp,
   normalizeAnthropic,
   normalizeClaudeManaged,
   normalizeCodex,
+  normalizeCursor,
+  normalizeDsh,
   normalizeOpencode,
 } from "./adapters";
 import {
@@ -9,6 +12,7 @@ import {
   isRecord,
   orderDecodedRecords,
   pairItems,
+  resultBlockText,
   resultPayloadText,
 } from "./helpers";
 import type {
@@ -39,11 +43,16 @@ export type {
 type Adapter = (ordered: ReturnType<typeof orderDecodedRecords>) => NormalizedItem[];
 
 const ADAPTERS: Record<string, Adapter> = {
+  acp: normalizeAcp,
   claude: normalizeAnthropic,
   "claude-managed": normalizeClaudeManaged,
   pi: normalizeAnthropic,
   codex: normalizeCodex,
   opencode: normalizeOpencode,
+  dsh: normalizeDsh,
+  // Amp's `--stream-json` is Claude Code-compatible: assistant, user, system and result events.
+  amp: normalizeAnthropic,
+  cursor: normalizeCursor,
 };
 
 export function normalizeSessionLogs(logs: SessionLogRecord[]): TranscriptParseResult {
@@ -128,7 +137,11 @@ function itemToBlock(item: NormalizedItem): ContentBlock | null {
       return metaBlock(item, "parse_error", { raw: item.raw });
     }
     case "unknown": {
-      return metaBlock(item, "unknown", unknownEventData(item.raw));
+      return metaBlock(item, "unknown", {
+        ...unknownEventData(item.raw),
+        status: item.status,
+        durationMs: item.durationMs,
+      });
     }
   }
 }
@@ -215,12 +228,55 @@ function unknownEventData(raw: unknown): Record<string, unknown> {
   if (!isRecord(raw)) return { type: "untyped event", raw };
   const eventType = typeof raw.type === "string" ? raw.type : undefined;
   const nested = isRecord(raw.item) ? raw.item : undefined;
-  const itemType = typeof nested?.type === "string" ? nested.type : undefined;
+  const rawItemType = typeof nested?.type === "string" ? nested.type : undefined;
+  // Codex marks item shapes it doesn't recognize as type "unknown" but keeps the
+  // real name in originalType (and the payload in value) — surface that instead
+  // of the literal "unknown" label.
+  const originalType =
+    rawItemType === "unknown" && typeof nested?.originalType === "string"
+      ? nested.originalType
+      : undefined;
+  const itemType = originalType ?? rawItemType;
   const type =
     eventType && itemType
       ? `${eventType} · ${itemType}`
       : (eventType ?? itemType ?? "untyped event");
-  return { type, eventType, itemType, raw };
+  const detail = originalType
+    ? summarizeCodexUnknownItem(originalType, isRecord(nested?.value) ? nested.value : undefined)
+    : undefined;
+  return { type, eventType, itemType, detail, raw };
+}
+
+function summarizeCodexUnknownItem(
+  originalType: string,
+  value: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!value) return undefined;
+  switch (originalType) {
+    case "userMessage": {
+      return resultBlockText(value.content) || undefined;
+    }
+    case "sleep": {
+      const ms = typeof value.durationMs === "number" ? value.durationMs : undefined;
+      return ms === undefined ? undefined : `sleep ${Math.round(ms / 1000)}s`;
+    }
+    case "imageView": {
+      const path = typeof value.path === "string" ? value.path : undefined;
+      return path ? path.split("/").pop() : undefined;
+    }
+    case "subAgentActivity": {
+      const kind = typeof value.kind === "string" ? value.kind : undefined;
+      const agentPath = typeof value.agentPath === "string" ? value.agentPath : undefined;
+      return [kind, agentPath].filter(Boolean).join(" · ") || undefined;
+    }
+    case "collabAgentToolCall": {
+      const tool = typeof value.tool === "string" ? value.tool : undefined;
+      const status = typeof value.status === "string" ? value.status : undefined;
+      return [tool, status].filter(Boolean).join(" · ") || undefined;
+    }
+    default:
+      return undefined;
+  }
 }
 
 function chooseCli(ordered: ReturnType<typeof orderDecodedRecords>): string {

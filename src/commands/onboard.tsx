@@ -3,8 +3,20 @@ import { Select } from "@inkjs/ui";
 import { Box, Text, useApp, useInput } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import pkg from "../../package.json";
+import { getSlackConfiguration, isSlackConfigured } from "../slack/config.ts";
 import { getApiKey } from "../utils/api-key.ts";
+import {
+  CONTAINER_ENGINE_LABELS,
+  composeCommandText,
+  engineForCommands,
+  isContainerEnginePreference,
+  resolveContainerEnginePreference,
+} from "./onboard/container-engine.ts";
 import { buildOnboardDashboardUrl } from "./onboard/dashboard-url.ts";
+import {
+  parseMaxConcurrentTasks,
+  resolveNonInteractiveProvider,
+} from "./onboard/non-interactive.ts";
 import { getAgentSummary, getPresetById, PRESETS } from "./onboard/presets.ts";
 import { CoreCredentialsStep } from "./onboard/steps/core-credentials.tsx";
 import { CustomTemplatesStep } from "./onboard/steps/custom-templates.tsx";
@@ -26,6 +38,7 @@ import { StartStep } from "./onboard/steps/start.tsx";
 import {
   getStepProgress,
   INITIAL_STATE,
+  isPullPolicy,
   type LogLine,
   nextStep,
   type OnboardProps,
@@ -41,13 +54,42 @@ const BANNER = `   _                    _     ____
 /_/   \\_\\__, |\\___|_| |_|\\__| |____/ \\_/\\_/ \\__,_|_|  |_| |_| |_|
        |___/`;
 
-export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
+export function Onboard({
+  dryRun = false,
+  yes = false,
+  preset,
+  maxConcurrentTasks,
+  pullPolicy,
+  containerEngine,
+}: OnboardProps) {
   const { exit } = useApp();
   const [state, setState] = useState<OnboardState>(() => {
     const initial = { ...INITIAL_STATE };
     if (preset) {
       initial.presetId = preset;
     }
+    const concurrency = parseMaxConcurrentTasks(maxConcurrentTasks);
+    if (!concurrency.ok) {
+      initial.step = "error";
+      initial.error = concurrency.error;
+      return initial;
+    }
+    initial.maxConcurrentTasks = concurrency.value;
+    if (pullPolicy !== undefined) {
+      if (!isPullPolicy(pullPolicy)) {
+        initial.step = "error";
+        initial.error = `Invalid pull policy "${pullPolicy}". Options: always, missing, never`;
+        return initial;
+      }
+      initial.pullPolicy = pullPolicy;
+    }
+    const engine = resolveContainerEnginePreference(containerEngine, process.env);
+    if (!engine.ok) {
+      initial.step = "error";
+      initial.error = engine.error;
+      return initial;
+    }
+    initial.containerEngine = engine.value;
     return initial;
   });
 
@@ -110,7 +152,10 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
   // Exit on done/error
   useEffect(() => {
     if (state.step === "done" || state.step === "error") {
-      const timer = setTimeout(() => exit(), 500);
+      const timer = setTimeout(() => {
+        if (state.step === "error") process.exitCode = 1;
+        exit();
+      }, 500);
       return () => clearTimeout(timer);
     }
   }, [state.step, exit]);
@@ -126,27 +171,26 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
 
     if (!preset) {
       goToError(
-        "--preset is required in non-interactive mode (--yes). Options: dev, content, research, solo",
+        "--preset is required in non-interactive mode (--yes). Options: full, dev, content, research, solo",
       );
       return;
     }
 
-    const selectedPreset = getPresetById(preset);
-    if (!selectedPreset || preset === "custom") {
-      goToError(`Invalid preset "${preset}". Options: dev, content, research, solo`);
-      return;
-    }
-
-    const claudeToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || "";
-    const anthropicKey = process.env.ANTHROPIC_API_KEY || "";
-    if (!claudeToken && !anthropicKey) {
+    const selectedPresetId = preset;
+    const selectedPreset = getPresetById(selectedPresetId);
+    if (!selectedPreset || selectedPresetId === "custom") {
       goToError(
-        "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY environment variable is required in non-interactive mode",
+        `Invalid preset "${selectedPresetId}". Options: full, dev, content, research, solo`,
       );
       return;
     }
 
-    const credentialType = anthropicKey ? "api_key" : "oauth";
+    const providerConfig = resolveNonInteractiveProvider(process.env);
+    if (!providerConfig.ok) {
+      goToError(providerConfig.error);
+      return;
+    }
+
     const apiKey = getApiKey() || crypto.randomBytes(16).toString("hex");
 
     const agentIds: Record<string, string> = {};
@@ -161,9 +205,10 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
       }
     }
 
+    const slackConfig = getSlackConfiguration(process.env);
     const integrations = {
       github: !!process.env.GITHUB_TOKEN,
-      slack: !!process.env.SLACK_BOT_TOKEN,
+      slack: isSlackConfigured(process.env),
       gitlab: !!process.env.GITLAB_TOKEN,
       sentry: !!process.env.SENTRY_AUTH_TOKEN,
     };
@@ -171,7 +216,9 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
     addLog(
       `Preset: ${selectedPreset.name} (${selectedPreset.services.reduce((s, e) => s + e.count, 0)} agents)`,
     );
-    addLog(`Harness: claude (${credentialType === "api_key" ? "API key" : "OAuth token"})`);
+    addLog(
+      `Provider: ${providerConfig.state.provider} → ${providerConfig.state.harness} (${providerConfig.credentialLabel})`,
+    );
     if (Object.values(integrations).some(Boolean)) {
       const enabled = Object.entries(integrations)
         .filter(([, v]) => v)
@@ -184,10 +231,7 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
       deployType: "local",
       presetId: selectedPreset.id,
       services: selectedPreset.services,
-      harness: "claude",
-      claudeOAuthToken: claudeToken,
-      anthropicApiKey: anthropicKey,
-      credentialType,
+      ...providerConfig.state,
       apiKey,
       agentIds,
       integrations,
@@ -196,6 +240,8 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
       githubName: process.env.GITHUB_NAME || "",
       slackBotToken: process.env.SLACK_BOT_TOKEN || "",
       slackAppToken: process.env.SLACK_APP_TOKEN || "",
+      slackSigningSecret: process.env.SLACK_SIGNING_SECRET || "",
+      slackMode: slackConfig.mode ?? "socket",
       gitlabToken: process.env.GITLAB_TOKEN || "",
       gitlabEmail: process.env.GITLAB_EMAIL || "",
       sentryToken: process.env.SENTRY_AUTH_TOKEN || "",
@@ -280,8 +326,14 @@ export function Onboard({ dryRun = false, yes = false, preset }: OnboardProps) {
           </Box>
           <Box marginTop={1} flexDirection="column">
             <Text bold>Useful commands:</Text>
-            <Text dimColor> docker compose logs -f</Text>
-            <Text dimColor> docker compose down</Text>
+            <Text dimColor>
+              {" "}
+              {composeCommandText(engineForCommands(state.containerEngine), "logs -f")}
+            </Text>
+            <Text dimColor>
+              {" "}
+              {composeCommandText(engineForCommands(state.containerEngine), "down")}
+            </Text>
             <Text dimColor> agent-swarm setup</Text>
           </Box>
         </Box>
@@ -310,8 +362,22 @@ function renderStep(step: OnboardStep, props: StepProps) {
           <Text bold>How would you like to deploy your swarm?</Text>
           <Box marginTop={1}>
             <Select
-              options={[{ label: "Local (Docker Compose)", value: "local" }]}
-              onChange={() => props.goToNext({ deployType: "local" })}
+              defaultValue={props.state.containerEngine}
+              options={[
+                {
+                  label: "Local, auto-detect engine (Docker if installed, else Podman)",
+                  value: "auto",
+                },
+                { label: `Local (${CONTAINER_ENGINE_LABELS.docker} Compose)`, value: "docker" },
+                {
+                  label: `Local (${CONTAINER_ENGINE_LABELS.podman} Compose, rootless)`,
+                  value: "podman",
+                },
+              ]}
+              onChange={(value) => {
+                if (!isContainerEnginePreference(value)) return;
+                props.goToNext({ deployType: "local", containerEngine: value });
+              }}
             />
           </Box>
           <Text dimColor>Remote (SSH) — Coming soon</Text>

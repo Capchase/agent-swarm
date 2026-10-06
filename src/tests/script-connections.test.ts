@@ -19,6 +19,9 @@ import { buildScriptCredentialBindings } from "../be/script-credential-broker";
 import { typecheckScript } from "../be/scripts/typecheck";
 import { runScript } from "../scripts-runtime/loader";
 import { registerScriptConnectionsTool } from "../tools/script-connections";
+import { SKIP_SANDBOX_SPAWN_TESTS } from "./sandbox-spawn-test-helpers";
+
+const skip = test.skipIf(SKIP_SANDBOX_SPAWN_TESTS);
 
 const createdBindingIds: string[] = [];
 const createdConnectionIds: string[] = [];
@@ -253,7 +256,7 @@ function serveOpenapiSpec(initialBody: string, initialEtag = '"v1"') {
 }
 
 beforeEach(() => {
-  process.env.AGENT_SWARM_API_KEY = "script-connections-test-key";
+  process.env.AGENT_SWARM_API_KEY = "example-script-connections-test-key";
   delete process.env.API_KEY;
   process.env.MCP_BASE_URL = "http://localhost:3013";
   setOpenapiSpecFetchForTesting(fixtureOpenapiFetch);
@@ -551,6 +554,56 @@ describe("script connections", () => {
       // 136 alters agent_tasks, which this migration-112-only fixture only creates partially.
       markMigrationApplied(database, "136_task_requester_provenance.sql");
       markMigrationApplied(database, "137_memory_retrieval_composite_index.sql");
+      // 140 rebuilds approval_requests, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "140_approval_request_cancelled_status.sql");
+      // 141 alters scheduled_tasks and 142 alters workflows, neither of which
+      // this migration-112-only fixture creates.
+      markMigrationApplied(database, "141_scheduled_task_automation_preflight.sql");
+      markMigrationApplied(database, "142_workflow_automation_preflight.sql");
+      // 143 backfills pricing, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "143_backfill_gpt_6_astra_pricing.sql");
+      // 147 alters scheduled_tasks, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "147_scheduled_tasks_parent_task.sql");
+      // 148 rebuilds pages, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "148_pages_svg.sql");
+      // 151 repairs scheduled_tasks, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "151_repair_scheduled_task_required_params.sql");
+      // 152 indexes task routing context absent from this migration-112-only fixture.
+      markMigrationApplied(database, "152_routing_decisions.sql");
+      // 156 alters inbox_item_state, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "156_inbox_item_state_read_at.sql");
+      // 157 alters scheduled_tasks and slack_messages, neither of which this
+      // migration-112-only fixture creates.
+      markMigrationApplied(database, "157_defer_provenance_and_marker.sql");
+      // 164 indexes agent_tasks columns and alters api_key_status, neither of
+      // which this migration-112-only fixture creates.
+      markMigrationApplied(database, "164_usage_cover_index_and_key_plans.sql");
+      markMigrationApplied(database, "166_approval_request_auto_cancellation.sql");
+      // 171 alters memory_retrieval, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "171_memory_retrieval_relevance.sql");
+      // 175 indexes workflow_runs, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "175_workflow_runs_list_index.sql");
+      // 177 indexes events, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "177_events_event_agent_created_index.sql");
+      // 182 alters agent_tasks, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "182_task_human_free_flag.sql");
+      // 184 alters agents and agent_tasks, which this migration-112-only fixture
+      // does not create.
+      markMigrationApplied(database, "184_model_catalog.sql");
+      // 186 alters api_key_status, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "186_api_key_seat_mismatch.sql");
+      // 185 alters api_key_status, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "185_api_key_auth_failures.sql");
+      // 190 alters memory_rating, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "190_memory_rating_model.sql");
+      // 194 cleans agent_memory, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "194_memory_orphan_chunks.sql");
+      // 191 indexes context_versions, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "191_context_versions_previous_index.sql");
+      // 192 rebuilds user_favorites, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "192_favorites_agent_fs_path.sql");
+      // 195 alters approval_requests, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "195_approval_request_approvals.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
@@ -1172,7 +1225,7 @@ describe("script connections", () => {
     createdBindingIds.push(bindingRow!.id);
   });
 
-  test("ctx.api runtime emits plain fetch with credential placeholders", async () => {
+  skip("ctx.api runtime emits plain fetch with credential placeholders", async () => {
     let observed: { url: string; authorization: string | null } | null = null;
     const server = Bun.serve({
       port: 0,

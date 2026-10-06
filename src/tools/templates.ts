@@ -111,6 +111,25 @@ Continue your work based on the human's input.`,
 });
 
 registerTemplate({
+  eventType: "hitl.timeout",
+  header: "",
+  defaultBody: `Your approval request ({{request_id}}) timed out with no answer.
+
+Title: {{title}}
+Deadline: {{expires_at}}
+Reason: {{reason}}
+
+No human responded before the deadline. Decide how to continue without this input.`,
+  variables: [
+    { name: "request_id", description: "The approval request ID" },
+    { name: "title", description: "Title of the approval request" },
+    { name: "expires_at", description: "The deadline that passed, ISO 8601" },
+    { name: "reason", description: "The resolutionReason stored on the request" },
+  ],
+  category: "task_lifecycle",
+});
+
+registerTemplate({
   eventType: "task.worker.failed",
   header: "",
   defaultBody: `Worker task failed \u2014 action needed.
@@ -197,6 +216,8 @@ Use the crashed agent's identity above as context for who was on it and what kin
 
 Dispatch via \`send-task\` with ALL of:
 - an explicit \`agentId\` (the chosen worker) — REQUIRED. If you omit it, \`send-task\` auto-routes to the original task's agent, which is the dead worker, and the work re-strands.
+- \`routingReason: "reroute_fault"\`
+- \`routingNote\`: explain why this worker is the right recovery target (at least 10 characters after trim, maximum 200)
 - \`taskType: "resume"\`
 - the tag \`resume-generation:{{generation_next}}\`
 - \`parentTaskId: {{original_task_id}}\`
@@ -251,7 +272,7 @@ Required capabilities: {{required_capabilities}}{{artifacts_block}}
 
 This task has been sitting unassigned because no currently-registered agent matches its required role/capabilities. Pick an agent to take this work over and RE-DELEGATE it — do NOT execute it yourself.
 
-Dispatch via \`send-task\` with an explicit \`agentId\` (REQUIRED — omitting it re-pools the work under the same affinity tag and it will starve again) and \`parentTaskId: {{original_task_id}}\`.
+Dispatch via \`send-task\` with an explicit \`agentId\` (REQUIRED — omitting it re-pools the work under the same affinity tag and it will starve again), \`routingReason: "overflow"\`, a \`routingNote\` explaining the worker choice (at least 10 characters after trim, maximum 200), and \`parentTaskId: {{original_task_id}}\`.
 
 This work will NOT fall back to the unassigned pool — you are the only re-delegation path.`,
   variables: [

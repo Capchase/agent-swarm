@@ -1,3 +1,6 @@
+import type { SlackMode } from "../../slack/config";
+import type { ContainerEnginePreference } from "./container-engine.ts";
+
 export type OnboardStep =
   | "welcome"
   | "deploy_type"
@@ -28,15 +31,44 @@ export interface LogLine {
   text: string;
 }
 
+export type InstallProvider = "claude" | "openai" | "openrouter" | "bedrock";
+export type HarnessProvider = "claude" | "codex" | "pi" | "opencode";
+
+export const PROVIDER_HARNESS: Record<InstallProvider, HarnessProvider> = {
+  claude: "claude",
+  openai: "codex",
+  openrouter: "pi",
+  bedrock: "pi",
+};
+
+export const PROVIDER_LABELS: Record<InstallProvider, string> = {
+  claude: "Claude Code",
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  bedrock: "AWS Bedrock (alpha)",
+};
+
+export const BEDROCK_ALPHA_NOTICE =
+  "Alpha: session summaries, memory rating, spend tracking and model tiers may be missing on Bedrock.";
+
 export interface OnboardState {
   step: OnboardStep;
   deployType: "local" | "remote";
   presetId: string | null;
   services: ServiceEntry[];
-  harness: "claude" | "pi";
+  provider: InstallProvider;
+  harness: HarnessProvider;
   claudeOAuthToken: string;
   anthropicApiKey: string;
   credentialType: "oauth" | "api_key";
+  openaiApiKey: string;
+  openrouterApiKey: string;
+  modelOverride: string;
+  awsRegion: string;
+  awsAccessKeyId: string;
+  awsSecretAccessKey: string;
+  awsSessionToken: string;
+  awsProfile: string;
   apiKey: string;
   agentIds: Record<string, string>;
   integrations: {
@@ -50,11 +82,17 @@ export interface OnboardState {
   githubName: string;
   slackBotToken: string;
   slackAppToken: string;
+  slackSigningSecret: string;
+  slackMode: SlackMode;
   gitlabToken: string;
   gitlabEmail: string;
   sentryToken: string;
   sentryOrg: string;
   apiPort: number;
+  maxConcurrentTasks: number | null;
+  pullPolicy: PullPolicy;
+  /** `auto` until the prereq check resolves it to the engine that passed. */
+  containerEngine: ContainerEnginePreference;
   outputDir: string;
   nonInteractive: boolean;
   error: string | null;
@@ -73,6 +111,15 @@ export interface OnboardProps {
   dryRun?: boolean;
   yes?: boolean;
   preset?: string;
+  maxConcurrentTasks?: string;
+  pullPolicy?: string;
+  containerEngine?: string;
+}
+
+export type PullPolicy = "always" | "missing" | "never";
+
+export function isPullPolicy(value: string): value is PullPolicy {
+  return value === "always" || value === "missing" || value === "never";
 }
 
 export interface StepProps {
@@ -94,7 +141,7 @@ export const STEP_LABELS: { step: OnboardStep; label: string }[] = [
   { step: "integration_menu", label: "Integrations" },
   { step: "review", label: "Review" },
   { step: "generate", label: "Generate" },
-  { step: "prereq_check", label: "Docker" },
+  { step: "prereq_check", label: "Engine" },
   { step: "start", label: "Start" },
   { step: "health_check", label: "Health" },
   { step: "post_connect", label: "Connect" },
@@ -132,10 +179,19 @@ export const INITIAL_STATE: OnboardState = {
   deployType: "local",
   presetId: null,
   services: [],
+  provider: "claude",
   harness: "claude",
   claudeOAuthToken: "",
   anthropicApiKey: "",
   credentialType: "oauth",
+  openaiApiKey: "",
+  openrouterApiKey: "",
+  modelOverride: "",
+  awsRegion: "",
+  awsAccessKeyId: "",
+  awsSecretAccessKey: "",
+  awsSessionToken: "",
+  awsProfile: "",
   apiKey: "",
   agentIds: {},
   integrations: { github: false, slack: false, gitlab: false, sentry: false },
@@ -144,11 +200,16 @@ export const INITIAL_STATE: OnboardState = {
   githubName: "",
   slackBotToken: "",
   slackAppToken: "",
+  slackSigningSecret: "",
+  slackMode: "socket",
   gitlabToken: "",
   gitlabEmail: "",
   sentryToken: "",
   sentryOrg: "",
   apiPort: 0,
+  maxConcurrentTasks: null,
+  pullPolicy: "always",
+  containerEngine: "auto",
   outputDir: process.cwd(),
   nonInteractive: false,
   error: null,
@@ -237,7 +298,7 @@ export function nextStep(current: OnboardStep, state: OnboardState): OnboardStep
       return "generate";
 
     case "prereq_check":
-      // If Docker is missing and user chose "files only", skip to done
+      // If the container engine is missing and user chose "files only", skip to done
       // Default: proceed to start
       return "start";
 

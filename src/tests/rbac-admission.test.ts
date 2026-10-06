@@ -22,11 +22,11 @@ import { handleFs } from "../http/fs";
 import { handleMcpOAuth } from "../http/mcp-oauth";
 import { handleTasks } from "../http/tasks";
 import { getPathSegments, parseQueryParams } from "../http/utils";
-import { decideAdmission, decideToolAdmission, type PermissionVerb } from "../rbac";
+import { decideAdmission, decideToolAdmission, isRbacEnabled, type PermissionVerb } from "../rbac";
 import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-rbac-admission.sqlite";
-const API_KEY = "test-api-key";
+const API_KEY = "example-test-api-key";
 const LEAD_ID = "aaaa7000-0000-4000-8000-000000000001";
 const ACTOR: IdentityActor = { kind: "operator", id: "op:test" };
 const MISSING_TASK_ID = "00000000-0000-4000-8000-000000000000";
@@ -149,7 +149,7 @@ beforeEach(async () => {
   closeDb();
   await removeDbFiles();
 
-  delete process.env.RBAC_ENABLED;
+  process.env.RBAC_ENABLED = "false";
   delete process.env.RBAC_AUDIT_DISABLED;
   delete process.env.RBAC_AUDIT_RETENTION_DAYS;
 
@@ -387,7 +387,7 @@ describe("handleCore admission wiring", () => {
     expect(admin.status).not.toBe(403);
     expect(admin.status).toBe(404);
 
-    delete process.env.RBAC_ENABLED;
+    process.env.RBAC_ENABLED = "false";
 
     const flagOff = await api(port, "GET", "/api/mcp-oauth/missing-server/authorize-url", {
       bearer: requesterToken,
@@ -481,4 +481,19 @@ describe("handleCore admission wiring", () => {
       source: "http",
     });
   });
+});
+
+test("RBAC defaults on and accepts explicit opt-outs", () => {
+  const previous = process.env.RBAC_ENABLED;
+  try {
+    delete process.env.RBAC_ENABLED;
+    expect(isRbacEnabled()).toBe(true);
+    for (const value of ["false", "0"]) {
+      process.env.RBAC_ENABLED = value;
+      expect(isRbacEnabled()).toBe(false);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.RBAC_ENABLED;
+    else process.env.RBAC_ENABLED = previous;
+  }
 });

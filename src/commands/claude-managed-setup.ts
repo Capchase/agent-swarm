@@ -12,7 +12,7 @@
  *
  * SDK shape note: the plan's spec referred to `skill_id` / `content_md` field
  * names, but the actual `@anthropic-ai/sdk` `client.beta.skills.create`
- * accepts `{ display_title?, files: Array<Uploadable> }` and returns a
+ * accepts `{ display_name?, files: Array<Uploadable> }` and returns a
  * response object with `id` (the field used as `skill_id` when later
  * referencing the skill from an agent definition via
  * `BetaManagedAgentsCustomSkillParams`). The MCP-server param shape is
@@ -22,7 +22,7 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import Anthropic, { BadRequestError, ConflictError } from "@anthropic-ai/sdk";
+import Anthropic, { ConflictError } from "@anthropic-ai/sdk";
 import type {
   AgentCreateParams,
   BetaManagedAgentsAgent,
@@ -30,9 +30,11 @@ import type {
   BetaManagedAgentsURLMCPServerParams,
 } from "@anthropic-ai/sdk/resources/beta/agents";
 import type { BetaEnvironment } from "@anthropic-ai/sdk/resources/beta/environments";
-import type { SkillCreateResponse } from "@anthropic-ai/sdk/resources/beta/skills";
+import type { BetaSkill } from "@anthropic-ai/sdk/resources/beta/skills";
 import { toFile } from "@anthropic-ai/sdk/uploads";
 
+import { buildSkillContent, type SkillTemplateConfig } from "../be/seed-skills/render";
+import { DEFAULT_MODEL_TIER_MAP } from "../types";
 import { getApiKey } from "../utils/api-key";
 import { promptHiddenInput } from "./codex-login.js";
 
@@ -64,9 +66,21 @@ export type ClaudeManagedSetupResult = {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const DEFAULT_AGENT_MODEL = "claude-sonnet-5";
+/** The claude-managed `regular` tier default — no per-model constant here. */
+const DEFAULT_AGENT_MODEL = DEFAULT_MODEL_TIER_MAP["claude-managed"].regular;
 const SKILLS_DIR_RELATIVE = "plugin/commands";
-const SKILLS_BETA_HEADER = "skills-2025-10-02";
+const SEEDED_SKILLS_DIR_RELATIVE = "templates/skills";
+
+/**
+ * Seeded skills that must also ship in the managed-agent definition.
+ *
+ * The runner opens every assigned task with `/work-on-task` and every offered
+ * task with `/review-offered-task`. Both live in `templates/skills/` and reach
+ * a normal worker through the DB → filesystem sync. Managed agents run in
+ * Anthropic's sandbox with no entrypoint sync, so they only ever see skills
+ * uploaded here.
+ */
+const SEEDED_SKILLS_TO_UPLOAD = ["work-on-task", "review-offered-task"];
 
 // Config keys persisted to `swarm_config`. The docker-entrypoint hydrates env
 // vars from these on worker boot.
@@ -116,7 +130,8 @@ Options:
 
 This command:
   1. Creates an Anthropic-side environment (cloud, unrestricted networking).
-  2. Uploads each plugin/commands/*.md as a managed-agents skill (skips on 409).
+  2. Uploads each plugin/commands/*.md plus the turn-prompt skills under
+     templates/skills/ as managed-agents skills (skips on 409).
   3. Creates a managed-agents agent referencing the uploaded skills + the
      swarm MCP server (MCP_BASE_URL/mcp).
   4. Persists the resulting IDs to swarm_config (managed_agent_id,
@@ -190,7 +205,7 @@ async function upsertConfig(
 // ─── Skills upload helpers ───────────────────────────────────────────────────
 
 /**
- * Slug used as the skill's `display_title`. Mirrors the slugs that
+ * Slug used as the skill's `display_name`, and so as the dedupe key on rerun. Mirrors the slugs that
  * `bun run build:pi-skills` generates for the worker-side filesystem layout.
  */
 function skillSlugFromFilename(filename: string): string {
@@ -211,19 +226,39 @@ async function loadSkillFiles(
   return out;
 }
 
+/**
+ * Load `SEEDED_SKILLS_TO_UPLOAD` from `templates/skills/<name>/` and render
+ * each as a SKILL.md, using the same frontmatter renderer the seeder uses.
+ */
+async function loadSeededSkillFiles(
+  templatesDir: string,
+  names: string[] = SEEDED_SKILLS_TO_UPLOAD,
+): Promise<Array<{ slug: string; absPath: string; content: string }>> {
+  const out: Array<{ slug: string; absPath: string; content: string }> = [];
+  for (const name of names) {
+    const dir = path.join(templatesDir, name);
+    const config = JSON.parse(
+      await readFile(path.join(dir, "config.json"), "utf8"),
+    ) as SkillTemplateConfig;
+    const body = await readFile(path.join(dir, "content.md"), "utf8");
+    out.push({ slug: name, absPath: dir, content: buildSkillContent(config, body) });
+  }
+  return out;
+}
+
 async function uploadSkill(
   client: Anthropic,
   slug: string,
   content: string,
   log: (msg: string) => void,
-  existingByTitle?: Map<string, string>,
+  existingByName?: Map<string, string>,
 ): Promise<string | null> {
-  // The SDK's beta.skills.create expects { display_title?, files: Uploadable[] }
+  // The SDK's beta.skills.create expects { display_name?, files: Uploadable[] }
   // and the API requires a SKILL.md at the root of the upload's top-level
   // folder. We name the single file "<slug>/SKILL.md" so each
   // plugin/commands/*.md becomes one skill in its own top-level folder.
-  if (existingByTitle?.has(slug)) {
-    const id = existingByTitle.get(slug)!;
+  if (existingByName?.has(slug)) {
+    const id = existingByName.get(slug)!;
     log(`  · skill "${slug}" already exists — reusing id=${id}`);
     return id;
   }
@@ -231,23 +266,20 @@ async function uploadSkill(
     const file = await toFile(Buffer.from(content, "utf8"), `${slug}/SKILL.md`, {
       type: "text/markdown",
     });
-    const res: SkillCreateResponse = await client.beta.skills.create({
-      display_title: slug,
+    // No `skills-2025-10-02` beta header: with it the API still answers in the
+    // old beta shape (`display_title`), which the SDK types no longer describe.
+    const res: BetaSkill = await client.beta.skills.create({
+      display_name: slug,
       files: [file],
-      betas: [SKILLS_BETA_HEADER],
     });
     log(`  + uploaded skill "${slug}" (id=${res.id})`);
     return res.id;
   } catch (err) {
-    // The API returns 400 (not 409) when display_title is reused. Both shapes
-    // are treated as "already exists" — caller pre-fetched the skill list to
-    // recover the id, but we may still race a concurrent upload. Surface the
-    // raw error if we can't recover.
-    const isDisplayTitleConflict =
-      err instanceof BadRequestError &&
-      typeof err.message === "string" &&
-      err.message.includes("display_title");
-    if (err instanceof ConflictError || isDisplayTitleConflict) {
+    // `display_name` is not unique, so reusing a name no longer fails (the
+    // old beta API answered 400 on a `display_title` collision). The caller's
+    // pre-fetched name index is the dedupe guard; a 409 is still treated as
+    // "already exists". Surface any other error.
+    if (err instanceof ConflictError) {
       log(`  · skill "${slug}" already exists (server-side) — skipping`);
       return null;
     }
@@ -438,8 +470,10 @@ export type RunClaudeManagedSetupDeps = {
   fetchConfig?: typeof fetchConfigByKey;
   upsert?: typeof upsertConfig;
   loadSkills?: typeof loadSkillFiles;
+  loadSeededSkills?: typeof loadSeededSkillFiles;
   uploadOne?: typeof uploadSkill;
   skillsDir?: string;
+  seededSkillsDir?: string;
   log?: (msg: string) => void;
 };
 
@@ -459,8 +493,11 @@ export async function runClaudeManagedSetupFlow(
   const fetchCfg = deps.fetchConfig ?? fetchConfigByKey;
   const upsert = deps.upsert ?? upsertConfig;
   const loadSkills = deps.loadSkills ?? loadSkillFiles;
+  const loadSeededSkills = deps.loadSeededSkills ?? loadSeededSkillFiles;
   const uploadOne = deps.uploadOne ?? uploadSkill;
   const skillsDir = deps.skillsDir ?? path.resolve(process.cwd(), SKILLS_DIR_RELATIVE);
+  const seededSkillsDir =
+    deps.seededSkillsDir ?? path.resolve(process.cwd(), SEEDED_SKILLS_DIR_RELATIVE);
 
   // Idempotency check: if an agent ID is already persisted, short-circuit
   // unless --force was passed.
@@ -495,19 +532,28 @@ export async function runClaudeManagedSetupFlow(
   log(`  + environment id=${env.id}`);
 
   // 2. Upload skills.
-  log(`Uploading skills from ${skillsDir} ...`);
-  const skillFiles = await loadSkills(skillsDir);
+  log(`Uploading skills from ${skillsDir} and ${seededSkillsDir} ...`);
+  const skillFiles = [
+    ...(await loadSkills(skillsDir)),
+    ...(await loadSeededSkills(seededSkillsDir)),
+  ];
   log(`  found ${skillFiles.length} skill markdown file(s)`);
   // Pre-fetch existing custom skills so we can reuse their IDs on rerun. The
-  // API returns 400 (not 409) on display_title collision and skill IDs aren't
-  // surfaced from that error, so the only recovery is to look them up.
-  const existingByTitle = new Map<string, string>();
+  // Skills API does not enforce unique `display_name`s, so a create never
+  // fails on reuse: this lookup is the only thing that stops a rerun from
+  // uploading a duplicate of every skill. Setup always sets `display_name` to
+  // the slug, so the slug is the dedupe key. If earlier runs left several
+  // skills under one name, reuse the most recently updated one.
+  const existingByName = new Map<string, string>();
+  const existingUpdatedAt = new Map<string, number>();
   try {
-    for await (const sk of client.beta.skills.list({
-      source: "custom",
-      betas: [SKILLS_BETA_HEADER],
-    })) {
-      if (sk.display_title) existingByTitle.set(sk.display_title, sk.id);
+    for await (const sk of client.beta.skills.list({ source: "custom" })) {
+      const updatedAt = Date.parse(sk.updated_at);
+      const seen = existingUpdatedAt.get(sk.display_name);
+      if (seen === undefined || updatedAt > seen) {
+        existingByName.set(sk.display_name, sk.id);
+        existingUpdatedAt.set(sk.display_name, updatedAt);
+      }
     }
   } catch (err) {
     log(`  · could not list existing skills (${(err as Error).message}); proceeding anyway`);
@@ -516,8 +562,8 @@ export async function runClaudeManagedSetupFlow(
   let reused = 0;
   let created = 0;
   for (const skill of skillFiles) {
-    const wasExisting = existingByTitle.has(skill.slug);
-    const id = await uploadOne(client, skill.slug, skill.content, log, existingByTitle);
+    const wasExisting = existingByName.has(skill.slug);
+    const id = await uploadOne(client, skill.slug, skill.content, log, existingByName);
     if (id) {
       skillIds.push(id);
       if (wasExisting) reused++;

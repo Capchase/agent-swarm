@@ -20,7 +20,10 @@ agent its own `AGENT_ID`. Multi-runtime mode does not synchronize arbitrary
 files between containers and does not turn separate workers into isolated
 agents.
 
-## Enable it in this order
+## Upgrade existing deployments
+
+Multi-runtime is enabled by default for fresh deployments. Set
+`MULTI_RUNTIME_ENABLED=false` explicitly while upgrading older workers.
 
 Update every worker that will serve the agent before enabling the flag on the
 API server:
@@ -39,6 +42,13 @@ Once the flag is on, registration without a runtime identity returns `400`, and
 the worker rollout must finish first. An old worker can otherwise fail to
 register on its next reconnect, and its anonymous shutdown cannot take the
 legacy agent-wide close path.
+
+Authenticated clients can read `multiRuntimeEnabled` from `GET /api/stats` to
+check the effective server setting. Use this field before interpreting an empty
+runtime-instance list: it distinguishes "the feature is off" from "the feature
+is on, but no runtime has registered yet." The value is evaluated per request,
+so it follows configuration reloads without exposing feature flags on the
+unauthenticated health endpoint.
 
 ### The task-limit seed
 
@@ -95,12 +105,13 @@ Create a `.env` beside the file first:
 API_KEY=replace-with-a-secret
 AGENT_ID=replace-with-one-stable-uuid
 CLAUDE_CODE_OAUTH_TOKEN=replace-with-your-token
+AGENT_SWARM_VERSION=replace-with-a-pinned-release-tag
 ```
 
 ```yaml title="docker-compose.yml"
 services:
   api:
-    image: ghcr.io/desplega-ai/agent-swarm:latest
+    image: ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-latest}
     pull_policy: always
     environment:
       API_KEY: ${API_KEY:?Set API_KEY in .env}
@@ -108,7 +119,7 @@ services:
     ports:
       - "3013:3013"
     volumes:
-      - swarm_api:/app
+      - swarm_api_data:/app/data
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3013/health || exit 1"]
       interval: 10s
@@ -118,7 +129,7 @@ services:
     restart: unless-stopped
 
   worker:
-    image: ghcr.io/desplega-ai/agent-swarm-worker:latest
+    image: ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-latest}
     pull_policy: always
     depends_on:
       api:
@@ -141,7 +152,7 @@ services:
 
 volumes:
   shared_agent_workspace:
-  swarm_api:
+  swarm_api_data:
   swarm_logs:
 ```
 
@@ -151,6 +162,10 @@ Start it with:
 docker compose up -d
 docker compose ps
 ```
+
+Pin `AGENT_SWARM_VERSION` to a release instead of tracking `latest`, and see
+[`upgrade.md`](https://github.com/desplega-ai/agent-swarm/blob/main/skills/agent-swarm/references/upgrade.md)
+before upgrading an existing install.
 
 For a deployment that already has an API, keep the `worker` service and point
 `MCP_BASE_URL` at that API instead. Do not give replicas separate workspace

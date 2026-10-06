@@ -21,8 +21,8 @@ import { getPathSegments, parseQueryParams } from "../http/utils";
 import type { PricingProvider, PricingTokenClass } from "../types";
 import { listenOnFreePort } from "./test-net";
 
-const TEST_DB_PATH = "./test-session-costs-golden.sqlite";
-const API_KEY = "test-session-costs-golden";
+const TEST_DB_PATH = "./example-test-session-costs-golden.sqlite";
+const API_KEY = "example-test-session-costs-golden";
 const RATE_EFFECTIVE_AT = 1_800_000_000_000;
 const FIXTURE_CREATED_AT = RATE_EFFECTIVE_AT + 1;
 const EPSILON = 1e-9;
@@ -314,6 +314,34 @@ describe("Phase 3 — session cost recompute golden fixtures", () => {
     expect(body.cost.costSource).toBe("pricing-table");
     expectExact(body.cost.totalCostUsd, expected);
     expectExact(expected, 0.00228);
+  });
+
+  // Boot-seeded rows only: Cursor's own models have no models.dev entry.
+  test("cursor composer runs price from the seeded Composer rates", async () => {
+    const body = await postCost({
+      sessionId: "cursor-composer",
+      provider: "cursor",
+      model: "composer-2.5",
+      totalCostUsd: 0,
+      inputTokens: 4_198,
+      outputTokens: 22,
+      cacheReadTokens: 3_424,
+    });
+    const expected = (4_198 * 3 + 3_424 * 0.5 + 22 * 15) / 1_000_000;
+
+    expect(body.cost.costSource).toBe("pricing-table");
+    expect(body.cost.totalCostUsd).toBeGreaterThan(0);
+    expectExact(body.cost.totalCostUsd, expected);
+
+    const auto = await postCost({
+      sessionId: "cursor-auto",
+      provider: "cursor",
+      model: "default",
+      totalCostUsd: 0,
+      inputTokens: 1_000,
+      outputTokens: 10,
+    });
+    expect(auto.cost.costSource).toBe("unpriced");
   });
 
   test("legacy cache writes without a TTL split keep the 5m class", async () => {

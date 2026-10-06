@@ -1,6 +1,10 @@
 import { getAaForConfig } from "../configs/aa.ts";
 import { configs } from "../configs/index.ts";
+import { type ScenarioCard, scenarioCard } from "../scenarios/cards.ts";
 import { scenarios } from "../scenarios/index.ts";
+import { SUITE_ID, suiteVersionFor } from "../scenarios/suite.ts";
+import { soloVariantId } from "./baseline.ts";
+import { validateConfigModel } from "./cost/resolve-alias.ts";
 import { normalizeOutcome } from "./normalize-outcome.ts";
 import type { Registry } from "./runner/index.ts";
 import { findDependencyCycles } from "./runner/topo.ts";
@@ -39,6 +43,7 @@ export const WORKER_SPEC_RESERVED_ENV = new Set([
   "AGENT_ID",
   "HARNESS_PROVIDER",
   "MODEL_OVERRIDE",
+  "REASONING_EFFORT_OVERRIDE",
   "MAX_CONCURRENT_TASKS",
   "YOLO",
   "DESPLEGA_TELEMETRY_ENV",
@@ -87,6 +92,22 @@ function validateWorkerSpec(
       errors.push(`${label}.env key "${key}" must match ${ENV_KEY_RE}`);
     } else if (WORKER_SPEC_RESERVED_ENV.has(key)) {
       errors.push(`${label}.env key "${key}" is reserved by the boot path`);
+    }
+  }
+  if (spec.profile !== undefined) {
+    const { role, description, capabilities } = spec.profile;
+    if (role === undefined && description === undefined && capabilities === undefined) {
+      errors.push(`${label}.profile must set role, description or capabilities`);
+    }
+    // The swarm API's profile route caps role at 100 chars.
+    if (role !== undefined && (role.trim().length === 0 || role.length > 100)) {
+      errors.push(`${label}.profile.role must be 1..100 chars`);
+    }
+    if (description !== undefined && description.trim().length === 0) {
+      errors.push(`${label}.profile.description must be non-empty when present`);
+    }
+    if (capabilities?.some((c) => typeof c !== "string" || c.trim().length === 0)) {
+      errors.push(`${label}.profile.capabilities entries must be non-empty strings`);
     }
   }
 }
@@ -188,6 +209,9 @@ function validateDimensions(
 export function validateScenario(s: Scenario): string[] {
   const errors: string[] = [];
   const names = new Set<string>();
+  if (!Number.isInteger(s.version) || s.version < 1) {
+    errors.push(`version must be a positive integer, got ${s.version}`);
+  }
   if (Array.isArray(s.workers)) {
     // WorkerSpec[] shape (v7 §9): 1..MAX entries; identity/env rules per spec.
     if (s.workers.length < 1 || s.workers.length > MAX_WORKERS) {
@@ -254,6 +278,13 @@ export function validateScenario(s: Scenario): string[] {
       `seed.sqlDump "${s.seed.sqlDump}" must be a bare filename ending in .sql (no path separators)`,
     );
   }
+  for (const spec of s.seed?.scripts ?? []) {
+    if (!/^[^/\\]+\.ts$/.test(spec.sourceFile)) {
+      errors.push(
+        `seed.scripts "${spec.name}" sourceFile "${spec.sourceFile}" must be a bare .ts filename`,
+      );
+    }
+  }
   if (s.seed?.memories !== undefined) {
     if (s.seed.memories.length > MAX_SEED_MEMORIES) {
       errors.push(`seed.memories has ${s.seed.memories.length} entries (max ${MAX_SEED_MEMORIES})`);
@@ -263,6 +294,18 @@ export function validateScenario(s: Scenario): string[] {
         errors.push(`seed.memories[${i}] must be a non-empty string`);
       }
     });
+  }
+  s.seed?.workerExec?.forEach((entry, i) => {
+    if (!Number.isInteger(entry.worker) || entry.worker < 0 || entry.worker >= workers) {
+      errors.push(`seed.workerExec[${i}].worker ${entry.worker} out of range [0, ${workers - 1}]`);
+    }
+    if (entry.commands.length === 0) errors.push(`seed.workerExec[${i}].commands is empty`);
+  });
+  if (s.humanInput !== undefined) {
+    if (s.humanInput.reply.trim().length === 0) errors.push("humanInput.reply must be non-empty");
+    // The answer arrives as a hitl-follow-up task; without this the runner
+    // grades as soon as the upfront task ends, before the work resumes.
+    if (!s.awaitSpawnedTasks) errors.push("humanInput requires awaitSpawnedTasks");
   }
   // OutcomeSpec v2 (v8.0): weighted graded dimensions.
   if (s.outcome.dimensions !== undefined) {
@@ -279,6 +322,94 @@ export function validateScenario(s: Scenario): string[] {
   return errors;
 }
 
+/**
+ * Cross-scenario rules for single-agent baselines (plan Q6). A `-solo` variant
+ * is only a fair baseline while it stays in lockstep with its swarm scenario:
+ * one worker and no lead, the same timeout and budgets, the same version, and a
+ * rubric whose every dimension also exists in the swarm rubric at the same
+ * weight (so the comparison in src/baseline.ts scores both on the same
+ * dimensions). Returns violations prefixed by the offending scenario id.
+ */
+export function validateBaselinePairs(all: Scenario[]): string[] {
+  const errors: string[] = [];
+  const byId = new Map(all.map((s) => [s.id, s]));
+  for (const solo of all) {
+    if (solo.baselineOf === undefined) continue;
+    const at = `scenario "${solo.id}"`;
+    const swarm = byId.get(solo.baselineOf);
+    if (!swarm) {
+      errors.push(`${at}: baselineOf "${solo.baselineOf}" is not a registered scenario`);
+      continue;
+    }
+    if (solo.id !== soloVariantId(swarm.id)) {
+      errors.push(`${at}: a baseline of "${swarm.id}" must be named "${soloVariantId(swarm.id)}"`);
+    }
+    if (swarm.baselineOf !== undefined) {
+      errors.push(`${at}: baselineOf "${swarm.id}" is itself a baseline`);
+    }
+    if (swarm.lead === undefined) {
+      errors.push(`${at}: baselineOf "${swarm.id}" has no lead, so it is not a swarm scenario`);
+    }
+    if (solo.lead !== undefined) errors.push(`${at}: a solo baseline must not have a lead`);
+    if (scenarioWorkerCount(solo.workers) !== 1) {
+      errors.push(`${at}: a solo baseline must boot exactly 1 worker`);
+    }
+    if (solo.seed?.workerFailures?.length) {
+      errors.push(`${at}: a solo baseline must not inject worker failures`);
+    }
+    for (const key of ["version", "timeoutMs", "budgetUsd", "budgetMs"] as const) {
+      if (solo[key] !== swarm[key]) {
+        errors.push(
+          `${at}: ${key} ${solo[key]} differs from "${swarm.id}" (${swarm[key]}); a baseline runs at the same budget`,
+        );
+      }
+    }
+    const swarmDims = new Map(normalizeOutcome(swarm.outcome).dimensions.map((d) => [d.name, d]));
+    for (const dim of normalizeOutcome(solo.outcome).dimensions) {
+      const twin = swarmDims.get(dim.name);
+      if (!twin) {
+        errors.push(`${at}: dimension "${dim.name}" does not exist in "${swarm.id}"`);
+      } else if (twin.weight !== dim.weight) {
+        errors.push(
+          `${at}: dimension "${dim.name}" weight ${dim.weight} differs from "${swarm.id}" (${twin.weight})`,
+        );
+      }
+    }
+  }
+  return errors;
+}
+
+/** DB-backed config rows (harness_configs) layered over the code seeds; null = code only. */
+let dbConfigs: { configs: HarnessConfig[]; archivedIds: Set<string> } | null = null;
+
+/**
+ * Install the harness_configs table contents as the config source. The server
+ * calls this at boot and after every POST/PATCH; the CLI never does, so it
+ * keeps using configs/index.ts alone. Rows win over code seeds with the same
+ * id, and archived rows drop out of the registry.
+ */
+export function setDbConfigs(
+  configs: HarnessConfig[] | null,
+  archivedIds: Iterable<string> = [],
+): void {
+  dbConfigs = configs ? { configs, archivedIds: new Set(archivedIds) } : null;
+}
+
+function mergedConfigs(): HarnessConfig[] {
+  if (!dbConfigs) return configs;
+  const byId = new Map(configs.map((c) => [c.id, c]));
+  for (const c of dbConfigs.configs) {
+    // A DB row that no longer validates is skipped, not fatal: one bad edit must not stop the server.
+    if (validateConfigModel(c).length > 0) {
+      console.warn(`[configs] skipping invalid DB config "${c.id}"`);
+      continue;
+    }
+    byId.set(c.id, c);
+  }
+  for (const id of dbConfigs.archivedIds) byId.delete(id);
+  return [...byId.values()];
+}
+
 /** Fail fast at CLI/server startup: aggregate every violation across all scenarios. */
 export function loadRegistry(): Registry {
   const violations: string[] = [];
@@ -287,14 +418,20 @@ export function loadRegistry(): Registry {
       violations.push(`scenario "${scenario.id}": ${error}`);
     }
   }
+  violations.push(...validateBaselinePairs(scenarios));
+  for (const config of configs) {
+    for (const error of validateConfigModel(config)) {
+      violations.push(`config "${config.id}": ${error}`);
+    }
+  }
   if (violations.length > 0) {
     throw new Error(
-      `invalid scenario definitions:\n${violations.map((v) => `  - ${v}`).join("\n")}`,
+      `invalid registry definitions:\n${violations.map((v) => `  - ${v}`).join("\n")}`,
     );
   }
   return {
     scenarios: new Map(scenarios.map((s) => [s.id, s])),
-    configs: new Map(configs.map((c) => [c.id, c])),
+    configs: new Map(mergedConfigs().map((c) => [c.id, c])),
   };
 }
 
@@ -314,6 +451,8 @@ export interface SerializedWorkerSpec {
  */
 export interface SerializedScenario {
   id: string;
+  /** Scenario version (bumped on any prompt, fixture or check change). */
+  version: number;
   name: string;
   description: string | null;
   /** Worker COUNT for either Scenario.workers shape (back-compat). */
@@ -322,6 +461,12 @@ export interface SerializedScenario {
   workerSpecs: SerializedWorkerSpec[] | null;
   /** Null when the scenario defines no lead (v7 §12). */
   lead: SerializedWorkerSpec | null;
+  /** Swarm scenario id this single-agent baseline pairs with (plan Q6); null otherwise. */
+  baselineOf: string | null;
+  /** Plain-English card (summary, what the agent does, how it is scored, tags, changelog); null when none is registered. */
+  card: ScenarioCard | null;
+  /** `swarm-evals@1.0` when this scenario version is in the suite manifest, else null. */
+  suite: string | null;
   tasks: {
     title: string;
     description: string;
@@ -329,7 +474,12 @@ export interface SerializedScenario {
     dependsOn: number[];
     outputSchema?: Record<string, unknown>;
   }[];
-  seed: { exec: string[]; sqlDump: string | null; memories: string[] } | null;
+  seed: {
+    exec: string[];
+    sqlDump: string | null;
+    memories: string[];
+    scripts: string[];
+  } | null;
   timeoutMs: number;
   /** v8.0 §5: cost budget (USD) for the deterministic efficiency dimension; null when unset. */
   budgetUsd: number | null;
@@ -359,18 +509,27 @@ function serializeWorkerSpec(w: WorkerSpec): SerializedWorkerSpec {
 }
 
 export function serializeScenario(s: Scenario): SerializedScenario {
-  const hasSeed = Boolean(s.seed?.exec?.length || s.seed?.sqlDump || s.seed?.memories?.length);
+  const hasSeed = Boolean(
+    s.seed?.exec?.length || s.seed?.sqlDump || s.seed?.memories?.length || s.seed?.scripts?.length,
+  );
   // v8.0: serialize gates/dimensions from the NORMALIZED outcome so the UI sees
   // a consistent view regardless of v1/v2 authoring. The synthetic
   // "tasks-completed" prepend on `checks` stays (the runner injects it).
   const normalized = normalizeOutcome(s.outcome);
   return {
     id: s.id,
+    version: s.version,
     name: s.name,
     description: s.description ?? null,
     workers: scenarioWorkerCount(s.workers),
     workerSpecs: Array.isArray(s.workers) ? s.workers.map(serializeWorkerSpec) : null,
     lead: s.lead ? serializeWorkerSpec(s.lead) : null,
+    baselineOf: s.baselineOf ?? null,
+    card: scenarioCard(s.id),
+    suite:
+      suiteVersionFor(s.id, s.version) === null
+        ? null
+        : `${SUITE_ID}@${suiteVersionFor(s.id, s.version)}`,
     tasks: s.tasks.map((t) => ({
       title: t.title,
       description: t.description,
@@ -382,6 +541,7 @@ export function serializeScenario(s: Scenario): SerializedScenario {
       ? {
           exec: s.seed?.exec ?? [],
           sqlDump: s.seed?.sqlDump ?? null,
+          scripts: (s.seed?.scripts ?? []).map((x) => x.name),
           memories: s.seed?.memories ?? [],
         }
       : null,
@@ -419,7 +579,9 @@ export function serializeConfig(c: HarnessConfig) {
     label: c.label ?? null,
     provider: c.provider,
     model: c.model ?? null,
+    modelAlias: c.modelAlias ?? null,
     modelTier: c.modelTier ?? null,
+    reasoningEffort: c.reasoningEffort ?? null,
     envKeys: c.env ? Object.keys(c.env) : [],
     /** v7.6 item D: AA benchmark block; null = unmatched (UI renders nothing). */
     aa: getAaForConfig(c.id),

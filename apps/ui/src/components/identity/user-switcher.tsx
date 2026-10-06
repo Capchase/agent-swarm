@@ -1,5 +1,5 @@
 /**
- * Sidebar-footer user switcher — surfaces the current identity at the bottom
+ * Sidebar-footer user switcher: surfaces the current identity at the bottom
  * of the app sidebar (always visible, single click to change). Replaces the
  * "you must pick one" modal as a discovery point: users see who they're
  * acting as, and switch / create a new identity from a dropdown.
@@ -51,12 +51,11 @@ export function UserSwitcher() {
   const [newName, setNewName] = useState("");
   const [newEmail, setNewEmail] = useState("");
 
-  // Older API servers (no /api/users) — hide entirely.
+  // Older API servers (no /api/users): hide entirely.
   if (!gate.supported) return null;
 
-  // Token-bound identity (DES-771): attribution is fixed server-side, so the
-  // chip still shows who you are but offers no switching — no dropdown, no
-  // create, nothing clickable.
+  // A deployment user or user-bound token fixes attribution. Show the
+  // identity without a dropdown or create action.
   if (locked) {
     if (!user) return null;
     return (
@@ -102,7 +101,7 @@ export function UserSwitcher() {
             <DropdownMenuTrigger asChild>
               <SidebarMenuButton
                 tooltip={user ? `Acting as ${user.name}` : "Pick identity"}
-                aria-label={user ? `Acting as ${user.name} — click to switch` : "Pick identity"}
+                aria-label={user ? `Acting as ${user.name}. Click to switch.` : "Pick identity"}
               >
                 <span
                   aria-hidden="true"
@@ -148,7 +147,7 @@ export function UserSwitcher() {
                 ))
               ) : (
                 <div className="px-2 py-3 text-xs text-muted-foreground italic">
-                  No users yet — create the first one below.
+                  No users yet. Create the first one below.
                 </div>
               )}
               <DropdownMenuSeparator />

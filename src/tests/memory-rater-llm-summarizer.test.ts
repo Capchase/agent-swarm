@@ -33,7 +33,8 @@ function makeOpenRouterResponse(content: string, init: ResponseInit = { status: 
 describe("getMemoryRaterModel", () => {
   test("returns the default when MEMORY_RATER_MODEL is unset", () => {
     expect(getMemoryRaterModel({})).toBe(DEFAULT_MEMORY_RATER_MODEL);
-    expect(DEFAULT_MEMORY_RATER_MODEL).toBe("google/gemini-3-flash-preview");
+    // The OpenRouter slug of the pinned rater model: one source of truth.
+    expect(DEFAULT_MEMORY_RATER_MODEL).toBe("deepseek/deepseek-v4.1-flash");
   });
 
   test("returns the env override when set", () => {
@@ -113,7 +114,7 @@ describe("runMemoryRater — request shape", () => {
 
     const result = await runMemoryRater({
       prompt: "test prompt",
-      apiKey: "test-api-key-123",
+      apiKey: "example-test-api-key-123",
       fetchImpl: fakeFetch,
     });
 
@@ -125,7 +126,7 @@ describe("runMemoryRater — request shape", () => {
 
     const headers = capturedInit?.headers as Record<string, string>;
     expect(headers["Content-Type"]).toBe("application/json");
-    expect(headers.Authorization).toBe("Bearer test-api-key-123");
+    expect(headers.Authorization).toBe("Bearer example-test-api-key-123");
 
     const body = JSON.parse(String(capturedInit?.body));
     expect(body.model).toBe(DEFAULT_MEMORY_RATER_MODEL);
@@ -151,7 +152,7 @@ describe("runMemoryRater — request shape", () => {
 
       const result = await runMemoryRater({
         prompt: "test prompt",
-        apiKey: "test-api-key-123",
+        apiKey: "example-test-api-key-123",
         fetchImpl: fakeFetch,
       });
 

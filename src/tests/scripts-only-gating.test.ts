@@ -17,6 +17,13 @@ import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-scripts-only-gating.sqlite";
 const SCRIPT_TOOL_NAMES = [
+  "extension-delete",
+  "extension-enable",
+  "extension-disable",
+  "extension-activate-version",
+  "extension-catalog",
+  "extension-install",
+  "extension-list",
   "get-script-run",
   "launch-script-run",
   "list-script-runs",
@@ -193,8 +200,8 @@ beforeEach(async () => {
   await scriptsOnlyEnvQueue;
   savedSlackBotToken = process.env.SLACK_BOT_TOKEN;
   savedSlackAppToken = process.env.SLACK_APP_TOKEN;
-  process.env.SLACK_BOT_TOKEN = "test-bot-token";
-  process.env.SLACK_APP_TOKEN = "test-app-token";
+  process.env.SLACK_BOT_TOKEN = "example-test-bot-token";
+  process.env.SLACK_APP_TOKEN = "example-test-app-token";
   await getDbClient().run("DELETE FROM swarm_config WHERE key = 'SCRIPTS_ONLY_MCP'");
 });
 

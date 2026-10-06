@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { Type } from "typebox";
 import { z } from "zod";
+import { SummaryWithRatingsSchema } from "../../be/memory/raters/llm.js";
 import {
   completeStructured,
+  completeStructuredWithModel,
   defaultSpawnClaudeCli,
 } from "../../utils/internal-ai/complete-structured.js";
 import type { ResolvedCredential } from "../../utils/internal-ai/credentials.js";
+import { summaryToolSchema } from "../../utils/internal-ai/summarize-session.js";
 
 const ResultZodSchema = z.object({
   summary: z.string(),
@@ -51,7 +54,7 @@ describe("completeStructured", () => {
       _credentialOverride: {
         kind: "openrouter",
         apiKey: "test",
-        modelDefault: "openrouter/google/gemini-3-flash-preview",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
       },
       _complete: async () => {
         invocations++;
@@ -67,6 +70,39 @@ describe("completeStructured", () => {
     });
     expect(invocations).toBe(1);
     expect(result).toEqual({ summary: "ok", count: 7 });
+  });
+
+  test("session summary with a blank referencesSource is accepted on the first call", async () => {
+    let invocations = 0;
+    const args = {
+      summary: "learned things",
+      ratings: [
+        { id: "m1", score: 0.9, reasoning: "useful", referencesSource: "linear:DES-1" },
+        { id: "m2", score: 0.1, reasoning: "not used", referencesSource: "" },
+        { id: "m3", score: 0.5, reasoning: "neutral", referencesSource: "   " },
+      ],
+    };
+    const result = await completeStructured({
+      zodSchema: SummaryWithRatingsSchema,
+      toolSchema: summaryToolSchema,
+      toolName: "record_session_summary",
+      toolDescription: "Record the session summary.",
+      systemPrompt: "sys",
+      userPrompt: "user",
+      _credentialOverride: {
+        kind: "openrouter",
+        apiKey: "test",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
+      },
+      _complete: async () => {
+        invocations++;
+        return makeMsg([
+          { type: "toolCall", id: "call_1", name: "record_session_summary", arguments: args },
+        ]);
+      },
+    });
+    expect(invocations).toBe(1);
+    expect(result?.ratings).toHaveLength(3);
   });
 
   for (const { label, text, expected } of [
@@ -98,7 +134,7 @@ describe("completeStructured", () => {
         _credentialOverride: {
           kind: "openrouter",
           apiKey: "test",
-          modelDefault: "openrouter/google/gemini-3-flash-preview",
+          modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
         },
         _complete: async () => {
           invocations++;
@@ -111,18 +147,41 @@ describe("completeStructured", () => {
     });
   }
 
+  test("unknown catalog model returns null without calling complete", async () => {
+    let invocations = 0;
+    const result = await completeStructured({
+      zodSchema: ResultZodSchema,
+      toolSchema: ResultToolSchema,
+      toolName: "record_result",
+      toolDescription: "Record the result.",
+      systemPrompt: "sys",
+      userPrompt: "user",
+      _credentialOverride: {
+        kind: "openai-codex",
+        apiKey: "test",
+        modelDefault: "openai-codex/nonexistent-model",
+      },
+      _complete: async () => {
+        invocations++;
+        return makeMsg([]);
+      },
+    });
+    expect(result).toBeNull();
+    expect(invocations).toBe(0);
+  });
+
   test("passes a provider-compatible forced tool choice", async () => {
     const credentials: ResolvedCredential[] = [
       {
         kind: "openrouter",
         apiKey: "test",
-        modelDefault: "openrouter/google/gemini-3-flash-preview",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
       },
-      { kind: "openai", apiKey: "test", modelDefault: "openai/gpt-5.4-mini" },
+      { kind: "openai", apiKey: "test", modelDefault: "openai/gpt-6-luna" },
       {
         kind: "openai-codex",
         apiKey: "test",
-        modelDefault: "openai-codex/gpt-5.4-mini",
+        modelDefault: "openai-codex/gpt-6-luna",
       },
       {
         kind: "anthropic",
@@ -172,7 +231,7 @@ describe("completeStructured", () => {
       _credentialOverride: {
         kind: "openrouter",
         apiKey: "test",
-        modelDefault: "openrouter/google/gemini-3-flash-preview",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
       },
       _complete: async () => {
         invocations++;
@@ -210,7 +269,7 @@ describe("completeStructured", () => {
         _credentialOverride: {
           kind: "openrouter",
           apiKey: "test",
-          modelDefault: "openrouter/google/gemini-3-flash-preview",
+          modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
         },
         _complete: async () => {
           invocations++;
@@ -241,7 +300,7 @@ describe("completeStructured", () => {
       _credentialOverride: {
         kind: "openrouter",
         apiKey: "test",
-        modelDefault: "openrouter/google/gemini-3-flash-preview",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
       },
       _complete: async () => {
         invocations++;
@@ -313,10 +372,12 @@ describe("completeStructured", () => {
     });
     expect(receivedSchema).toBeDefined();
     const schema = receivedSchema as {
+      $schema: string;
       type: string;
       properties: { summary: { type: string }; count: { type: string } };
       required: string[];
     };
+    expect(schema.$schema).toBe("http://json-schema.org/draft-07/schema#");
     expect(schema.type).toBe("object");
     expect(schema.properties.summary.type).toBe("string");
     expect(schema.properties.count.type).toBe("number");
@@ -347,7 +408,7 @@ describe("completeStructured", () => {
   test("claude-cli exhaustion logs one scrubbed line", async () => {
     const original = console.error;
     const errors: unknown[][] = [];
-    const secret = "sk-proj-abcdefghijklmnopqrstuvwxyz012345";
+    const secret = "example-sk-proj-abcdefghijklmnopqrstuvwxyz012345";
     console.error = (...args: unknown[]) => {
       errors.push(args);
     };
@@ -372,7 +433,7 @@ describe("completeStructured", () => {
       expect(errors[0]).toHaveLength(1);
       expect(errors[0]?.[0]).toBeString();
       expect(errors[0]?.[0]).toContain("callerTag=session-summary:test kind=claude-cli");
-      expect(errors[0]?.[0]).toContain("provider failed with [REDACTED:");
+      expect(errors[0]?.[0]).toContain("provider failed with example-[REDACTED:");
       expect(errors[0]?.[0]).not.toContain(secret);
     } finally {
       console.error = original;
@@ -416,7 +477,7 @@ describe("completeStructured", () => {
         _credentialOverride: {
           kind: "openrouter",
           apiKey: "test",
-          modelDefault: "openrouter/google/gemini-3-flash-preview",
+          modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
         },
         _complete: async () =>
           makeMsg([
@@ -466,5 +527,63 @@ describe("defaultSpawnClaudeCli", () => {
       if (savedBridge !== undefined) process.env.SWARM_USE_CLAUDE_BRIDGE = savedBridge;
       await Bun.$`rm -f ${fakeBinary}`.quiet();
     }
+  });
+});
+
+describe("completeStructuredWithModel", () => {
+  const baseOpts = {
+    zodSchema: ResultZodSchema,
+    toolSchema: ResultToolSchema,
+    toolName: "record_result",
+    toolDescription: "Record the result.",
+    systemPrompt: "sys",
+    userPrompt: "user",
+  };
+
+  test("pi-ai path: reports the credential's resolved model next to the data", async () => {
+    const result = await completeStructuredWithModel({
+      ...baseOpts,
+      _credentialOverride: {
+        kind: "openrouter",
+        apiKey: "test",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
+      },
+      _complete: async () =>
+        makeMsg([
+          {
+            type: "toolCall",
+            id: "call_1",
+            name: "record_result",
+            arguments: { summary: "ok", count: 7 },
+          },
+        ]),
+    });
+    expect(result).toEqual({
+      data: { summary: "ok", count: 7 },
+      model: "openrouter/deepseek/deepseek-v4.1-flash",
+    });
+  });
+
+  test("assistant-text fallback also reports the model", async () => {
+    const result = await completeStructuredWithModel({
+      ...baseOpts,
+      _credentialOverride: {
+        kind: "openrouter",
+        apiKey: "test",
+        modelDefault: "openrouter/deepseek/deepseek-v4.1-flash",
+      },
+      _complete: async () => makeMsg([{ type: "text", text: '{"summary":"t","count":2}' }]),
+    });
+    expect(result?.model).toBe("openrouter/deepseek/deepseek-v4.1-flash");
+    expect(result?.data).toEqual({ summary: "t", count: 2 });
+  });
+
+  test("claude-cli path: reports the cli model alias", async () => {
+    const result = await completeStructuredWithModel({
+      ...baseOpts,
+      _credentialOverride: { kind: "claude-cli", modelDefault: "haiku" } as ResolvedCredential,
+      _spawnClaudeCli: async () => JSON.stringify({ summary: "cli", count: 1 }),
+    });
+    expect(result).toEqual({ data: { summary: "cli", count: 1 }, model: "haiku" });
   });
 });

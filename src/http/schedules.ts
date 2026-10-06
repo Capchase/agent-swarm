@@ -6,20 +6,24 @@ import { resolveHttpAuditUserId } from "../be/audit-user";
 import {
   createScheduledTask,
   deleteScheduledTask,
+  extensionAgentAssignmentError,
   getAgentById,
   getScheduledTaskById,
   getScheduledTaskByName,
   getScheduledTasks,
   getWorkflow,
+  isExtensionAgent,
   updateScheduledTask,
   withFavoriteFlags,
 } from "../be/db";
+import { explicitModelErrorForAgent } from "../be/model-validation";
 import { mergeScheduleTiming, validateRecurringTiming } from "../be/schedules/validate";
 import { getScript } from "../be/scripts/db";
 import { calculateNextRun, dispatchScheduleTarget } from "../scheduler/scheduler";
 import {
   AgentTaskSchema,
   AssetKeySchema,
+  AutomationIntegrationIdSchema,
   ModelTierSchema,
   ScheduledTaskSchema,
   ScheduledTaskTargetTypeSchema,
@@ -46,11 +50,16 @@ const scheduleUpdateBodySchema = z.object({
   timezone: z.string().optional(),
   model: z.string().nullable().optional(),
   modelTier: ModelTierSchema.nullable().optional(),
+  /** Accept a `model` the catalog does not list (a custom id). Without it an unknown id is a 400. */
+  allowCustomModel: z.boolean().optional(),
   nextRunAt: z.string().nullable().optional(),
   targetType: ScheduledTaskTargetTypeSchema.optional(),
   workflowId: z.string().uuid().nullable().optional(),
   scriptName: z.string().nullable().optional(),
   scriptArgs: z.record(z.string(), z.unknown()).nullable().optional(),
+  params: z.record(z.string(), z.unknown()).optional(),
+  requiredParams: z.array(z.string()).optional(),
+  requires: z.array(AutomationIntegrationIdSchema).optional(),
 });
 
 // `ScheduledTaskSchema` carries `.refine()` checks, so Zod v4 forbids the
@@ -75,7 +84,7 @@ const scheduleWithOptionalFavoriteSchema = ScheduledTaskSchema.safeExtend({
 /** Slim list row — `taskTemplate` swapped for a bounded preview (see `ScheduledTaskSummary`). */
 const { taskTemplate: _omittedTaskTemplate, ...scheduleShapeWithoutTemplate } =
   ScheduledTaskSchema.shape;
-const scheduleSummaryWithFavoriteSchema = z.object({
+export const scheduleSummaryWithFavoriteSchema = z.object({
   ...scheduleShapeWithoutTemplate,
   taskTemplatePreview: z.string(),
   favorite: z.boolean(),
@@ -102,11 +111,16 @@ const createSchedule = route({
     timezone: z.string().optional(),
     model: z.string().optional(),
     modelTier: ModelTierSchema.optional(),
+    /** Accept a `model` the catalog does not list (a custom id). Without it an unknown id is a 400. */
+    allowCustomModel: z.boolean().optional(),
     scheduleType: z.enum(["recurring", "one_time"]).optional(),
     targetType: ScheduledTaskTargetTypeSchema.optional(),
     workflowId: z.string().uuid().optional(),
     scriptName: z.string().optional(),
     scriptArgs: z.record(z.string(), z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
+    requiredParams: z.array(z.string()).optional(),
+    requires: z.array(AutomationIntegrationIdSchema).optional(),
     delayMs: z.number().int().optional(),
     runAt: z.string().optional(),
   }),
@@ -348,6 +362,10 @@ export async function handleSchedules(
         jsonError(res, "Target agent not found", 400);
         return true;
       }
+      if (isExtensionAgent(agent)) {
+        jsonError(res, extensionAgentAssignmentError(agent), 400);
+        return true;
+      }
     }
 
     const targetType = body.targetType ?? "agent-task";
@@ -374,6 +392,16 @@ export async function handleSchedules(
         jsonError(res, `Script not found: ${body.scriptName}`, 400);
         return true;
       }
+    }
+
+    const modelError = await explicitModelErrorForAgent({
+      model: splitLegacyModelAlias({ model: body.model, modelTier: body.modelTier }).model,
+      allowCustomModel: body.allowCustomModel,
+      agentId: body.targetAgentId,
+    });
+    if (modelError) {
+      jsonError(res, modelError, 400);
+      return true;
     }
 
     try {
@@ -425,6 +453,9 @@ export async function handleSchedules(
         workflowId: body.workflowId,
         scriptName: body.scriptName,
         scriptArgs: body.scriptArgs,
+        params: body.params,
+        requiredParams: body.requiredParams,
+        requires: body.requires,
         createdBy: (await resolveHttpAuditUserId(req, myAgentId)) ?? undefined,
       });
 
@@ -519,21 +550,51 @@ export async function handleSchedules(
         throw error;
       }
     }
+    // The escape hatch is a request flag, not a schedule column. `body` aliases
+    // `parsed.body`, so read the flag before stripping it.
+    const allowCustomModel = parsed.body.allowCustomModel;
+    delete body.allowCustomModel;
+    const existing = await getScheduledTaskById(parsed.params.id);
+    if (!existing) {
+      jsonError(res, "Schedule not found", 404);
+      return true;
+    }
+    // A move to another agent re-judges the stored model against the new harness.
+    const agentChanged =
+      parsed.body.targetAgentId !== undefined &&
+      parsed.body.targetAgentId !== existing.targetAgentId;
     if (parsed.body.model !== undefined || parsed.body.modelTier !== undefined) {
       const normalizedModel = splitLegacyModelAlias({
         model: parsed.body.model,
         modelTier: parsed.body.modelTier,
       });
+      // A model the schedule already stores is not re-judged, so an unrelated edit still saves.
+      if (normalizedModel.model !== existing.model || agentChanged) {
+        const modelError = await explicitModelErrorForAgent({
+          model: normalizedModel.model,
+          allowCustomModel: allowCustomModel || normalizedModel.model === existing.model,
+          agentId: parsed.body.targetAgentId ?? existing.targetAgentId,
+        });
+        if (modelError) {
+          jsonError(res, modelError, 400);
+          return true;
+        }
+      }
       if (parsed.body.model !== undefined) body.model = normalizedModel.model ?? null;
       if (parsed.body.modelTier !== undefined || normalizedModel.modelTier) {
         body.modelTier = normalizedModel.modelTier ?? null;
       }
-    }
-
-    const existing = await getScheduledTaskById(parsed.params.id);
-    if (!existing) {
-      jsonError(res, "Schedule not found", 404);
-      return true;
+    } else if (agentChanged && existing.model) {
+      // Harness only: the stored id already passed the catalog check when it was written.
+      const modelError = await explicitModelErrorForAgent({
+        model: existing.model,
+        allowCustomModel: true,
+        agentId: parsed.body.targetAgentId ?? existing.targetAgentId,
+      });
+      if (modelError) {
+        jsonError(res, modelError, 400);
+        return true;
+      }
     }
 
     // Reject updates on completed one-time schedules
@@ -571,6 +632,10 @@ export async function handleSchedules(
       const agent = await getAgentById(parsed.body.targetAgentId);
       if (!agent) {
         jsonError(res, "Target agent not found", 400);
+        return true;
+      }
+      if (isExtensionAgent(agent)) {
+        jsonError(res, extensionAgentAssignmentError(agent), 400);
         return true;
       }
     }

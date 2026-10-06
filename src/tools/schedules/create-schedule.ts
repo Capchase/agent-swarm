@@ -3,7 +3,15 @@ import { CronExpressionParser } from "cron-parser";
 import * as z from "zod";
 import { authorizeAssetKeyWrite } from "@/be/asset-key-auth";
 import { resolveTaskAuditUserId } from "@/be/audit-user";
-import { createScheduledTask, getAgentById, getScheduledTaskByName, getWorkflow } from "@/be/db";
+import {
+  createScheduledTask,
+  extensionAgentAssignmentError,
+  getAgentById,
+  getScheduledTaskByName,
+  getWorkflow,
+  isExtensionAgent,
+} from "@/be/db";
+import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { getScript } from "@/be/scripts/db";
 import { calculateNextRun } from "@/scheduler";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
@@ -97,11 +105,17 @@ export const createScheduleInputSchema = z.object({
     .min(1)
     .optional()
     .describe(
-      "Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent.",
+      "Concrete model override for tasks created by this schedule. Interpreted by each assignee's harness/provider and does not switch providers. Prefer modelTier for portable intent. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
     ),
   modelTier: ModelTierSchema.optional().describe(
     "Portable model tier for tasks created by this schedule: 'smol', 'regular', 'smart', or 'ultra'. Resolved by each assignee's harness/provider at run time.",
   ),
+  allowCustomModel: z
+    .boolean()
+    .optional()
+    .describe(
+      "Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet.",
+    ),
 });
 
 const scheduleDataShape = {
@@ -120,6 +134,7 @@ const scheduleDataShape = {
   lastRunAt: z.string().optional(),
   nextRunAt: z.string().optional(),
   createdByAgentId: z.string().optional(),
+  parentTaskId: z.string().optional(),
   timezone: z.string().optional(),
   model: z.string().optional(),
   modelTier: ModelTierSchema.optional(),
@@ -169,6 +184,7 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         enabled,
         model,
         modelTier,
+        allowCustomModel,
       },
       requestInfo,
       _meta,
@@ -228,6 +244,9 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         if (!agent) {
           return toolErr(`Target agent not found: ${targetAgentId}`);
         }
+        if (isExtensionAgent(agent)) {
+          return toolErr(extensionAgentAssignmentError(agent));
+        }
       }
 
       // Cross-field targetType validation
@@ -252,8 +271,15 @@ export const registerCreateScheduleTool = (server: McpServer) => {
         }
       }
 
+      const normalizedModel = splitLegacyModelAlias({ model, modelTier });
+      const modelError = await explicitModelErrorForAgent({
+        model: normalizedModel.model,
+        allowCustomModel,
+        agentId: targetAgentId,
+      });
+      if (modelError) return toolErr(modelError);
+
       try {
-        const normalizedModel = splitLegacyModelAlias({ model, modelTier });
         // Calculate initial nextRunAt
         let nextRunAt: string | undefined;
         if (enabled === false) {

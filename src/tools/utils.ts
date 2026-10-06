@@ -5,6 +5,11 @@ import type {
   ShapeOutput,
   ZodRawShapeCompat,
 } from "@modelcontextprotocol/sdk/server/zod-compat.js";
+import {
+  getParseErrorMessage,
+  normalizeObjectSchema,
+  safeParseAsync,
+} from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {
   CallToolResult,
@@ -23,9 +28,15 @@ import { scrubObject, scrubSecrets } from "../utils/secret-scrubber";
 type Meta = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 const scriptSdkRequestOrigins = new WeakSet<object>();
+const extensionRequestOrigins = new WeakSet<object>();
 
 export function markScriptSdkRequestOrigin<T extends object>(meta: T): T {
   scriptSdkRequestOrigins.add(meta);
+  return meta;
+}
+
+export function markExtensionRequestOrigin<T extends object>(meta: T): T {
+  extensionRequestOrigins.add(meta);
   return meta;
 }
 
@@ -36,7 +47,7 @@ export type RequestInfo = {
   runtimeInstanceId: string | undefined;
   sourceTaskId: string | undefined;
   contextKey: string | undefined;
-  callOrigin: "mcp" | "script-sdk";
+  callOrigin: "mcp" | "script-sdk" | "extension";
 };
 
 export const getRequestInfo = (req: Meta): RequestInfo => {
@@ -73,7 +84,11 @@ export const getRequestInfo = (req: Meta): RequestInfo => {
     runtimeInstanceId: typeof runtimeInstanceId === "string" ? runtimeInstanceId : undefined,
     sourceTaskId,
     contextKey,
-    callOrigin: scriptSdkRequestOrigins.has(req) ? "script-sdk" : "mcp",
+    callOrigin: extensionRequestOrigins.has(req)
+      ? "extension"
+      : scriptSdkRequestOrigins.has(req)
+        ? "script-sdk"
+        : "mcp",
   };
 };
 
@@ -229,6 +244,40 @@ const scriptRunNudge = (r: SwarmToolResult): string | undefined => {
   return !r.ok && body?.error === "timeout" ? SCRIPT_RUN_TIMEOUT_NUDGE : scriptAuthoringNudge(r);
 };
 
+const SLACK_API_DISK_NUDGE =
+  "That path is on the API server's disk, not in your container — call this from a task you own (or pass its taskId) to get the file as a task attachment with a fetchCommand.";
+
+const slackDownloadFileNudge = (r: SwarmToolResult): string | undefined =>
+  r.ok && (r.data as { savedPath?: unknown } | undefined)?.savedPath
+    ? SLACK_API_DISK_NUDGE
+    : undefined;
+
+const slackReadNudge = (r: SwarmToolResult): string | undefined => {
+  if (!r.ok) return undefined;
+  const messages = (r.data as { messages?: Array<{ files?: Array<{ localPath?: unknown }> }> })
+    ?.messages;
+  return messages?.some((m) => m.files?.some((f) => Boolean(f.localPath)))
+    ? SLACK_API_DISK_NUDGE
+    : undefined;
+};
+
+// Sole caller (storeProgressBlockedWaitingNudge) only reaches this once ms is
+// past BLOCKED_WAITING_MIN_ELAPSED_MS (3 minutes), so there's no sub-minute case.
+function formatIdleDuration(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return remMinutes > 0 ? `${hours}h${remMinutes}m` : `${hours}h`;
+}
+
+const storeProgressBlockedWaitingNudge = (r: SwarmToolResult): string | undefined => {
+  if (!r.ok) return undefined;
+  const ms = (r.data as { blockedWaitingElapsedMs?: unknown } | undefined)?.blockedWaitingElapsedMs;
+  if (typeof ms !== "number") return undefined;
+  return `That reads as blocked-waiting, ${formatIdleDuration(ms)} since your last update — keep working if you can, and if the wait is genuinely long, defer-task is one way to resume later instead of polling.`;
+};
+
 const workflowLongScriptTimeoutNudge = (r: SwarmToolResult): string | undefined => {
   if (!r.ok) return undefined;
   const hint = (r.data as { longScriptTimeoutHint?: unknown } | undefined)?.longScriptTimeoutHint;
@@ -241,6 +290,9 @@ const workflowLongScriptTimeoutNudge = (r: SwarmToolResult): string | undefined 
  * single sentence; derive only from already-scrubbed result fields.
  */
 export const NUDGES: Record<string, (result: SwarmToolResult) => string | undefined> = {
+  "defer-task": (r) =>
+    r.ok ? "Stop working on this task now; the wake-up task will carry your note." : undefined,
+  "store-progress": storeProgressBlockedWaitingNudge,
   "script-run": scriptRunNudge,
   "script-upsert": scriptAuthoringNudge,
   "launch-script-run": scriptAuthoringNudge,
@@ -249,6 +301,8 @@ export const NUDGES: Record<string, (result: SwarmToolResult) => string | undefi
   "update-workflow": workflowLongScriptTimeoutNudge,
   "patch-workflow": workflowLongScriptTimeoutNudge,
   "patch-workflow-node": workflowLongScriptTimeoutNudge,
+  "slack-download-file": slackDownloadFileNudge,
+  "slack-read": slackReadNudge,
   "script-search": (r) => {
     if (!r.ok) return undefined;
     // proxyScriptsApi wraps the parsed HTTP body as data = { status, data },
@@ -583,7 +637,7 @@ const ctxControlMiddleware: FinalizeMiddleware = async (result, ctx) => {
   // Calls made through ctx.swarm.* execute inside a script sandbox, so their
   // response never enters the model's context. The script SDK has a separate,
   // much higher hard response limit to protect the sandbox heap.
-  if (ctx.callOrigin === "script-sdk") return result;
+  if (ctx.callOrigin === "script-sdk" || ctx.callOrigin === "extension") return result;
   if (CTX_CONTROL_EXEMPT_TOOLS.has(ctx.toolName)) return result;
 
   const fullWire = composeWireResult(result);
@@ -724,6 +778,92 @@ type ToolConfig<
   _meta?: Record<string, unknown>;
 };
 
+const preloadedToolsByServer = new WeakMap<McpServer, ReadonlySet<string>>();
+
+/** Configure before registration. The set belongs to one MCP session, never the fleet. */
+export function setPreloadedTools(server: McpServer, names: readonly string[]): void {
+  preloadedToolsByServer.set(server, new Set(names));
+}
+
+type ExtensionDispatcher = typeof import("../extensions/dispatcher");
+
+async function applyPreToolCall(
+  name: string,
+  args: unknown,
+  requestInfo: RequestInfo,
+  inputSchema?: AnySchema | ZodRawShapeCompat,
+): Promise<{
+  args: unknown;
+  blocked?: SwarmToolResult;
+  dispatcher?: ExtensionDispatcher;
+}> {
+  if (requestInfo.callOrigin !== "mcp") return { args };
+
+  const dispatcher = await import("../extensions/dispatcher");
+  const result = await dispatcher.dispatchPre(
+    "pre.tool.call",
+    { tool: name, args, requestInfo },
+    inputSchema
+      ? {
+          validateModify: async (data) => {
+            const schema = normalizeObjectSchema(inputSchema) ?? inputSchema;
+            const parsed = await safeParseAsync(schema as AnySchema, data.args);
+            if (parsed.success) return { success: true, data: { args: parsed.data } };
+
+            const message = scrubSecrets(getParseErrorMessage(parsed.error));
+            console.warn(
+              `[extensions] Ignored invalid arguments from pre.tool.call for ${name}: ${message}`,
+            );
+            return {
+              success: false,
+              error: new Error(`Modified arguments for tool "${name}" are invalid: ${message}`),
+            };
+          },
+        }
+      : {
+          transformModify: ({ extension }) => {
+            const message = scrubSecrets(
+              `[extensions] Ignored pre.tool.call argument rewrite for tool "${name}" from extension "${extension.name}" because the tool has no input schema`,
+            );
+            console.warn(message);
+            throw new Error(message);
+          },
+        },
+  );
+
+  if (result.action === "block") {
+    return {
+      args,
+      blocked: toolErr(result.reason, {
+        details: `Extension "${result.extension.name}" rejected this tool call.`,
+      }),
+      dispatcher,
+    };
+  }
+  return {
+    args: inputSchema && result.action === "modify" ? result.data.args : args,
+    dispatcher,
+  };
+}
+
+function dispatchPostToolCall(
+  dispatcher: ExtensionDispatcher | undefined,
+  name: string,
+  args: unknown,
+  outcome: SwarmToolResult,
+  requestInfo: RequestInfo,
+  durationMs: number,
+): void {
+  if (!dispatcher) return;
+  void dispatcher.dispatchPost("post.tool.call", {
+    tool: name,
+    args,
+    result: outcome,
+    requestInfo,
+    durationMs,
+  });
+}
+
 /**
  * Creates a tool registration helper that automatically extracts request info
  * and passes it as the second parameter to the callback.
@@ -749,21 +889,35 @@ export const createToolRegistrar = (server: McpServer) => {
     config: ToolConfig<InputArgs, OutputArgs>,
     cb: ToolCallbackWithInfo<InputArgs>,
   ) => {
+    const toolConfig = preloadedToolsByServer.get(server)?.has(name)
+      ? { ...config, _meta: { ...config._meta, "anthropic/alwaysLoad": true } }
+      : config;
     // When inputSchema is undefined, the MCP SDK calls handler(extra) with a single arg.
     // When inputSchema is defined, it calls handler(args, extra) with two args.
     if (config.inputSchema === undefined) {
-      return server.registerTool(name, config, (async (meta: Meta) => {
+      return server.registerTool(name, toolConfig, (async (meta: Meta) => {
         const requestInfo = getRequestInfo(meta);
         return withSpan(
           "mcp.tool",
           async (span) => {
-            const outcome = await (
-              cb as (
-                requestInfo: RequestInfo,
-                meta: Meta,
-              ) => SwarmToolResult | Promise<SwarmToolResult>
-            )(requestInfo, meta);
+            const pre = await applyPreToolCall(name, {}, requestInfo);
+            let durationMs = 0;
+            let outcome = pre.blocked;
+            if (!outcome) {
+              const startedAt = Date.now();
+              try {
+                outcome = await (
+                  cb as (
+                    requestInfo: RequestInfo,
+                    meta: Meta,
+                  ) => SwarmToolResult | Promise<SwarmToolResult>
+                )(requestInfo, meta);
+              } finally {
+                durationMs = Date.now() - startedAt;
+              }
+            }
             const result = await finalizeSwarmToolResult(name, outcome, requestInfo);
+            dispatchPostToolCall(pre.dispatcher, name, {}, outcome, requestInfo, durationMs);
             span.setAttributes(toolResultAttributes(result));
             return result;
           },
@@ -772,21 +926,43 @@ export const createToolRegistrar = (server: McpServer) => {
       }) as Parameters<typeof server.registerTool>[2]);
     }
 
-    return server.registerTool(name, config, (async (args: InferInput<InputArgs>, meta: Meta) => {
+    return server.registerTool(name, toolConfig, (async (
+      args: InferInput<InputArgs>,
+      meta: Meta,
+    ) => {
       const requestInfo = getRequestInfo(meta);
       return withSpan(
         // Span name carries the tool: a static `mcp.tool` is unreadable in a
         // trace tree. Cardinality is bounded — tool names are a fixed enum.
         `mcp.tool ${name}`,
         async (span) => {
-          const outcome = await (
-            cb as (
-              args: InferInput<InputArgs>,
-              requestInfo: RequestInfo,
-              meta: Meta,
-            ) => SwarmToolResult | Promise<SwarmToolResult>
-          )(args, requestInfo, meta);
+          const pre = await applyPreToolCall(name, args, requestInfo, config.inputSchema);
+          const effectiveArgs = pre.args as InferInput<InputArgs>;
+          let durationMs = 0;
+          let outcome = pre.blocked;
+          if (!outcome) {
+            const startedAt = Date.now();
+            try {
+              outcome = await (
+                cb as (
+                  args: InferInput<InputArgs>,
+                  requestInfo: RequestInfo,
+                  meta: Meta,
+                ) => SwarmToolResult | Promise<SwarmToolResult>
+              )(effectiveArgs, requestInfo, meta);
+            } finally {
+              durationMs = Date.now() - startedAt;
+            }
+          }
           const result = await finalizeSwarmToolResult(name, outcome, requestInfo);
+          dispatchPostToolCall(
+            pre.dispatcher,
+            name,
+            effectiveArgs,
+            outcome,
+            requestInfo,
+            durationMs,
+          );
           span.setAttributes(toolResultAttributes(result));
           return result;
         },

@@ -20,6 +20,9 @@ function headers(config: SwarmConfig): Record<string, string> {
     ...(config.runtimeInstanceId
       ? { "X-Runtime-Instance-ID": Redacted.value(config.runtimeInstanceId) }
       : {}),
+    ...(config.extensionToken
+      ? { "X-Extension-Token": Redacted.value(config.extensionToken) }
+      : {}),
     "Content-Type": "application/json",
   };
 }
@@ -123,6 +126,15 @@ function bridgeRequestFor(name: string, args: unknown): BridgeRequest | null {
       if (!taskId) throw new Error("task_cancel requires string `taskId`");
       return { method: "POST", path: `/api/tasks/${encodeURIComponent(taskId)}/cancel` };
     }
+    case "approval_cancel": {
+      const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
+      if (!requestId) throw new Error("approval_cancel requires string `requestId`");
+      return {
+        method: "POST",
+        path: `/api/approval-requests/${encodeURIComponent(requestId)}/cancel`,
+        body: { reason: body.reason },
+      };
+    }
 
     // ── kv ──
     case "kv_get":
@@ -152,6 +164,16 @@ function bridgeRequestFor(name: string, args: unknown): BridgeRequest | null {
           offset: body.offset,
         }),
       };
+
+    // ── realtime rooms ──
+    case "room_get":
+      return { method: "GET", path: appendQuery("/api/rooms/get", body) };
+    case "room_change":
+      return { method: "POST", path: "/api/rooms/change", body };
+    case "room_reset":
+      return { method: "POST", path: "/api/rooms/reset", body };
+    case "room_decode":
+      return { method: "POST", path: "/api/rooms/decode", body };
 
     // ── repos ──
     case "repo_list":
@@ -441,7 +463,7 @@ async function callBridgeApi(
   name: string,
   args: unknown,
   config: SwarmConfig,
-  options: { throwOnError?: boolean } = {},
+  options: { throwOnError?: boolean; preserveData?: boolean } = {},
 ): Promise<unknown> {
   const baseUrl = Redacted.value(config.mcpBaseUrl).replace(/\/$/, "");
   const request = bridgeRequestFor(name, args);
@@ -478,7 +500,8 @@ async function callBridgeApi(
         : `api failed with ${res.status}`;
     throw new Error(`swarm-sdk: ${name} failed with ${res.status}: ${message}`);
   }
-  return scrubObject({ success: res.ok, status: res.status, data });
+  const result = { success: res.ok, status: res.status, data };
+  return options.preserveData ? result : scrubObject(result);
 }
 
 async function callTool(name: string, args: unknown, config: SwarmConfig): Promise<unknown> {
@@ -512,15 +535,32 @@ async function callTool(name: string, args: unknown, config: SwarmConfig): Promi
   return callBridgeApi(name, args, config);
 }
 
-export function createSwarmSdk(
-  config: SwarmConfig,
-): Record<string, (args?: unknown) => Promise<unknown>> {
-  const target: Record<string, unknown> = {};
+type RoomMethods = Record<
+  "get" | "change" | "reset" | "decode",
+  (args?: unknown) => Promise<unknown>
+>;
+type RuntimeSwarmSdk = Record<string, (args?: unknown) => Promise<unknown>> & { room: RoomMethods };
+
+export function createSwarmSdk(config: SwarmConfig): RuntimeSwarmSdk {
+  const roomCall = (method: keyof RoomMethods) => async (args?: unknown) => {
+    const result = (await callBridgeApi(`room_${method}`, args, config, {
+      throwOnError: true,
+      preserveData: true,
+    })) as { data: { room?: unknown } };
+    return method === "decode" ? result.data : result.data.room;
+  };
+  const room: RoomMethods = {
+    get: roomCall("get"),
+    change: roomCall("change"),
+    reset: roomCall("reset"),
+    decode: roomCall("decode"),
+  };
+  const target: Record<string, unknown> = { room };
   return new Proxy(target, {
     get(target, prop) {
       if (typeof prop !== "string") return undefined;
       if (prop in target) return target[prop];
       return (args?: unknown) => callTool(prop, args, config);
     },
-  }) as Record<string, (args?: unknown) => Promise<unknown>>;
+  }) as RuntimeSwarmSdk;
 }

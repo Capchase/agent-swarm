@@ -8,7 +8,8 @@
  * Scope of THIS module (step-3):
  *   - `auth_mode === 'public'`: ungated. HTML responses inline-inject the
  *     `BROWSER_SDK_JS` constant from `src/artifact-sdk/browser-sdk.ts` (reused
- *     verbatim — no token-injection hook on the client). JSON responses
+ *     verbatim — no token-injection hook on the client). SVG responses serve
+ *     raw bytes with a restrictive CSP and no injected scripts. JSON responses
  *     302-redirect to the SPA `/pages/:id` route (the JSON renderer lives
  *     in the SPA, not the API — step-6/7).
  *   - `auth_mode === 'authed'`: returns 401. step-4 narrows this to also
@@ -52,14 +53,14 @@ const publicPageRoute = route({
   method: "get",
   path: "/p/{id}",
   pattern: ["p", null],
-  summary: "Render a page (HTML inline; JSON redirects to SPA)",
+  summary: "Render a page (HTML/SVG inline; JSON redirects to SPA)",
   tags: ["Pages"],
   params: z.object({ id: z.string() }),
   responses: {
     200: {
-      description: "Rendered HTML page",
+      description: "Rendered HTML page or raw SVG image",
       unstructured:
-        "Serves the page's raw agent-authored HTML body (SDK-injected) or, for ?print=1 on a JSON-content page, a standalone printable HTML document — not a JSON shape",
+        "Serves raw image/svg+xml bytes, the page's agent-authored HTML body (SDK-injected) or, for ?print=1 on a JSON-content page, a standalone printable HTML document — not a JSON shape",
     },
     302: { description: "Redirect to SPA for JSON content" },
     401: { description: "Page requires an authenticated session" },
@@ -102,26 +103,36 @@ const publicPageJsonRoute = route({
  * Default `<head>` injection: `<base>` so links escape the iframe, Tailwind
  * Play CDN so agent pages can use utility classes out of the box, Space
  * Grotesk / Space Mono fonts to match the swarm SPA, a small reset that
- * makes pages theme-aware (dark by default) so an agent who writes zero CSS
+ * makes pages theme-aware (light by default) so an agent who writes zero CSS
  * still gets a presentable page, and finally the Browser SDK so
  * `window.swarmSdk` works.
  *
- * Agent-provided styles ALWAYS win — the reset uses generic selectors with
- * low specificity. Tailwind is loaded as an opt-in tool, not an enforced
- * theme.
+ * Agent-provided styles can override these defaults. Tailwind utilities stay
+ * available, but its Preflight reset is disabled to preserve browser heading,
+ * margin, and list styles.
  */
 const PAGE_HEAD_DEFAULTS = `<base target="_blank">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
+<script>
+  if (window.tailwind) {
+    window.tailwind.config = { corePlugins: { preflight: false } };
+  }
+</script>
 <style>
+  *, ::before, ::after { box-sizing: border-box; border: 0 solid #e5e7eb; }
+  hr { border-top-width: 1px; }
+  img, video { display: block; max-width: 100%; height: auto; }
+  button, input, optgroup, select, textarea, ::file-selector-button { font: inherit; }
   :root {
-    --swarm-bg: #0b0f17;
-    --swarm-card: #121826;
-    --swarm-border: #22304a;
-    --swarm-text: #e6eaf2;
-    --swarm-muted: #7c8aa6;
+    color-scheme: light;
+    --swarm-bg: #fbfbfa;
+    --swarm-card: #ffffff;
+    --swarm-border: #e5e7eb;
+    --swarm-text: #111827;
+    --swarm-muted: #6b7280;
     --swarm-primary: #3b82f6;
   }
   html, body { background: var(--swarm-bg); color: var(--swarm-text); }
@@ -579,6 +590,21 @@ export async function handlePagesPublic(
       authMode: page.authMode,
       body: page.body,
     });
+    await bumpViewCount(page.id);
+    return true;
+  }
+
+  // SVG stays byte-for-byte intact, including when ?print=1 is supplied.
+  if (page.contentType === "image/svg+xml") {
+    const headers: Record<string, string> = {
+      "Content-Type": "image/svg+xml",
+      "Cache-Control": page.authMode === "public" ? "public, max-age=1800" : "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    };
+    if (inlineSetCookie) headers["Set-Cookie"] = inlineSetCookie;
+    res.writeHead(200, headers);
+    res.end(page.body);
     await bumpViewCount(page.id);
     return true;
   }

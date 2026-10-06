@@ -11,28 +11,33 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { deriveDefaultRoute, routeCredentialStatus, routeUnsetEnv } from "@desplega/model-routing";
 import { type Span, trace } from "@opentelemetry/api";
 import {
   type RunStopHookSessionSummaryOpts,
   runStopHookSessionSummarySubprocess,
 } from "../hooks/hook";
-import {
-  CONTEXT_FORMULA,
-  clampContextPercent,
-  computeContextUsedUnified,
-  getContextWindowSize,
-} from "../utils/context-window";
-import { validateClaudeCredentials } from "../utils/credentials";
+import { isClaudeBridgeEffective, resolveClaudeTransport } from "../utils/claude-transport";
+import { getContextWindowSize } from "../utils/context-window";
+import { CLAUDE_CREDENTIALS_HINT, validateClaudeCredentials } from "../utils/credentials";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import {
   parseStderrForErrors,
+  redactRateLimitEventLine,
   SessionErrorTracker,
   trackErrorFromJson,
 } from "../utils/error-tracker";
 import { fetchInstalledMcpServers } from "../utils/mcp-server-fetcher";
 import { swarmRuntimeInstanceId } from "../utils/multi-runtime";
+import {
+  detachedProcessGroup,
+  registerProcessGroup,
+  terminateProcessGroup,
+} from "../utils/process-group";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { canonicalizeTrustDirectories } from "../utils/trust-directory";
+import { normalizeClaudeMessage } from "./claude-session-events";
+import { resolveSlashSkillPrompt } from "./codex-skill-resolver";
 import { CTX_MODE_NUDGE_EVERY } from "./ctx-mode-env";
 import { buildOtelTraceparentEnv, isHarnessOtelEnabled } from "./otel-env";
 import { applyReasoningEffort, type ReasoningEffort } from "./reasoning-effort";
@@ -51,18 +56,49 @@ import type {
 
 /**
  * Predicate used by the worker boot loop and the credential-status endpoint.
- * The claude harness needs EITHER `CLAUDE_CODE_OAUTH_TOKEN` (preferred) or
- * `ANTHROPIC_API_KEY` — both are listed as missing when neither is present.
+ * The claude harness is ready when its default route (subscription, API key,
+ * gateway, Foundry, Bedrock, or Vertex; see `deriveDefaultRoute`) has every
+ * env var it needs. With no route at all, the two first-party credentials are
+ * listed as missing.
  */
 export function checkClaudeCredentials(env: Record<string, string | undefined>): CredStatus {
-  if (env.CLAUDE_CODE_OAUTH_TOKEN || env.ANTHROPIC_API_KEY) {
-    return { ready: true, missing: [], satisfiedBy: "env" };
+  const route = deriveDefaultRoute("claude", env);
+  if (!route) {
+    return {
+      ready: false,
+      missing: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+      hint: CLAUDE_CREDENTIALS_HINT,
+    };
   }
-  return {
-    ready: false,
-    missing: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
-    hint: "Set either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY (one is enough).",
-  };
+  const status = routeCredentialStatus(route, env);
+  if (status.ready) return { ready: true, missing: [], satisfiedBy: "env" };
+  return { ready: false, missing: status.missing, hint: status.hint };
+}
+
+/**
+ * `env` without the credentials its claude default route does not use. On a
+ * gateway or cloud route this drops `CLAUDE_CODE_OAUTH_TOKEN`: Claude Code
+ * 2.1.286 sends that token as `Authorization: Bearer` to ANTHROPIC_BASE_URL
+ * whenever no gateway key outranks it, and claude-bridge authenticates from it.
+ *
+ * Dropped keys are blanked, not deleted, so the `?? process.env` fallbacks in
+ * the binary/transport resolvers cannot bring them back. On routes that leave
+ * api.anthropic.com they are blanked even when `env` lacks them. Claude Code
+ * treats a blank token as unset (verified on 2.1.286).
+ */
+export function withClaudeRouteEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const route = deriveDefaultRoute("claude", env);
+  if (!route) return env;
+  const firstParty = route.provider === "anthropic";
+  const unset = routeUnsetEnv("claude", route).filter((key) =>
+    firstParty ? env[key] : env[key] !== "",
+  );
+  if (unset.length === 0) return env;
+  const next = { ...env };
+  for (const key of unset) next[key] = "";
+  return next;
 }
 
 /** Task file data written to /tmp for hook to read */
@@ -72,19 +108,19 @@ interface TaskFileData {
   startedAt: string;
 }
 
-function getTaskFilePath(pid: number): string {
-  return `/tmp/agent-swarm-task-${pid}.json`;
+export function getTaskFilePath(key: string | number): string {
+  return `/tmp/agent-swarm-task-${key}.json`;
 }
 
-async function writeTaskFile(pid: number, data: TaskFileData): Promise<string> {
-  const filePath = getTaskFilePath(pid);
+async function writeTaskFile(key: string | number, data: TaskFileData): Promise<string> {
+  const filePath = getTaskFilePath(key);
   await writeFile(filePath, JSON.stringify(data, null, 2));
   return filePath;
 }
 
-async function cleanupTaskFile(pid: number): Promise<void> {
+export async function cleanupTaskFile(key: string | number): Promise<void> {
   try {
-    await unlink(getTaskFilePath(pid));
+    await unlink(getTaskFilePath(key));
   } catch {
     // File might already be deleted or never created
   }
@@ -106,6 +142,8 @@ export function parseClaudeBinary(raw: string | undefined): string[] {
 }
 
 const MIN_CLAUDE_QUEUE_STEERING_VERSION = [2, 1, 205] as const;
+const CLAUDE_VERSION_PROBE_TIMEOUT_MS = 1_000;
+const CLAUDE_VERSION_PROBE_MAX_BUFFER_BYTES = 64 * 1024;
 
 /**
  * Operator kill-switch for the stream-json invocation path.
@@ -116,7 +154,7 @@ const MIN_CLAUDE_QUEUE_STEERING_VERSION = [2, 1, 205] as const;
  * long-standing `-p` invocation back without a code change; `=1` forces the
  * stream-json path without probing. Unset (the default) probes `--version`.
  */
-function resolveClaudeQueueSteeringOverride(
+export function resolveClaudeQueueSteeringOverride(
   env: Record<string, string | undefined>,
 ): boolean | undefined {
   const raw = env.CLAUDE_QUEUE_STEERING?.trim().toLowerCase();
@@ -867,6 +905,59 @@ export function buildClaudeCodeRuntimeEnv(
   };
 }
 
+export function buildClaudeSessionEnvironment(
+  config: ProviderSessionConfig,
+  model: string,
+  taskFilePath: string,
+): { env: Record<string, string>; appliedReasoningEffort: ReasoningEffort | null } {
+  const sourceEnv = { ...withClaudeRouteEnv(config.env || process.env) };
+  // Summaries run in the adapter process. Do not bypass Claude's OAuth filtering for hooks.
+  delete sourceEnv.AGENT_SWARM_CLAUDE_OAUTH_TOKEN;
+  const reasoningApplication = applyReasoningEffort("claude", model, config.reasoningEffort);
+  return {
+    env: {
+      ENABLE_PROMPT_CACHING_1H: "1",
+      ...sourceEnv,
+      ...buildClaudeCodeRuntimeEnv(sourceEnv),
+      ...buildClaudeCodeOtelEnv(sourceEnv),
+      ...(reasoningApplication.kind === "claude-env" ? reasoningApplication.env : {}),
+      TASK_FILE: taskFilePath,
+      AGENT_SWARM_TASK_ID: config.taskId,
+      AGENT_SWARM_AGENT_ID: config.agentId,
+      AGENT_SWARM_ADAPTER_SESSION_SUMMARY: "1",
+      CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY: CTX_MODE_NUDGE_EVERY,
+    } as Record<string, string>,
+    appliedReasoningEffort:
+      reasoningApplication.kind === "claude-env" ? (config.reasoningEffort ?? null) : null,
+  };
+}
+
+export async function runClaudeSessionSummary(
+  config: ProviderSessionConfig,
+  transcript: readonly string[],
+  runSummary: (opts: RunStopHookSessionSummaryOpts) => Promise<void>,
+): Promise<void> {
+  const text = transcript.join("\n");
+  if (text.length <= 100) {
+    console.warn(`session_summary skipped (claude): transcript too short (${text.length} chars)`);
+    return;
+  }
+  try {
+    await runSummary({
+      agentId: config.agentId,
+      transcript: text,
+      env: {
+        ...withClaudeRouteEnv({ ...process.env, ...config.env }),
+        AGENT_SWARM_TASK_ID: config.taskId,
+        MCP_BASE_URL: config.apiUrl,
+        AGENT_SWARM_API_KEY: config.apiKey,
+      },
+    });
+  } catch (error) {
+    console.error("session_summary failed (claude):", scrubSecrets(String(error)));
+  }
+}
+
 /**
  * Resolve the path at which the per-task system prompt is staged on disk.
  *
@@ -891,6 +982,38 @@ export function getSystemPromptFilePath(taskId: string): string {
   return `/tmp/agent-swarm-system-prompt-${taskId}.txt`;
 }
 
+/**
+ * Inline the runner's leading `/<skill>` command before the prompt reaches
+ * Claude Code.
+ *
+ * Claude Code expands `/<skill> <args>` into `<command-args>{args}</command-args>`
+ * plus the skill text, and appends `ARGUMENTS: {args}` when the skill has no
+ * `$ARGUMENTS` placeholder (a `$ARGUMENTS` placeholder only moves the second
+ * copy). The runner puts the whole task body — task text, context preamble,
+ * memories — in those args, so every task's first message carried it twice.
+ * Inlining the SKILL.md ourselves, with the resolver codex/opencode/dsh already
+ * use, keeps the skill text and sends the body once.
+ *
+ * Commands with no SKILL.md under `<home>/.claude/skills` pass through for
+ * Claude Code to expand natively. Exported for unit testing.
+ */
+export async function resolveClaudePrompt(prompt: string, home: string): Promise<string> {
+  const resolved = await resolveSlashSkillPrompt(prompt, {
+    providerLabel: "claude",
+    skillsDir: join(home, ".claude", "skills"),
+    // Native expansion drops frontmatter too. It also matters for argv: the
+    // `-p` path passes the prompt as a positional, and a leading `---` is
+    // parsed as an unknown option.
+    stripFrontmatter: true,
+    emit: (event) => {
+      if (event.type === "raw_stderr") console.warn(event.content.trimEnd());
+    },
+  });
+  // Any other leading dash would hit the same argv parse error; keep the
+  // native (duplicated but working) form instead.
+  return resolved.startsWith("-") ? prompt : resolved;
+}
+
 class ClaudeSession implements ProviderSession {
   private proc: ReturnType<typeof Bun.spawn>;
   private stdinWriter:
@@ -905,7 +1028,7 @@ class ClaudeSession implements ProviderSession {
   private _sessionId: string | undefined;
   private completionPromise: Promise<ProviderResult>;
   private errorTracker = new SessionErrorTracker();
-  private taskFilePid: number;
+  private taskFileKey: string;
   private contextWindowSize: number;
   /** Path to the system-prompt temp file when one was staged for this session. */
   private systemPromptFile: string | null;
@@ -921,7 +1044,7 @@ class ClaudeSession implements ProviderSession {
     private config: ProviderSessionConfig,
     private model: string,
     taskFilePath: string,
-    taskFilePid: number,
+    taskFileKey: string,
     private sessionMcpConfig: string | null = null,
     private claudeBinaryArgv: readonly string[] = ["claude"],
     systemPromptFile: string | null = null,
@@ -932,7 +1055,7 @@ class ClaudeSession implements ProviderSession {
       opts: RunStopHookSessionSummaryOpts,
     ) => Promise<void> = runStopHookSessionSummarySubprocess,
   ) {
-    this.taskFilePid = taskFilePid;
+    this.taskFileKey = taskFileKey;
     this.contextWindowSize = getContextWindowSize(model);
     this.systemPromptFile = systemPromptFile;
     this.transcript = [`User: ${scrubSecrets(config.prompt)}`];
@@ -942,54 +1065,20 @@ class ClaudeSession implements ProviderSession {
       `\x1b[2m[${config.role}]\x1b[0m \x1b[36m▸\x1b[0m Spawning Claude (model: ${model}) for task ${config.taskId.slice(0, 8)}`,
     );
 
-    const sourceEnv = config.env || process.env;
-    // Gated cross-service OTel linking: when SWARM_ENABLE_HARNESS_OTEL (or the
-    // deprecated SWARM_ENABLE_CLAUDE_CODE_OTEL alias) is on, inject TRACEPARENT
-    // from the active worker span so Claude Code's spans nest under our
-    // worker.session trace. Returns {} (no-op) when off. Spread after sourceEnv
-    // so the freshly-computed TRACEPARENT wins over any stale value the
-    // container env might carry.
-    const otelEnv = buildClaudeCodeOtelEnv(sourceEnv);
-    const runtimeEnv = buildClaudeCodeRuntimeEnv(sourceEnv);
-    // Phase 4 (reasoning-effort plan): env-only path. `additionalArgs` (pushed
-    // after `buildCommand()`'s base argv) naturally wins over this env var per
-    // the Claude CLI's own precedence if an operator puts `--effort` there.
-    const reasoningApplication = applyReasoningEffort("claude", model, config.reasoningEffort);
-    const reasoningEnv = reasoningApplication.kind === "claude-env" ? reasoningApplication.env : {};
-    this.appliedReasoningEffort =
-      reasoningApplication.kind === "claude-env" ? (config.reasoningEffort ?? null) : null;
-    this.proc = Bun.spawn(cmd, {
-      cwd: this.config.cwd,
-      env: {
-        ENABLE_PROMPT_CACHING_1H: "1",
-        ...sourceEnv,
-        ...runtimeEnv,
-        ...otelEnv,
-        ...reasoningEnv,
-        TASK_FILE: taskFilePath,
-        // Belt-and-braces: TASK_FILE on disk can disappear mid-session (race
-        // with task lifecycle), which silently drops the Stop-hook memory
-        // rater. The hook prefers these env vars when present. See PR #444.
-        AGENT_SWARM_TASK_ID: config.taskId,
-        AGENT_SWARM_AGENT_ID: config.agentId,
-        // The parent adapter owns a reliable in-memory stream-json transcript.
-        // Prevent the child Stop hook from attempting the missing CLI artifact.
-        AGENT_SWARM_ADAPTER_SESSION_SUMMARY: "1",
-        // claude CLI strips CLAUDE_CODE_OAUTH_TOKEN from hook subprocess env
-        // (security: prevents OAuth-token leakage to user-written hooks).
-        // Mirror it under a name claude doesn't recognize so the Stop hook
-        // can resolve the claude-cli fallback in internal-ai/credentials.ts.
-        ...(sourceEnv.CLAUDE_CODE_OAUTH_TOKEN
-          ? { AGENT_SWARM_CLAUDE_OAUTH_TOKEN: sourceEnv.CLAUDE_CODE_OAUTH_TOKEN }
-          : {}),
-        CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY: CTX_MODE_NUDGE_EVERY,
-      } as Record<string, string>,
-      // Only pipe stdin on the stream-json path; on the `-p` path the child
-      // has never had a stdin pipe and must not start waiting for one.
-      ...(this.queueSteeringSupported ? { stdin: "pipe" as const } : {}),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const sessionEnvironment = buildClaudeSessionEnvironment(config, model, taskFilePath);
+    this.appliedReasoningEffort = sessionEnvironment.appliedReasoningEffort;
+    this.proc = registerProcessGroup(
+      Bun.spawn(cmd, {
+        cwd: this.config.cwd,
+        detached: detachedProcessGroup,
+        env: sessionEnvironment.env,
+        // Only pipe stdin on the stream-json path; on the `-p` path the child
+        // has never had a stdin pipe and must not start waiting for one.
+        ...(this.queueSteeringSupported ? { stdin: "pipe" as const } : {}),
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
 
     if (this.queueSteeringSupported) {
       const stdin = this.proc.stdin;
@@ -1005,7 +1094,7 @@ class ClaudeSession implements ProviderSession {
           );
           this.closeStdin();
           try {
-            this.proc.kill("SIGTERM");
+            void terminateProcessGroup(this.proc.pid);
           } catch {
             // The subprocess may already have exited after the broken pipe.
           }
@@ -1015,7 +1104,7 @@ class ClaudeSession implements ProviderSession {
           "\x1b[33m[claude]\x1b[0m Claude stdin was not piped; terminating the session to avoid waiting without a prompt.",
         );
         try {
-          this.proc.kill("SIGTERM");
+          void terminateProcessGroup(this.proc.pid);
         } catch {
           // The subprocess may already have exited.
         }
@@ -1148,19 +1237,21 @@ class ClaudeSession implements ProviderSession {
       for await (const chunk of stdout) {
         stdoutChunks++;
         const text = new TextDecoder().decode(chunk);
-        // Scrub before every log-egress point: file write, listener emit, and
-        // downstream pretty-print / session-logs push (all consume event.content).
-        logFileHandle.write(scrubSecrets(text));
 
         const combined = partialLine + text;
         const parts = combined.split("\n");
         partialLine = parts.pop() || "";
 
         for (const line of parts) {
+          // Scrub and redact before every log-egress point: file write,
+          // listener emit, and downstream pretty-print / session-logs push
+          // (all consume event.content). The file is written per complete
+          // line so a rate_limit_event is redacted as a whole JSON object.
+          logFileHandle.write(`${scrubSecrets(redactRateLimitEventLine(line))}\n`);
           const trimmed = line.trim();
           if (!trimmed) continue;
 
-          this.emit({ type: "raw_log", content: scrubSecrets(trimmed) });
+          this.emit({ type: "raw_log", content: scrubSecrets(redactRateLimitEventLine(trimmed)) });
           this.processJsonLine(trimmed, (cost) => {
             lastCost = cost;
           });
@@ -1168,8 +1259,12 @@ class ClaudeSession implements ProviderSession {
       }
 
       // Handle remaining partial line
+      if (partialLine) logFileHandle.write(scrubSecrets(redactRateLimitEventLine(partialLine)));
       if (partialLine.trim()) {
-        this.emit({ type: "raw_log", content: scrubSecrets(partialLine.trim()) });
+        this.emit({
+          type: "raw_log",
+          content: scrubSecrets(redactRateLimitEventLine(partialLine.trim())),
+        });
         this.processJsonLine(partialLine.trim(), (cost) => {
           lastCost = cost;
         });
@@ -1201,32 +1296,12 @@ class ClaudeSession implements ProviderSession {
     }
     await logFileHandle.end();
     const exitCode = await this.proc.exited;
+    await terminateProcessGroup(this.proc.pid);
 
-    const transcript = this.transcript.join("\n");
-    if (transcript.length <= 100) {
-      console.warn(
-        `session_summary skipped (claude): transcript too short (${transcript.length} chars)`,
-      );
-    } else {
-      try {
-        await this.runSessionSummary({
-          agentId: this.config.agentId,
-          transcript,
-          env: {
-            ...process.env,
-            ...this.config.env,
-            AGENT_SWARM_TASK_ID: this.config.taskId,
-            MCP_BASE_URL: this.config.apiUrl,
-            AGENT_SWARM_API_KEY: this.config.apiKey,
-          },
-        });
-      } catch (err) {
-        console.error("session_summary failed (claude):", scrubSecrets(String(err)));
-      }
-    }
+    await runClaudeSessionSummary(this.config, this.transcript, this.runSessionSummary);
 
     // Cleanup task file, per-session MCP config, and per-task system prompt
-    await cleanupTaskFile(this.taskFilePid);
+    await cleanupTaskFile(this.taskFileKey);
     if (this.sessionMcpConfig) {
       try {
         await unlink(this.sessionMcpConfig);
@@ -1268,6 +1343,8 @@ class ClaudeSession implements ProviderSession {
       failureReason,
       rateLimitResetAt: this.errorTracker.getRateLimitResetAt(),
       rateLimitWindows: this.errorTracker.getRateLimitWindows(),
+      modelRateLimit: this.errorTracker.getModelRateLimit(),
+      creditsRequired: this.errorTracker.getCreditsRequired(),
       appliedReasoningEffort: this.appliedReasoningEffort,
     };
   }
@@ -1284,232 +1361,22 @@ class ClaudeSession implements ProviderSession {
         this.closeStdin();
       }
 
-      // Session ID from init message
-      if (json.type === "system" && json.subtype === "init" && json.session_id) {
-        this._sessionId = json.session_id;
-        this.emit({
-          type: "session_init",
-          sessionId: json.session_id,
-          provider: "claude",
-          ...(this.harnessVariant ? { harnessVariant: this.harnessVariant } : {}),
-          ...(this.harnessVariantMeta ? { harnessVariantMeta: this.harnessVariantMeta } : {}),
-        });
-        if (json.model) {
-          // Phase 4: the CLI's `init.model` reflects the actual model after any
-          // backoff/fallback. Update `this.model` so subsequent CostData rows
-          // (and the pricing lookup the API runs) use the right rate.
-          this.model = json.model;
-          this.contextWindowSize = getContextWindowSize(json.model);
-        }
-      }
-
-      // Compaction detection
-      if (json.type === "system" && json.subtype === "compact_boundary" && json.compact_metadata) {
-        this.emit({
-          type: "compaction",
-          preCompactTokens: json.compact_metadata.pre_tokens ?? 0,
-          compactTrigger: json.compact_metadata.trigger ?? "auto",
-          contextTotalTokens: this.contextWindowSize,
-        });
-      }
-
-      // Cost data from result
-      if (json.type === "result" && json.total_cost_usd !== undefined) {
-        const usage = json.usage as
-          | {
-              input_tokens?: number;
-              output_tokens?: number;
-              cache_read_input_tokens?: number;
-              cache_creation_input_tokens?: number;
-              cache_creation?: {
-                ephemeral_5m_input_tokens?: unknown;
-                ephemeral_1h_input_tokens?: unknown;
-              };
-              // Phase 4: claude extended-thinking flows surface this — the
-              // CLI emits `thinking_input_tokens` when the model produced
-              // thinking content during the turn.
-              thinking_input_tokens?: number;
-            }
-          | undefined;
-        // Rejects non-numbers outright: Number(null) is 0, and a null costUSD
-        // must surface as "unknown", never "$0".
-        const toFiniteNumber = (value: unknown): number | undefined =>
-          typeof value === "number" && Number.isFinite(value) ? value : undefined;
-        const cacheCreation = usage?.cache_creation;
-        const cacheWrite5mTokens = cacheCreation
-          ? toFiniteNumber(cacheCreation.ephemeral_5m_input_tokens)
-          : undefined;
-        const cacheWrite1hTokens = cacheCreation
-          ? toFiniteNumber(cacheCreation.ephemeral_1h_input_tokens)
-          : undefined;
-        // Token counters are load-bearing downstream: the server gives models[]
-        // precedence over top-level usage for BOTH row token totals and pricing,
-        // so a zero-filled counter would store a fabricated $0 'pricing-table'
-        // row. Negative counts would be rejected by the wire schema and void
-        // the whole cost write.
-        const toTokenCount = (value: unknown): number | undefined => {
-          const n = toFiniteNumber(value);
-          return n !== undefined && n >= 0 ? n : undefined;
-        };
-        const mappedModels =
-          json.modelUsage && typeof json.modelUsage === "object" && !Array.isArray(json.modelUsage)
-            ? Object.entries(json.modelUsage as Record<string, unknown>).map(([model, entry]) => {
-                const modelUsage =
-                  entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null;
-                if (!modelUsage) return null;
-                const inputTokens = toTokenCount(modelUsage.inputTokens);
-                const outputTokens = toTokenCount(modelUsage.outputTokens);
-                const cacheReadTokens = toTokenCount(modelUsage.cacheReadInputTokens);
-                const cacheWriteTokens = toTokenCount(modelUsage.cacheCreationInputTokens);
-                if (
-                  inputTokens === undefined ||
-                  outputTokens === undefined ||
-                  cacheReadTokens === undefined ||
-                  cacheWriteTokens === undefined
-                ) {
-                  return null;
-                }
-                // Advisory fields degrade per-field: a malformed value is
-                // omitted without invalidating the entry.
-                const webSearchRequests = toTokenCount(modelUsage.webSearchRequests);
-                const harnessCostUsd = toFiniteNumber(modelUsage.costUSD);
-                return {
-                  model,
-                  inputTokens,
-                  outputTokens,
-                  cacheReadTokens,
-                  cacheWriteTokens,
-                  ...(webSearchRequests === undefined ? {} : { webSearchRequests }),
-                  ...(harnessCostUsd === undefined ? {} : { harnessCostUsd }),
-                };
-              })
-            : undefined;
-        // One malformed entry poisons the whole breakdown — a partial list
-        // would silently undercount the session. Fall back to top-level usage
-        // (the pre-breakdown path) instead of manufacturing zeros.
-        const models =
-          mappedModels && mappedModels.length > 0 && mappedModels.every((m) => m !== null)
-            ? (mappedModels as NonNullable<CostData["models"]>)
-            : undefined;
-
-        const cost: CostData = {
-          sessionId: "", // Set by the runner with the appropriate runner session ID
-          taskId: this.config.taskId,
-          agentId: this.config.agentId,
-          totalCostUsd: json.total_cost_usd || 0,
-          inputTokens: usage?.input_tokens ?? 0,
-          outputTokens: usage?.output_tokens ?? 0,
-          cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
-          cacheWriteTokens: usage?.cache_creation_input_tokens ?? 0,
-          cacheWrite5mTokens,
-          cacheWrite1hTokens,
-          // Phase 4: surface thinking tokens; previously dropped on the floor.
-          thinkingTokens: usage?.thinking_input_tokens ?? 0,
-          models,
-          durationMs: json.duration_ms || 0,
-          // Phase 4: honest null when the CLI omits num_turns instead of a
-          // faked `1` (would have under-counted in dashboards).
-          numTurns: json.num_turns ?? null,
-          model: this.model,
-          isError: json.is_error || false,
-          provider: "claude",
-        };
-        setCost(cost);
-        this.emit({
-          type: "result",
-          cost,
-          isError: json.is_error || false,
-        });
-
-        // Update context window size from modelUsage if available
-        if (json.modelUsage) {
-          const modelKey = Object.keys(json.modelUsage)[0];
-          if (modelKey && json.modelUsage[modelKey]?.contextWindow) {
-            this.contextWindowSize = json.modelUsage[modelKey].contextWindow;
-          }
-        }
-      }
-
-      // Tool use from assistant messages — emit tool_start for auto-progress
-      if (json.type === "assistant" && json.message) {
-        const message = json.message as {
-          content?: Array<{
-            type: string;
-            name?: string;
-            id?: string;
-            input?: unknown;
-            text?: string;
-          }>;
-        };
-
-        // Emit a `message` event BEFORE any tool_start events for this turn.
-        // The runner uses this as an "assistant turn boundary" to implicit-close
-        // any worker.tool spans left open by the previous turn (the Claude CLI
-        // doesn't emit per-tool completion events for harness-side tools like
-        // Bash/Read/Edit, so without this boundary their spans would stay open
-        // until session shutdown and report inflated duration_ms).
-        const text = Array.isArray(message.content)
-          ? message.content
-              .filter((b) => b.type === "text" && typeof b.text === "string")
-              .map((b) => b.text as string)
-              .join("")
-          : "";
-        this.emit({ type: "message", role: "assistant", content: text });
-        // Subagent (sidechain) frames carry `parent_tool_use_id`; only the
-        // main thread's text should win the `ProviderResult.output` fallback.
-        if (text && !json.parent_tool_use_id) {
-          this.lastAssistantText = text;
-          this.transcript.push(`Assistant: ${scrubSecrets(text)}`);
-        }
-
-        if (message.content) {
-          for (const block of message.content) {
-            if (block.type === "tool_use" && block.name) {
-              this.transcript.push(
-                `Tool[${block.name}] started: ${scrubSecrets(JSON.stringify(block.input ?? {}))}`,
-              );
-              this.emit({
-                type: "tool_start",
-                toolCallId: block.id || "",
-                toolName: block.name,
-                args: block.input || {},
-              });
-            }
-          }
-        }
-
-        // Context usage extraction from assistant message usage.
-        // Phase 9: unified `input + cache + output` formula across every
-        // provider so cross-provider percent comparisons are meaningful.
-        if (json.message.usage) {
-          const usage = json.message.usage;
-          const contextUsed = computeContextUsedUnified({
-            inputTokens: usage.input_tokens,
-            cacheReadTokens: usage.cache_read_input_tokens,
-            cacheCreateTokens: usage.cache_creation_input_tokens,
-            outputTokens: usage.output_tokens,
-          });
-          const contextTotal = this.contextWindowSize;
-
-          this.emit({
-            type: "context_usage",
-            contextUsedTokens: contextUsed,
-            contextTotalTokens: contextTotal,
-            contextPercent: clampContextPercent(contextUsed, contextTotal) ?? 0,
-            outputTokens: usage.output_tokens ?? 0,
-            contextFormula: CONTEXT_FORMULA,
-          });
-        }
-      }
-
-      if (json.type === "user" && Array.isArray(json.message?.content)) {
-        for (const block of json.message.content) {
-          if (block?.type !== "tool_result") continue;
-          const content =
-            typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
-          this.transcript.push(`Tool result: ${scrubSecrets(content)}`);
-        }
-      }
+      const normalized = normalizeClaudeMessage(json, {
+        taskId: this.config.taskId,
+        agentId: this.config.agentId,
+        model: this.model,
+        contextWindowSize: this.contextWindowSize,
+        harnessVariant: this.harnessVariant,
+        harnessVariantMeta: this.harnessVariantMeta,
+        transport: "cli",
+      });
+      if (normalized.sessionId) this._sessionId = normalized.sessionId;
+      if (normalized.model) this.model = normalized.model;
+      if (normalized.contextWindowSize) this.contextWindowSize = normalized.contextWindowSize;
+      if (normalized.cost) setCost(normalized.cost);
+      if (normalized.assistantText) this.lastAssistantText = normalized.assistantText;
+      this.transcript.push(...normalized.transcriptEntries);
+      for (const event of normalized.events) this.emit(event);
 
       trackErrorFromJson(json, this.errorTracker);
     } catch {
@@ -1537,7 +1404,7 @@ class ClaudeSession implements ProviderSession {
   async abort(): Promise<void> {
     this.closeStdin();
     try {
-      this.proc.kill("SIGTERM");
+      await terminateProcessGroup(this.proc.pid);
     } catch {
       // The subprocess may already have exited.
     }
@@ -1548,6 +1415,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   readonly name = "claude";
   readonly traits: ProviderTraits = {
     hasMcp: true,
+    hasToolSearch: true,
     // Claude Code reads ~/.claude/skills itself and advertises every skill's
     // name + description natively.
     nativeSkillDiscovery: true,
@@ -1573,7 +1441,12 @@ export class ClaudeAdapter implements ProviderAdapter {
 
     const model = config.model || "opus";
 
-    const sourceEnv = config.env || process.env;
+    const sourceEnv = withClaudeRouteEnv(config.env || process.env);
+    const sessionConfig: ProviderSessionConfig = {
+      ...config,
+      prompt: await resolveClaudePrompt(config.prompt, process.env.HOME ?? homedir()),
+    };
+    const transport = resolveClaudeTransport(sourceEnv);
     const credType = validateClaudeCredentials(sourceEnv);
     console.log(`\x1b[2m[claude]\x1b[0m Using credential: ${credType}`);
 
@@ -1595,6 +1468,16 @@ export class ClaudeAdapter implements ProviderAdapter {
       useClaudeBridge,
       bridgeRequestedWithoutOAuth,
     } = resolveClaudeBinaryArgv(sourceEnv);
+    if (transport === "sdk" && isClaudeBridgeEffective(sourceEnv)) {
+      throw new Error(
+        "CLAUDE_TRANSPORT=sdk cannot run with an effective Claude Bridge configuration. Select CLI transport or disable the bridge.",
+      );
+    }
+    const claudeSdk = transport === "sdk" ? await import("./claude-sdk-session") : undefined;
+    claudeSdk?.validateClaudeSdkAdditionalArgs([
+      ...claudeBinaryArgv.slice(1),
+      ...(config.additionalArgs ?? []),
+    ]);
     if (bridgeRequestedWithoutOAuth) {
       console.warn(
         `\x1b[33m[claude]\x1b[0m SWARM_USE_CLAUDE_BRIDGE is set but no CLAUDE_CODE_OAUTH_TOKEN is present — falling back to stock 'claude'. claude-bridge requires a subscription/OAuth token (it forwards only the OAuth token to claude and strips ANTHROPIC_*); API-key billing is identical headless vs interactive, so the bridge isn't needed.`,
@@ -1657,8 +1540,8 @@ export class ClaudeAdapter implements ProviderAdapter {
       }
     }
 
-    const taskFilePid = process.pid;
-    const taskFilePath = await writeTaskFile(taskFilePid, {
+    const taskFileKey = `${process.pid}-${config.taskId}`;
+    const taskFilePath = await writeTaskFile(taskFileKey, {
       taskId: config.taskId,
       agentId: config.agentId,
       startedAt: new Date().toISOString(),
@@ -1712,14 +1595,25 @@ export class ClaudeAdapter implements ProviderAdapter {
     const queueSteeringOverride = resolveClaudeQueueSteeringOverride(sourceEnv);
     let harnessVersion: string | undefined;
     try {
-      const result = Bun.spawnSync([...effectiveClaudeBinaryArgv, "--version"], {
-        env: sourceEnv,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      if (result.success) {
-        const trimmed =
-          `${result.stdout?.toString() ?? ""}\n${result.stderr?.toString() ?? ""}`.trim();
+      const probe = registerProcessGroup(
+        Bun.spawn([...effectiveClaudeBinaryArgv, "--version"], {
+          detached: detachedProcessGroup,
+          env: sourceEnv,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          timeout: CLAUDE_VERSION_PROBE_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+          maxBuffer: CLAUDE_VERSION_PROBE_MAX_BUFFER_BYTES,
+        }),
+      );
+      const exitCode = await probe.exited.finally(() => terminateProcessGroup(probe.pid));
+      const [stdout, stderr] = await Promise.all([
+        new Response(probe.stdout).text(),
+        new Response(probe.stderr).text(),
+      ]);
+      if (exitCode === 0) {
+        const trimmed = `${stdout}\n${stderr}`.trim();
         if (trimmed) {
           harnessVersion = trimmed;
           harnessVariantMeta = { version: trimmed };
@@ -1734,18 +1628,35 @@ export class ClaudeAdapter implements ProviderAdapter {
     // binary. A wrapper keeps today's `-p` invocation and simply can't steer.
     const queueSteeringSupported =
       queueSteeringOverride ??
-      (!isInteractiveTmuxClaude && supportsClaudeQueueSteering(harnessVersion));
+      (transport === "sdk" ||
+        (!isInteractiveTmuxClaude && supportsClaudeQueueSteering(harnessVersion)));
     if (!queueSteeringSupported && queueSteeringOverride === undefined) {
       console.warn(
         `\x1b[33m[claude]\x1b[0m Queued steering requires Claude Code >= ${MIN_CLAUDE_QUEUE_STEERING_VERSION.join(".")}; detected ${harnessVersion ?? "an unknown version"}. Steering messages will be promoted to follow-up tasks.`,
       );
     }
 
+    if (transport === "sdk") {
+      return claudeSdk!.createClaudeSdkSession({
+        config: sessionConfig,
+        model,
+        taskFilePath,
+        taskFileKey,
+        sessionMcpConfig,
+        claudeBinaryArgv: effectiveClaudeBinaryArgv,
+        systemPromptFile,
+        harnessVariant,
+        harnessVariantMeta,
+        queueSteeringSupported,
+        runSessionSummary: this.runSessionSummary,
+      });
+    }
+
     return new ClaudeSession(
-      config,
+      sessionConfig,
       model,
       taskFilePath,
-      taskFilePid,
+      taskFileKey,
       sessionMcpConfig,
       effectiveClaudeBinaryArgv,
       systemPromptFile,

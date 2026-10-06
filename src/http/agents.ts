@@ -1,16 +1,21 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { isAlias } from "@desplega/model-catalog";
 import { ensure } from "@desplega.ai/business-use";
 import { z } from "zod";
 import {
   computeContentHash,
   createAgent,
   deleteSwarmConfigByKey,
+  EXTENSION_AGENT_ROLE,
   getAgentById,
+  getAgentDailyTaskCounts,
   getAgentWithTasks,
   getAllAgents,
   getAllAgentsWithTasks,
   getDbClient,
+  getResolvedConfig,
   getSwarmConfigs,
+  ReservedAgentRoleError,
   resetEmptyPollCount,
   setAgentHarnessProvider,
   updateAgentActivity,
@@ -25,6 +30,12 @@ import {
   upsertSwarmConfig,
 } from "../be/db";
 import { createEvent } from "../be/events";
+import { setAgentHarnessCliVersion } from "../be/harness-model-support";
+import {
+  sanitizeModelTierOverrides,
+  setAgentModelTierOverrides,
+} from "../be/model-tier-resolution";
+import { explicitModelError, harnessModelErrorFor } from "../be/model-validation";
 import {
   getRuntimeInstanceById,
   listRuntimeInstancesForAgent,
@@ -34,23 +45,33 @@ import {
   setRuntimeCredentialReady,
   upsertRuntimeInstance,
 } from "../be/multi-runtime";
+import { ACP_TARGET_IDS } from "../providers/acp-target-catalog";
 import { reasoningCapability } from "../providers/reasoning-effort";
 import { ALL_CAPABILITIES, getEnabledCapabilities } from "../server";
 import { telemetry } from "../telemetry";
 import {
   type Agent,
+  AgentAcpStatusSchema,
   AgentAvatarSchema,
   AgentCredStatusSchema,
   AgentLatestModelSchema,
   AgentSchema,
   AgentStatusSchema,
   AgentWithTasksSchema,
+  type ProfileSyncConflict,
   type ProviderName,
   ProviderNameSchema,
   ReasoningEffortSchema,
   RuntimeInstanceSchema,
+  VersionableFieldSchema,
 } from "../types";
+import {
+  type ClaudeTransport,
+  isClaudeBridgeEffective,
+  resolveClaudeTransport,
+} from "../utils/claude-transport";
 import { MAX_PROFILE_FILE_LENGTH } from "../utils/constants";
+import { HeartbeatExpiryError } from "../utils/heartbeat-expiry";
 import {
   type BudgetedIdentityField,
   IDENTITY_FIELD_BUDGETS,
@@ -136,6 +157,14 @@ const registerAgent = route({
      * enforcing the mode-dependent requirement.
      */
     runtimeInstanceId: z.string().min(1).optional(),
+    /**
+     * The worker's parsed MODEL_TIER_* env overrides, {provider: {tier: model}}.
+     * Values only. Stored on the agent row for claim-time resolution; `{}`
+     * clears, omitted leaves the stored value unchanged.
+     */
+    modelTierOverrides: z.record(z.string(), z.record(z.string(), z.string())).optional(),
+    /** The worker's harness CLI version (`claude --version` / `codex --version`). */
+    harnessCliVersion: z.string().max(64).optional(),
   }),
   responses: {
     200: {
@@ -170,7 +199,70 @@ const setAgentHarnessProviderRoute = route({
   },
 });
 
-const LocalHarnessProviderSchema = z.enum(["claude", "codex", "pi", "opencode"]);
+const LocalHarnessProviderSchema = z.enum([
+  "claude",
+  "codex",
+  "pi",
+  "opencode",
+  "acp",
+  "dsh",
+  "amp",
+  "cursor",
+]);
+const AcpRuntimeConfigSchema = z
+  .object({
+    target: z.enum(ACP_TARGET_IDS),
+    command: z.string().trim().min(1).nullable().optional(),
+    args: z.array(z.string()).optional(),
+    envKeys: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).optional(),
+    modelEnvKey: z
+      .string()
+      .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+      .nullable()
+      .optional(),
+    options: z.record(z.string(), z.union([z.string(), z.boolean()])).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.target === "custom" && !value.command) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["command"],
+        message: "Custom ACP targets require a command",
+      });
+    }
+  });
+
+const ClaudeTransportSchema = z.enum(["cli", "sdk"]);
+
+const ClaudeRuntimeConfigSchema = z.object({
+  transport: ClaudeTransportSchema.nullable().optional(),
+});
+
+const ClaudeRuntimeMetadataSchema = z.object({
+  transport: ClaudeTransportSchema.nullable(),
+  effectiveTransport: ClaudeTransportSchema,
+  inheritedTransport: ClaudeTransportSchema,
+  bridgeEffective: z.boolean(),
+});
+
+const getAgentRuntimeRoute = route({
+  method: "get",
+  path: "/api/agents/{id}/runtime",
+  pattern: ["api", "agents", null, "runtime"],
+  summary: "Get an agent's runtime configuration",
+  description:
+    "Returns the agent's explicit Claude transport override, the effective transport after config precedence, and whether Claude Bridge is effective. Values never include credentials.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  query: z.object({ repoId: z.string().optional() }),
+  responses: {
+    200: {
+      description: "Agent runtime configuration",
+      schema: z.object({ claude: ClaudeRuntimeMetadataSchema }),
+    },
+    404: { description: "Agent not found" },
+  },
+});
 
 const updateAgentRuntimeRoute = route({
   method: "patch",
@@ -178,14 +270,17 @@ const updateAgentRuntimeRoute = route({
   pattern: ["api", "agents", null, "runtime"],
   summary: "Update an agent's runtime harness and default model",
   description:
-    "Updates `agents.harness_provider` and upserts agent-scoped `swarm_config` rows for HARNESS_PROVIDER, MODEL_OVERRIDE, and REASONING_EFFORT_OVERRIDE. The settings apply to future provider sessions. For `model` and `reasoning_effort`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it.",
+    "Updates `agents.harness_provider` and agent-scoped runtime config. The settings apply to future provider sessions. For `model`, `reasoning_effort`, and `claude.transport`: omit the field to leave it unchanged, send `null` to clear the corresponding override, or send a value to set it. A `model` the model catalog does not list is a 400 unless `allow_custom_model` is true. A `latest:` alias is not accepted here (aliases resolve for a task's model and for `MODEL_TIER_*` values); `reasoning_effort` must be one the harness and model support.",
   tags: ["Agents"],
   params: z.object({ id: z.string() }),
+  query: z.object({ repoId: z.string().optional() }),
   body: z.object({
     harness_provider: LocalHarnessProviderSchema,
     model: z.string().trim().min(1).nullable().optional(),
     allow_custom_model: z.boolean().optional().default(false),
     reasoning_effort: ReasoningEffortSchema.nullable().optional(),
+    acp: AcpRuntimeConfigSchema.optional(),
+    claude: ClaudeRuntimeConfigSchema.optional(),
   }),
   responses: {
     200: { description: "Updated agent row", schema: AgentWithCapacitySchema },
@@ -194,13 +289,84 @@ const updateAgentRuntimeRoute = route({
   },
 });
 
+class ClaudeTransportConflictError extends Error {}
+
+async function getClaudeRuntimeMetadata(
+  agentId: string,
+  repoId?: string,
+): Promise<{
+  transport: ClaudeTransport | null;
+  effectiveTransport: ClaudeTransport;
+  inheritedTransport: ClaudeTransport;
+  bridgeEffective: boolean;
+}> {
+  const resolvedConfigs = await getResolvedConfig(agentId, repoId);
+  const inheritedConfigs = await getResolvedConfig(undefined, repoId);
+  const agentTransportRows = await getSwarmConfigs({
+    scope: "agent",
+    scopeId: agentId,
+    key: "CLAUDE_TRANSPORT",
+  });
+  const resolvedEnv = Object.fromEntries(
+    resolvedConfigs.map((config) => [config.key, config.value]),
+  );
+  const inheritedEnv = Object.fromEntries(
+    inheritedConfigs.map((config) => [config.key, config.value]),
+  );
+  const rawTransport = agentTransportRows[0]?.value;
+  const transport = rawTransport === "cli" || rawTransport === "sdk" ? rawTransport : null;
+  return {
+    transport,
+    effectiveTransport: resolveClaudeTransport(resolvedEnv),
+    inheritedTransport: resolveClaudeTransport(inheritedEnv),
+    bridgeEffective: isClaudeBridgeEffective(resolvedEnv),
+  };
+}
+
+/**
+ * Effective `CLAUDE_TRANSPORT` for a batch of agents, using the same
+ * global → agent precedence as `getClaudeRuntimeMetadata` (minus repo scope,
+ * which a list has no context for). Two queries total, not two per agent.
+ * Non-Claude agents and invalid values yield `undefined` so the list never
+ * fails on one bad config row.
+ */
+async function resolveListClaudeTransports(
+  agents: ReadonlyArray<{ id: string; harnessProvider?: ProviderName | null }>,
+): Promise<Map<string, ClaudeTransport>> {
+  const result = new Map<string, ClaudeTransport>();
+  if (!agents.some((agent) => agent.harnessProvider === "claude")) return result;
+  const [globalRows, agentRows] = await Promise.all([
+    getSwarmConfigs({ scope: "global", key: "CLAUDE_TRANSPORT" }),
+    getSwarmConfigs({ scope: "agent", key: "CLAUDE_TRANSPORT" }),
+  ]);
+  const globalValue = globalRows[0]?.value;
+  const agentValues = new Map(agentRows.map((row) => [row.scopeId, row.value]));
+  for (const agent of agents) {
+    if (agent.harnessProvider !== "claude") continue;
+    try {
+      result.set(
+        agent.id,
+        resolveClaudeTransport({ CLAUDE_TRANSPORT: agentValues.get(agent.id) ?? globalValue }),
+      );
+    } catch {
+      // Invalid stored value: leave the field absent rather than 500 the list.
+    }
+  }
+  return result;
+}
+
+/** List/detail rows carry the effective Claude transport so the dashboard can flag SDK agents. */
+const AgentListItemSchema = AgentWithCapacityAndTasksSchema.extend({
+  claudeTransport: ClaudeTransportSchema.optional(),
+});
+
 const listAgents = route({
   method: "get",
   path: "/api/agents",
   pattern: ["api", "agents"],
   summary: "List all agents",
   description:
-    "Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`.",
+    "Returns agents WITHOUT the six identity-markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/`setupScript`) by default — they bloat the list by ~16 KB/agent and the overview never renders them. Pass `fields=full` to restore them, or fetch a single agent via `GET /api/agents/{id}`. Extension identities (`ext:<name>`, role `extension`) are never listed; they are API principals, not workers.",
   tags: ["Agents"],
   query: z.object({
     include: z.enum(["tasks"]).optional(),
@@ -210,7 +376,7 @@ const listAgents = route({
   responses: {
     200: {
       description: "Agent list with capacity info",
-      schema: z.object({ agents: z.array(AgentWithCapacityAndTasksSchema) }),
+      schema: z.object({ agents: z.array(AgentListItemSchema) }),
     },
   },
 });
@@ -260,7 +426,7 @@ const listAgentRuntimeInstances = route({
   pattern: ["api", "agents", null, "runtime-instances"],
   summary: "List runtime instances serving an agent",
   description:
-    "Read-only view of the worker processes currently registered for a logical agent. Rows exist only for multi-runtime registrations (MULTI_RUNTIME_ENABLED), so the list is empty in the default configuration. `isLive` combines `status` with `lastSeenAt` freshness against the server's staleness cutoff (`staleThresholdMinutes`); `reportedSlots` is each process's self-reported capacity, distinct from the agent's logical `maxTasks` policy.",
+    "Read-only view of the worker processes currently registered for a logical agent. Rows exist only for multi-runtime registrations (MULTI_RUNTIME_ENABLED), so the list is empty when the flag is disabled. `isLive` combines `status` with `lastSeenAt` freshness against the server's staleness cutoff (`staleThresholdMinutes`); `reportedSlots` is each process's self-reported capacity, distinct from the agent's logical `maxTasks` policy.",
   tags: ["Agents"],
   params: z.object({ id: z.string() }),
   responses: {
@@ -274,6 +440,29 @@ const listAgentRuntimeInstances = route({
     404: { description: "Agent not found" },
   },
 });
+
+const getAgentTaskActivity = route({
+  method: "get",
+  path: "/api/agents/{id}/task-activity",
+  pattern: ["api", "agents", null, "task-activity"],
+  summary: "Daily task counts for an agent",
+  description:
+    "Number of tasks created for the agent per UTC day over the last `days` days (default 365, max 730), oldest first. Days with no tasks are omitted. Backs the activity heatmap on the agent page.",
+  tags: ["Agents"],
+  params: z.object({ id: z.string() }),
+  query: z.object({ days: z.coerce.number().int().min(1).max(730).optional() }),
+  responses: {
+    200: {
+      description: "Daily task counts",
+      schema: z.object({
+        days: z.array(z.object({ date: z.string(), count: z.number().int() })),
+      }),
+    },
+    404: { description: "Agent not found" },
+  },
+});
+
+const ContentHashSchema = z.string().regex(/^[0-9a-f]{64}$/, "sha256 hex");
 
 const ProfileSyncRejectionSchema = z.object({
   field: z.enum(["soulMd", "identityMd", "claudeMd", "toolsMd"]),
@@ -306,6 +495,12 @@ const updateAgentProfileRoute = route({
     changeSource: z.string().optional(),
     changedByAgentId: z.string().optional(),
     changeReason: z.string().optional(),
+    /**
+     * Compare-and-set token per field: the sha256 (hex) of the content the edit
+     * was based on. A field whose current value hashes differently is dropped
+     * (the DB moved since), without failing the rest of the update.
+     */
+    expectedHashes: z.partialRecord(VersionableFieldSchema, ContentHashSchema).optional(),
   }),
   responses: {
     200: { description: "Profile updated", schema: AgentWithCapacitySchema },
@@ -343,7 +538,7 @@ const getAgent = route({
     include: z.enum(["tasks"]).optional(),
   }),
   responses: {
-    200: { description: "Agent with capacity info", schema: AgentWithCapacityAndTasksSchema },
+    200: { description: "Agent with capacity info", schema: AgentListItemSchema },
     404: { description: "Agent not found" },
   },
 });
@@ -366,6 +561,8 @@ const credentialStatusBody = z.object({
    * without `cred_status`, the API preserves existing readiness/live-test data.
    */
   latest_model: AgentLatestModelSchema.optional(),
+  /** ACP session options discovered after session/new. Merge-only. */
+  acp: AgentAcpStatusSchema.optional(),
 });
 
 const updateAgentCredentialStatusRoute = route({
@@ -429,6 +626,12 @@ export async function handleAgentRegister(
     const parsed = await registerAgent.parse(req, res, pathSegments, new URLSearchParams());
     if (!parsed) return true;
 
+    // Extension identities are created only by the extension lifecycle.
+    if (parsed.body.role === EXTENSION_AGENT_ROLE) {
+      jsonError(res, `Role "${EXTENSION_AGENT_ROLE}" is reserved for extension identities.`, 400);
+      return true;
+    }
+
     const agentId = myAgentId || crypto.randomUUID();
     // Read once so one mode applies consistently even if a config reload
     // flips the flag mid-request.
@@ -480,6 +683,19 @@ export async function handleAgentRegister(
           parsed.body.harness_provider !== existingAgent.harnessProvider
         ) {
           await setAgentHarnessProvider(existingAgent.id, parsed.body.harness_provider);
+          // The agent-scope MODEL_OVERRIDE may still name the old harness family. The worker
+          // falls back to its adapter default at spawn; the row stays for a human to fix.
+          const harness = parsed.body.harness_provider;
+          const override = (
+            await getSwarmConfigs({ scope: "agent", scopeId: agentId, key: "MODEL_OVERRIDE" })
+          )[0]?.value;
+          if (override && (await harnessModelErrorFor(override, harness))) {
+            getDbClient().afterCommit(() => {
+              console.warn(
+                `[agents] MODEL_OVERRIDE ${override} of agent ${agentId} does not run on its new ${harness} harness (was ${existingAgent.harnessProvider ?? "unset"}); update or clear it`,
+              );
+            });
+          }
         }
         await resetEmptyPollCount(existingAgent.id);
         if (multiRuntime && parsed.body.runtimeInstanceId) {
@@ -528,6 +744,17 @@ export async function handleAgentRegister(
 
       return { agent, created: true };
     });
+
+    if (parsed.body.harnessCliVersion !== undefined) {
+      await setAgentHarnessCliVersion(agentId, parsed.body.harnessCliVersion.trim() || null);
+    }
+
+    if (parsed.body.modelTierOverrides) {
+      await setAgentModelTierOverrides(
+        agentId,
+        sanitizeModelTierOverrides(parsed.body.modelTierOverrides),
+      );
+    }
 
     telemetry.agent("registered", {
       role: parsed.body.role,
@@ -600,8 +827,16 @@ export async function handleAgentsRest(
     const agents = includeTasks
       ? await getAllAgentsWithTasks({ slim })
       : await getAllAgents({ slim });
-    const agentsWithCapacity = await Promise.all(agents.map(agentWithCapacity));
-    listAgents.respond(res, 200, { agents: agentsWithCapacity });
+    const [agentsWithCapacity, transports] = await Promise.all([
+      Promise.all(agents.map(agentWithCapacity)),
+      resolveListClaudeTransports(agents),
+    ]);
+    listAgents.respond(res, 200, {
+      agents: agentsWithCapacity.map((agent) => {
+        const claudeTransport = transports.get(agent.id);
+        return claudeTransport ? { ...agent, claudeTransport } : agent;
+      }),
+    });
     return true;
   }
 
@@ -655,6 +890,19 @@ export async function handleAgentsRest(
     return true;
   }
 
+  if (getAgentTaskActivity.match(req.method, pathSegments)) {
+    const parsed = await getAgentTaskActivity.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getAgentById(parsed.params.id))) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    getAgentTaskActivity.respond(res, 200, {
+      days: await getAgentDailyTaskCounts(parsed.params.id, parsed.query.days ?? 365),
+    });
+    return true;
+  }
+
   if (updateAgentProfileRoute.match(req.method, pathSegments)) {
     const parsed = await updateAgentProfileRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
@@ -694,6 +942,7 @@ export async function handleAgentsRest(
           }
         : undefined;
 
+    const conflicts: ProfileSyncConflict[] = [];
     let agent: Agent | null;
     try {
       agent = await updateAgentProfile(
@@ -713,8 +962,16 @@ export async function handleAgentsRest(
           ...(body.avatar !== undefined ? { avatar: body.avatar } : {}),
         },
         versionMeta,
+        {
+          expectedHashes: body.expectedHashes,
+          onConflict: (conflict) => conflicts.push(conflict),
+        },
       );
     } catch (error) {
+      if (error instanceof HeartbeatExpiryError || error instanceof ReservedAgentRoleError) {
+        jsonError(res, error.message, 400);
+        return true;
+      }
       if (error instanceof IdentityFieldBudgetError) {
         if (
           versionMeta?.changeSource === "self_edit" ||
@@ -755,10 +1012,29 @@ export async function handleAgentsRest(
       return true;
     }
 
+    // A dropped field still answers 200 (the rest of the update landed), so the
+    // drop must be visible somewhere: one event per field, queryable later.
+    for (const conflict of conflicts) {
+      try {
+        await createEvent({
+          category: "system",
+          event: "system.profile_sync_conflict",
+          status: "skipped",
+          source: "api",
+          agentId: parsed.params.id,
+          data: { ...conflict, changeSource: versionMeta?.changeSource ?? null },
+        });
+      } catch (eventError) {
+        const message = eventError instanceof Error ? eventError.message : String(eventError);
+        console.error(scrubSecrets(`[profile-sync] Failed to persist conflict event: ${message}`));
+      }
+    }
+
     if (versionMeta?.changeSource === "self_edit" || versionMeta?.changeSource === "session_sync") {
       try {
         for (const field of Object.keys(IDENTITY_FIELD_BUDGETS) as BudgetedIdentityField[]) {
-          if (body[field] === undefined) continue;
+          // A field dropped by the compare-and-set was not written: nothing reconciled.
+          if (body[field] === undefined || conflicts.some((c) => c.field === field)) continue;
           await createEvent({
             category: "system",
             event: "system.profile_sync_reconciled",
@@ -815,10 +1091,33 @@ export async function handleAgentsRest(
     return true;
   }
 
+  if (getAgentRuntimeRoute.match(req.method, pathSegments)) {
+    const parsed = await getAgentRuntimeRoute.parse(req, res, pathSegments, queryParams);
+    if (!parsed) return true;
+    if (!(await getAgentById(parsed.params.id))) {
+      jsonError(res, "Agent not found", 404);
+      return true;
+    }
+    getAgentRuntimeRoute.respond(res, 200, {
+      claude: await getClaudeRuntimeMetadata(parsed.params.id, parsed.query.repoId),
+    });
+    return true;
+  }
+
   if (updateAgentRuntimeRoute.match(req.method, pathSegments)) {
     const parsed = await updateAgentRuntimeRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    const { harness_provider, model, allow_custom_model, reasoning_effort } = parsed.body;
+    const { harness_provider, model, allow_custom_model, reasoning_effort, acp, claude } =
+      parsed.body;
+
+    if (acp && harness_provider !== "acp") {
+      jsonError(res, "ACP configuration requires harness_provider=acp", 400);
+      return true;
+    }
+    if (claude && harness_provider !== "claude") {
+      jsonError(res, "Claude configuration requires harness_provider=claude", 400);
+      return true;
+    }
 
     // Validate the requested level against the hybrid capability lookup
     // before touching the DB. `model` may be omitted (leave MODEL_OVERRIDE
@@ -837,8 +1136,11 @@ export async function handleAgentsRest(
                 key: "MODEL_OVERRIDE",
               })
             )[0]?.value ?? "");
-      const capability = reasoningCapability(harness_provider, modelForValidation ?? "");
-      if (!capability.levels.includes(reasoning_effort)) {
+      const allowedLevels =
+        harness_provider === "acp"
+          ? []
+          : reasoningCapability(harness_provider, modelForValidation ?? "").levels;
+      if (!allowedLevels.includes(reasoning_effort)) {
         json(
           res,
           {
@@ -846,7 +1148,7 @@ export async function handleAgentsRest(
             harness: harness_provider,
             model: modelForValidation || null,
             level: reasoning_effort,
-            allowed: capability.levels,
+            allowed: allowedLevels,
           },
           400,
         );
@@ -854,56 +1156,171 @@ export async function handleAgentsRest(
       }
     }
 
-    const agent = await getDbClient().transaction(async () => {
-      const updated = await setAgentHarnessProvider(
-        parsed.params.id,
-        harness_provider as ProviderName,
+    // An explicit model must be in the catalog unless the caller marks it custom
+    // (`allow_custom_model`). `null` clears the override and `undefined` leaves it.
+    if (typeof model === "string" && isAlias(model)) {
+      jsonError(
+        res,
+        `A latest: alias cannot be an agent's default model ("${model}"). Set the alias on a task, or as a MODEL_TIER_<PROVIDER>_<TIER> value.`,
+        400,
       );
-      if (!updated) return null;
-
-      await upsertSwarmConfig({
-        scope: "agent",
-        scopeId: parsed.params.id,
-        key: "HARNESS_PROVIDER",
-        value: harness_provider,
-        description: "Set via PATCH /api/agents/{id}/runtime",
+      return true;
+    }
+    if (typeof model === "string") {
+      const modelError = await explicitModelError({
+        model,
+        allowCustomModel: allow_custom_model,
+        harnessProvider: harness_provider,
       });
-
-      // `model === null` clears MODEL_OVERRIDE; `undefined` leaves it
-      // untouched; a string sets/updates it. Symmetric with reasoning_effort
-      // below — this closes a pre-existing gap (there was previously no way
-      // to clear MODEL_OVERRIDE via the API).
-      if (model === null) {
-        await deleteSwarmConfigByKey("agent", parsed.params.id, "MODEL_OVERRIDE");
-      } else if (model !== undefined) {
-        await upsertSwarmConfig({
-          scope: "agent",
-          scopeId: parsed.params.id,
-          key: "MODEL_OVERRIDE",
-          value: model,
-          description: allow_custom_model
-            ? "Custom model set via PATCH /api/agents/{id}/runtime"
-            : "Set via PATCH /api/agents/{id}/runtime",
-        });
+      if (modelError) {
+        jsonError(res, modelError, 400);
+        return true;
       }
+    }
 
-      // Same tri-state contract for REASONING_EFFORT_OVERRIDE. Note: until
-      // the runner reads this key (Phase 3), setting it is a no-op on the
-      // worker side — this phase only wires storage + validation.
-      if (reasoning_effort === null) {
-        await deleteSwarmConfigByKey("agent", parsed.params.id, "REASONING_EFFORT_OVERRIDE");
-      } else if (reasoning_effort !== undefined) {
+    let agent: Agent | null;
+    try {
+      agent = await getDbClient().transaction(async () => {
+        const updated = await setAgentHarnessProvider(
+          parsed.params.id,
+          harness_provider as ProviderName,
+        );
+        if (!updated) return null;
+
         await upsertSwarmConfig({
           scope: "agent",
           scopeId: parsed.params.id,
-          key: "REASONING_EFFORT_OVERRIDE",
-          value: reasoning_effort,
+          key: "HARNESS_PROVIDER",
+          value: harness_provider,
           description: "Set via PATCH /api/agents/{id}/runtime",
         });
-      }
 
-      return updated;
-    });
+        // `model === null` clears MODEL_OVERRIDE; `undefined` leaves it
+        // untouched; a string sets/updates it. Symmetric with reasoning_effort
+        // below. This closes a pre-existing gap (there was previously no way
+        // to clear MODEL_OVERRIDE via the API).
+        if (model === null) {
+          await deleteSwarmConfigByKey("agent", parsed.params.id, "MODEL_OVERRIDE");
+        } else if (model !== undefined) {
+          await upsertSwarmConfig({
+            scope: "agent",
+            scopeId: parsed.params.id,
+            key: "MODEL_OVERRIDE",
+            value: model,
+            description: allow_custom_model
+              ? "Custom model set via PATCH /api/agents/{id}/runtime"
+              : "Set via PATCH /api/agents/{id}/runtime",
+          });
+        }
+
+        // Same tri-state contract for REASONING_EFFORT_OVERRIDE. Note: until
+        // the runner reads this key (Phase 3), setting it is a no-op on the
+        // worker side. This phase only wires storage + validation.
+        if (reasoning_effort === null) {
+          await deleteSwarmConfigByKey("agent", parsed.params.id, "REASONING_EFFORT_OVERRIDE");
+        } else if (reasoning_effort !== undefined) {
+          await upsertSwarmConfig({
+            scope: "agent",
+            scopeId: parsed.params.id,
+            key: "REASONING_EFFORT_OVERRIDE",
+            value: reasoning_effort,
+            description: "Set via PATCH /api/agents/{id}/runtime",
+          });
+        }
+
+        if (claude?.transport === null) {
+          await deleteSwarmConfigByKey("agent", parsed.params.id, "CLAUDE_TRANSPORT");
+        } else if (claude?.transport !== undefined) {
+          await upsertSwarmConfig({
+            scope: "agent",
+            scopeId: parsed.params.id,
+            key: "CLAUDE_TRANSPORT",
+            value: claude.transport,
+            description: "Set via PATCH /api/agents/{id}/runtime",
+          });
+        }
+
+        if (harness_provider === "claude") {
+          const metadata = await getClaudeRuntimeMetadata(parsed.params.id, parsed.query.repoId);
+          if (metadata.bridgeEffective && metadata.effectiveTransport === "sdk") {
+            throw new ClaudeTransportConflictError(
+              "SDK transport cannot run while Claude Bridge is active. Choose CLI, or disable the bridge configuration.",
+            );
+          }
+        }
+
+        if (acp) {
+          await upsertSwarmConfig({
+            scope: "agent",
+            scopeId: parsed.params.id,
+            key: "ACP_TARGET",
+            value: acp.target,
+            description: "Set via PATCH /api/agents/{id}/runtime",
+          });
+          if (acp.command !== undefined) {
+            if (acp.command === null) {
+              await deleteSwarmConfigByKey("agent", parsed.params.id, "ACP_TARGET_COMMAND");
+            } else {
+              await upsertSwarmConfig({
+                scope: "agent",
+                scopeId: parsed.params.id,
+                key: "ACP_TARGET_COMMAND",
+                value: acp.command,
+                description: "Set via PATCH /api/agents/{id}/runtime",
+              });
+            }
+          }
+          if (acp.args !== undefined) {
+            await upsertSwarmConfig({
+              scope: "agent",
+              scopeId: parsed.params.id,
+              key: "ACP_TARGET_ARGS",
+              value: JSON.stringify(acp.args),
+              description: "Set via PATCH /api/agents/{id}/runtime",
+            });
+          }
+          if (acp.envKeys !== undefined) {
+            await upsertSwarmConfig({
+              scope: "agent",
+              scopeId: parsed.params.id,
+              key: "ACP_TARGET_ENV_KEYS",
+              value: JSON.stringify(acp.envKeys),
+              description: "Set via PATCH /api/agents/{id}/runtime",
+            });
+          }
+          if (acp.modelEnvKey !== undefined) {
+            if (acp.modelEnvKey === null) {
+              await deleteSwarmConfigByKey("agent", parsed.params.id, "ACP_MODEL_ENV_KEY");
+            } else {
+              await upsertSwarmConfig({
+                scope: "agent",
+                scopeId: parsed.params.id,
+                key: "ACP_MODEL_ENV_KEY",
+                value: acp.modelEnvKey,
+                description: "Set via PATCH /api/agents/{id}/runtime",
+              });
+            }
+          }
+          if (acp.options !== undefined) {
+            await upsertSwarmConfig({
+              scope: "agent",
+              scopeId: parsed.params.id,
+              key: "ACP_CONFIG_OPTIONS",
+              value: JSON.stringify(acp.options),
+              description: "Set via PATCH /api/agents/{id}/runtime",
+            });
+          }
+        }
+
+        return updated;
+      });
+    } catch (error) {
+      if (error instanceof ClaudeTransportConflictError) {
+        jsonError(res, error.message, 400);
+        return true;
+      }
+      throw error;
+    }
 
     if (!agent) {
       jsonError(res, "Agent not found", 404);
@@ -997,10 +1414,11 @@ export async function handleAgentsRest(
               parsed.body.cred_status.latestModel ??
               agent.credStatus?.latestModel ??
               null,
+            acp: parsed.body.acp ?? parsed.body.cred_status.acp ?? agent.credStatus?.acp ?? null,
           }
         : null;
       finalAgent = (await updateAgentCredStatus(parsed.params.id, nextStatus)) ?? agent;
-    } else if (parsed.body.latest_model) {
+    } else if (parsed.body.latest_model || parsed.body.acp) {
       const current = agent.credStatus ?? {
         ready: parsed.body.ready ?? true,
         missing: parsed.body.missing ?? [],
@@ -1008,14 +1426,16 @@ export async function handleAgentsRest(
         hint: null,
         liveTest: null,
         latestModel: null,
-        reportedAt: parsed.body.latest_model.reportedAt,
+        reportedAt: parsed.body.latest_model?.reportedAt ?? parsed.body.acp!.reportedAt,
         reportKind: "post_task" as const,
         bedrock: null,
+        acp: null,
       };
       finalAgent =
         (await updateAgentCredStatus(parsed.params.id, {
           ...current,
-          latestModel: parsed.body.latest_model,
+          latestModel: parsed.body.latest_model ?? current.latestModel,
+          acp: parsed.body.acp ?? current.acp,
         })) ?? agent;
     }
     updateAgentCredentialStatusRoute.respond(res, 200, await agentWithCapacity(finalAgent));
@@ -1056,7 +1476,16 @@ export async function handleAgentsRest(
       return true;
     }
 
-    getAgent.respond(res, 200, await agentWithCapacity(agent));
+    const [agentWithCap, transports] = await Promise.all([
+      agentWithCapacity(agent),
+      resolveListClaudeTransports([agent]),
+    ]);
+    const claudeTransport = transports.get(agent.id);
+    getAgent.respond(
+      res,
+      200,
+      claudeTransport ? { ...agentWithCap, claudeTransport } : agentWithCap,
+    );
     return true;
   }
 

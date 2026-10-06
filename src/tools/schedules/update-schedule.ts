@@ -4,12 +4,15 @@ import * as z from "zod";
 import { authorizeAssetKeyWrite } from "@/be/asset-key-auth";
 import { resolveTaskAuditUserId } from "@/be/audit-user";
 import {
+  extensionAgentAssignmentError,
   getAgentById,
   getScheduledTaskById,
   getScheduledTaskByName,
   getWorkflow,
+  isExtensionAgent,
   updateScheduledTask,
 } from "@/be/db";
+import { explicitModelErrorForAgent } from "@/be/model-validation";
 import { mergeScheduleTiming, validateRecurringTiming } from "@/be/schedules/validate";
 import { getScript } from "@/be/scripts/db";
 import { calculateNextRun } from "@/scheduler";
@@ -67,10 +70,18 @@ export const updateScheduleInputSchema = z.object({
     .min(1)
     .nullable()
     .optional()
-    .describe("Concrete model override for tasks created by this schedule. Set to null to clear."),
+    .describe(
+      "Concrete model override for tasks created by this schedule. Set to null to clear. The model must run on the assignee's harness (an Anthropic model on a Claude agent, an OpenAI model on a Codex agent); a mismatch is rejected.",
+    ),
   modelTier: ModelTierSchema.nullable()
     .optional()
     .describe("Portable model tier for tasks created by this schedule. Set to null to clear."),
+  allowCustomModel: z
+    .boolean()
+    .optional()
+    .describe(
+      "Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet.",
+    ),
 });
 
 const scheduleDataShape = {
@@ -89,6 +100,7 @@ const scheduleDataShape = {
   lastRunAt: z.string().optional(),
   nextRunAt: z.string().optional(),
   createdByAgentId: z.string().optional(),
+  parentTaskId: z.string().optional(),
   timezone: z.string().optional(),
   model: z.string().optional(),
   modelTier: ModelTierSchema.optional(),
@@ -136,6 +148,7 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
         enabled,
         model,
         modelTier,
+        allowCustomModel,
       },
       requestInfo,
       _meta,
@@ -184,6 +197,9 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
         const agent = await getAgentById(targetAgentId);
         if (!agent) {
           return toolErr(`Target agent not found: ${targetAgentId}`);
+        }
+        if (isExtensionAgent(agent)) {
+          return toolErr(extensionAgentAssignmentError(agent));
         }
       }
 
@@ -240,12 +256,32 @@ export const registerUpdateScheduleTool = (server: McpServer) => {
         if (targetAgentId !== undefined) updateData.targetAgentId = targetAgentId;
         if (timezone !== undefined) updateData.timezone = timezone;
         if (enabled !== undefined) updateData.enabled = enabled;
+        // A move to another agent re-judges the stored model against the new harness.
+        const agentChanged =
+          targetAgentId !== undefined && targetAgentId !== schedule.targetAgentId;
         if (model !== undefined || modelTier !== undefined) {
           const normalizedModel = splitLegacyModelAlias({ model, modelTier });
+          // A model the schedule already stores is not re-judged, so an unrelated edit still saves.
+          if (normalizedModel.model !== schedule.model || agentChanged) {
+            const modelError = await explicitModelErrorForAgent({
+              model: normalizedModel.model,
+              allowCustomModel: allowCustomModel || normalizedModel.model === schedule.model,
+              agentId: targetAgentId ?? schedule.targetAgentId,
+            });
+            if (modelError) return toolErr(modelError);
+          }
           if (model !== undefined) updateData.model = normalizedModel.model ?? null;
           if (modelTier !== undefined || normalizedModel.modelTier) {
             updateData.modelTier = normalizedModel.modelTier ?? null;
           }
+        } else if (agentChanged && schedule.model) {
+          // Harness only: the stored id already passed the catalog check when it was written.
+          const modelError = await explicitModelErrorForAgent({
+            model: schedule.model,
+            allowCustomModel: true,
+            agentId: targetAgentId ?? schedule.targetAgentId,
+          });
+          if (modelError) return toolErr(modelError);
         }
 
         // Recalculate nextRunAt based on schedule type

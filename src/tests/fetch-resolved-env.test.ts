@@ -1,7 +1,7 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   applyResolvedEnvToProcessEnv,
-  BOOT_ENV_SNAPSHOT,
+  fetchRepoConfig,
   fetchResolvedEnv,
   RELOADABLE_ENV_KEYS,
 } from "../commands/runner";
@@ -17,14 +17,16 @@ import {
 let server: ReturnType<typeof Bun.serve>;
 let testUrl: string;
 
-/** `rawBody`, when set, is sent verbatim (bypassing JSON.stringify) so a test can simulate a truly malformed response body. */
-type MockResponse = { status: number; body: unknown; rawBody?: string };
+type MockResponse = { status: number; body: unknown };
 
 const defaultMockResponse: MockResponse = {
   status: 200,
   body: { configs: [] },
 };
 const mockResponsesByAgentId = new Map<string, MockResponse>();
+const requestedRepoIds = new Map<string, string | null>();
+/** Every `GET /api/keys/available` query string observed by the mock server, most recent last. */
+const keysAvailableRequests: string[] = [];
 
 beforeAll(() => {
   server = Bun.serve({
@@ -34,11 +36,19 @@ beforeAll(() => {
 
       if (url.pathname === "/api/config/resolved") {
         const agentId = url.searchParams.get("agentId") ?? "";
+        requestedRepoIds.set(agentId, url.searchParams.get("repoId"));
         const mockResponse = mockResponsesByAgentId.get(agentId) ?? defaultMockResponse;
-        return new Response(mockResponse.rawBody ?? JSON.stringify(mockResponse.body), {
+        return new Response(JSON.stringify(mockResponse.body), {
           status: mockResponse.status,
           headers: { "Content-Type": "application/json" },
         });
+      }
+
+      if (url.pathname === "/api/keys/available") {
+        keysAvailableRequests.push(url.search);
+        const totalKeys = Number(url.searchParams.get("totalKeys") ?? "1");
+        const availableIndices = Array.from({ length: totalKeys }, (_, i) => i);
+        return Response.json({ success: true, availableIndices, totalKeys });
       }
 
       return new Response("Not found", { status: 404 });
@@ -52,6 +62,185 @@ afterAll(() => {
 });
 
 describe("fetchResolvedEnv", () => {
+  test("repository scope requires the requested repository identity", async () => {
+    const repoId = crypto.randomUUID();
+    let url = "https://github.com/another-owner/fixture";
+    const api = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ repos: [{ id: repoId, url, name: "fixture" }] }),
+    });
+    try {
+      expect(
+        await fetchRepoConfig(api.url.toString(), "fixture", "owner/fixture", true),
+      ).toBeNull();
+      url = "https://github.com/owner/fixture-extra";
+      expect(
+        await fetchRepoConfig(api.url.toString(), "fixture", "owner/fixture", true),
+      ).toBeNull();
+      for (const repositoryUrl of [
+        "https://github.com/owner/fixture.git",
+        "git@github.com:owner/fixture.git",
+      ]) {
+        url = repositoryUrl;
+        expect(
+          (await fetchRepoConfig(api.url.toString(), "fixture", "owner/fixture", true))?.id,
+        ).toBe(repoId);
+      }
+    } finally {
+      api.stop(true);
+    }
+  });
+
+  test("resolves full repository URLs and normalizes the API name filter", async () => {
+    const repoId = crypto.randomUUID();
+    let registeredUrl = "https://github.com/owner/fixture.git";
+    const requestedNames: Array<string | null> = [];
+    const api = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const name = new URL(req.url).searchParams.get("name");
+        requestedNames.push(name);
+        return Response.json({
+          repos: name === "fixture" ? [{ id: repoId, url: registeredUrl, name: "fixture" }] : [],
+        });
+      },
+    });
+    try {
+      for (const requested of [
+        "https://github.com/owner/fixture",
+        "https://github.com/owner/fixture.git",
+        "https://github.com/owner/fixture.git/",
+        "owner/fixture.git/",
+      ]) {
+        expect((await fetchRepoConfig(api.url.toString(), "fixture", requested, true))?.id).toBe(
+          repoId,
+        );
+      }
+      registeredUrl = "git@github.com:owner/fixture.git";
+      expect((await fetchRepoConfig(api.url.toString(), "fixture", registeredUrl, true))?.id).toBe(
+        repoId,
+      );
+      registeredUrl = "https://another-host.test/owner/fixture";
+      expect(
+        await fetchRepoConfig(
+          api.url.toString(),
+          "fixture",
+          "https://github.com/owner/fixture",
+          true,
+        ),
+      ).toBeNull();
+      expect(requestedNames.every((name) => name === "fixture")).toBe(true);
+    } finally {
+      api.stop(true);
+    }
+  });
+
+  test("passes repository scope and restores the transport default after deletion", async () => {
+    const agentId = crypto.randomUUID();
+    const repoId = crypto.randomUUID();
+    const baseEnv = { CLAUDE_TRANSPORT: "cli" };
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: { configs: [{ key: "CLAUDE_TRANSPORT", value: "sdk" }] },
+    });
+    const assigned = await fetchResolvedEnv(testUrl, "key", agentId, baseEnv, undefined, {
+      repoId,
+    });
+    expect(requestedRepoIds.get(agentId)).toBe(repoId);
+    expect(assigned.env.CLAUDE_TRANSPORT).toBe("sdk");
+    expect(baseEnv.CLAUDE_TRANSPORT).toBe("cli");
+    expect(RELOADABLE_ENV_KEYS.has("CLAUDE_TRANSPORT")).toBe(false);
+
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+    const inherited = await fetchResolvedEnv(testUrl, "key", agentId, baseEnv);
+    expect(inherited.env.CLAUDE_TRANSPORT).toBe("cli");
+    expect(requestedRepoIds.get(agentId)).toBeNull();
+  });
+
+  test("selects both Claude credential pools for the executing adapter despite repository harness config", async () => {
+    const agentId = crypto.randomUUID();
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: {
+        configs: [
+          { key: "HARNESS_PROVIDER", value: "codex" },
+          { key: "CLAUDE_CODE_OAUTH_TOKEN", value: "fixture-oauth-a,fixture-oauth-b" },
+          { key: "ANTHROPIC_API_KEY", value: "fixture-api-a,fixture-api-b" },
+          { key: "CLAUDE_TRANSPORT", value: "sdk" },
+        ],
+      },
+    });
+    const result = await fetchResolvedEnv(testUrl, "key", agentId, {}, "claude-haiku-4-5", {
+      repoId: crypto.randomUUID(),
+      provider: "claude",
+    });
+    expect(result.resolvedProvider).toBe("claude");
+    expect(result.env.HARNESS_PROVIDER).toBe("claude");
+    expect(result.env.CLAUDE_TRANSPORT).toBe("sdk");
+    expect(result.env.CLAUDE_CODE_OAUTH_TOKEN).toMatch(/^fixture-oauth-[ab]$/);
+    expect(result.env.ANTHROPIC_API_KEY).toMatch(/^fixture-api-[ab]$/);
+    expect(result.credentialSelections.map((selection) => selection.keyType)).toEqual([
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "ANTHROPIC_API_KEY",
+    ]);
+  });
+
+  describe("model-scoped window filter — GET /api/keys/available?model=<family>", () => {
+    beforeEach(() => {
+      keysAvailableRequests.length = 0;
+    });
+
+    function envWithOauthPool(totalKeys: number): Record<string, string> {
+      return {
+        CLAUDE_CODE_OAUTH_TOKEN: Array.from({ length: totalKeys }, (_, i) => `tok-${i}`).join(","),
+      };
+    }
+
+    test("modelTier: 'ultra' and no model issues model=fable", async () => {
+      const agentId = "agent-model-ultra";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), undefined, {
+        provider: "claude",
+        modelTier: "ultra",
+      });
+      expect(keysAvailableRequests).toEqual([
+        "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=fable",
+      ]);
+    });
+
+    test("model: 'claude-fable-5-1' issues the same model=fable", async () => {
+      const agentId = "agent-model-fable-explicit";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), "claude-fable-5-1", {
+        provider: "claude",
+      });
+      expect(keysAvailableRequests).toEqual([
+        "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=fable",
+      ]);
+    });
+
+    test("model: 'claude-sonnet-5' issues model=sonnet", async () => {
+      const agentId = "agent-model-sonnet";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), "claude-sonnet-5", {
+        provider: "claude",
+      });
+      expect(keysAvailableRequests).toEqual([
+        "?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32&model=sonnet",
+      ]);
+    });
+
+    test("modelTier: 'smol' issues no model param (haiku has no weekly window)", async () => {
+      const agentId = "agent-model-smol";
+      mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+      await fetchResolvedEnv(testUrl, "key", agentId, envWithOauthPool(32), undefined, {
+        provider: "claude",
+        modelTier: "smol",
+      });
+      expect(keysAvailableRequests).toEqual(["?keyType=CLAUDE_CODE_OAUTH_TOKEN&totalKeys=32"]);
+    });
+  });
+
   test("returns baseEnv when apiUrl is empty", async () => {
     const baseEnv = { EXISTING: "value" };
     const result = await fetchResolvedEnv("", "key", "agent-1", baseEnv);
@@ -106,49 +295,6 @@ describe("fetchResolvedEnv", () => {
     const baseEnv = { EXISTING: "value" };
     const result = await fetchResolvedEnv("http://localhost:19999", "key", "agent-1", baseEnv);
     expect(result.env).toEqual({ EXISTING: "value" });
-  });
-
-  // ─── Non-authoritative config-fetch regression ──────────────────────────
-  //
-  // `configuredReloadableKeys` must be `undefined` — not an empty Set — on
-  // every failure path, so `applyResolvedEnvToProcessEnv` treats "the fetch
-  // failed" the same as "don't touch anything" rather than "every
-  // reloadable key's row was deleted". An empty Set here previously read as
-  // the latter and reset every live operator setting (e.g.
-  // CLAUDE_TRUST_PRESEED) back to the boot baseline on a transient outage.
-
-  test("configuredReloadableKeys is undefined (non-authoritative) on a non-200 response", async () => {
-    const agentId = "agent-500-reloadable";
-    mockResponsesByAgentId.set(agentId, { status: 500, body: { error: "server error" } });
-
-    const result = await fetchResolvedEnv(testUrl, "key", agentId, {});
-    expect(result.configuredReloadableKeys).toBeUndefined();
-  });
-
-  test("configuredReloadableKeys is undefined (non-authoritative) when the API is unreachable", async () => {
-    const result = await fetchResolvedEnv("http://localhost:19999", "key", "agent-1", {});
-    expect(result.configuredReloadableKeys).toBeUndefined();
-  });
-
-  test("configuredReloadableKeys is undefined (non-authoritative) when the response body isn't valid JSON", async () => {
-    const agentId = "agent-bad-json";
-    mockResponsesByAgentId.set(agentId, {
-      status: 200,
-      body: undefined,
-      rawBody: "{ this is not valid json",
-    });
-
-    const result = await fetchResolvedEnv(testUrl, "key", agentId, {});
-    expect(result.configuredReloadableKeys).toBeUndefined();
-  });
-
-  test("configuredReloadableKeys is a (possibly empty) Set on an authoritative 200 with no configs", async () => {
-    const agentId = "agent-authoritative-empty";
-    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
-
-    const result = await fetchResolvedEnv(testUrl, "key", agentId, {});
-    expect(result.configuredReloadableKeys).toBeDefined();
-    expect(result.configuredReloadableKeys?.size).toBe(0);
   });
 
   test("does not mutate the baseEnv object", async () => {
@@ -332,111 +478,117 @@ describe("applyResolvedEnvToProcessEnv", () => {
     expect(changed).toContain("MODEL_OVERRIDE");
     expect(process.env.MODEL_OVERRIDE).toBe("new-value");
   });
+});
 
-  // ─── CLAUDE_TRUST_PRESEED reset-precedence regression ───────────────────
-  //
-  // Without `configuredReloadableKeys`, a stored `false` for a
-  // RELOADABLE_ENV_KEYS entry survived its own swarm_config row deletion: the
-  // next `fetchResolvedEnv(..., process.env, ...)` copied the *live*
-  // (already-mutated) process.env as its base, so a deleted row resolved to
-  // "whatever the last reload wrote" instead of the boot/default value. See
-  // BOOT_ENV_SNAPSHOT + the `configuredReloadableKeys` param.
-
-  test("a key that drops out of configuredReloadableKeys is restored to the boot baseline, not left stuck", () => {
-    snapshot("SLACK_DISABLE");
-    // Round 1: a swarm_config row sets a value distinct from the real boot
-    // baseline (whatever the environment provides — deliberately not
-    // asserted as unset, since a dev/CI environment may set this key).
-    const bootValue = BOOT_ENV_SNAPSHOT.SLACK_DISABLE;
-    const configuredValue = bootValue === "true" ? "false" : "true";
-    applyResolvedEnvToProcessEnv({ SLACK_DISABLE: configuredValue }, new Set(["SLACK_DISABLE"]));
-    expect(process.env.SLACK_DISABLE).toBe(configuredValue);
-
-    // Round 2: the row is gone (UI "Reset") — freshEnv still carries the
-    // stale value in the plain object (mirrors fetchResolvedEnv spreading
-    // baseEnv), but configuredReloadableKeys no longer lists the key.
-    const changed = applyResolvedEnvToProcessEnv({ SLACK_DISABLE: configuredValue }, new Set());
-
-    expect(changed).toContain("SLACK_DISABLE");
-    expect(process.env.SLACK_DISABLE).toBe(bootValue);
+describe("memory rater config reload", () => {
+  const deploymentValue = process.env.MEMORY_RATERS;
+  afterEach(() => {
+    if (deploymentValue === undefined) delete process.env.MEMORY_RATERS;
+    else process.env.MEMORY_RATERS = deploymentValue;
   });
 
-  test("omitting configuredReloadableKeys never restores anything (back-compat with the two tests above)", () => {
-    snapshot("SLACK_DISABLE");
-    process.env.SLACK_DISABLE = "true";
+  test("empty override survives reload; deleting it restores the deployment value", async () => {
+    const agentId = "memory-rater-reload";
+    mockResponsesByAgentId.set(agentId, {
+      status: 200,
+      body: { configs: [{ key: "MEMORY_RATERS", value: "" }] },
+    });
+    const disabled = await fetchResolvedEnv(testUrl, "key", agentId);
+    applyResolvedEnvToProcessEnv(disabled.env);
+    expect(process.env.MEMORY_RATERS).toBe("");
+    const repeated = await fetchResolvedEnv(testUrl, "key", agentId);
+    expect(repeated.env.MEMORY_RATERS).toBe("");
 
-    const changed = applyResolvedEnvToProcessEnv({ SLACK_DISABLE: "true" });
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
+    const removed = await fetchResolvedEnv(testUrl, "key", agentId);
+    applyResolvedEnvToProcessEnv(removed.env);
+    expect(process.env.MEMORY_RATERS).toBe(deploymentValue);
+  });
 
-    expect(changed).toEqual([]);
-    expect(process.env.SLACK_DISABLE).toBe("true");
+  test.each([undefined, "", "llm"])("missing row restores base value %s", async (value) => {
+    const result = await fetchResolvedEnv(testUrl, "key", "memory-rater-base", {
+      MEMORY_RATERS: value,
+    });
+    process.env.MEMORY_RATERS = "explicit-self,llm";
+    applyResolvedEnvToProcessEnv(result.env);
+    expect(process.env.MEMORY_RATERS).toBe(value);
+  });
+
+  test("failed reload retains the last applied empty override", async () => {
+    process.env.MEMORY_RATERS = "";
+    mockResponsesByAgentId.set("memory-rater-failure", { status: 500, body: {} });
+    const result = await fetchResolvedEnv(testUrl, "key", "memory-rater-failure");
+    applyResolvedEnvToProcessEnv(result.env);
+    expect(process.env.MEMORY_RATERS).toBe("");
   });
 });
 
-describe("fetchResolvedEnv + applyResolvedEnvToProcessEnv — CLAUDE_TRUST_PRESEED reset end-to-end", () => {
-  const savedValue = process.env.CLAUDE_TRUST_PRESEED;
-
+describe("agent-scoped PI_CODEMODE_MODELS reaches the worker env", () => {
+  // The server merges global, agent and repo rows into /api/config/resolved
+  // (getResolvedConfig); the worker applies the result to process.env, which
+  // the pi adapter reads when the next task's session starts. PI_CODEMODE and
+  // PI_TOOL_DEFERRAL take the same path and are covered below.
+  const saved = process.env.PI_CODEMODE_MODELS;
   afterEach(() => {
-    if (savedValue === undefined) {
-      delete process.env.CLAUDE_TRUST_PRESEED;
-    } else {
-      process.env.CLAUDE_TRUST_PRESEED = savedValue;
+    if (saved === undefined) delete process.env.PI_CODEMODE_MODELS;
+    else process.env.PI_CODEMODE_MODELS = saved;
+  });
+
+  test("the row lands in process.env and is reported as changed", async () => {
+    delete process.env.PI_CODEMODE_MODELS;
+    mockResponsesByAgentId.set("pi-pilot-agent", {
+      status: 200,
+      body: { configs: [{ key: "PI_CODEMODE_MODELS", value: "true" }] },
+    });
+    const result = await fetchResolvedEnv(testUrl, "key", "pi-pilot-agent");
+    const changed = applyResolvedEnvToProcessEnv(result.env);
+    expect(changed).toContain("PI_CODEMODE_MODELS");
+    expect(process.env.PI_CODEMODE_MODELS).toBe("true");
+  });
+});
+
+describe("deleting a reloadable config row", () => {
+  // One key per test: the runner remembers each overridden key's boot value
+  // for the life of the process.
+  const keys = ["PI_CODEMODE", "PI_TOOL_DEFERRAL", "SWARM_ORG_NAME"];
+  const saved = new Map(keys.map((key) => [key, process.env[key]]));
+  afterEach(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
   });
 
-  test("false -> reset restores the boot baseline instead of staying stuck at false", async () => {
-    expect(RELOADABLE_ENV_KEYS.has("CLAUDE_TRUST_PRESEED")).toBe(true);
-    delete process.env.CLAUDE_TRUST_PRESEED; // boot baseline: unset (documented default: true)
+  async function reload(agentId: string, configs: Array<{ key: string; value: string }>) {
+    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs } });
+    const result = await fetchResolvedEnv(testUrl, "key", agentId);
+    return applyResolvedEnvToProcessEnv(result.env);
+  }
 
-    const agentId = "agent-trust-preseed-reset";
+  test("unset at boot: deleting the row unsets the var", async () => {
+    delete process.env.PI_CODEMODE;
+    await reload("row-delete-unset", [{ key: "PI_CODEMODE", value: "true" }]);
+    expect(process.env.PI_CODEMODE).toBe("true");
 
-    // Step 1: an operator sets CLAUDE_TRUST_PRESEED=false via swarm_config,
-    // and the runner applies it live.
-    mockResponsesByAgentId.set(agentId, {
-      status: 200,
-      body: { configs: [{ key: "CLAUDE_TRUST_PRESEED", value: "false" }] },
-    });
-    const first = await fetchResolvedEnv(testUrl, "key", agentId);
-    expect(first.configuredReloadableKeys.has("CLAUDE_TRUST_PRESEED")).toBe(true);
-    applyResolvedEnvToProcessEnv(first.env, first.configuredReloadableKeys);
-    expect(process.env.CLAUDE_TRUST_PRESEED).toBe("false");
-
-    // Step 2: the operator clicks "Reset" — the row is deleted — and the
-    // next reload runs.
-    mockResponsesByAgentId.set(agentId, { status: 200, body: { configs: [] } });
-    const second = await fetchResolvedEnv(testUrl, "key", agentId);
-    expect(second.configuredReloadableKeys.has("CLAUDE_TRUST_PRESEED")).toBe(false);
-    applyResolvedEnvToProcessEnv(second.env, second.configuredReloadableKeys);
-
-    // Restored to the boot baseline (unset here — worker falls back to the
-    // documented default, true), not stuck at the deleted row's last value.
-    expect(process.env.CLAUDE_TRUST_PRESEED).toBeUndefined();
+    const changed = await reload("row-delete-unset", []);
+    expect(changed).toContain("PI_CODEMODE");
+    expect(process.env.PI_CODEMODE).toBeUndefined();
   });
 
-  test("a transient config-fetch failure does NOT reset a previously-configured value", async () => {
-    delete process.env.CLAUDE_TRUST_PRESEED; // boot baseline: unset (documented default: true)
+  test("set at boot: deleting the overriding row restores the boot value", async () => {
+    process.env.PI_TOOL_DEFERRAL = "false";
+    await reload("row-delete-boot", [{ key: "PI_TOOL_DEFERRAL", value: "true" }]);
+    expect(process.env.PI_TOOL_DEFERRAL).toBe("true");
 
-    const agentId = "agent-trust-preseed-transient-failure";
+    const changed = await reload("row-delete-boot", []);
+    expect(changed).toContain("PI_TOOL_DEFERRAL");
+    expect(process.env.PI_TOOL_DEFERRAL).toBe("false");
+  });
 
-    // Step 1: an operator sets CLAUDE_TRUST_PRESEED=false via swarm_config,
-    // and the runner applies it live — same as the happy-path test above.
-    mockResponsesByAgentId.set(agentId, {
-      status: 200,
-      body: { configs: [{ key: "CLAUDE_TRUST_PRESEED", value: "false" }] },
-    });
-    const first = await fetchResolvedEnv(testUrl, "key", agentId);
-    applyResolvedEnvToProcessEnv(first.env, first.configuredReloadableKeys);
-    expect(process.env.CLAUDE_TRUST_PRESEED).toBe("false");
-
-    // Step 2: the config API has a transient outage on the next reload — the
-    // row was never deleted, the fetch just failed this round.
-    mockResponsesByAgentId.set(agentId, { status: 503, body: { error: "unavailable" } });
-    const second = await fetchResolvedEnv(testUrl, "key", agentId, process.env);
-    expect(second.configuredReloadableKeys).toBeUndefined();
-    applyResolvedEnvToProcessEnv(second.env, second.configuredReloadableKeys);
-
-    // The live value must survive the outage — a reset here would silently
-    // re-enable the trust dialog (CLAUDE_TRUST_PRESEED back to the true
-    // default) until the next successful reload.
-    expect(process.env.CLAUDE_TRUST_PRESEED).toBe("false");
+  test("set at boot and never overridden: untouched", async () => {
+    process.env.SWARM_ORG_NAME = "container-org";
+    const changed = await reload("row-never-set", []);
+    expect(changed).not.toContain("SWARM_ORG_NAME");
+    expect(process.env.SWARM_ORG_NAME).toBe("container-org");
   });
 });

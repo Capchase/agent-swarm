@@ -17,8 +17,8 @@
  *      `$HOME/.claude.json` before spawning. It can cover all worker project
  *      directories and can be disabled with CLAUDE_TRUST_PRESEED=false.
  *
- * `Bun.spawn` and the synchronous binary-version probe are stubbed so the
- * tests don't actually exec anything; we read the argv off the call args.
+ * `Bun.spawn` is stubbed so the tests don't actually exec anything; we read
+ * the session argv off the call args and ignore the binary-version probe.
  * `Bun.which` is stubbed for the tmux gate so the tests don't depend on the
  * host having tmux installed. `$HOME` is redirected to a tmp dir so the
  * trust-preseed never touches the real `~/.claude.json`.
@@ -88,17 +88,6 @@ function makeFakeProc(): ReturnType<typeof Bun.spawn> {
     ref: () => {},
     unref: () => {},
   } as unknown as ReturnType<typeof Bun.spawn>;
-}
-
-/**
- * The adapter probes `<binary> --version` synchronously before it spawns the
- * session. Keep integration tests hermetic: a `bunx <package>` probe can do
- * package resolution and outlive Bun's per-test timeout under CI load.
- */
-function mockClaudeVersionProbe(): ReturnType<typeof spyOn> {
-  return spyOn(Bun, "spawnSync").mockImplementation((() => ({
-    success: false,
-  })) as typeof Bun.spawnSync);
 }
 
 async function createCompletedSession(adapter: ClaudeAdapter, config: ProviderSessionConfig) {
@@ -252,7 +241,7 @@ describe("SWARM_USE_CLAUDE_BRIDGE boolean parsing", () => {
 describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", () => {
   test("bridge requested + OAuth token present → routes to claude-bridge", () => {
     const r = resolveClaudeBinaryArgv(
-      { SWARM_USE_CLAUDE_BRIDGE: "true", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-x" },
+      { SWARM_USE_CLAUDE_BRIDGE: "true", CLAUDE_CODE_OAUTH_TOKEN: "example-sk-ant-oat01-x" },
       {},
     );
     expect(r.useClaudeBridge).toBe(true);
@@ -262,7 +251,7 @@ describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", ()
 
   test("bridge requested + no OAuth (only API key) → falls back to stock claude", () => {
     const r = resolveClaudeBinaryArgv(
-      { SWARM_USE_CLAUDE_BRIDGE: "true", ANTHROPIC_API_KEY: "sk-ant-api" },
+      { SWARM_USE_CLAUDE_BRIDGE: "true", ANTHROPIC_API_KEY: "example-sk-ant-api" },
       {},
     );
     expect(r.useClaudeBridge).toBe(false);
@@ -279,7 +268,7 @@ describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", ()
   test("OAuth token from fallbackEnv (container env) also enables the bridge", () => {
     const r = resolveClaudeBinaryArgv(
       { SWARM_USE_CLAUDE_BRIDGE: "true" },
-      { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-fallback" },
+      { CLAUDE_CODE_OAUTH_TOKEN: "example-sk-ant-oat01-fallback" },
     );
     expect(r.useClaudeBridge).toBe(true);
     expect(r.bridgeRequestedWithoutOAuth).toBe(false);
@@ -295,7 +284,7 @@ describe("resolveClaudeBinaryArgv — claude-bridge requires an OAuth token", ()
   });
 
   test("bridge not requested → never flagged, stock claude", () => {
-    const r = resolveClaudeBinaryArgv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-x" }, {});
+    const r = resolveClaudeBinaryArgv({ CLAUDE_CODE_OAUTH_TOKEN: "example-sk-ant-oat01-x" }, {});
     expect(r.useClaudeBridge).toBe(false);
     expect(r.bridgeRequestedWithoutOAuth).toBe(false);
     expect(r.argv).toEqual(["claude"]);
@@ -628,6 +617,7 @@ describe("backupMalformedClaudeJson", () => {
 
 describe("CLAUDE_BINARY env override", () => {
   // Cache the originals and restore after each test so the suite stays clean.
+  let originalClaudeTransport: string | undefined;
   let originalClaudeBinary: string | undefined;
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
@@ -635,12 +625,13 @@ describe("CLAUDE_BINARY env override", () => {
   let originalTrustPreseed: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
-  let spawnSyncSpy: ReturnType<typeof spyOn>;
   let whichSpy: ReturnType<typeof spyOn>;
   let spawnedArgs: Array<readonly string[]>;
   let spawnedEnvs: Array<Record<string, string> | undefined>;
 
   beforeEach(async () => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     originalClaudeBinary = process.env.CLAUDE_BINARY;
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -653,16 +644,17 @@ describe("CLAUDE_BINARY env override", () => {
     delete process.env.CLAUDE_TRUST_PRESEED;
     delete process.env.CLAUDE_QUEUE_STEERING;
     // Credential check runs before binary resolution; satisfy it.
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "example-test-token";
 
     spawnedArgs = [];
     spawnedEnvs = [];
     spawnSpy = spyOn(Bun, "spawn").mockImplementation(((cmd: readonly string[], opts?: unknown) => {
-      spawnedArgs.push(cmd);
-      spawnedEnvs.push((opts as { env?: Record<string, string> } | undefined)?.env);
+      if (cmd.at(-1) !== "--version") {
+        spawnedArgs.push(cmd);
+        spawnedEnvs.push((opts as { env?: Record<string, string> } | undefined)?.env);
+      }
       return makeFakeProc();
     }) as typeof Bun.spawn);
-    spawnSyncSpy = mockClaudeVersionProbe();
 
     // Default: pretend tmux IS on PATH so non-tmux-gate tests don't trip.
     whichSpy = spyOn(Bun, "which").mockImplementation((name: string) => {
@@ -673,13 +665,17 @@ describe("CLAUDE_BINARY env override", () => {
 
   afterEach(async () => {
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
     whichSpy.mockRestore();
     await rm(homeDir, { recursive: true, force: true });
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
     }
     if (originalClaudeBinary === undefined) {
       delete process.env.CLAUDE_BINARY;
@@ -800,7 +796,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           CLAUDE_BINARY: LEGACY_BRIDGE_COMPAT_BINARY,
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -817,7 +813,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           CLAUDE_BINARY: LEGACY_BRIDGE_COMPAT_COMMAND,
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -834,7 +830,7 @@ describe("CLAUDE_BINARY env override", () => {
       adapter,
       makeConfig({
         // env has CLAUDE_CODE_OAUTH_TOKEN but no CLAUDE_BINARY → process.env wins.
-        env: { CLAUDE_CODE_OAUTH_TOKEN: "test-token" } as Record<string, string>,
+        env: { CLAUDE_CODE_OAUTH_TOKEN: "example-test-token" } as Record<string, string>,
       }),
     );
 
@@ -860,7 +856,7 @@ describe("CLAUDE_BINARY env override", () => {
     await createCompletedSession(adapter, makeConfig());
 
     expect(spawnedArgs[0][0]).toBe("claude-bridge");
-    expect(spawnedEnvs[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe("test-token");
+    expect(spawnedEnvs[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBe("example-test-token");
   });
 
   test("SWARM_USE_CLAUDE_BRIDGE=true forwards Anthropic local auth through bridge flag", async () => {
@@ -870,14 +866,14 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           SWARM_USE_CLAUDE_BRIDGE: "true",
-          ANTHROPIC_API_KEY: "sk-ant-test",
+          ANTHROPIC_API_KEY: "example-sk-ant-test",
         } as Record<string, string>,
       }),
     );
 
     expect(spawnedArgs[0][0]).toBe("claude-bridge");
     expect(spawnedArgs[0]).toContain("--desplega-local-auth");
-    expect(spawnedEnvs[0]?.ANTHROPIC_API_KEY).toBe("sk-ant-test");
+    expect(spawnedEnvs[0]?.ANTHROPIC_API_KEY).toBe("example-sk-ant-test");
     expect(spawnedEnvs[0]?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
@@ -900,7 +896,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           SWARM_USE_CLAUDE_BRIDGE: "true",
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -917,7 +913,7 @@ describe("CLAUDE_BINARY env override", () => {
       makeConfig({
         env: {
           SWARM_USE_CLAUDE_BRIDGE: "false",
-          CLAUDE_CODE_OAUTH_TOKEN: "test-token",
+          CLAUDE_CODE_OAUTH_TOKEN: "example-test-token",
         } as Record<string, string>,
       }),
     );
@@ -928,7 +924,7 @@ describe("CLAUDE_BINARY env override", () => {
   test("SWARM_USE_CLAUDE_BRIDGE=true without OAuth token falls back to stock claude", async () => {
     const origApiKey = process.env.ANTHROPIC_API_KEY;
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+    process.env.ANTHROPIC_API_KEY = "example-sk-ant-test";
     process.env.SWARM_USE_CLAUDE_BRIDGE = "true";
     try {
       const adapter = new ClaudeAdapter();
@@ -947,16 +943,18 @@ describe("CLAUDE_BINARY env override", () => {
 });
 
 describe("Claude Bridge tmux fail-fast gate", () => {
+  let originalClaudeTransport: string | undefined;
   let originalClaudeBinary: string | undefined;
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
   let originalHome: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
-  let spawnSyncSpy: ReturnType<typeof spyOn>;
   let whichSpy: ReturnType<typeof spyOn>;
 
   beforeEach(async () => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     originalClaudeBinary = process.env.CLAUDE_BINARY;
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -965,21 +963,24 @@ describe("Claude Bridge tmux fail-fast gate", () => {
     process.env.HOME = homeDir;
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "example-test-token";
     spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => makeFakeProc()) as typeof Bun.spawn);
-    spawnSyncSpy = mockClaudeVersionProbe();
     whichSpy = spyOn(Bun, "which");
   });
 
   afterEach(async () => {
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
     whichSpy.mockRestore();
     await rm(homeDir, { recursive: true, force: true });
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
     }
     if (originalClaudeBinary === undefined) {
       delete process.env.CLAUDE_BINARY;
@@ -1067,6 +1068,7 @@ describe("Claude Bridge tmux fail-fast gate", () => {
 });
 
 describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
+  let originalClaudeTransport: string | undefined;
   let originalClaudeBinary: string | undefined;
   let originalUseClaudeBridge: string | undefined;
   let originalOauthToken: string | undefined;
@@ -1074,10 +1076,11 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
   let originalTrustPreseed: string | undefined;
   let homeDir: string;
   let spawnSpy: ReturnType<typeof spyOn>;
-  let spawnSyncSpy: ReturnType<typeof spyOn>;
   let whichSpy: ReturnType<typeof spyOn>;
 
   beforeEach(async () => {
+    originalClaudeTransport = process.env.CLAUDE_TRANSPORT;
+    delete process.env.CLAUDE_TRANSPORT;
     originalClaudeBinary = process.env.CLAUDE_BINARY;
     originalUseClaudeBridge = process.env.SWARM_USE_CLAUDE_BRIDGE;
     originalOauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
@@ -1088,9 +1091,8 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
     delete process.env.CLAUDE_BINARY;
     delete process.env.SWARM_USE_CLAUDE_BRIDGE;
     delete process.env.CLAUDE_TRUST_PRESEED;
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "example-test-token";
     spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => makeFakeProc()) as typeof Bun.spawn);
-    spawnSyncSpy = mockClaudeVersionProbe();
     whichSpy = spyOn(Bun, "which").mockImplementation((name: string) => {
       if (name === "tmux") return "/usr/bin/tmux";
       return null;
@@ -1099,13 +1101,17 @@ describe("Trust pre-seed via ClaudeAdapter.createSession", () => {
 
   afterEach(async () => {
     spawnSpy.mockRestore();
-    spawnSyncSpy.mockRestore();
     whichSpy.mockRestore();
     await rm(homeDir, { recursive: true, force: true });
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalClaudeTransport === undefined) {
+      delete process.env.CLAUDE_TRANSPORT;
+    } else {
+      process.env.CLAUDE_TRANSPORT = originalClaudeTransport;
     }
     if (originalClaudeBinary === undefined) {
       delete process.env.CLAUDE_BINARY;

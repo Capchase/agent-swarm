@@ -76,6 +76,8 @@ describe("asset namespace MCP exposure", () => {
       "send-task",
       {
         agentId: targetAgentId,
+        routingReason: "human_pinned",
+        routingNote: "This test explicitly selects the target worker",
         task: `inherited namespace ${Date.now()}`,
         allowDuplicate: true,
       },
@@ -90,6 +92,8 @@ describe("asset namespace MCP exposure", () => {
       "send-task",
       {
         agentId: targetAgentId,
+        routingReason: "human_pinned",
+        routingNote: "This test explicitly selects the target worker",
         task: `wrong namespace ${Date.now()}`,
         key: `personal/${otherUserId}/drafts/`,
         allowDuplicate: true,

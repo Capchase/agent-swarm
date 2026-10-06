@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Event as OpencodeEvent } from "@opencode-ai/sdk";
+import { resolveProviderOutput, trackAssistantText } from "../commands/runner";
 import type {
   ProviderEvent,
   ProviderResult,
@@ -28,7 +29,7 @@ function testConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSes
     agentId: "agent-1",
     taskId: "task-1",
     apiUrl: "http://localhost:0",
-    apiKey: "test-key",
+    apiKey: "example-test-key",
     cwd: "/tmp/test",
     logFile: "/tmp/test.log",
     ...overrides,
@@ -666,7 +667,7 @@ describe("OpencodeSession — cost aggregation", () => {
     expect(result.cost?.cacheReadTokens).toBe(30);
     expect(result.cost?.cacheWriteTokens).toBe(8);
     expect(result.cost?.numTurns).toBe(1);
-  });
+  }, 30_000);
 
   test("reasoning tokens are summed across distinct finalized messages", async () => {
     const { result } = await driveSession([
@@ -779,7 +780,7 @@ describe("OpencodeSession — raw_log persistence", () => {
         expect(() => JSON.parse(rl.content)).not.toThrow();
       }
     }
-  });
+  }, 30_000);
 });
 
 // ── Phase 9: context_usage emission ───────────────────────────────────────────
@@ -927,6 +928,122 @@ describe("OpencodeSession — context_usage emission (phase 9 fix)", () => {
 
 // ── DES-300: per-task isolation ────────────────────────────────────────────────
 
+describe("OpencodeSession — assistant text for final-message validation", () => {
+  beforeEach(() => {
+    mock.restore();
+  });
+
+  const SESSION = "sess-abc-123";
+
+  function messageUpdated(
+    id: string,
+    role: "assistant" | "user",
+    completed: boolean,
+  ): OpencodeEvent {
+    const now = Date.now();
+    return {
+      type: "message.updated",
+      properties: {
+        info: {
+          id,
+          sessionID: SESSION,
+          role,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: completed ? { created: now, completed: now + 1 } : { created: now },
+          parentID: "",
+          modelID: "m",
+          providerID: "p",
+          mode: "live",
+          path: { cwd: "/", root: "/" },
+        } as never,
+      },
+    };
+  }
+
+  function textPart(
+    messageID: string,
+    id: string,
+    text: string,
+    extra: { synthetic?: boolean; ignored?: boolean } = {},
+  ): OpencodeEvent {
+    return {
+      type: "message.part.updated",
+      properties: {
+        part: { id, sessionID: SESSION, messageID, type: "text", text, ...extra } as never,
+      },
+    };
+  }
+
+  const idle: OpencodeEvent = { type: "session.idle", properties: { sessionID: SESSION } };
+
+  function assistantTexts(emitted: ProviderEvent[]): string[] {
+    return emitted.flatMap((e) =>
+      e.type === "message" && e.role === "assistant" ? [e.content] : [],
+    );
+  }
+
+  test("the runner's final-message buffer holds the last step's text, ready for outputSchema validation", async () => {
+    const final = JSON.stringify({ verdict: "pass", score: 3 });
+    const { emitted } = await driveSession([
+      messageUpdated("m1", "assistant", false),
+      textPart("m1", "p1", "Checking the page first."),
+      messageUpdated("m1", "assistant", true),
+      // Step 2 is tool-free and carries the answer.
+      messageUpdated("m2", "assistant", false),
+      textPart("m2", "p2", final),
+      messageUpdated("m2", "assistant", true),
+      idle,
+    ]);
+
+    expect(assistantTexts(emitted)).toEqual(["Checking the page first.", final]);
+
+    const holder: { value?: string } = {};
+    for (const e of emitted) trackAssistantText(holder, e);
+    expect(resolveProviderOutput({ output: undefined }, holder)).toBe(final);
+  });
+
+  test("user-message text and synthetic or ignored parts are never emitted as assistant text", async () => {
+    const { emitted } = await driveSession([
+      messageUpdated("u1", "user", true),
+      textPart("u1", "pu", "the task prompt"),
+      messageUpdated("m1", "assistant", false),
+      textPart("m1", "p-synth", "injected reminder", { synthetic: true }),
+      textPart("m1", "p-ign", "ignored text", { ignored: true }),
+      textPart("m1", "p1", "real answer"),
+      messageUpdated("m1", "assistant", true),
+      idle,
+    ]);
+
+    expect(assistantTexts(emitted)).toEqual(["real answer"]);
+  });
+
+  test("streamed snapshots and replayed finalized updates emit the message once, with its full text", async () => {
+    const { emitted } = await driveSession([
+      messageUpdated("m1", "assistant", false),
+      textPart("m1", "p1", '{"a"'),
+      textPart("m1", "p1", '{"a": 1}'),
+      messageUpdated("m1", "assistant", true),
+      messageUpdated("m1", "assistant", true),
+      idle,
+    ]);
+
+    expect(assistantTexts(emitted)).toEqual(['{"a": 1}']);
+  });
+
+  test("a text part that lands after its message finalized re-emits the fuller text", async () => {
+    const { emitted } = await driveSession([
+      messageUpdated("m1", "assistant", false),
+      textPart("m1", "p1", "first half. "),
+      messageUpdated("m1", "assistant", true),
+      textPart("m1", "p2", "second half."),
+      idle,
+    ]);
+
+    expect(assistantTexts(emitted)).toEqual(["first half.", "first half. second half."]);
+  });
+});
+
 describe("OpencodeAdapter — per-task isolation (DES-300)", () => {
   let prevOpencodeSkillsDir: string | undefined;
 
@@ -1038,6 +1155,37 @@ describe("OpencodeAdapter — per-task isolation (DES-300)", () => {
     }
   });
 
+  test("swarm MCP headers carry the task id and context key", async () => {
+    const events: OpencodeEvent[] = [
+      { type: "session.idle", properties: { sessionID: "sess-abc-123" } },
+    ];
+    await driveSession(
+      events,
+      testConfig({ taskId: "task-1", contextKey: "task:slack:C1:1700000000.000100" }),
+    );
+
+    const opts = lastCreateOpencodeConfig as {
+      config?: { mcp?: Record<string, { headers?: Record<string, string> }> };
+    };
+    const headers = opts.config?.mcp?.swarm?.headers;
+    expect(headers?.["X-Source-Task-Id"]).toBe("task-1");
+    expect(headers?.["X-Context-Key"]).toBe("task:slack:C1:1700000000.000100");
+  });
+
+  test("swarm MCP headers omit the context key when the task has none", async () => {
+    const events: OpencodeEvent[] = [
+      { type: "session.idle", properties: { sessionID: "sess-abc-123" } },
+    ];
+    await driveSession(events, testConfig({ taskId: "task-1" }));
+
+    const opts = lastCreateOpencodeConfig as {
+      config?: { mcp?: Record<string, { headers?: Record<string, string> }> };
+    };
+    const headers = opts.config?.mcp?.swarm?.headers;
+    expect(headers?.["X-Source-Task-Id"]).toBe("task-1");
+    expect(headers?.["X-Context-Key"]).toBeUndefined();
+  });
+
   test("swarm MCP headers omit the runtime identity when unset", async () => {
     const prev = process.env.SWARM_RUNTIME_INSTANCE_ID;
     delete process.env.SWARM_RUNTIME_INSTANCE_ID;
@@ -1076,7 +1224,7 @@ describe("OpencodeAdapter — per-task isolation (DES-300)", () => {
   });
 
   test("per-task config file is written as valid JSON", async () => {
-    const cfg = testConfig({ taskId: "task-cfg-json" });
+    const cfg = testConfig({ taskId: "task-cfg-json", contextKey: "task:api:ctx-1" });
     await inspectSessionBeforeIdle(cfg, async () => {
       const configFile = Bun.file("/tmp/opencode-task-cfg-json.json");
       const exists = await configFile.exists();
@@ -1084,9 +1232,16 @@ describe("OpencodeAdapter — per-task isolation (DES-300)", () => {
       if (exists) {
         const text = await configFile.text();
         expect(() => JSON.parse(text)).not.toThrow();
-        const parsed = JSON.parse(text) as { mcp?: unknown; permission?: unknown };
+        const parsed = JSON.parse(text) as {
+          mcp?: { swarm?: { headers?: Record<string, string> } };
+          permission?: unknown;
+        };
         expect(parsed.mcp).toBeDefined();
         expect(parsed.permission).toBeDefined();
+        // The per-task file must carry the task identity too: `opencode serve`
+        // reads this file (via OPENCODE_CONFIG), not the in-process object.
+        expect(parsed.mcp?.swarm?.headers?.["X-Source-Task-Id"]).toBe("task-cfg-json");
+        expect(parsed.mcp?.swarm?.headers?.["X-Context-Key"]).toBe("task:api:ctx-1");
       }
     });
 
@@ -1242,5 +1397,102 @@ describe("OpencodeAdapter — context-mode plugin wiring (phase 4)", () => {
     const built = getBuiltConfig();
     expect(built.mcp).toBeDefined();
     expect(built.mcp?.["context-mode"]).toBeUndefined();
+  });
+});
+
+describe("OpencodeAdapter: session create timeout", () => {
+  let prevTimeout: string | undefined;
+
+  beforeEach(() => {
+    prevTimeout = process.env.OPENCODE_SERVER_TIMEOUT_MS;
+    mock.restore();
+  });
+
+  afterEach(() => {
+    if (prevTimeout === undefined) delete process.env.OPENCODE_SERVER_TIMEOUT_MS;
+    else process.env.OPENCODE_SERVER_TIMEOUT_MS = prevTimeout;
+    Bun.$`rm -rf /tmp/opencode-task-timeout.json /tmp/opencode-data-task-timeout`.quiet().nothrow();
+    Bun.$`rm -rf /tmp/test/.opencode`.quiet().nothrow();
+  });
+
+  test("a hung session.create fails the spawn after OPENCODE_SERVER_TIMEOUT_MS and closes the server", async () => {
+    process.env.OPENCODE_SERVER_TIMEOUT_MS = "50";
+    const closeServer = mock(() => {});
+    const fakeServer = { url: "http://127.0.0.1:12345", close: closeServer };
+    const fakeClient = {
+      session: {
+        create: () => new Promise<never>(() => {}),
+        prompt: async () => ({ data: {}, error: undefined }),
+      },
+      event: { subscribe: async () => ({ stream: makeStream([]) }) },
+    };
+    mock.module("@opencode-ai/sdk", () => ({
+      createOpencode: async () => ({ client: fakeClient, server: fakeServer }),
+    }));
+
+    const { OpencodeAdapter } = await import("../providers/opencode-adapter");
+    const adapter = new OpencodeAdapter();
+
+    await expect(adapter.createSession(testConfig({ taskId: "task-timeout" }))).rejects.toThrow(
+      "opencode session create timed out after 50ms",
+    );
+    expect(closeServer).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OpencodeAdapter: event stream ends without session.idle", () => {
+  beforeEach(() => {
+    mock.restore();
+  });
+
+  afterEach(() => {
+    Bun.$`rm -rf /tmp/opencode-task-stream-end.json /tmp/opencode-data-task-stream-end`
+      .quiet()
+      .nothrow();
+    Bun.$`rm -rf /tmp/test/.opencode`.quiet().nothrow();
+  });
+
+  test("settles the session as failed and caps SSE reconnects so a dead server cannot hold the slot", async () => {
+    let subscribeArgs: { sseMaxRetryAttempts?: number } | undefined;
+    const closeServer = mock(() => {});
+    const fakeClient = {
+      session: {
+        create: async () => ({ data: { id: "sess-stream-end" }, error: undefined }),
+        prompt: async () => ({ data: {}, error: undefined }),
+      },
+      event: {
+        subscribe: async (args: { sseMaxRetryAttempts?: number }) => {
+          subscribeArgs = args;
+          // The server died: the stream closes with no session.idle.
+          return { stream: makeStream([]) };
+        },
+      },
+    };
+    mock.module("@opencode-ai/sdk", () => ({
+      createOpencode: async () => ({
+        client: fakeClient,
+        server: { url: "http://127.0.0.1:12345", close: closeServer },
+      }),
+    }));
+
+    const { OpencodeAdapter, OPENCODE_SSE_MAX_RETRY_ATTEMPTS } = await import(
+      "../providers/opencode-adapter"
+    );
+    const session = await new OpencodeAdapter().createSession(
+      testConfig({ taskId: "task-stream-end" }),
+    );
+    session.onEvent(() => {});
+
+    const settled = await Promise.race([
+      session.waitForCompletion(),
+      Bun.sleep(2_000).then(() => "pending" as const),
+    ]);
+    expect(settled).not.toBe("pending");
+    const result = settled as ProviderResult;
+    expect(result.exitCode).toBe(1);
+    expect(result.isError).toBe(true);
+    expect(result.failureReason).toContain("runner exited without result");
+    expect(subscribeArgs?.sseMaxRetryAttempts).toBe(OPENCODE_SSE_MAX_RETRY_ATTEMPTS);
+    expect(closeServer).toHaveBeenCalledTimes(1);
   });
 });

@@ -22,10 +22,10 @@ Workers learn the server's enabled capabilities at registration (`POST /api/agen
 
 All MCP tools have structured annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) to improve Claude Code's Tool Search discoverability. Tools are split into two tiers:
 
-- **Core tools** — Always available in context: task lifecycle, basic communication, memory recall, and swarm awareness
-- **Deferred tools** — Discovered on demand via Claude Code's Tool Search when the agent needs them (scheduling, config, skills, workflows, MCP servers, Slack, user identity, repos, etc.)
+- **Core tools** — 25 tools classified for immediate availability when their capabilities are enabled. These cover task lifecycle, memory, swarm awareness, and recurring operations: `script-run`, `db-query`, `kv-get`, `script-query-types`, `get-repos`, `accept-steer`, `memory-edit`, `script-search`, `steer-task`, `kv-list`, and `get-config`.
+- **Deferred tools** — Discovered on demand via Claude Code's Tool Search, including scheduling, configuration writes, skills, workflows, MCP servers, Slack, and user identity.
 
-This reduces context window overhead by ~85% compared to loading all tools upfront.
+Loading recurring operations upfront avoids repeated discovery while leaving less frequent tools out of the initial context.
 
 ## Large Result Handling
 
@@ -43,6 +43,23 @@ value inside a script with `ctx.swarm.kv_get` and return only the derived
 answer. Script-internal `ctx.swarm.*` responses are not subject to the 10 KB
 model-context ceiling; see [Scripts runtime](/docs/guides/scripts-runtime) for
 that separate boundary.
+
+## Realtime rooms
+
+The `kv` capability exposes four room tools for state shared with browser pages, agents, scripts, and workflows:
+
+| Tool | Purpose |
+|------|---------|
+| `room-get` | Read current room state. |
+| `room-change` | Apply `set`, `delete`, `insert`, `increment`, or `text` operations. |
+| `room-reset` | Replace the document with a new generation. |
+| `room-decode` | Decode a saved snapshot without changing the room. |
+
+Scripts use `ctx.swarm.room.get/change/reset/decode`. Browser pages use `swarmSdk.room(name, {schemaVersion})` for state and presence, and `swarmSdk.channel(name)` for transient messages. Room changes do not create page versions.
+
+Room snapshots have a 2 MiB encoded limit and normally flush within one second. Presence and channel messages are not persisted. A schema mismatch keeps state readable but rejects writes until an explicit reset. Deploy a single API replica for shared room state.
+
+See the [Rooms API reference](/docs/api-reference/rooms) for request schemas.
 
 ## Core Tools
 
@@ -94,23 +111,29 @@ Send a task to a specific agent, create an unassigned task, or offer a task for 
 |-----------|------|----------|-------------|
 | `task` | string | Yes | Task description |
 | `agentId` | string | No | Target agent (omit for pool) |
+| `routingReason` | string | With `agentId` | Why this agent was selected: `skill`, `continuity`, `overflow`, `human_pinned`, or `reroute_fault`. Omit for pool routing |
+| `routingNote` | string | With `agentId` | Why this worker fits the task: at least 10 characters after trimming whitespace, at most 200 characters |
 | `offerMode` | boolean | No | Offer instead of direct assign |
 | `priority` | number | No | Priority 0-100 (default: 50) |
 | `tags` | array | No | Tags for filtering |
 | `taskType` | string | No | Task type classification |
 | `dependsOn` | array | No | Task IDs this depends on |
+| `requiredCapabilities` | array | No | Capabilities required for task routing |
+| `leadOnly` | boolean | No | Structured authorization constraint for privileged work. Only Lead agents may be assigned, offered, or claim the task; the platform never infers this from task text. |
 | `parentTaskId` | uuid | No | Parent task for session continuity |
 | `key` | string | No | Logical asset namespace. Child tasks inherit their parent's namespace when provided |
 | `dir` | string | No | Working directory (absolute path) for the agent to start in |
 | `model` | string | No | Concrete model override for this task. Interpreted by the assignee's harness/provider and wins over `modelTier` when both are present. |
 | `modelTier` | string | No | Portable model intent for this task: `smol`, `regular`, `smart`, or `ultra`. Resolved at claim/run time by the assignee's harness/provider. Legacy shortnames map as `haiku→smol`, `sonnet→regular`, `opus→smart`, `fable→ultra`. |
+| `allowCustomModel` | boolean | No | Accept a `model` the model catalog does not list. Without it an unknown model id is rejected. Only for ids the catalog cannot know yet (a fresh launch, a private deployment). |
 | `effort` | string | No | Reasoning effort for this task: `off`, `low`, `medium`, `high`, `xhigh`, or Codex-only `max` when the selected model supports it. |
 | `slackChannelId` | string | No | Slack channel ID for progress updates (auto-inherited if omitted) |
 | `slackThreadTs` | string | No | Slack thread timestamp (auto-inherited if omitted) |
 | `slackUserId` | string | No | Slack user ID of the original requester (auto-inherited if omitted) |
 | `overrideSlackContext` | boolean | No | Set with both channel and thread fields for an intentional audited cross-channel handoff. Without it, routes conflicting with the parent or Slack context key are rejected. |
-| `requestedByUserId` | uuid | No | ID of the human user who originally requested this task chain. Auto-inherited from the caller's current task so attribution flows through multi-hop delegation (lead → worker → child tasks). |
+| `requestedByUserId` | uuid | No | ID of the human user who originally requested this task chain. Auto-inherited from the caller's current task so attribution flows through multi-hop delegation (lead → worker → child tasks). Only lead agents can name a user other than the requester of their current task. |
 | `followUpConfig` | object | No | Control the lead follow-up created when this task finishes. Use `disabled: true` to suppress it, or `onCompleted` / `onFailed` to inject outcome-specific instructions for long-running flows. |
+| `outputSchema` | object | No | JSON Schema the assignee's final output must satisfy. `store-progress` rejects a completion that doesn't match. Supported keywords: `type`, `required`, `properties`, `enum`, `const`, `items`; every nested schema under `properties`/`items` must itself be a plain object, or `send-task` rejects it at ingress. |
 
 Slack metadata and `requestedByUserId` are auto-inherited from the creator's current task via the `X-Source-Task-Id` header. Slack channel/thread fields inherit as one route: explicit values that conflict with the parent or Slack context key are rejected unless both fields are provided with `overrideSlackContext: true` for an intentional audited handoff.
 
@@ -134,10 +157,13 @@ Store task progress, or mark a task as completed or failed.
 | `output` | string | No | Output (for completion). Validated against `outputSchema` if the task defines one |
 | `failureReason` | string | No | Reason (for failure) |
 | `attachments` | array | No | Pointer-based artifacts to attach to the task (max 20 per call). Each entry is one of: `{kind: "agent-fs", path, name, orgId?, driveId?, ...}`, `{kind: "url", url, name, ...}`, `{kind: "shared-fs", path, name, ...}`, `{kind: "page", pageId, name, ...}`. Agent-fs pointers are verified before task state changes using the explicit org/drive pair or the registering agent's configured defaults. May be sent on any call (progress or completion); accumulates across calls; deduped by `sha256` when present, else by `(kind, pointer, name)`. No inline file data — upload to agent-fs first and attach by path. |
+| `citations` | array | No | Claim sources, upserted by index across calls. Use only for factual claims the reader cannot already see in the thread or task tree, 1-2 sources; none on delegation, routing, acks, or status replies. Reference each in `output` with `[citation:N]`, or set `general: true` for a source that backs the whole answer. Kinds: `task`, `memory`, `github`, `slack`, `agent-fs`, `page`, `script-run`, `url`. The first completing call is refused (the task stays in progress) if a marker has no entry, a citation fails validation, or a non-general citation is unreferenced; after one refusal, completion proceeds and those markers are dropped. At most 50 per call/task. |
 | `persistMemory` | boolean | No | Opt in to task-completion memory persistence for automatic or recurring tasks. Manual tasks persist by default; scheduled, system, heartbeat, monitor, and digest tasks are skipped unless this is `true`. |
 | `force` | boolean | No | On an already-terminal task, replace only the explicitly supplied `output` and/or `failureReason`. Status, `finishedAt`, completion events, memories, follow-ups, and capacity updates are preserved rather than replayed. |
 
 Terminal results are first-call-wins. Repeating the same result succeeds as an idempotent no-op; a different result is rejected and reported as discarded unless `force: true` is explicit. Forced corrections still validate `outputSchema` and return `wasForcedOverwrite: true` on success.
+
+For a nonterminal task, progress text such as "waiting for" or "blocked on" can return `blockedWaitingElapsedMs` and a nudge to use `defer-task` when at least three minutes have elapsed since the previous update. This is advice only; it does not create a wake-up or change the task's status.
 
 ### cancel-task
 
@@ -152,10 +178,10 @@ Cancel a task that is pending or in progress. Only the lead or task creator can 
 
 Send additional instructions to a task that is already running. Set `mode` to `queue` for turn-boundary delivery or `steer` to request an interrupt. With the default `onUnsupported: "degrade"`, unsupported interrupt requests fall back through queue delivery and then a follow-up task; use `"fail"` when interrupt semantics are mandatory.
 
-pi-mono and Claude Managed advertise both modes. Claude Code, Devin, opencode,
-and Codex advertise queue only. Codex delivers queued messages at the next
-`SessionStart`, `PostToolUse`, or `Stop` lifecycle hook; messages that are never
-picked up are promoted to follow-up tasks by the terminal sweep. See
+pi-mono, Claude Managed, Codex, and Cursor advertise both modes. Claude Code,
+Devin, opencode, and Amp advertise queue only. Amp delivers queued messages at
+the next tool result; messages that are never picked up are promoted to
+follow-up tasks by the terminal sweep. See
 [Steer a Running Task](/docs/guides/task-steering) for the capability matrix
 and lifecycle.
 
@@ -239,6 +265,31 @@ Lead-only registry for typed script API connections. Supports OpenAPI-backed
 `ctx.api.<slug>.graphql(query, vars)`, and proxied MCP
 `ctx.mcp.<slug>.<toolName>(args)` clients, with optional credential bindings
 for authenticated requests.
+
+### model-catalog-refresh
+
+Lead-only. Refresh the swarm model catalog and pricing rows from models.dev. Without `force`, skips the network when the last check is under 4h old. A forced refresh is accepted once per minute; a second one inside that window returns `skipped-cooldown` with `retryAfterMs`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `force` | boolean | No | Fetch even if the last check is under 4h old (default `false`) |
+
+### model-catalog-overlay-upsert
+
+Lead-only. Add or update hand-verified facts for one model, for example a launch models.dev has not listed yet. Overlay fields win over models.dev, and overlay prices fill pricing-table gaps so cost recompute prices the model. The row auto-expires once models.dev matches every fact you set.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `provider` | string | Yes | models.dev provider id: `anthropic`, `openai`, `openrouter`, `amazon-bedrock`, `opencode` |
+| `modelId` | string | Yes | Model id as models.dev keys it (e.g. `claude-opus-5-5`) |
+| `reason` | string | Yes | Why this overlay exists (source of the facts) |
+| `name` | string | No | Display name |
+| `releaseDate` | string | No | Release date, `YYYY-MM-DD` |
+| `contextWindow` | number | No | Context window, tokens |
+| `maxOutput` | number | No | Max output tokens |
+| `reasoningOptions` | array | No | Reasoning options, models.dev shape: `[{type, values?}]` |
+| `pricing` | object | No | USD per million tokens |
+| `verifiedBy` | string | No | Who verified the facts (URL, person, agent) |
 
 ## Prompt Template Tools
 
@@ -350,7 +401,7 @@ Download a file from Slack by file ID or URL.
 
 Register an AgentMail inbox ID to route incoming emails to this agent.
 
-Requires the `agentmail` capability (**disabled by default**). See the [AgentMail integration guide](/docs/guides/agentmail-integration) for credentials and setup.
+Requires the `agentmail` capability (**disabled by default**). See the [AgentMail integration guide](/docs/integrations/agentmail) for credentials and setup.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -457,8 +508,10 @@ Manage tasks in the pool: create, claim, release, accept, reject, or move to/fro
 | `dir` | string | No | Working directory (absolute path) for the agent to start in (only used with `create` action) |
 | `model` | string | No | Concrete model override for the created task (only used with `create` action) |
 | `modelTier` | string | No | Portable model tier for the created task: `smol`, `regular`, `smart`, or `ultra` (only used with `create` action) |
+| `allowCustomModel` | boolean | No | Accept a `model` the model catalog does not list; without it an unknown model id is rejected (only used with `create` action) |
 | `effort` | string | No | Reasoning effort for the created task: `off`, `low`, `medium`, `high`, `xhigh`, or Codex-only `max` when supported |
-| `requiredCapabilities` | array | No | Capability requirements recorded on a newly pooled task for routing-affinity triage |
+| `requiredCapabilities` | array | No | Capabilities required for routing the newly created task |
+| `leadOnly` | boolean | No | Structured authorization constraint for a newly created privileged task. Only Lead agents may claim it. |
 
 ## Messaging Tools
 
@@ -529,7 +582,7 @@ Manage HTTP service discovery. Registry entries are keyed by the calling agent's
 
 ### create-schedule / list-schedules / update-schedule / patch-schedule / delete-schedule / run-schedule-now
 
-Manage recurring and one-time task automation. Any registered agent can update or delete schedules. Schedules now support native `targetType` routing: create an agent task (`agent-task`), trigger a workflow directly, or launch a saved catalog script. Agent-task schedules also support both a concrete `model` override and a portable `modelTier` (`smol`, `regular`, `smart`, `ultra`) that is passed through to the tasks they create.
+Manage recurring and one-time task automation. Any registered agent can update or delete schedules. Schedules now support native `targetType` routing: create an agent task (`agent-task`), trigger a workflow directly, or launch a saved catalog script. Agent-task schedules also support both a concrete `model` override and a portable `modelTier` (`smol`, `regular`, `smart`, `ultra`) that is passed through to the tasks they create. A `model` the model catalog does not list is rejected unless `allowCustomModel: true` is set.
 
 Schedules accept a logical asset `key`; tasks they create inherit that namespace. `list-schedules` supports exact `key` and subtree `keyPrefix` filters, while `update-schedule` and `patch-schedule` can move a schedule by updating its key.
 
@@ -540,6 +593,21 @@ to overwrite and leave the rest of the stored row untouched.
 
 See [Scheduled Tasks](/docs/concepts/scheduling) for details.
 
+### defer-task
+
+Complete the current task now and wake up later to continue it. Use it when the result needs time: a build, a deploy, a reply.
+
+Pass `taskId`, one of `delayMs` or `runAt`, a `summary` of what you did and where things stand, a `note` that says what is pending, and optional `checks` to verify on wake-up. The task reaches its final state (`completed`) on this call and receives a `deferred` tag. A one-off schedule targets you, and its child task carries the deferred task as `parentTaskId` so the wake-up run receives the prior context. Use this tool instead of creating a continuation schedule by hand.
+
+- **Early wake-up:** optionally pass `wakeOn: { event: "settled", taskId: "<watched-task-id>" }`, or use `taskIds: ["<first-id>", "<second-id>"]` instead of `taskId`. `mode` defaults to `all` (every member must match); use `mode: "any"` for the first match. Events are `task.completed`, `task.failed`, or `settled` (completed, failed, or cancelled). Cancellation does not match either named event. IDs must be unique, exist, be nonterminal, and differ from the task being deferred. Any invalid or already-terminal member rejects the entire call without completing the task or creating a schedule. One `delayMs` or `runAt` deadline is still required for the whole set; events and the deadline share a single wake-up so racing triggers do not create duplicate children. Pending waits survive API restarts. The member whose settlement wakes you creates no separate lead follow-up for your agent unless its `followUpConfig` sets `onCompleted`/`onFailed`; an `all`-mode member that settles while others are pending still does.
+- **Structured output:** if the task has an `outputSchema`, pass `output` as a JSON string matching it. The tool stores that string verbatim as terminal output and puts the summary and deferral details in the task log. Missing or invalid output is rejected before creating a schedule. Without a schema, terminal output says when the agent will check back, or names the agents it is waiting on and the latest wake-up time; `output` is ignored. The time uses the requester's stored timezone, falling back to a labeled UTC time when none is set. Full summary, checks, and schedule details remain in the task log.
+
+See [deferring until another task finishes](/docs/concepts/scheduling#deferring-until-another-task-finishes) for an example.
+
+If a watched member defers, that completion does not count as a match. The member follows its resume task across further deferrals without changing the set's ceiling. Disabling or deleting a successor schedule before it runs makes the parent's completion eligible on the next reconciliation; a wait for `task.failed` still falls back to its ceiling.
+
+Superseded members follow their `resume` children without waking or extending the ceiling, regardless of whether supersession or child creation happens first. If no resume child exists, the wait holds to its original ceiling. Supersession itself never matches an event.
+
 ## Workflow Tools
 
 ### create-workflow
@@ -548,12 +616,14 @@ Create a new automation workflow with a DAG definition.
 
 Upstream outputs require an `inputs` mapping. Agent-task templates may interpolate declared aliases, but executable source uses a stricter security boundary: inline `script` source allows only `input`, `workflow`, `swarm`, and `run` values, while named `swarm-script` source is never workflow-interpolated. Pass trigger and upstream values through `config.args`; unresolved source tokens fail the node before execution.
 
+Workflow triggers can use `webhook`, `schedule`, `manual`, or the internal event form `{ "type": "event", "eventName": "slack.message" }`.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | Yes | Unique workflow name |
 | `description` | string | No | What the workflow does |
 | `definition` | object | Yes | DAG definition with `nodes` array |
-| `triggers` | array | No | Trigger configs: `webhook`, `schedule`, or `manual` |
+| `triggers` | array | No | Trigger configs: `webhook`, `schedule`, `manual`, or `event` |
 | `cooldown` | object | No | Cooldown period: `{ hours, minutes, seconds }` |
 | `input` | object | No | Workflow-level input values (env vars, secrets, or literals) |
 | `key` | string | No | Logical asset namespace inherited by tasks created from this workflow |
@@ -685,14 +755,24 @@ Partially update a single node in a workflow definition. Merges the provided fie
 
 ### request-human-input
 
-Create an approval request that pauses until a human responds. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond.
+Create an approval request and return at once with the request ID and URL. The answer arrives later as a `hitl-follow-up` task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `title` | string | Yes | Title of the approval request |
 | `questions` | array | Yes | Questions to ask the human |
+| `timeoutSeconds` | integer | No | Seconds until the request expires. After that it becomes `timeout` and the requesting agent gets a `hitl-follow-up` task. |
 
-Approval requests are accessible via the dashboard at `/approval-requests/{id}`. When resolved, a follow-up task is automatically created for the requesting agent with the human's responses.
+Approval requests are accessible via the dashboard at `/approval-requests/{id}`. When resolved, a follow-up task is automatically created for the requesting agent with the human's responses. A request with no `timeoutSeconds` is cancelled after `APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS` days (default 7) with no answer. An answer after the deadline is refused with 409.
+
+### cancel-approval-request
+
+Cancel a pending approval request by ID. Allowed for a lead agent, or for the agent that owns the request's source task. If the request gates a running or waiting workflow run, that run is cancelled too. A second cancel returns `alreadyCancelled: true`. The same action is available as `POST /api/approval-requests/{id}/cancel` and as `approval_cancel` in the scripts SDK.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `requestId` | uuid | Yes | Approval request ID |
+| `reason` | string | No | Reason for cancellation (max 500 characters) |
 
 ## Pages Tools
 
@@ -702,11 +782,13 @@ DB-backed pages let agents publish static reports, dashboards, and JSON action s
 
 Stores an HTML or JSON page in the swarm and returns shareable URLs. Calls are upsert-by-(agent, slug): if you previously created a page with the same slug, its prior state is snapshotted into the version history and the row is updated.
 
+HTML pages receive fonts, basic layout styles, and Tailwind utilities when served. Tailwind Preflight is disabled so it does not reset authored headings, spacing, or lists. These defaults apply to existing pages without regenerating their stored HTML. A page can still use explicit Tailwind utilities to override individual styles.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `title` | string | Yes | Human-readable title shown in listings |
 | `body` | string | Yes | Full page body (HTML document or JSON-render spec, per `contentType`) |
-| `contentType` | enum | Yes | `text/html` (renders at `/p/:id`) or `application/json` (rendered by the SPA) |
+| `contentType` | enum | Yes | `text/html` or `image/svg+xml` (served directly at `/p/:id`), or `application/json` (rendered by the SPA) |
 | `slug` | string | No | URL slug. Defaults to kebab-cased title. Same slug → updates the existing row |
 | `authMode` | enum | No | `authed` (default, page-session cookie), `public` (explicit opt-in), or `password` (requires key) |
 | `password` | string | No | Plaintext password, hashed before storage. Only meaningful for `authMode='password'` |
@@ -934,7 +1016,7 @@ Manage MCP server definitions and installations. Servers are scoped (agent → s
 
 ### mcp-server-create
 
-Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope requires lead.
+Create a new MCP server definition. Agent-scope servers are auto-installed for the creating agent. Swarm/global scope and stdio servers require lead.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -972,7 +1054,7 @@ List MCP servers with optional filters.
 
 ### mcp-server-update
 
-Update an MCP server's configuration. Only the owner or lead can update.
+Update an MCP server's configuration. Only the owner or lead can update. Changing or enabling what a stdio server runs requires lead.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1107,17 +1189,82 @@ List durable script workflow runs, optionally filtered by status or agent ID.
 | `limit` | number | No | Maximum runs to return (default: 50) |
 | `offset` | number | No | Pagination offset |
 
+## Extension tools
+
+The `scripts` capability includes tools for trusted TypeScript hook bundles. Extensions run
+inside the API server process. See the [extensions guide](/docs/guides/extensions) for the
+bundle format, event contracts, and lead/operator activation workflow.
+
+### extension-list
+
+List installed extensions with their version, activation state, priority, failure count,
+and owner (`createdByAgentId`). The owner differs from the extension runtime `agentId`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `enabledOnly` | boolean | No | Return only enabled extensions |
+
+### extension-catalog
+
+List the predefined extensions that can be installed, with their declared assets and
+installed state. The catalog (also `GET /api/extensions/catalog`) is the only install source.
+
+*No parameters.*
+
+### extension-install
+
+Install an extension from the catalog by `template` name, or from an inline bundle
+(`manifest` plus `files`). The two forms are mutually exclusive. Inline bundles need
+`EXTENSION_ALLOW_INLINE_INSTALL=true` and a lead, operator, or dashboard-user caller;
+with the flag off the call fails with `inline_install_disabled`, and workers get 403.
+Install creates the extension, its `ext:<name>` agent, and every asset it declares
+(scripts, and disabled schedules, workflows and skills). Any authenticated agent can
+install from the catalog; the installing agent becomes its owner (`createdByAgentId`),
+and workers may install subsequent versions only for their own extensions, without
+activating them. A trusted lead can enable the new extension with `extension-enable`;
+operators and dashboard users can also activate it. Installation itself never enables
+an extension.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `template` | string | No | Name of a predefined extension from `extension-catalog`. Exclusive with `manifest`/`files` |
+| `manifest` | object | No | Inline bundle manifest. Requires `files` |
+| `files` | object | No | Inline bundle files keyed by relative path. Requires `manifest` |
+| `priority` | integer | No | Handler priority; lower values run first |
+| `config` | object | No | Extension configuration |
+
+### Extension lifecycle
+
+Enable, disable, and version activation require a lead, operator, or dashboard user.
+Workers can delete their own disabled extensions, but cannot activate any extension
+or modify another owner's bundle.
+`EXTENSION_ALLOW_LEAD_ACTIVATION=false` restricts enable, disable, and version activation
+to operators/dashboard users; leads can still install drafts and delete disabled extensions.
+Extensions execute inside the API process without host isolation.
+
+| Tool | Required parameters | Behavior |
+|------|---------------------|----------|
+| `extension-enable` | `id` (UUID) | Load and enable an installed extension |
+| `extension-disable` | `id` (UUID) | Disable an extension and remove its registered hooks |
+| `extension-activate-version` | `id` (UUID), `version` (positive integer) | Activate a stored version, reloading it if enabled |
+| `extension-delete` | `id` (UUID) | Delete a disabled extension and its stored history; disable it first |
+
+Get the installed `id` from `extension-list`. The script SDK exposes these tools with
+underscores, for example `ctx.swarm.extension_enable({ id })`.
+
 ## Debug Tools
 
 ### db-query
 
-Execute a read-only SQL query against the swarm database. Available to all authenticated agents — be aware results may include secrets (`oauth_tokens`, `configs`). Results capped at 100 rows.
+Execute a read-only SQL query against the swarm database. Available to all authenticated agents — be aware results may include secrets (`oauth_tokens`, `configs`). Results are capped by the operator-configurable `DB_QUERY_MCP_MAX_ROWS` limit. Read-only enforcement also applies to fallback execution when bounded queries are disabled; write statements with `RETURNING` cannot bypass it.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `sql` | string | Conditional | SQL query (read-only only — writes are rejected). Required unless the deprecated `query` alias is provided |
 | `query` | string | Conditional | Deprecated runtime alias for `sql` |
 | `params` | array | No | Query parameters |
+
+Responses include `total`, `truncated`, and `rowLimit` so callers can distinguish a complete result set from one capped by the configured row limit.
 
 ### get-oauth-access-token
 
@@ -1140,6 +1287,7 @@ Search accumulated memories with natural language.
 | `query` | string | Yes | Natural language search query |
 | `scope` | string | No | `all`, `agent`, or `swarm` |
 | `source` | string | No | Filter by source type |
+| `keyPrefix` | string | No | Only memories whose key starts with this text, for example `/longterm/facts/`. Literal and case-sensitive; applied before the result cut |
 | `limit` | number | No | Max results (default: 10) |
 
 When called inside a task, `memory-search` may also return response-side `rateHint` nudges for manual and file-index memories so agents can call `memory_rate(...)` without looking up the signature separately.
@@ -1172,6 +1320,7 @@ the background. The caller always owns the row, for both scopes.
 | `tags` | string[] | No | Free-form tags, for example a repo name or a topic |
 | `taskId` | uuid | No | The task this learning came from |
 | `intent` | string | No | Why this is worth remembering. Kept in the audit trail |
+| `key` | string | No | Logical path such as `/longterm/facts/swarm-runtime/slug`, stored on every chunk. Lowercase segments, leading `/`. A `name` that starts with `/longterm/` is used as the key when `key` is absent. Fails if you already use that key in the scope. A key under `/longterm` must start with `/longterm/company-story`, `/longterm/entities/people`, `/longterm/entities/customers`, `/longterm/facts`, `/longterm/decisions`, `/longterm/workstreams` or `/longterm/timeline`; such a memory never expires and is protected from cleanup. `/longterm/company-story`, `/longterm/entities` and `/longterm/timeline` are lead-only. A memory with no key is inbox material |
 
 Returns `memoryIds`, `chunks`, and `queued`. Search first with `memory-search`
 when a similar memory may exist, then `memory-edit` it instead of storing a
@@ -1180,7 +1329,9 @@ duplicate. The seeded `memory` skill holds the full guidance.
 ### memory-edit
 
 Edit an existing memory in place while preserving its ID, rating history, and
-audit trail.
+audit trail. Agents can edit their own memories, including memories they shared
+with the swarm. Editing another agent's memory by ID requires a lead agent;
+shared visibility does not grant edit permission.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1193,10 +1344,11 @@ audit trail.
 | `newString` | string | No | Replacement string for `exact` mode; may be empty |
 | `intent` | string | Yes | Why you are editing the memory |
 | `expectedVersion` | number | No | Optional optimistic-concurrency guard |
+| `newKey` | string | No | Move the memory to this logical path on every chunk, keeping ID, rating posterior, access count and author. Alone it is a pure move (no content fields). Same allowed roots and lead-only roots as `memory-store`. Moving into `/longterm` clears the expiry on every chunk; moving out does not restore it |
 
 ### memory-delete
 
-Delete a memory by ID. Agents can delete their own memories; lead agents can also delete swarm-scoped memories.
+Delete a memory by ID. Agents can delete their own agent-scoped memories; only the lead can delete swarm-scoped memories. The same rule applies to `DELETE /api/memory/{id}`, which the script SDK's `memory_delete` calls.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -1266,7 +1418,7 @@ List registered repos with their guidelines (PR checks, merge policy, review gui
 
 ### update-repo
 
-Update a repo's configuration including guidelines.
+Update a repo's configuration including guidelines. Only the lead can change `allowMerge`: resend its current value to edit other guidelines.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

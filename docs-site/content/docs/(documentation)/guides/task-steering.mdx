@@ -5,6 +5,8 @@ description: Add context to a running agent, request an interrupt, and understan
 
 Task steering sends new instructions to work that has already started. Use it to correct an assumption, add missing context, or redirect an agent without cancelling the task and starting over.
 
+Steering messages identify the sender by name and kind (human or agent) in the agent prompt and dashboard. Buffered Slack steering retains the human sender's attribution when delivered.
+
 ## Choose a delivery mode
 
 | Mode | Meaning | Use when |
@@ -21,13 +23,15 @@ Not every harness can interrupt. Task responses include `supportedSteerModes`, a
 | opencode | `queue` | `queued` |
 | Devin | `queue` | `queued` |
 | Claude Code | `queue` | `queued` |
-| Codex | `queue` | `queued` (delivered by Codex lifecycle hooks at the next tool-call boundary) |
+| Codex | `steer`, `queue` | `steered` (native `turn/steer` on the per-task app-server) |
+| Cursor | `steer`, `queue` | `steered` (`run.steer()` on the in-flight run) |
+| Amp | `queue` | `queued` (appended to the next tool result) |
 
-Claude Code queue delivery additionally depends on a supported stock CLI invocation. See [Harness Providers: Claude queue-steering gate](/docs/guides/harness-providers#claude-queue-steering-gate). Codex delivery is harness-side: the worker image registers managed Codex hooks that inject queued messages into the running session; there is no mid-turn interrupt. See [Harness Providers: Codex harness-side delivery](/docs/guides/harness-providers#codex-harness-side-delivery-codex-hook).
+Claude Code queue delivery additionally depends on a supported stock CLI invocation. See [Harness Providers: Claude queue-steering gate](/docs/guides/harness-providers#claude-queue-steering-gate). Codex steers the active turn through its per-task app-server and starts queued messages after that turn ends; legacy `codex exec` sessions still use hook delivery. See [Harness Providers: Live task steering](/docs/guides/harness-providers#live-task-steering). Amp has no interrupt primitive: a queued message is appended to the next tool result, so the model reads it mid-turn.
 
 ## Enable steering
 
-Steering is **disabled by default**. Set `STEERING_ENABLED=true` (or `1`) on the API server and worker containers to turn it on. While disabled, new steering requests are rejected across HTTP, MCP, scripts, and Slack; the dashboard hides its steering controls and the server does not register `steer-task` or `accept-steer`. Existing message history stays readable, and delivery callbacks plus terminal-status promotion remain enabled so messages already in flight can finish safely if the flag is turned off again.
+Steering is **enabled by default**. Set `STEERING_ENABLED=false` (or `0`) on the API server and worker containers to turn it off. While disabled, new steering requests are rejected across HTTP, MCP, scripts, and Slack; the dashboard hides its steering controls and the server does not register `steer-task` or `accept-steer`. Existing message history stays readable, and delivery callbacks plus terminal-status promotion remain enabled so messages already in flight can finish safely if the flag is turned off again.
 
 The flag can also be set as a global `swarm_config` entry — global config rows are injected into the server environment at startup and on config reload.
 
@@ -111,14 +115,15 @@ Inspect the audit trail with `GET /api/tasks/{id}/steering-messages`. Worker del
 
 ### Slack
 
-Slack thread steering is opt-in:
+Slack thread steering defaults to the lead with queued delivery. Set
+`SLACK_THREAD_STEERING=off` to disable it, or choose another mode:
 
 ```bash
 SLACK_THREAD_STEERING=lead       # or all
 SLACK_THREAD_STEERING_MODE=queue # or steer
 ```
 
-`lead` targets the latest in-progress lead task in the thread. `all` targets the latest active task regardless of role. When the flag is unset, existing thread follow-up routing is unchanged. See [Slack Integration](/docs/guides/slack-integration#live-steering-instead-of-follow-up-tasks).
+`lead` targets the latest in-progress lead task in the thread. `all` targets the latest active task regardless of role. When the flag is unset, existing thread follow-up routing is unchanged. See [Slack Integration](/docs/integrations/slack#live-steering-instead-of-follow-up-tasks).
 
 ## Message lifecycle
 

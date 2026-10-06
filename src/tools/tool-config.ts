@@ -2,8 +2,8 @@
  * Tool classification for context optimization.
  *
  * CORE_TOOLS: Always in Claude Code's context (no Tool Search needed).
- * These are tools that every worker/lead session needs immediately at startup
- * for task lifecycle, basic communication, and memory recall.
+ * These cover session startup and recurring fleet-wide operations, selected
+ * by distinct-task prevalence and tool-description cost.
  *
  * All other registered tools rely on Claude Code's Tool Search feature
  * (auto-activates when total tool tokens exceed ~10K).
@@ -22,6 +22,7 @@ export const CORE_TOOLS = new Set([
   "task-action", // claim/release/accept/reject
   "send-task", // delegate subtasks
   "get-tasks", // list/filter tasks
+  "defer-task", // complete now, wake up later to continue
 
   // Memory (used at session start)
   "memory-search", // recall relevant context
@@ -32,6 +33,19 @@ export const CORE_TOOLS = new Set([
 
   // Swarm awareness
   "get-swarm", // check who's online
+
+  // Recurring operations (14-day fleet task prevalence)
+  "script-run", // run inline or reusable scripts
+  "db-query", // inspect swarm state
+  "kv-get", // retrieve durable task data
+  "script-query-types", // inspect the live script SDK
+  "get-repos", // locate repositories
+  "accept-steer", // acknowledge task steering
+  "memory-edit", // update existing learnings
+  "script-search", // find reusable scripts
+  "steer-task", // redirect active work
+  "kv-list", // discover durable task data
+  "get-config", // inspect configuration
 ]);
 
 /** Tools that can be discovered via Tool Search on demand */
@@ -64,19 +78,16 @@ export const DEFERRED_TOOLS = new Set([
   "list-services",
   "update-service-status",
 
-  // Config (5)
+  // Config (7)
   "set-config",
-  "get-config",
   "list-config",
   "delete-config",
   "credential-bindings",
   "script-connections",
+  "model-catalog-refresh",
+  "model-catalog-overlay-upsert",
 
-  // Memory (1)
-  "memory-edit",
-
-  // Repos (2)
-  "get-repos",
+  // Repos (1)
   "update-repo",
 
   // Profiles (3)
@@ -88,7 +99,7 @@ export const DEFERRED_TOOLS = new Set([
   "read-messages",
   "post-message",
 
-  // Slack (12)
+  // Slack (12): task-context gated; keep out of CORE_TOOLS
   "slack-reply",
   "slack-read",
   "slack-upload-file",
@@ -131,14 +142,12 @@ export const DEFERRED_TOOLS = new Set([
   "delete-prompt-template",
   "preview-prompt-template",
 
-  // Debug (1)
-  "db-query",
-
   // Metrics (1)
   "create_metric",
 
-  // Approval Requests (1)
+  // Approval Requests (2)
   "request-human-input",
+  "cancel-approval-request",
 
   // Skills (12)
   "skill-create",
@@ -180,31 +189,37 @@ export const DEFERRED_TOOLS = new Set([
   "create_page",
   "delete-page",
 
-  // KV store (5)
-  "kv-get",
+  // KV store (3)
   "kv-set",
   "kv-delete",
   "kv-incr",
-  "kv-list",
 
-  // Reusable scripts (9)
-  "script-search",
-  "script-run",
+  // Realtime rooms (4)
+  "room-get",
+  "room-change",
+  "room-reset",
+  "room-decode",
+
+  // Reusable scripts and extensions (13)
   "script-upsert",
   "script-delete",
-  "script-query-types",
   "script-apis",
   "launch-script-run",
   "get-script-run",
   "list-script-runs",
+  "extension-delete",
+  "extension-enable",
+  "extension-disable",
+  "extension-activate-version",
+  "extension-catalog",
+  "extension-install",
+  "extension-list",
 
   // External command routes (1)
   "swarm_x",
 
-  // Other (6)
-  "accept-steer",
+  // Other (3)
   "cancel-task",
-  "steer-task",
   "inject-learning",
   "get-metrics",
 ]);

@@ -5,7 +5,7 @@
  * and tests every API endpoint for correct behavior.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { rm, unlink } from "node:fs/promises";
 import type { Subprocess } from "bun";
 import { Webhook } from "svix";
@@ -20,7 +20,7 @@ const TEST_DB_PATH = `/tmp/test-http-integration-${Date.now()}.sqlite`;
 // the attachment test was leaking data/fs/tasks/<id>/ into the worktree).
 const TEST_FS_DIR = `/tmp/test-http-integration-fs-${Date.now()}`;
 let BASE = "";
-const TEST_API_KEY = "test-http-integration-key";
+const TEST_API_KEY = "example-test-http-integration-key";
 
 let serverProc: Subprocess;
 
@@ -103,6 +103,11 @@ beforeAll(async () => {
       DATABASE_PATH: TEST_DB_PATH,
       API_KEY: TEST_API_KEY,
       AGENT_FS_LOCAL_DIR: TEST_FS_DIR,
+      // Worker containers expose agent-fs credentials. Clear the remote
+      // provider selectors so this integration suite uses its isolated dir.
+      AGENT_FS_API_URL: "",
+      API_AGENT_FS_API_KEY: "",
+      AGENT_FS_API_KEY: "",
       CAPABILITIES: "core,task-pool,messaging,profiles,services,scheduling,memory",
       // Disable optional integrations
       SLACK_BOT_TOKEN: "",
@@ -383,6 +388,83 @@ describe("Agents", () => {
     expect(unrelated.body.events).toHaveLength(0);
   });
 
+  test("PUT /api/agents/:id/profile — expectedHashes drops a stale field, keeps the rest", async () => {
+    const sha = (v: string) => createHash("sha256").update(v).digest("hex");
+    const base = "# CLAUDE.md\n\nbase the session materialized";
+    const seeded = await put(`/api/agents/${ids.workerAgent}/profile`, {
+      body: { claudeMd: base, changeSource: "self_edit" },
+      agentId: ids.workerAgent,
+    });
+    expect(seeded.status).toBe(200);
+
+    const reconciledClaudeMd = async () =>
+      (
+        await get(
+          `/api/events?${new URLSearchParams({
+            event: "system.profile_sync_reconciled",
+            agentId: ids.workerAgent,
+            dataField: "claudeMd",
+            limit: "100",
+          })}`,
+          { agentId: ids.workerAgent },
+        )
+      ).body.events.length as number;
+    const before = await reconciledClaudeMd();
+
+    // A copy based on something the DB already moved past: dropped, 200, and
+    // the other field of the same sync still lands.
+    const stale = await put(`/api/agents/${ids.workerAgent}/profile`, {
+      body: {
+        claudeMd: "stale copy",
+        toolsMd: "fresh tools",
+        changeSource: "session_sync",
+        expectedHashes: { claudeMd: sha("an older materialization") },
+      },
+      agentId: ids.workerAgent,
+    });
+    expect(stale.status).toBe(200);
+    expect(stale.body.claudeMd).toBe(base);
+    expect(stale.body.toolsMd).toBe("fresh tools");
+    expect(await reconciledClaudeMd()).toBe(before); // not written → not reconciled
+    const conflictEvents = await get(
+      `/api/events?${new URLSearchParams({
+        event: "system.profile_sync_conflict",
+        agentId: ids.workerAgent,
+        dataField: "claudeMd",
+        limit: "1",
+      })}`,
+      { agentId: ids.workerAgent },
+    );
+    expect(conflictEvents.body.events[0]).toMatchObject({
+      event: "system.profile_sync_conflict",
+      status: "skipped",
+      data: {
+        field: "claudeMd",
+        expectedHash: sha("an older materialization"),
+        currentHash: sha(base),
+        changeSource: "session_sync",
+      },
+    });
+
+    // An edit on top of the current value applies.
+    const edited = await put(`/api/agents/${ids.workerAgent}/profile`, {
+      body: {
+        claudeMd: "edited in session",
+        changeSource: "session_sync",
+        expectedHashes: { claudeMd: sha(base) },
+      },
+      agentId: ids.workerAgent,
+    });
+    expect(edited.status).toBe(200);
+    expect(edited.body.claudeMd).toBe("edited in session");
+
+    const malformed = await put(`/api/agents/${ids.workerAgent}/profile`, {
+      body: { claudeMd: "x", expectedHashes: { claudeMd: "not-a-sha256" } },
+      agentId: ids.workerAgent,
+    });
+    expect(malformed.status).toBe(400);
+  });
+
   test("PUT /api/agents/:id/profile — non-existent returns 404", async () => {
     const { status } = await put(`/api/agents/${randomUUID()}/profile`, {
       body: { role: "ghost" },
@@ -453,6 +535,7 @@ describe("Tasks", () => {
     expect(status).toBe(201);
     expect(body.id).toBeDefined();
     expect(body.task).toBe("Integration test task 1");
+    expect(body.routingSource).toBe("engine_default");
     ids.task = body.id;
   });
 
@@ -462,11 +545,27 @@ describe("Tasks", () => {
       body: {
         task: "Integration test task 2",
         agentId: ids.workerAgent,
+        routingReason: "human_pinned",
       },
     });
     expect(status).toBe(201);
     expect(body.agentId).toBe(ids.workerAgent);
+    expect(body.routingReason).toBe("human_pinned");
+    expect(body.routingSource).toBe("declared");
+    expect(body.routingNote).toBeUndefined(); // REST deliberately keeps notes optional.
     ids.task2 = body.id;
+  });
+
+  test("POST /api/tasks — rejects explicit assignment without routingReason", async () => {
+    const { status, body } = await post("/api/tasks", {
+      agentId: ids.leadAgent,
+      body: {
+        task: "Missing routing reason",
+        agentId: ids.workerAgent,
+      },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("routingReason");
   });
 
   test("GET /api/tasks — list all tasks", async () => {
@@ -474,7 +573,8 @@ describe("Tasks", () => {
     expect(status).toBe(200);
     expect(body.tasks).toBeDefined();
     expect(Array.isArray(body.tasks)).toBe(true);
-    expect(body.total).toBeGreaterThanOrEqual(2);
+    // `total` is an opt-in COUNT(*): omitted unless `includeTotal=true`.
+    expect(body.total).toBeUndefined();
   });
 
   test("GET /api/tasks?status=pending — filter by status", async () => {
@@ -500,10 +600,23 @@ describe("Tasks", () => {
   });
 
   test("GET /api/tasks?limit=1 — pagination", async () => {
-    const { status, body } = await get("/api/tasks?limit=1");
+    const { status, body } = await get("/api/tasks?limit=1&includeTotal=true");
     expect(status).toBe(200);
     expect(body.tasks.length).toBe(1);
     expect(body.total).toBeGreaterThanOrEqual(2);
+  });
+
+  test("GET /api/tasks?fields=timeline — narrow timeline rows", async () => {
+    const { status, body } = await get("/api/tasks?fields=timeline&orderBy=createdAt&limit=5");
+    expect(status).toBe(200);
+    expect(body.tasks.length).toBeGreaterThanOrEqual(1);
+    for (const t of body.tasks) {
+      expect(typeof t.id).toBe("string");
+      expect(typeof t.status).toBe("string");
+      expect(t.progress).toBeUndefined();
+      expect(t.tags).toBeUndefined();
+    }
+    expect(body.total).toBeUndefined();
   });
 
   test("GET /api/tasks/:id — get specific task", async () => {
@@ -598,6 +711,27 @@ describe("Tasks", () => {
     expect(body.alreadyFinished).toBe(true);
   });
 
+  test("POST /api/tasks/:id/finish — records the provider of a task whose harness never started", async () => {
+    const agentId = randomUUID();
+    expect((await post("/api/agents", { agentId, body: { name: "SpawnFailWorker" } })).status).toBe(
+      201,
+    );
+    const created = await post("/api/tasks", {
+      agentId: ids.leadAgent,
+      body: { task: "Spawn failure provider test", agentId, routingReason: "human_pinned" },
+    });
+    const taskId = created.body.id as string;
+    expect((await get("/api/poll", { agentId })).body.trigger?.taskId).toBe(taskId);
+
+    const finished = await post(`/api/tasks/${taskId}/finish`, {
+      agentId,
+      body: { status: "failed", failureReason: "Spawn failed: no binary", provider: "dsh" },
+    });
+    expect(finished.status).toBe(200);
+    expect(finished.body.task.status).toBe("failed");
+    expect(finished.body.task.provider).toBe("dsh");
+  });
+
   test("POST /api/tasks/:id/finish — terminal retries reject, no-op, or force text only", async () => {
     const agentId = randomUUID();
     const registered = await post("/api/agents", {
@@ -608,7 +742,7 @@ describe("Tasks", () => {
 
     const created = await post("/api/tasks", {
       agentId: ids.leadAgent,
-      body: { task: "Terminal finish guard test", agentId },
+      body: { task: "Terminal finish guard test", agentId, routingReason: "human_pinned" },
     });
     expect(created.status).toBe(201);
     const taskId = created.body.id as string;
@@ -679,7 +813,11 @@ describe("Tasks", () => {
     // Create a task for worker, try to finish as worker2
     const createRes = await post("/api/tasks", {
       agentId: ids.leadAgent,
-      body: { task: "Forbidden finish test", agentId: ids.workerAgent },
+      body: {
+        task: "Forbidden finish test",
+        agentId: ids.workerAgent,
+        routingReason: "human_pinned",
+      },
     });
     const taskId = createRes.body.id;
     const { status } = await post(`/api/tasks/${taskId}/finish`, {
@@ -708,7 +846,11 @@ describe("Task Pause & Resume", () => {
   test("create a task to pause", async () => {
     const { body } = await post("/api/tasks", {
       agentId: ids.leadAgent,
-      body: { task: "Pause test task", agentId: ids.workerAgent2 },
+      body: {
+        task: "Pause test task",
+        agentId: ids.workerAgent2,
+        routingReason: "human_pinned",
+      },
     });
     pauseTaskId = body.id;
   });
@@ -1080,7 +1222,11 @@ describe("Polling", () => {
 
     const created = await post("/api/tasks", {
       agentId: ids.leadAgent,
-      body: { task: "Task with an attachment", agentId: attachAgent },
+      body: {
+        task: "Task with an attachment",
+        agentId: attachAgent,
+        routingReason: "human_pinned",
+      },
     });
     expect(created.status).toBe(201);
     const taskId = created.body.id as string;
@@ -1569,6 +1715,7 @@ describe("Memory", () => {
         body: {
           task: `Automatic memory integration test: ${taskCase.label}`,
           agentId: ids.workerAgent,
+          routingReason: "human_pinned",
           source: taskCase.source,
           taskType: taskCase.taskType,
           tags: taskCase.tags,
@@ -1599,6 +1746,7 @@ describe("Memory", () => {
       body: {
         task: "Scheduled memory integration opt-in test",
         agentId: ids.workerAgent,
+        routingReason: "human_pinned",
         source: "schedule",
         taskType: "daily-digest",
         tags: ["schedule:test"],
@@ -1628,6 +1776,7 @@ describe("Memory", () => {
       body: {
         task: "Manual memory integration test",
         agentId: ids.workerAgent,
+        routingReason: "human_pinned",
       },
     });
     expect(task.status).toBe(201);
@@ -1873,7 +2022,7 @@ describe("AgentMail Webhooks (with filters)", () => {
   let AGENTMAIL_PORT = 0;
   const AGENTMAIL_DB = `/tmp/test-agentmail-${Date.now()}.sqlite`;
   let AGENTMAIL_BASE = "";
-  const WEBHOOK_SECRET = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"; // test-only secret
+  const WEBHOOK_SECRET = `whsec_${Buffer.alloc(32, 1).toString("base64")}`;
   let agentmailProc: Subprocess;
 
   function signPayload(payload: unknown): { body: string; headers: Record<string, string> } {

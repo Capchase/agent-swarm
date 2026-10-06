@@ -4,12 +4,20 @@ import {
   getLeadAgent,
   getMostRecentTaskInThread,
 } from "../be/db";
+import { findUserByExternalId } from "../be/users";
 import { createAdditiveBuffer } from "../tasks/additive-buffer";
 import { slackContextKey } from "../tasks/context-key";
-import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { getSlackApp } from "./app";
 import { buildBufferFlushBlocks } from "./blocks";
-import { rewriteSlackMentions } from "./enrich";
+import { resolveSlackUserId, rewriteSlackMentions } from "./enrich";
+import type { SlackFile } from "./files";
+import {
+  bufferedFileFailures,
+  buildEffectiveText,
+  createSlackTaskWithFiles,
+  fetchSlackFiles,
+  notifySlackFileFailures,
+} from "./inbound-files";
 import { extractSlackMessageText } from "./message-text";
 import { ensureSlackThreadTree, isSlackRenderV2Enabled } from "./render-v2";
 import { getAgentDisplayName, getAgentEmoji } from "./responses";
@@ -22,6 +30,8 @@ interface BufferedMessage {
   ts: string;
   channelId: string;
   threadTs: string;
+  files?: SlackFile[];
+  botUserId?: string;
 }
 
 const BUFFER_TIMEOUT_MS = Number(process.env.ADDITIVE_SLACK_BUFFER_MS) || 10_000;
@@ -53,6 +63,8 @@ export function bufferThreadMessage(
   text: string,
   userId: string,
   ts: string,
+  files?: SlackFile[],
+  botUserId?: string,
 ): void {
   slackBuffer.enqueue(makeKey(channelId, threadTs), {
     text,
@@ -60,6 +72,8 @@ export function bufferThreadMessage(
     ts,
     channelId,
     threadTs,
+    files,
+    botUserId,
   });
 }
 
@@ -87,8 +101,15 @@ export async function instantFlush(key: string): Promise<void> {
 
 /**
  * Fetch thread context from Slack for the buffer flush task description.
+ * Messages in `excludeTs` (the buffered follow-ups themselves) are skipped:
+ * the description already carries them below the context block.
  */
-async function getThreadContextForBuffer(channelId: string, threadTs: string): Promise<string> {
+async function getThreadContextForBuffer(
+  channelId: string,
+  threadTs: string,
+  excludeTs: ReadonlySet<string>,
+  botUserId?: string,
+): Promise<string> {
   const app = getSlackApp();
   if (!app) return "";
 
@@ -103,7 +124,7 @@ async function getThreadContextForBuffer(channelId: string, threadTs: string): P
     if (messages.length === 0) return "";
 
     const formatted = messages
-      .filter((m) => extractSlackMessageText(m) !== "")
+      .filter((m) => !(m.ts && excludeTs.has(m.ts)) && extractSlackMessageText(m) !== "")
       .map((m) => {
         const msg = m as Record<string, unknown>;
         const isBotMessage = msg.bot_id !== undefined || msg.subtype === "bot_message";
@@ -116,7 +137,7 @@ async function getThreadContextForBuffer(channelId: string, threadTs: string): P
       })
       .join("\n");
 
-    return await rewriteSlackMentions(formatted);
+    return await rewriteSlackMentions(formatted, botUserId);
   } catch (error) {
     console.error("[Slack] Failed to fetch thread context for buffer:", error);
     return "";
@@ -143,13 +164,40 @@ async function slackFlush(
   // Buffer is guaranteed to have at least one item — the first carries the
   // original requester's userId (same semantics as the pre-refactor version).
   const originalRequesterId = items[0]!.userId;
+  // Every buffered item is resolved from the same bot's auth.test() cache —
+  // any item carrying it is representative of the whole flush.
+  const botUserId = items.find((item) => item.botUserId)?.botUserId;
 
   console.log(`[Slack] Flushing buffer: ${key} (${items.length} messages, immediate=${immediate})`);
+
+  // Keep only metadata during the debounce; downloads live for this flush only.
+  const app = getSlackApp();
+  const files = items.flatMap((item) => item.files ?? []);
+  await using inbound = app
+    ? await fetchSlackFiles(app.client, files)
+    : {
+        files,
+        fetched: [],
+        failed: bufferedFileFailures(files),
+        async [Symbol.asyncDispose]() {},
+      };
+  const resolvedFiles = new Map(inbound.files.map((file) => [file.id, file]));
 
   // Build combined task description. Any in-body `<@U…>` mentions the
   // requester typed are rewritten via the identity primitive so the agent
   // sees a name or the explicit UNKNOWN sentinel — never a raw Slack ID.
-  const combinedText = await rewriteSlackMentions(items.map((m) => m.text).join("\n---\n"));
+  const combinedText = await rewriteSlackMentions(
+    items
+      .map((item) =>
+        buildEffectiveText(
+          item.text,
+          item.files?.map((file) => resolvedFiles.get(file.id) ?? file),
+          inbound.failed,
+        ),
+      )
+      .join("\n---\n"),
+    botUserId,
+  );
   const description = `[Thread follow-up — ${items.length} message(s) buffered]\n\n${combinedText}`;
 
   // Find the latest active task in this thread for dependency chaining
@@ -160,18 +208,41 @@ async function slackFlush(
     );
   }
 
-  const steering = await requestSlackThreadSteering({
-    channelId,
-    threadTs,
-    message: combinedText,
-    messageTimestamps: items.map((item) => item.ts),
-  });
+  const requestedByUserId = app
+    ? await resolveSlackUserId(app.client, originalRequesterId, {
+        sampleEventType: "buffered_thread_reply",
+        sampleContext: items[0]!.text,
+      })
+    : (await findUserByExternalId("slack", originalRequesterId))?.id;
+
+  // A steering row has one sender. Keep consecutive messages from that sender
+  // together, then flush the remaining senders in order after successful delivery.
+  const nextSenderIndex = items.findIndex((item) => item.userId !== originalRequesterId);
+  const steeringItems = nextSenderIndex === -1 ? items : items.slice(0, nextSenderIndex);
+
+  // Steering carries text only. As on the mention path, files need a follow-up
+  // task so its attachments exist before a worker can claim it.
+  const steering =
+    files.length === 0
+      ? await requestSlackThreadSteering({
+          channelId,
+          threadTs,
+          message:
+            nextSenderIndex === -1
+              ? combinedText
+              : await rewriteSlackMentions(
+                  steeringItems.map((item) => item.text).join("\n---\n"),
+                  botUserId,
+                ),
+          messageTimestamps: steeringItems.map((item) => item.ts),
+          requestedByUserId,
+        })
+      : null;
   if (steering) {
     console.log(
       `[Slack] Buffer flushed → steering ${steering.result.outcome} for task ${steering.task.id}`,
     );
 
-    const app = getSlackApp();
     const agent = steering.task.agentId ? await getAgentById(steering.task.agentId) : undefined;
     if (app) {
       if (!isSlackRenderV2Enabled()) {
@@ -191,13 +262,21 @@ async function slackFlush(
         }
       }
     }
+    if (nextSenderIndex !== -1) {
+      await slackFlush(items.slice(nextSenderIndex), key, immediate);
+    }
     return;
   }
 
   const lead = await getLeadAgent();
 
   // Thread context for the task
-  const threadContext = await getThreadContextForBuffer(channelId, threadTs);
+  const threadContext = await getThreadContextForBuffer(
+    channelId,
+    threadTs,
+    new Set(items.map((item) => item.ts)),
+    botUserId,
+  );
   const fullDescription = threadContext
     ? `<thread_context>\n${threadContext}\n</thread_context>\n\n${description}`
     : description;
@@ -207,17 +286,27 @@ async function slackFlush(
   const dependsOn = !immediate && latestActiveTask ? [latestActiveTask.id] : undefined;
 
   const mostRecentTask = await getMostRecentTaskInThread(channelId, threadTs);
-  const task = await createTaskWithSiblingAwareness(fullDescription, {
-    agentId: lead?.id,
-    source: "slack",
-    slackChannelId: channelId,
-    slackThreadTs: threadTs,
-    slackTriggerMessageTs: items.at(-1)!.ts,
-    slackUserId: originalRequesterId,
-    dependsOn,
-    parentTaskId: mostRecentTask?.id,
-    contextKey: slackContextKey({ channelId, threadTs }),
-  });
+  const { task, unattached } = await createSlackTaskWithFiles(
+    fullDescription,
+    {
+      agentId: lead?.id,
+      routingReason:
+        lead && mostRecentTask?.agentId === lead.id ? "continuity" : lead ? "skill" : undefined,
+      routingSource: lead ? "engine_default" : undefined,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+      slackTriggerMessageTs: items.at(-1)!.ts,
+      slackUserId: originalRequesterId,
+      requestedByUserId,
+      dependsOn,
+      parentTaskId: mostRecentTask?.id,
+      contextKey: slackContextKey({ channelId, threadTs }),
+    },
+    inbound,
+  );
+
+  if (app) await notifySlackFileFailures(app.client, channelId, threadTs, unattached);
 
   console.log(
     `[Slack] Buffer flushed → task ${task.id} (dependsOn: ${dependsOn ? dependsOn.join(", ") : "none"})`,
@@ -229,7 +318,6 @@ async function slackFlush(
   }
 
   // Slack feedback with Block Kit
-  const app = getSlackApp();
   if (app) {
     const hasDependency = !immediate && !!latestActiveTask;
     const blocks = buildBufferFlushBlocks({

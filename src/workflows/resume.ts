@@ -1,4 +1,5 @@
 import {
+  cancelPendingApprovalRequestsForRun,
   cancelTask,
   getCompletedStepNodeIds,
   getDbClient,
@@ -10,23 +11,34 @@ import {
   getWorkflowRun,
   getWorkflowRunStep,
   getWorkflowRunStepsByRunId,
+  listCancelledApprovalRequestsForRun,
+  listCancelledApprovalRequestsForStep,
   resolveWaitState,
   updateWorkflowRun,
   updateWorkflowRunStep,
 } from "../be/db";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import {
+  type ApprovalSlackClient,
+  postApprovalCancellationUpdates,
+} from "./approval-notifications";
+import { shapeApprovalResolution } from "./approval-resolution";
+import { loadCompletedStepRouting } from "./completed-step-routing";
 import { FAILED_TASK_OUTPUT_PREFIX } from "./constants";
-import { findReadyNodes, walkGraph } from "./engine";
+import { getNextTargets } from "./definition";
+import { findReadyNodes, hasRunningStep, walkGraph } from "./engine";
 import type { WorkflowEventBus } from "./event-bus";
 import { workflowEventBus } from "./event-bus";
 import type { ExecutorRegistry } from "./executors/registry";
 import { computeNextPort } from "./executors/wait";
 import { resolveForeachParent } from "./foreach-join";
 import { getSecretInputKeys } from "./input";
+import { findWorkflowReadinessProblems, formatReadinessProblems } from "./readiness";
 import {
   checkpointPortStepAndResolveSuccessors,
   completeTaskStepAndResolveSuccessors,
   failStepAndRunIfWaiting,
+  scheduleTaskStepRetry,
 } from "./task-step-routing";
 import { matchesFilter } from "./wait-filter";
 
@@ -41,7 +53,7 @@ interface TaskEvent {
 
 interface ApprovalEvent {
   requestId: string;
-  status: "approved" | "rejected" | "timeout";
+  status: "approved" | "rejected" | "timeout" | "cancelled";
   responses: Record<string, unknown> | null;
   workflowRunId?: string;
   workflowRunStepId?: string;
@@ -76,7 +88,9 @@ export function setupWorkflowResumeListener(
     try {
       const event = data as TaskEvent;
       if (!event.workflowRunId || !event.workflowRunStepId) return;
-      await handleTaskFailure(event, event.failureReason ?? "Task failed", registry);
+      await handleTaskFailure(event, event.failureReason ?? "Task failed", registry, {
+        retryable: true,
+      });
     } catch (err) {
       console.error("[workflows] Handle task failure error:", err);
     }
@@ -87,7 +101,7 @@ export function setupWorkflowResumeListener(
     try {
       const event = data as TaskEvent;
       if (!event.workflowRunId || !event.workflowRunStepId) return;
-      await handleTaskFailure(event, "Task was cancelled", registry);
+      await handleTaskFailure(event, "Task was cancelled", registry, { retryable: false });
     } catch (err) {
       console.error("[workflows] Handle task cancellation error:", err);
     }
@@ -195,7 +209,17 @@ export async function finalizeOrWait(runId: string): Promise<void> {
   // finalized from a stale snapshot strands that branch.
   await getDbClient().transaction(async () => {
     const steps = await getWorkflowRunStepsByRunId(runId);
-    const hasWaiting = steps.some((s) => s.status === "waiting");
+    // A branch still executing belongs to a live walk, which finalizes the
+    // run itself; its finalizer only acts on a `running` run.
+    if (hasRunningStep(steps)) {
+      const run = await getWorkflowRun(runId);
+      if (run?.status === "waiting") await updateWorkflowRun(runId, { status: "running" });
+      return;
+    }
+    // A step queued for the retry poller is still live, like a waiting one.
+    const hasWaiting = steps.some(
+      (s) => s.status === "waiting" || (s.status === "failed" && s.nextRetryAt != null),
+    );
     if (hasWaiting) {
       await updateWorkflowRun(runId, { status: "waiting" });
     } else {
@@ -209,7 +233,10 @@ export async function finalizeOrWait(runId: string): Promise<void> {
 }
 
 /**
- * Handle task failure/cancellation — respects workflow's onNodeFailure config.
+ * Handle task failure/cancellation.
+ * A failed (never cancelled) task of an agent-task node with `retry` and
+ * attempts left is re-dispatched through the retry poller first.
+ * Otherwise the workflow's onNodeFailure config applies:
  * 'fail' (default): mark the entire run as failed.
  * 'continue': treat as completed with error output, let convergence proceed.
  */
@@ -217,6 +244,7 @@ async function handleTaskFailure(
   event: TaskEvent,
   reason: string,
   registry: ExecutorRegistry,
+  options: { retryable: boolean },
 ): Promise<void> {
   const run = await getWorkflowRun(event.workflowRunId!);
   if (!run || (run.status !== "waiting" && run.status !== "running")) return;
@@ -227,6 +255,23 @@ async function handleTaskFailure(
 
   const workflow = await getWorkflow(run.workflowId);
   if (!workflow) return;
+
+  if (options.retryable) {
+    const retry = await scheduleTaskStepRetry(
+      workflow.definition,
+      run.id,
+      step,
+      event.taskId,
+      reason,
+    );
+    if (retry === "scheduled") {
+      console.log(
+        `[workflows] Task ${event.taskId} failed; step ${step.nodeId} of run ${run.id} queued for retry ${step.retryCount + 1}`,
+      );
+      return;
+    }
+    if (retry === "not-claimed") return;
+  }
 
   const onFailure = workflow.definition.onNodeFailure ?? "fail";
 
@@ -308,6 +353,35 @@ export async function retryFailedRun(runId: string, registry: ExecutorRegistry):
   const failedStep = steps.find((s) => s.status === "failed");
   if (!failedStep) throw new Error("No failed step found");
 
+  const completedNodeIds = new Set(await getCompletedStepNodeIds(runId));
+
+  // A retry re-executes the failed node and everything after it. Refuse before the
+  // run is reset when a node still to run cannot run (say, a system-one-decision node with no API
+  // key), so the retry does not repeat side effects only to fail again downstream.
+  const notReady = await findWorkflowReadinessProblems(
+    { nodes: workflow.definition.nodes.filter((node) => !completedNodeIds.has(node.id)) },
+    registry,
+  );
+  if (notReady.length > 0) {
+    throw new Error(`Retry not started, run left failed: ${formatReadinessProblems(notReady)}`);
+  }
+
+  const { activeEdges } = await loadCompletedStepRouting(
+    workflow.definition,
+    runId,
+    completedNodeIds,
+  );
+  const foreachParent = resolveForeachParent(workflow.definition, failedStep.nodeId);
+  const failedNode =
+    foreachParent ?? workflow.definition.nodes.find((n) => n.id === failedStep.nodeId);
+  if (!failedNode) throw new Error(`Node ${failedStep.nodeId} not found in workflow definition`);
+  const hasStructuralPredecessor = workflow.definition.nodes.some(
+    (node) => node.next && getNextTargets(node.next).includes(failedNode.id),
+  );
+  const hasActivePredecessor = [...activeEdges].some((edge) => edge.endsWith(`→${failedNode.id}`));
+  const shouldRetryFailedNode =
+    foreachParent != null || !hasStructuralPredecessor || hasActivePredecessor;
+
   // Reset step and run. Claimed inside a transaction: two concurrent retries
   // (HTTP route + MCP tool) both pass the guard above, and a double reset
   // walks the same failed node twice.
@@ -315,51 +389,52 @@ export async function retryFailedRun(runId: string, registry: ExecutorRegistry):
   const claimed = await getDbClient().transaction(async () => {
     const current = await getWorkflowRun(runId);
     if (!current || current.status !== "failed") return false;
-    await updateWorkflowRunStep(failedStep.id, { status: "pending", error: null });
+    await updateWorkflowRunStep(failedStep.id, {
+      status: shouldRetryFailedNode ? "pending" : "cancelled",
+      error: shouldRetryFailedNode ? null : "Skipped on retry because its branch was not active",
+    });
     await updateWorkflowRun(runId, { status: "running", error: null, context: ctx });
     return true;
   });
   if (!claimed) throw new Error("Run is not in failed state");
 
-  // Resume from the failed node — use findReadyNodes for convergence safety
-  const completedNodeIds = new Set(await getCompletedStepNodeIds(runId));
-  const readyNodes = findReadyNodes(workflow.definition, completedNodeIds);
-  const failedNode =
-    resolveForeachParent(workflow.definition, failedStep.nodeId) ??
-    workflow.definition.nodes.find((n) => n.id === failedStep.nodeId);
-  if (!failedNode) throw new Error(`Node ${failedStep.nodeId} not found in workflow definition`);
+  // Resume from the failed node — use findReadyNodes for convergence safety.
+  // findReadyNodes returns every node without a completed step, including a
+  // branch whose step is still running or waiting on its task. That branch is
+  // not the retry's to run: walking it again executes it twice.
+  const liveNodeIds = new Set(
+    steps.filter((s) => s.status === "running" || s.status === "waiting").map((s) => s.nodeId),
+  );
+  const readyNodes = findReadyNodes(workflow.definition, completedNodeIds, activeEdges).filter(
+    (n) => n.id === failedNode.id || !liveNodeIds.has(n.id),
+  );
 
-  // Include the failed node if it's not already in ready nodes
-  const nodesToRun = readyNodes.some((n) => n.id === failedNode.id)
-    ? readyNodes
-    : [failedNode, ...readyNodes];
+  // Loop and foreach retry targets can be absent from readyNodes even when
+  // active; include them explicitly, but never revive an untaken branch.
+  const nodesToRun =
+    !shouldRetryFailedNode || readyNodes.some((n) => n.id === failedNode.id)
+      ? readyNodes
+      : [failedNode, ...readyNodes];
   const secretKeys = getSecretInputKeys(workflow.input);
   await walkGraph(workflow.definition, runId, ctx, nodesToRun, registry, workflow.id, secretKeys);
 }
 
 /**
- * Cancel a workflow run and all its non-terminal steps.
- * Also cancels any in-progress tasks spawned by waiting/running steps.
+ * The DB writes of a run cancel, with no Slack post. Returns false when the
+ * run is missing or already terminal. Called inside a caller's transaction,
+ * the writes join it (as a SAVEPOINT) and commit or roll back with it.
  */
-export async function cancelWorkflowRun(runId: string, reason?: string): Promise<void> {
-  const run = await getWorkflowRun(runId);
-  if (!run) throw new Error("Workflow run not found");
-
+export async function cancelWorkflowRunRows(runId: string, cancelReason: string): Promise<boolean> {
   const terminalStatuses = ["completed", "failed", "cancelled", "skipped"];
-  if (terminalStatuses.includes(run.status)) {
-    throw new Error(`Cannot cancel run in '${run.status}' state`);
-  }
-
   const now = new Date().toISOString();
-  const cancelReason = reason ?? "Cancelled by user";
 
   // Step snapshot, task cancels, and both status writes commit together so a
   // step created after the snapshot cannot survive the cancel and a
   // concurrent cancel cannot interleave. Task lifecycle events queue behind
   // this transaction's COMMIT (afterCommit) and drop on rollback.
-  await getDbClient().transaction(async () => {
+  return await getDbClient().transaction(async () => {
     const current = await getWorkflowRun(runId);
-    if (!current || terminalStatuses.includes(current.status)) return;
+    if (!current || terminalStatuses.includes(current.status)) return false;
 
     // Cancel non-terminal steps and their associated tasks
     const steps = await getWorkflowRunStepsByRunId(runId);
@@ -379,13 +454,80 @@ export async function cancelWorkflowRun(runId: string, reason?: string): Promise
       });
     }
 
+    await cancelPendingApprovalRequestsForRun(runId, cancelReason);
+
     // Mark the run itself as cancelled
     await updateWorkflowRun(runId, {
       status: "cancelled",
       error: cancelReason,
       finishedAt: now,
     });
+    return true;
   });
+}
+
+/**
+ * Cancel a workflow run and all its non-terminal steps.
+ * Also cancels any in-progress tasks spawned by waiting/running steps.
+ */
+export async function cancelWorkflowRun(runId: string, reason?: string): Promise<void> {
+  const run = await getWorkflowRun(runId);
+  if (!run) throw new Error("Workflow run not found");
+
+  const terminalStatuses = ["completed", "failed", "cancelled", "skipped"];
+  if (terminalStatuses.includes(run.status) && run.status !== "cancelled") {
+    throw new Error(`Cannot cancel run in '${run.status}' state`);
+  }
+
+  const cancelReason = reason ?? "Cancelled by user";
+  const applied = await cancelWorkflowRunRows(runId, cancelReason);
+
+  // The migration trigger also catches direct step cancellation. Re-read after
+  // commit so its rows are included alongside the run-wide sweep.
+  const cancelledApprovals = await listCancelledApprovalRequestsForRun(runId);
+  const latestRun = await getWorkflowRun(runId);
+  if (!applied && latestRun?.status !== "cancelled") {
+    throw new Error(`Cannot cancel run in '${latestRun?.status ?? "missing"}' state`);
+  }
+  await postApprovalCancellationUpdates(
+    cancelledApprovals,
+    applied ? cancelReason : (latestRun?.error ?? cancelReason),
+  );
+}
+
+/** Cancel one HITL step and close any approval request it gates. */
+export async function cancelWorkflowRunStep(
+  stepId: string,
+  reason = "Cancelled by user",
+  slackClient?: ApprovalSlackClient,
+): Promise<void> {
+  const now = new Date().toISOString();
+  let persistedReason = reason;
+  await getDbClient().transaction(async () => {
+    const step = await getWorkflowRunStep(stepId);
+    if (!step) throw new Error("Workflow run step not found");
+    if (step.nodeType !== "human-in-the-loop") {
+      throw new Error("Only human-in-the-loop steps have an approval cancellation lifecycle");
+    }
+    if (["completed", "failed", "skipped"].includes(step.status)) {
+      throw new Error(`Cannot cancel step in '${step.status}' state`);
+    }
+    if (step.status === "cancelled") {
+      persistedReason = step.error ?? reason;
+      return;
+    }
+
+    const task = await getTaskByWorkflowRunStepId(stepId);
+    if (task) await cancelTask(task.id, reason);
+    await updateWorkflowRunStep(stepId, {
+      status: "cancelled",
+      error: reason,
+      finishedAt: now,
+    });
+  });
+
+  const approvals = await listCancelledApprovalRequestsForStep(stepId);
+  await postApprovalCancellationUpdates(approvals, persistedReason, slackClient);
 }
 
 /**
@@ -411,15 +553,22 @@ async function resumeFromApprovalResolution(
 
   const ctx = (run.context ?? {}) as Record<string, unknown>;
 
-  // Determine output port based on approval status
-  const nextPort =
-    event.status === "timeout" ? "timeout" : event.status === "rejected" ? "rejected" : "approved";
+  if (event.status === "cancelled") {
+    console.warn(
+      `[workflows] approval ${event.requestId} is cancelled; step ${event.workflowRunStepId} stays waiting for the run cancel path`,
+    );
+    return;
+  }
 
-  const stepOutput = {
-    requestId: event.requestId,
-    status: event.status,
-    responses: event.responses,
-  };
+  // Output and port for the approval status. A step parked by an executor other
+  // than human-in-the-loop shapes its own (see shapeApprovalResolution).
+  const { output: stepOutput, nextPort } = shapeApprovalResolution(
+    registry,
+    workflow.definition,
+    step.nodeId,
+    step.output,
+    { requestId: event.requestId, status: event.status, responses: event.responses },
+  );
 
   // Use port-based routing to determine the correct successors.
   // findReadyNodes without activeEdges would return ALL structural successors

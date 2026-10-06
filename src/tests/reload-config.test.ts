@@ -3,6 +3,7 @@ import { unlink } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { initAgentMail, resetAgentMail } from "../agentmail";
 import { closeDb, deleteSwarmConfig, getDbClient, initDb, upsertSwarmConfig } from "../be/db";
+import { getEmbeddingProvider, resetEmbeddingProvider } from "../be/memory";
 import { initGitHub, resetGitHub } from "../github";
 import {
   __resetInjectedEnvTracking,
@@ -10,8 +11,10 @@ import {
   _resetAutoReloadForTests,
   flushPendingIntegrationsReload,
   loadGlobalConfigsIntoEnv,
+  reloadGlobalConfigsAndIntegrations,
   scheduleIntegrationsReload,
 } from "../http/core";
+import { isOriginAllowedForCredentials } from "../http/utils";
 import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-reload-config.sqlite";
@@ -199,6 +202,48 @@ describe("reload-config", () => {
     expect(process.env.API_KEY).toBeUndefined();
   });
 
+  test("stored CORS bypass cannot enable or override deployment CORS at boot or reload", async () => {
+    const key = "CORS_ALLOW_ANY_ORIGIN";
+    const original = process.env[key];
+    const rowId = await insertLegacyReservedRow(key, "true");
+    try {
+      for (const override of [false, true]) {
+        delete process.env[key];
+        expect(await loadGlobalConfigsIntoEnv(override)).not.toContain(key);
+        expect(process.env[key]).toBeUndefined();
+        expect(isOriginAllowedForCredentials("https://attacker.invalid")).toBe(false);
+        process.env[key] = "false";
+        await loadGlobalConfigsIntoEnv(override);
+        expect(process.env[key]).toBe("false");
+        process.env[key] = "true";
+        await loadGlobalConfigsIntoEnv(override);
+        expect(process.env[key]).toBe("true");
+        expect(isOriginAllowedForCredentials("https://attacker.invalid")).toBe(false);
+      }
+    } finally {
+      await deleteSwarmConfig(rowId);
+      if (original === undefined) delete process.env[key];
+      else process.env[key] = original;
+    }
+  });
+
+  test("stored lead activation gate cannot override the deployment at boot or reload", async () => {
+    const key = "EXTENSION_ALLOW_LEAD_ACTIVATION";
+    const original = process.env[key];
+    const rowId = await insertLegacyReservedRow(key, "true");
+    try {
+      process.env[key] = "false";
+      for (const override of [false, true]) {
+        expect(await loadGlobalConfigsIntoEnv(override)).not.toContain(key);
+        expect(process.env[key]).toBe("false");
+      }
+    } finally {
+      await deleteSwarmConfig(rowId);
+      if (original === undefined) delete process.env[key];
+      else process.env[key] = original;
+    }
+  });
+
   test("loadGlobalConfigsIntoEnv skips unreadable reserved secret rows before decrypting them", async () => {
     const id = await insertUnreadableReservedSecretRow("SECRETS_ENCRYPTION_KEY");
 
@@ -234,6 +279,81 @@ describe("reload-config", () => {
   test("unknown endpoint returns 404", async () => {
     const res = await fetch(`${baseUrl}/nonexistent`, { method: "POST" });
     expect(res.status).toBe(404);
+  });
+
+  // Regression: EMBEDDING_API_KEY / OPENAI_API_KEY used to be read once at
+  // OpenAIEmbeddingProvider construction and never revisited, so a key set
+  // (or rotated) via the dashboard/API stayed inert until the API process
+  // restarted (customer-reported, Jan Carbonell 2026-09-16: valid key,
+  // reload reported it loaded, embeddings still stayed off). Assert the
+  // full path: no key -> provider unconfigured -> config write + reload ->
+  // provider live, without a restart.
+  test("reload turns embeddings on without a restart once a key lands via config", async () => {
+    const originalEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const originalOpenAiKey = process.env.OPENAI_API_KEY;
+    delete process.env.EMBEDDING_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    resetEmbeddingProvider();
+    expect(getEmbeddingProvider().isConfigured()).toBe(false);
+
+    const config = await upsertSwarmConfig({
+      scope: "global",
+      key: "EMBEDDING_API_KEY",
+      value: "sk-test-not-a-real-key",
+      isSecret: true,
+    });
+
+    try {
+      const result = await reloadGlobalConfigsAndIntegrations();
+      expect(result.keysUpdated).toContain("EMBEDDING_API_KEY");
+      expect(result.integrationsReinitialized).toContain("embeddings");
+      expect(getEmbeddingProvider().isConfigured()).toBe(true);
+    } finally {
+      await deleteSwarmConfig(config.id);
+      delete process.env.EMBEDDING_API_KEY;
+      if (originalOpenAiKey === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenAiKey;
+      }
+      resetEmbeddingProvider();
+      if (originalEmbeddingKey !== undefined) {
+        process.env.EMBEDDING_API_KEY = originalEmbeddingKey;
+      }
+    }
+  });
+
+  test("reload applies HTTP mode without reporting a Slack socket as reinitialized", async () => {
+    const keys = [
+      "SLACK_MODE",
+      "SLACK_DISABLE",
+      "SLACK_BOT_TOKEN",
+      "SLACK_SIGNING_SECRET",
+    ] as const;
+    const originals = new Map(keys.map((key) => [key, process.env[key]]));
+    process.env.SLACK_DISABLE = "false";
+    process.env.SLACK_BOT_TOKEN = "xoxb-test";
+    process.env.SLACK_SIGNING_SECRET = "synthetic-signing-secret";
+    const config = await upsertSwarmConfig({
+      scope: "global",
+      key: "SLACK_MODE",
+      value: "http",
+    });
+
+    try {
+      const result = await reloadGlobalConfigsAndIntegrations();
+      expect(result.keysUpdated).toContain("SLACK_MODE");
+      expect(result.integrationsReinitialized).not.toContain("slack");
+      expect(process.env.SLACK_MODE).toBe("http");
+    } finally {
+      await deleteSwarmConfig(config.id);
+      await loadGlobalConfigsIntoEnv(true);
+      for (const key of keys) {
+        const value = originals.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   // Regression: injection used to be one-way. Deleting a global row left the
@@ -404,7 +524,7 @@ describe("auto-reload debouncer", () => {
     const testKey = `__TEST_OVERRIDE_LIVE_${Date.now()}`;
     process.env[testKey] = "shipped-by-deploy";
 
-    // Pre-existing env should win at startup, but reload uses override=true.
+    // Pre-existing env set manually here; reload (and boot) use override=true.
     await upsertSwarmConfig({ scope: "global", key: testKey, value: "from-config" });
     scheduleIntegrationsReload(20);
 

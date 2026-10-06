@@ -35,6 +35,40 @@ export type ScriptScope = "agent" | "global";
 export type ScriptFsMode = "none" | "workspace-rw";
 export type ScriptApiRawOptions = { raw: true };
 export type ScriptApiDefaultOptions = { raw?: false };
+export type RoutingReason = "skill" | "continuity" | "overflow" | "human_pinned" | "reroute_fault";
+export type TaskSendArgs = Record<string, unknown> & {
+  task: string;
+} & (
+  | {
+      agentId: string;
+      routingReason: RoutingReason;
+      /** At least 10 characters after trim; maximum 200. */
+      routingNote: string;
+    }
+  | { agentId?: never; routingReason?: never; routingNote?: string }
+);
+export type AgentTaskStepConfig = {
+  template?: string;
+  task?: string;
+  agentId?: string;
+  routingReason?: RoutingReason;
+  routingNote?: string;
+  tags?: string[];
+  priority?: number;
+  offerMode?: boolean;
+  dir?: string;
+  vcsRepo?: string;
+  model?: string;
+  parentTaskId?: string;
+  requestedByUserId?: string;
+  outputSchema?: Record<string, unknown>;
+  /** Wait for the dispatched task to reach a terminal status before resolving. Default: true. */
+  waitForCompletion?: boolean;
+  /** Max ms to wait for a terminal status before throwing. Default: 2h. Only used when waitForCompletion is true. */
+  timeoutMs?: number;
+  /** Throw when the task ends failed/cancelled/superseded (default), or resolve with {taskId,status,error} when false. */
+  failOnTaskFailure?: boolean;
+};
 
 export interface ScriptApiRawResult {
   ok: boolean;
@@ -105,15 +139,40 @@ export interface KvListData<T = unknown> {
   namespace: string;
 }
 
+export type RoomOperation =
+  | { type: "set"; path: Array<string | number>; value: JsonValue }
+  | { type: "delete"; path: Array<string | number> }
+  | { type: "insert"; path: Array<string | number>; index: number; values: JsonValue[] }
+  | { type: "increment"; path: Array<string | number>; by: number }
+  | { type: "text"; path: Array<string | number>; index: number; deleteCount?: number; insert?: string };
+
+export interface RoomView {
+  namespace: string;
+  name: string;
+  schemaVersion: number;
+  generation: string;
+  stale: boolean;
+  state: unknown;
+  snapshot: string;
+  bytes: number;
+}
+
+export interface RoomDecoded {
+  schemaVersion: number;
+  generation: string;
+  state: unknown;
+}
+
 export interface SwarmSdk {
   // --- memory ---
-  memory_search(args: { query: string; intent: string; scope?: "all" | "agent" | "swarm"; limit?: number; source?: string }): Promise<unknown>;
+  memory_search(args: { query: string; intent: string; scope?: "all" | "agent" | "swarm"; limit?: number; source?: string; keyPrefix?: string }): Promise<unknown>;
   memory_get(args: { memoryId: string; intent: string }): Promise<unknown>;
   memory_rate(args: { id: string; useful: boolean; note?: string }): Promise<unknown>;
   // --- tasks ---
   task_list(args?: Record<string, unknown>): Promise<unknown>;
   task_get(args: { taskId: string }): Promise<unknown>;
   task_storeProgress(args: Record<string, unknown>): Promise<unknown>;
+  task_defer(args: { taskId: string; delayMs?: number; runAt?: string; wakeOn?: { event: "task.completed" | "task.failed" | "settled"; taskId: string }; summary: string; note: string; checks?: string[] }): Promise<unknown>;
   task_poll(args?: Record<string, unknown>): Promise<unknown>;
   // --- kv ---
   kv_get<T = unknown>(args: { key: string; namespace?: string }): Promise<KvSdkResponse<KvEntry<T>>>;
@@ -125,6 +184,17 @@ export interface SwarmSdk {
   kv_del(args: { key: string; namespace?: string }): Promise<KvSdkResponse<KvEmptyData, 204>>;
   kv_incr(args: { key: string; by?: number; namespace?: string }): Promise<KvSdkResponse<KvEntry<number>>>;
   kv_list<T = unknown>(args?: { prefix?: string; namespace?: string; limit?: number; offset?: number }): Promise<KvSdkResponse<KvListData<T>>>;
+  // --- realtime rooms ---
+  room: {
+    get(args?: { name?: string; namespace?: string; schemaVersion?: number }): Promise<RoomView>;
+    change(args: { name?: string; namespace?: string; schemaVersion?: number; operations: RoomOperation[] }): Promise<RoomView>;
+    reset(args?: { name?: string; namespace?: string; schemaVersion?: number; state?: Record<string, JsonValue> }): Promise<RoomView>;
+    decode(args: { value: unknown }): Promise<RoomDecoded>;
+  };
+  room_get(args?: { name?: string; namespace?: string; schemaVersion?: number }): Promise<unknown>;
+  room_change(args: { name?: string; namespace?: string; schemaVersion?: number; operations: RoomOperation[] }): Promise<unknown>;
+  room_reset(args?: { name?: string; namespace?: string; schemaVersion?: number; state?: unknown }): Promise<unknown>;
+  room_decode(args: { value: unknown }): Promise<unknown>;
   // --- repos ---
   repo_list(args?: Record<string, unknown>): Promise<unknown>;
   // --- schedules ---
@@ -168,7 +238,7 @@ export interface SwarmSdk {
 
   // --- write: memory ---
   memory_delete(args: { id: string }): Promise<unknown>;
-  memory_store(args: { content: string; name: string; scope?: "agent" | "swarm"; tags?: string[]; taskId?: string; intent?: string }): Promise<unknown>;
+  memory_store(args: { content: string; name: string; scope?: "agent" | "swarm"; tags?: string[]; taskId?: string; intent?: string; key?: string }): Promise<unknown>;
   memory_edit(args: {
     memoryId?: string;
     key?: string;
@@ -179,11 +249,12 @@ export interface SwarmSdk {
     newString?: string;
     intent: string;
     expectedVersion?: number;
+    newKey?: string;
   }): Promise<unknown>;
   inject_learning(args: { content: string; name?: string; scope?: "agent" | "swarm"; source?: string; tags?: string[] }): Promise<unknown>;
 
   // --- write: tasks ---
-  task_send(args: Record<string, unknown>): Promise<unknown>;
+  task_send(args: TaskSendArgs): Promise<unknown>;
   task_cancel(args: { taskId: string }): Promise<unknown>;
   task_steer(args: { taskId: string; message: string; mode?: "steer" | "queue"; onUnsupported?: "degrade" | "fail" }): Promise<unknown>;
   task_action(args: Record<string, unknown>): Promise<unknown>;
@@ -191,6 +262,21 @@ export interface SwarmSdk {
   // --- write: config ---
   config_set(args: { key: string; value: unknown; scope?: "global" | "agent" | "repo"; scopeId?: string; isSecret?: boolean }): Promise<unknown>;
   config_delete(args: { id: string }): Promise<unknown>;
+
+  // --- write: model catalog ---
+  modelCatalog_refresh(args?: { force?: boolean }): Promise<unknown>;
+  modelCatalog_overlayUpsert(args: {
+    provider: string;
+    modelId: string;
+    name?: string;
+    releaseDate?: string;
+    contextWindow?: number;
+    maxOutput?: number;
+    reasoningOptions?: Array<{ type: string; values?: string[] }>;
+    pricing?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
+    reason: string;
+    verifiedBy?: string;
+  }): Promise<unknown>;
 
   // --- write: slack ---
   slack_post(args: { channelId: string; message: string; blocks?: unknown }): Promise<unknown>;
@@ -244,6 +330,15 @@ export interface SwarmSdk {
   script_launchRun(args: { source: string; args?: unknown; idempotencyKey?: string; scriptName?: string; requestedByUserId?: string }): Promise<unknown>;
   script_getRun(args: { id: string }): Promise<unknown>;
   script_listRuns(args?: { status?: "running" | "paused" | "completed" | "failed" | "cancelled" | "aborted_limit"; agentId?: string; limit?: number; offset?: number }): Promise<unknown>;
+
+  // --- write: extensions ---
+  extension_catalog(args?: Record<string, never>): Promise<unknown>;
+  extension_install(args: { template: string; priority?: number; config?: Record<string, unknown> } | { manifest: Record<string, unknown>; files: Record<string, string>; priority?: number; config?: Record<string, unknown> }): Promise<unknown>;
+  extension_list(args?: { enabledOnly?: boolean }): Promise<unknown>;
+  extension_delete(args: { id: string }): Promise<unknown>;
+  extension_enable(args: { id: string }): Promise<unknown>;
+  extension_disable(args: { id: string }): Promise<unknown>;
+  extension_activate_version(args: { id: string; version: number }): Promise<unknown>;
 
   // --- write: repos ---
   repo_update(args: Record<string, unknown>): Promise<unknown>;
@@ -312,6 +407,7 @@ export interface SwarmSdk {
 
   // --- human input ---
   request_humanInput(args: Record<string, unknown>): Promise<unknown>;
+  approval_cancel(args: { requestId: string; reason?: string }): Promise<unknown>;
 }
 
 export interface ScriptStdlib {
@@ -338,26 +434,7 @@ export interface ScriptWorkflowSteps {
   ): Promise<unknown>;
   agentTask(
     label: string,
-    config: {
-      template?: string;
-      task?: string;
-      agentId?: string;
-      tags?: string[];
-      priority?: number;
-      offerMode?: boolean;
-      dir?: string;
-      vcsRepo?: string;
-      model?: string;
-      parentTaskId?: string;
-      requestedByUserId?: string;
-      outputSchema?: Record<string, unknown>;
-      /** Wait for the dispatched task to reach a terminal status before resolving. Default: true. */
-      waitForCompletion?: boolean;
-      /** Max ms to wait for a terminal status before throwing. Default: 2h. Only used when waitForCompletion is true. */
-      timeoutMs?: number;
-      /** Throw when the task ends failed/cancelled/superseded (default), or resolve with {taskId,status,error} when false. */
-      failOnTaskFailure?: boolean;
-    },
+    config: AgentTaskStepConfig,
   ): Promise<unknown>;
   swarmScript(
     label: string,
@@ -410,7 +487,7 @@ export async function scriptSdkTypesWithGeneratedApis(
   return `${SCRIPT_SDK_TYPES}\n${apiTypes}\n${mcpTypes}\n${resolvedAppTypes}\n`;
 }
 
-const STDLIB_MODULE_TYPES = `
+export const SCRIPT_STDLIB_MODULE_TYPES = `
 declare module "stdlib" {
   export interface Redacted<T> {
     readonly __redactedBrand?: T;
@@ -431,7 +508,7 @@ declare module "stdlib" {
 `;
 
 function stdlibTypesFor(sdkModuleBody: string): string {
-  return `${STDLIB_MODULE_TYPES}
+  return `${SCRIPT_STDLIB_MODULE_TYPES}
 declare module "swarm-sdk" {
 ${sdkModuleBody.replace(/^/gm, "  ")}
 }
@@ -789,8 +866,6 @@ interface Window {
 
 const USER_FILE = "/virtual/user-script.ts";
 const CHECK_FILE = "/virtual/check.ts";
-const SDK_FILE = "/virtual/swarm-sdk.d.ts";
-const STDLIB_FILE = "/virtual/stdlib.d.ts";
 const RUNTIME_GLOBALS_FILE = "/virtual/runtime-globals.d.ts";
 
 /**
@@ -812,6 +887,7 @@ function scriptTypesBase(): string {
 function createCompilerHost(
   files: Map<string, string>,
   options: ts.CompilerOptions,
+  virtualModules: ReadonlyMap<string, string> = new Map(),
 ): ts.CompilerHost {
   const host = ts.createCompilerHost(options, true);
   const originalGetSourceFile = host.getSourceFile.bind(host);
@@ -844,11 +920,9 @@ function createCompilerHost(
       if (moduleName === "./user-script") {
         return { resolvedFileName: USER_FILE, extension: ts.Extension.Ts };
       }
-      if (moduleName === "swarm-sdk") {
-        return { resolvedFileName: SDK_FILE, extension: ts.Extension.Dts };
-      }
-      if (moduleName === "stdlib") {
-        return { resolvedFileName: STDLIB_FILE, extension: ts.Extension.Dts };
+      const virtualModule = virtualModules.get(moduleName);
+      if (virtualModule) {
+        return { resolvedFileName: virtualModule, extension: ts.Extension.Dts };
       }
       // For external packages, resolve from project root so node_modules is found
       const base = containingFile.startsWith("/virtual/") ? projectBase : containingFile;
@@ -933,10 +1007,12 @@ function toStructured(diag: ts.Diagnostic): ScriptDiagnostic {
   };
 }
 
-export async function typecheckScript(
-  source: string,
-  context: ScriptTypeContext = {},
-): Promise<ScriptTypecheckResult> {
+export async function typecheckWithAmbient(args: {
+  source: string;
+  modules: Record<string, string>;
+  ambient?: Record<string, string>;
+  checkFile: string;
+}): Promise<ScriptTypecheckResult> {
   const options: ts.CompilerOptions = {
     allowImportingTsExtensions: true,
     lib: ["lib.es2022.d.ts"],
@@ -949,35 +1025,23 @@ export async function typecheckScript(
     types: [],
   };
 
-  const apiTypes = getScriptApiTypes(context);
-  const mcpTypes = getScriptMcpTypes(context);
-  const appTypes = await getScriptAppTypes(context);
-  const sdkTypes = await scriptSdkTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes);
-  const stdlibTypes = appTypes
-    ? await scriptStdlibTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes)
-    : SCRIPT_STDLIB_TYPES;
   const files = new Map<string, string>([
-    [USER_FILE, source],
-    [SDK_FILE, sdkTypes],
-    [STDLIB_FILE, stdlibTypes],
+    [USER_FILE, args.source],
     [RUNTIME_GLOBALS_FILE, SCRIPT_RUNTIME_GLOBALS],
-    [
-      CHECK_FILE,
-      `/// <reference path="./runtime-globals.d.ts" />
-import run from "./user-script";
-import type { ScriptMain } from "swarm-sdk";
-const _scriptMain: ScriptMain = run;
-void _scriptMain;
-`,
-    ],
+    [CHECK_FILE, args.checkFile],
   ]);
+  const virtualModules = new Map<string, string>();
+  for (const [moduleName, source] of Object.entries(args.modules)) {
+    const fileName = `/virtual/${moduleName.replace(/[^A-Za-z0-9_.-]/g, "_")}.d.ts`;
+    files.set(fileName, source);
+    virtualModules.set(moduleName, fileName);
+  }
+  for (const [name, source] of Object.entries(args.ambient ?? {})) {
+    files.set(`/virtual/ambient-${name.replace(/[^A-Za-z0-9_.-]/g, "_")}.d.ts`, source);
+  }
 
-  const host = createCompilerHost(files, options);
-  const program = ts.createProgram(
-    [USER_FILE, CHECK_FILE, SDK_FILE, STDLIB_FILE, RUNTIME_GLOBALS_FILE],
-    options,
-    host,
-  );
+  const host = createCompilerHost(files, options, virtualModules);
+  const program = ts.createProgram([...files.keys()], options, host);
   const diagnostics = [
     ...program.getSyntacticDiagnostics(),
     ...program.getSemanticDiagnostics(),
@@ -1001,4 +1065,27 @@ void _scriptMain;
     ),
     structured: diagnostics.map(toStructured),
   };
+}
+
+export async function typecheckScript(
+  source: string,
+  context: ScriptTypeContext = {},
+): Promise<ScriptTypecheckResult> {
+  const apiTypes = getScriptApiTypes(context);
+  const mcpTypes = getScriptMcpTypes(context);
+  const appTypes = await getScriptAppTypes(context);
+  const sdkTypes = await scriptSdkTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes);
+  const stdlibTypes = appTypes
+    ? await scriptStdlibTypesWithGeneratedApis(apiTypes, mcpTypes, appTypes)
+    : SCRIPT_STDLIB_TYPES;
+  return typecheckWithAmbient({
+    source,
+    modules: { "swarm-sdk": sdkTypes, stdlib: stdlibTypes },
+    checkFile: `/// <reference path="./runtime-globals.d.ts" />
+import run from "./user-script";
+import type { ScriptMain } from "swarm-sdk";
+const _scriptMain: ScriptMain = run;
+void _scriptMain;
+`,
+  });
 }

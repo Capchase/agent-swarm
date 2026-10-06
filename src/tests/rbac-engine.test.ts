@@ -45,6 +45,7 @@ const LEAD_ONLY_VERBS: PermissionVerb[] = [
   "agent.profile.update.any",
   "agent.context.read.any",
   "memory.learning.inject",
+  "memory.write.consolidated",
   "channel.delete",
   "integration.kapso.manage",
   "integration.slack.post",
@@ -81,7 +82,24 @@ const LEAD_ONLY_VERBS: PermissionVerb[] = [
   "script.api.delete",
 ];
 
+const OPERATOR_ONLY_VERBS: PermissionVerb[] = [];
+const LEAD_OR_OPERATOR_OR_USER_VERBS: PermissionVerb[] = [
+  "mcp-server.stdio.write",
+  "memory.read.any",
+  "extension.write",
+  "task.requester.assign",
+  "extension.activate",
+  "extension.install.inline",
+  "repo.merge-policy.write",
+];
+const OPERATOR_OR_USER_VERBS: PermissionVerb[] = ["comb.presence", "approval.respond"];
+
+const LEAD_OR_OPERATOR_VERBS: PermissionVerb[] = ["models.catalog.write"];
+
+const AGENT_OR_OPERATOR_VERBS: PermissionVerb[] = ["models.harness-support.write"];
+
 const LEAD_OR_RESOURCE_OWNER_VERBS: PermissionVerb[] = [
+  "memory.edit.any",
   "skill.update.any",
   "skill.delete.any",
   "mcp-server.delete.any",
@@ -92,6 +110,8 @@ const LEAD_OR_RESOURCE_OWNER_VERBS: PermissionVerb[] = [
 const LEAD_OR_TASK_CREATOR_VERBS: PermissionVerb[] = ["task.cancel.any", "task.steer.any"];
 
 const LEAD_OR_OWN_NAMESPACE_VERBS: PermissionVerb[] = ["kv.write.any"];
+
+const HUMAN_OR_LEAD_OR_RESOURCE_OWNER_VERBS: PermissionVerb[] = ["approval.cancel.any"];
 
 const ANY_AUTHENTICATED_VERBS: PermissionVerb[] = [
   "app.manage",
@@ -110,7 +130,11 @@ const REQUESTER_OWNS_TASK_VERBS: PermissionVerb[] = [
   "task.action.own",
 ];
 
-const COMPOSITE_VERBS: PermissionVerb[] = ["memory.delete.any", "task.fs.mutate"];
+const COMPOSITE_VERBS: PermissionVerb[] = [
+  "memory.delete.any",
+  "task.fs.mutate",
+  "task.progress.write",
+];
 
 // ── Resource fixtures ────────────────────────────────────────────────────────
 
@@ -167,9 +191,15 @@ describe("verb-group partition", () => {
       ...LEAD_OR_RESOURCE_OWNER_VERBS,
       ...LEAD_OR_TASK_CREATOR_VERBS,
       ...LEAD_OR_OWN_NAMESPACE_VERBS,
+      ...HUMAN_OR_LEAD_OR_RESOURCE_OWNER_VERBS,
       ...ANY_AUTHENTICATED_VERBS,
       ...REQUESTER_OWNS_TASK_VERBS,
       ...COMPOSITE_VERBS,
+      ...OPERATOR_ONLY_VERBS,
+      ...LEAD_OR_OPERATOR_OR_USER_VERBS,
+      ...OPERATOR_OR_USER_VERBS,
+      ...LEAD_OR_OPERATOR_VERBS,
+      ...AGENT_OR_OPERATOR_VERBS,
     ];
     expect(new Set(grouped).size).toBe(grouped.length);
     expect(grouped.sort()).toEqual([...PERMISSION_VERBS].sort());
@@ -215,6 +245,123 @@ describe("lead-only verbs", () => {
   });
 });
 
+describe("operator-or-user verbs", () => {
+  const expected: Expected = {
+    lead: false,
+    worker: false,
+    ownerWorker: false,
+    creatorWorker: false,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of OPERATOR_ONLY_VERBS) {
+    test(`${verb}: operator or user allowed`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("lead-or-operator-or-user verbs", () => {
+  const expected: Expected = {
+    lead: true,
+    worker: false,
+    ownerWorker: false,
+    creatorWorker: false,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of LEAD_OR_OPERATOR_OR_USER_VERBS) {
+    test(`${verb}: lead, operator, or user allowed`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("operator-or-user verbs", () => {
+  const expected: Expected = {
+    lead: false,
+    worker: false,
+    ownerWorker: false,
+    creatorWorker: false,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of OPERATOR_OR_USER_VERBS) {
+    test(`${verb}: the operator or a dashboard user allowed, agents denied`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("agent-or-operator verbs", () => {
+  const expected: Expected = {
+    lead: true,
+    worker: true,
+    ownerWorker: true,
+    creatorWorker: true,
+    userRequester: false,
+    foreignUser: false,
+    operator: true,
+  };
+  for (const verb of AGENT_OR_OPERATOR_VERBS) {
+    test(`${verb}: any registered agent or the operator allowed, dashboard users denied`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("lead-or-operator verbs", () => {
+  const expected: Expected = {
+    lead: true,
+    worker: false,
+    ownerWorker: false,
+    creatorWorker: false,
+    userRequester: false,
+    foreignUser: false,
+    operator: true,
+  };
+  for (const verb of LEAD_OR_OPERATOR_VERBS) {
+    test(`${verb}: only the lead or the operator allowed`, () => {
+      expectDecisions(verb, { kind: "none" }, expected);
+    });
+  }
+});
+
+describe("extension ownership", () => {
+  test("workers create extensions and write only their own existing resource", () => {
+    const worker = { kind: "agent", agentId: "extension-owner", isLead: false } as const;
+    for (const resource of [
+      { kind: "extension" },
+      { kind: "extension", extensionId: "ext-1", createdByAgentId: worker.agentId },
+    ] as const) {
+      expect(
+        can({ principal: worker, verb: "extension.write", resource, source: "http" }).allow,
+      ).toBe(true);
+    }
+    for (const createdByAgentId of [null, "other-agent"]) {
+      expect(
+        can({
+          principal: worker,
+          verb: "extension.write",
+          resource: { kind: "extension", extensionId: "ext-1", createdByAgentId },
+          source: "http",
+        }).allow,
+      ).toBe(false);
+    }
+    expect(
+      can({
+        principal: { ...worker, agentId: "" },
+        verb: "extension.write",
+        resource: { kind: "extension" },
+        source: "http",
+      }).allow,
+    ).toBe(false);
+  });
+});
+
 describe("lead-or-resource-owner verbs", () => {
   const expected: Expected = {
     lead: true,
@@ -235,6 +382,33 @@ describe("lead-or-resource-owner verbs", () => {
     const decision = can({
       principal: PRINCIPALS.ownerWorker,
       verb: "skill.update.any",
+      resource: { kind: "owned", ownerAgentId: null },
+      source: "mcp",
+    });
+    expect(decision.allow).toBe(false);
+  });
+});
+
+describe("human-or-lead-or-resource-owner verbs (approval.cancel.any)", () => {
+  const expected: Expected = {
+    lead: true,
+    worker: false,
+    ownerWorker: true,
+    creatorWorker: false,
+    userRequester: true,
+    foreignUser: true,
+    operator: true,
+  };
+  for (const verb of HUMAN_OR_LEAD_OR_RESOURCE_OWNER_VERBS) {
+    test(`${verb}: humans, lead, or owner allowed`, () => {
+      expectDecisions(verb, OWNED_RESOURCE, expected);
+    });
+  }
+
+  test("ownerless resource denies non-lead agents", () => {
+    const decision = can({
+      principal: PRINCIPALS.ownerWorker,
+      verb: "approval.cancel.any",
       resource: { kind: "owned", ownerAgentId: null },
       source: "mcp",
     });
@@ -363,28 +537,28 @@ describe("any-authenticated verbs", () => {
   }
 });
 
-describe("memory.delete.any composite (owner OR (lead AND scope=swarm))", () => {
-  test("swarm-scoped memory: owner or lead allowed", () => {
+describe("memory.delete.any composite (human, lead for swarm, owner for agent scope)", () => {
+  test("swarm-scoped memory: lead and humans allowed, owner worker denied", () => {
     expectDecisions("memory.delete.any", SWARM_MEMORY_RESOURCE, {
       lead: true,
       worker: false,
-      ownerWorker: true,
+      ownerWorker: false,
       creatorWorker: false,
-      userRequester: false,
-      foreignUser: false,
-      operator: false,
+      userRequester: true,
+      foreignUser: true,
+      operator: true,
     });
   });
 
-  test("agent-scoped memory: only owner allowed — lead is denied (deny edge)", () => {
+  test("agent-scoped memory: owner and humans allowed — lead is denied (deny edge)", () => {
     expectDecisions("memory.delete.any", AGENT_MEMORY_RESOURCE, {
       lead: false,
       worker: false,
       ownerWorker: true,
       creatorWorker: false,
-      userRequester: false,
-      foreignUser: false,
-      operator: false,
+      userRequester: true,
+      foreignUser: true,
+      operator: true,
     });
   });
 });
@@ -400,6 +574,36 @@ describe("task.fs.mutate composite (operator OR user OR lead OR assignee OR crea
       foreignUser: true, // any authenticated user passes (fs.ts canMutateTask)
       operator: true,
     });
+  });
+});
+
+describe("task.progress.write composite (operator OR user OR lead OR assignee OR unassigned)", () => {
+  test("the creator and an unrelated worker are denied on an assigned task", () => {
+    expectDecisions("task.progress.write", TASK_RESOURCE, {
+      lead: true,
+      worker: false,
+      ownerWorker: true, // assignee (task.agentId)
+      creatorWorker: false,
+      userRequester: true,
+      foreignUser: true,
+      operator: true,
+    });
+  });
+
+  test("any agent may write an unassigned task", () => {
+    expectDecisions(
+      "task.progress.write",
+      { kind: "task", taskId: "task-2", agentId: null },
+      {
+        lead: true,
+        worker: true,
+        ownerWorker: true,
+        creatorWorker: true,
+        userRequester: true,
+        foreignUser: true,
+        operator: true,
+      },
+    );
   });
 });
 

@@ -1,42 +1,49 @@
-import { Database } from "bun:sqlite";
-import { parseProviderMeta } from "@/utils/provider-metadata.ts";
+import type { Database } from "bun:sqlite";
 import pkg from "../../package.json";
 import { defaultAssetKey, normalizeAssetKey } from "../assets/key";
-import { configureDbResolver } from "../prompts/resolver";
+import {
+  generateDefaultClaudeMd,
+  generateDefaultIdentityMd,
+  matchesDefaultClaudeMd,
+  matchesDefaultIdentityMd,
+} from "../prompts/defaults";
+import { realtimeBus } from "../realtime/bus";
 import { slackChannelFromContextKey } from "../tasks/slack-routing";
-import { telemetry } from "../telemetry";
+import { _resolveIntegrationType, emitIntegrationConnected, telemetry } from "../telemetry";
+import { scheduleOrgDomainRecompute } from "../telemetry-identity";
+import {
+  emitTaskTelemetry,
+  type TaskTelemetryEvent,
+  type TaskTelemetryInput,
+} from "../telemetry-trigger";
 import type {
   ActiveSession,
   Agent,
   AgentAvatar,
-  AgentCredStatus,
   AgentLog,
   AgentLogEventType,
   AgentMcpServer,
   AgentSkill,
   AgentStatus,
   AgentTask,
-  AgentTaskSource,
   AgentTaskStatus,
   AgentTaskSummary,
   AgentWithTasks,
   AssetEntityType,
   AssetKeyMapping,
   AssetSummary,
+  AutomationIntegrationId,
   Budget,
   BudgetRefusalCause,
   BudgetRefusalNotification,
   BudgetScope,
-  ChangeSource,
   Channel,
   ChannelMessage,
   ChannelType,
   ContextSnapshot,
   ContextSnapshotEventType,
-  ContextVersion,
   CooldownConfig,
   FavoriteItemType,
-  FollowUpConfig,
   InboxItemState,
   InboxItemStatus,
   InboxItemType,
@@ -63,12 +70,12 @@ import type {
   PricingProvider,
   PricingRow,
   PricingTokenClass,
+  ProfileExpectedHashes,
+  ProfileSyncConflict,
   PromptTemplate,
   PromptTemplateHistory,
   ProviderName,
-  ReasoningEffort,
   RepoGuidelines,
-  RoutingAffinity,
   ScheduledTask,
   ScheduledTaskSummary,
   ScriptRun,
@@ -115,73 +122,272 @@ import type {
   WorkflowVersion,
 } from "../types";
 import {
-  AgentAvatarSchema,
   type CreateTaskOptions,
   CreateTaskOptionsSchema,
-  FollowUpConfigSchema,
   isTerminalTaskStatus,
   type ModelTier,
   parseModelTier,
-  ReasoningEffortSchema,
-  RoutingAffinitySchema,
   SERVER_GENERATED_ATTACHMENT_CAPABILITY,
   SessionCostModelBreakdownSchema,
 } from "../types";
+import {
+  CODEX_AUTH_FAILURE_BENCH_MS,
+  CODEX_AUTH_FAILURE_BENCH_THRESHOLD,
+  CODEX_AUTH_WATCH_NAMESPACE,
+  codexAuthBenchMarkerKey,
+} from "../utils/codex-auth-failure";
 import { deriveProviderFromKeyType } from "../utils/credentials";
-import { isEnvFlagEnabled } from "../utils/env-flag";
 import type { RateLimitWindowTelemetry } from "../utils/error-tracker";
 import { extractGitHubPullRequestUrls } from "../utils/github-pull-request";
+import { validateHeartbeatExpiry } from "../utils/heartbeat-expiry";
 import {
   type BudgetedIdentityField,
   checkIdentityFieldBudget,
   IdentityFieldBudgetError,
 } from "../utils/identity-field-budget";
+import { activeModelBlock, type ModelFamily } from "../utils/model-rate-limit-windows";
 import { getCurrentRequestUserId } from "../utils/request-auth-context";
 import { registerVolatileSecret, scrubSecrets } from "../utils/secret-scrubber";
-import { auditAssetKeys, enforceAssetKeyStartupAudit } from "./asset-key-audit";
-import { migrateLegacyCredentialBindingBlob } from "./connection-bindings-blob-migration";
-import { decryptSecret, encryptSecret, getEncryptionKey, resolveEncryptionKey } from "./crypto";
+import {
+  estimateClaudePlan,
+  planAllowsModelFamily,
+  SUBSCRIPTION_KEY_TYPES,
+} from "../utils/subscription-plans";
+import { auditAssetKeys } from "./asset-key-audit";
+import { decryptSecret, encryptSecret, getEncryptionKey } from "./crypto";
 import { normalizeDate, normalizeDateRequired } from "./date-utils";
-import { createBunSqliteClient, type DbClient } from "./db-client";
-import { runMigrations } from "./migrations/runner";
-import { autoEncryptLegacyOAuthSecrets } from "./oauth-encryption-backfill";
-import { seedDefaultTemplates } from "./seed-prompt-templates";
+import {
+  type AgentRow,
+  configureAgentDependencies,
+  ExtensionAgentAssignmentError,
+  getActiveTaskCount,
+  getAgentById,
+  getAllAgents,
+  isAgentEligibleForTask,
+  isExtensionAgent,
+  NOT_EXTENSION_AGENT_SQL,
+  ReservedAgentRoleError,
+  reservedRoleViolation,
+  rowToAgent,
+} from "./db/agents";
+import {
+  type ApprovalRequestListFilters,
+  type ApprovalVote,
+  approvalRequestListClause,
+} from "./db/approvals";
+import {
+  computeContentHash,
+  createContextVersion,
+  getLatestContextVersion,
+} from "./db/context-versions";
+import { getDb, getDbClient } from "./db/runtime";
+import { classifyTaskHumanFree, reclassifyTaskHumanFree } from "./db/tasks/human-free";
+import {
+  type AgentTaskRow,
+  configureTaskReadDependencies,
+  type ExistingTrackerContextWork,
+  findExistingLinearTrackerContextWork,
+  getTaskById,
+  getTasksByAgentId,
+  rowToAgentTask,
+  rowToAgentTaskSummary,
+} from "./db/tasks/read";
+import { configureTaskWriteDependencies, failTask } from "./db/tasks/write";
 import { promotePendingSteeringForTask } from "./steering";
-import { isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
+import { isInternalConfigKey, isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
 import { emitTaskStarted } from "./task-lifecycle-events";
 
-let db: Database | null = null;
-let sqliteVecAvailable = false;
+export {
+  refreshActiveSessionOnActivity,
+  SESSION_ACTIVITY_REFRESH_MIN_INTERVAL_MS,
+} from "./db/active-sessions";
+export {
+  buildRoutingAffinityFromAgent,
+  createAgent,
+  deleteAgent,
+  EXTENSION_AGENT_ROLE,
+  ExtensionAgentAssignmentError,
+  extensionAgentAssignmentError,
+  getActiveTaskCount,
+  getAgentById,
+  getAgentDailyTaskCounts,
+  getAgentHarnessProviders,
+  getAgentStatusCounts,
+  getAllAgents,
+  getLeadAgent,
+  getRemainingCapacity,
+  hasCapacity,
+  incrementEmptyPollCount,
+  isAgentEligibleForTask,
+  isExtensionAgent,
+  isPoolAffinityEnforcementEnabled,
+  listAgentsWithCredStatusByProvider,
+  MAX_EMPTY_POLLS,
+  NOT_EXTENSION_AGENT_SQL,
+  ReservedAgentRoleError,
+  reservedRoleViolation,
+  resetEmptyPollCount,
+  setAgentHarnessProvider,
+  shouldBlockPolling,
+  updateAgentActivity,
+  updateAgentCredentialMissing,
+  updateAgentCredentialState,
+  updateAgentCredStatus,
+  updateAgentMaxTasks,
+  updateAgentProvider,
+  updateAgentStatus,
+  updateAgentStatusFromCapacity,
+} from "./db/agents";
+export { recordKeySeatMismatch } from "./db/api-keys";
+export {
+  type ApprovalRequestSummary,
+  type ApprovalVote,
+  getPendingApprovalVoteState,
+  listApprovalRequestSummaries,
+  recordApprovalVotes,
+} from "./db/approvals";
+export {
+  computeContentHash,
+  createContextVersion,
+  getContextVersion,
+  getContextVersionHistory,
+  getLatestContextVersion,
+} from "./db/context-versions";
 
-type TaskTelemetryProps = Parameters<typeof telemetry.taskEvent>[1];
+configureAgentDependencies({
+  createLogEntry: (entry) => createLogEntry(entry),
+  installSystemDefaultSkillsForAgent: (agentId) => installSystemDefaultSkillsForAgent(agentId),
+});
+
+export {
+  __resetSqliteVecExtensionPathCacheForTests,
+  closeDb,
+  getDb,
+  getDbClient,
+  initDb,
+  isSqliteVecAvailable,
+  resolveSqliteVecExtensionPath,
+} from "./db/runtime";
+
+export {
+  type ExistingTrackerContextWork,
+  type ExistingTrackerContextWorkReason,
+  findCompletedTaskInThread,
+  findExistingLinearTrackerContextWork,
+  findRecentCancelledTaskInThread,
+  findTaskByGitHub,
+  findTaskByVcs,
+  getAgentCurrentTask,
+  getAgentWorkingOnThread,
+  getAllTasks,
+  getChildTasks,
+  getCompletedSlackTasks,
+  getInProgressSlackTasks,
+  getInProgressTasksByContextKey,
+  getLatestActiveTaskInThread,
+  getLatestLeadTaskInThread,
+  getLatestScriptRunStepTaskByContextKey,
+  getLatestTaskByContextKey,
+  getMostRecentTaskInThread,
+  getPendingSlackRelayTasks,
+  getRecentlyFinishedWorkerTasks,
+  getSlackTasksMissingTree,
+  getSupersededTasksWithoutResume,
+  getSupersededTasksWithUnsettledDependents,
+  getTaskById,
+  getTaskStats,
+  getTasksByAgentId,
+  getTasksByStatus,
+  getTasksCount,
+  hasNonTerminalRerouteDecisionChild,
+  hasNonTerminalResumeChild,
+  isLinearTrackerContextKey,
+  markFinalizedSlackRelaysDelivered,
+  markSlackRelayAttempted,
+  markSlackRelayDelivered,
+  markTasksNotified,
+  resetTasksNotified,
+  type TaskFilters,
+} from "./db/tasks/read";
+
+export {
+  assignUnassignedTaskPending,
+  backfillSupersedeTaskResumeTaskId,
+  cancelTask,
+  completeTask,
+  createTask,
+  deleteTask,
+  failTask,
+  getOrphanedInProgressTasksForAgent,
+  getPausedTasksForAgent,
+  getPendingTaskForAgent,
+  getRecentlyCancelledTasksForAgent,
+  overwriteTerminalTaskResultText,
+  pauseTask,
+  recordTaskProviderIfUnset,
+  resetOrphanedInProgressTasksForAgent,
+  resumeTask,
+  settleSupersededTaskDependents,
+  startTask,
+  supersedeTask,
+  updateTaskClaudeSessionId,
+  updateTaskProgress,
+  updateTaskTitle,
+} from "./db/tasks/write";
+
+configureTaskWriteDependencies({
+  createLogEntry: (...args) => createLogEntry(...args),
+  checkDependencies: (...args) => checkDependencies(...args),
+  reconcileTaskPullRequestAttachments: (...args) => reconcileTaskPullRequestAttachments(...args),
+  emitTaskLifecycleTelemetryAfterCommit: (...args) =>
+    emitTaskLifecycleTelemetryAfterCommit(...args),
+  taskContextForTelemetry: (...args) => taskContextForTelemetry(...args),
+  promotePendingSteeringForTask: (...args) => promotePendingSteeringForTask(...args),
+  cascadeFailDependents: (...args) => cascadeFailDependents(...args),
+});
+
+configureTaskReadDependencies({
+  checkDependencies: (taskId) => checkDependencies(taskId),
+  assetKeyPrefixPattern: (input) => assetKeyPrefixPattern(input),
+  previewText: (text, maxChars) => previewText(text, maxChars),
+});
+
 type TaskTelemetryContext = {
   provider?: ProviderName;
   harnessVariant?: string;
   harnessVersion?: string;
 };
 
-function assetKeyPrefixPattern(input: string): string {
-  const canonical = normalizeAssetKey(input);
-  return `${canonical.replace(/[\\%_]/g, "\\$&")}%`;
+/** LIKE pattern matching strings that start with `prefix` literally (use with `ESCAPE '\\'`). */
+function literalPrefixPattern(prefix: string): string {
+  return `${prefix.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
-function emitTaskLifecycleTelemetryAfterCommit(
-  event: string,
-  props: TaskTelemetryProps,
+function assetKeyPrefixPattern(input: string): string {
+  return literalPrefixPattern(normalizeAssetKey(input));
+}
+
+function emitTaskLifecycleTelemetryAfterCommit<S extends TaskTelemetryEvent>(
+  event: S,
+  props: TaskTelemetryInput<S>,
   verify?: (task: AgentTask | null) => boolean,
+  actorUserId?: string | null,
 ): void {
   // afterCommit (not queueMicrotask): under an async client transaction,
   // microtasks drain before COMMIT, so the verify read could observe
   // uncommitted state. afterCommit runs strictly post-COMMIT/ROLLBACK.
   getDbClient().afterCommit(() => {
+    // `trigger_surface` is resolved (one read up the parent chain) and
+    // `source` renamed to `task_source` inside emitTaskTelemetry, so every
+    // lifecycle event of a task reports the same root surface.
     if (!verify) {
-      telemetry.taskEvent(event, props);
+      void emitTaskTelemetry(event, props, actorUserId);
       return;
     }
-    getTaskById(props.taskId)
+    getTaskById((props as { taskId: string }).taskId)
       .then((task) => {
         if (!verify(task)) return;
-        telemetry.taskEvent(event, props);
+        return emitTaskTelemetry(event, props, actorUserId);
       })
       .catch((err) =>
         console.error(
@@ -201,303 +407,6 @@ function taskContextForTelemetry(task: AgentTask): TaskTelemetryContext {
     context.harnessVersion = String(harnessVersion);
   }
   return context;
-}
-
-export function isSqliteVecAvailable(): boolean {
-  return sqliteVecAvailable;
-}
-
-/**
- * Resolve the sqlite-vec loadable extension path without opening a Database.
- * Mirrors loadSqliteVec's env-var-first, npm-fallback resolution, but returns
- * the path instead of loading it: the bounded db-query child process (see
- * src/http/db-query-bounded.ts) opens its own read-only connection and must
- * load the extension itself, so the parent resolves the path once and passes
- * it along. The result is memoized — `undefined` is a valid resolved answer
- * (extension genuinely unavailable) and is cached too, so a failing
- * `require` doesn't retry on every query.
- */
-let cachedSqliteVecExtensionPath: string | undefined | null = null;
-
-export function resolveSqliteVecExtensionPath(): string | undefined {
-  if (cachedSqliteVecExtensionPath !== null) return cachedSqliteVecExtensionPath;
-  const extensionPath = process.env.SQLITE_VEC_EXTENSION_PATH;
-  if (extensionPath) {
-    cachedSqliteVecExtensionPath = extensionPath;
-    return cachedSqliteVecExtensionPath;
-  }
-  try {
-    cachedSqliteVecExtensionPath = (
-      require("sqlite-vec") as { getLoadablePath(): string }
-    ).getLoadablePath();
-  } catch {
-    cachedSqliteVecExtensionPath = undefined;
-  }
-  return cachedSqliteVecExtensionPath;
-}
-
-/** Test-only: clear the memoized sqlite-vec extension path cache. */
-export function __resetSqliteVecExtensionPathCacheForTests(): void {
-  cachedSqliteVecExtensionPath = null;
-}
-
-function loadSqliteVec(database: Database): void {
-  sqliteVecAvailable = false;
-  try {
-    const extensionPath = process.env.SQLITE_VEC_EXTENSION_PATH;
-    if (extensionPath) {
-      database.loadExtension(extensionPath);
-    } else {
-      const sqliteVec = require("sqlite-vec");
-      sqliteVec.load(database);
-    }
-    sqliteVecAvailable = true;
-    console.log(`[db] sqlite-vec loaded${extensionPath ? ` from ${extensionPath}` : ""}`);
-  } catch (err) {
-    console.warn(
-      "[db] sqlite-vec not available, falling back to in-memory cosine:",
-      (err as Error).message,
-    );
-  }
-}
-
-export function initDb(dbPath = "./agent-swarm-db.sqlite"): Database {
-  if (db) {
-    return db;
-  }
-
-  // Fast path for tests: restore from pre-built template that already has
-  // migrations, seeds, and all post-init work baked in. Only the per-connection
-  // PRAGMA and the in-memory resolver function need to be set.
-  const templateGlobals = globalThis as typeof globalThis & {
-    __testMigrationTemplate?: Uint8Array;
-  };
-  const templateBytes = templateGlobals.__testMigrationTemplate;
-  if (templateBytes) {
-    db = Database.deserialize(templateBytes);
-    db.run("PRAGMA busy_timeout = 5000;");
-    db.run("PRAGMA foreign_keys = ON;");
-    loadSqliteVec(db);
-    configureDbResolver(resolvePromptTemplate);
-    enforceAssetKeyStartupAudit(db);
-    // Ensure the encryption key is resolved even when restoring from the test
-    // template. The cache may have been cleared via __resetEncryptionKeyForTests
-    // between test suites; this call is a no-op if the cache is already warm.
-    resolveEncryptionKey(dbPath);
-    return db;
-  }
-
-  db = new Database(dbPath, { create: true });
-  console.log(`Database initialized at ${dbPath}`);
-
-  const database = db;
-  database.run("PRAGMA journal_mode = WAL;");
-  database.run("PRAGMA busy_timeout = 5000;");
-  database.run("PRAGMA foreign_keys = ON;");
-  database.run("PRAGMA synchronous = NORMAL;");
-  database.run("PRAGMA cache_size = -64000;");
-  database.run("PRAGMA mmap_size = 268435456;");
-  database.run("PRAGMA temp_store = MEMORY;");
-
-  // Load sqlite-vec extension for vector search.
-  // In compiled binaries (`bun build --compile`) the JS lives in /$bunfs/ and
-  // `require.resolve("sqlite-vec-<platform>/vec0.so")` can't find the native
-  // asset — so we prefer an explicit filesystem path when set, and only fall
-  // back to the npm resolver for normal dev runs.
-  loadSqliteVec(database);
-
-  // Run database migrations (schema creation + incremental changes)
-  try {
-    runMigrations(database);
-  } catch (error) {
-    db = null;
-    try {
-      database.close();
-    } catch (closeError) {
-      console.error("[migrations] Failed to close database after migration failure:", closeError);
-    }
-    throw error;
-  }
-
-  // Compatibility migration for legacy databases that predate profile fields
-  ensureAgentProfileColumns(database);
-
-  // Migration: Remove restrictive CHECK constraint on agent_tasks.status
-  // Old databases have CHECK(status IN ('pending','in_progress','completed','failed'))
-  // which blocks 'cancelled', 'paused', 'offered', 'unassigned' statuses
-  try {
-    const taskSchemaInfo = db
-      .prepare<{ sql: string | null }, []>(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_tasks'",
-      )
-      .get();
-
-    const schemaSql = taskSchemaInfo?.sql ?? "";
-    const hasStatusCheck = /status\s+TEXT\b[^,]*\bCHECK\s*\(\s*status\s+IN\s*\(/i.test(schemaSql);
-    const statusAllowsCancelled = /status\s+IN\s*\([^)]*'cancelled'/i.test(schemaSql);
-    const needsStatusMigration = hasStatusCheck && !statusAllowsCancelled;
-
-    if (needsStatusMigration) {
-      console.log("[Migration] Removing restrictive CHECK constraint on agent_tasks.status");
-      db.run("PRAGMA foreign_keys=off");
-
-      // Migrations run before this compatibility guard, so a legacy table now
-      // carries every current column. Rebuilding from an old hard-coded column
-      // list would silently discard later fields. Derive the replacement
-      // schema, copy list, indexes, and triggers from the live table instead;
-      // remove only the obsolete status CHECK.
-      const rebuiltSchemaSql = schemaSql
-        .replace(
-          /^(CREATE TABLE\s+(?:IF NOT EXISTS\s+)?)(?:"agent_tasks"|agent_tasks)/i,
-          "$1agent_tasks_new",
-        )
-        .replace(/\s+CHECK\s*\(\s*status\s+IN\s*\([^)]*\)\s*\)/i, "");
-      if (rebuiltSchemaSql === schemaSql || !/agent_tasks_new/i.test(rebuiltSchemaSql)) {
-        throw new Error("Could not derive agent_tasks schema without legacy status CHECK");
-      }
-      const columns = db
-        .prepare<{ name: string }, []>('PRAGMA table_info("agent_tasks")')
-        .all()
-        .map((column) => `"${column.name.replaceAll('"', '""')}"`)
-        .join(", ");
-      const schemaObjects = db
-        .prepare<{ sql: string }, []>(
-          `SELECT sql FROM sqlite_master
-           WHERE tbl_name = 'agent_tasks'
-             AND type IN ('index', 'trigger')
-             AND sql IS NOT NULL
-           ORDER BY type, name`,
-        )
-        .all()
-        .map((row) => row.sql);
-
-      database.transaction(() => {
-        database.run("DROP TABLE IF EXISTS agent_tasks_new");
-        database.run(rebuiltSchemaSql);
-        database.run(`INSERT INTO agent_tasks_new (${columns}) SELECT ${columns} FROM agent_tasks`);
-        database.run("DROP TABLE agent_tasks");
-        database.run("ALTER TABLE agent_tasks_new RENAME TO agent_tasks");
-        for (const sql of schemaObjects) database.run(sql);
-      })();
-
-      db.run("PRAGMA foreign_keys=on");
-      console.log("[Migration] Successfully removed CHECK constraint on agent_tasks.status");
-    }
-  } catch (e) {
-    console.error("[Migration] Failed to update agent_tasks CHECK constraint:", e);
-    try {
-      db.run("PRAGMA foreign_keys=on");
-    } catch (cleanupError) {
-      console.error("[Migration] Failed to re-enable SQLite foreign_keys pragma:", cleanupError);
-    }
-    throw e;
-  }
-
-  // Mandatory namespace invariant: structural corruption is fatal before the
-  // API starts listening. Unknown personal users/provider drift remain
-  // readable warnings so operators can repair them through the audit surface.
-  enforceAssetKeyStartupAudit(database);
-
-  // Backfill: Seed v1 for existing agents that don't have any context versions yet
-  seedContextVersions();
-
-  // Inject DB resolver into the prompt template resolver (DI to avoid worker/API boundary violation)
-  configureDbResolver(resolvePromptTemplate);
-
-  // Seed default prompt templates from the in-memory code registry
-  seedDefaultTemplates();
-
-  const hasExistingEncryptedSecrets =
-    (database
-      .prepare<{ present: number }, []>(
-        `SELECT EXISTS(
-           SELECT 1 FROM swarm_config WHERE isSecret = 1 AND encrypted = 1
-           UNION ALL
-           SELECT 1 FROM oauth_apps
-             WHERE clientSecretEncrypted = 1 AND clientSecret IS NOT NULL
-           UNION ALL
-           SELECT 1 FROM oauth_authorizations WHERE tokensEncrypted = 1
-         ) AS present`,
-      )
-      .get()?.present ?? 0) === 1;
-
-  // Track whether user provided the key (for backup decision)
-  const userProvidedKey = !!(
-    process.env.SECRETS_ENCRYPTION_KEY?.length || process.env.SECRETS_ENCRYPTION_KEY_FILE?.length
-  );
-
-  // Resolve the secrets encryption key after migrations so we can tell whether
-  // this DB already contains encrypted secret rows (must reuse an explicit or
-  // on-disk key) or is still plaintext-only (safe to generate a new key before
-  // auto-migrating legacy plaintext rows).
-  resolveEncryptionKey(dbPath, { allowGenerate: !hasExistingEncryptedSecrets });
-
-  // Migration 117 carries plaintext tracker OAuth rows with explicit flags;
-  // encrypt them only after the shared key has been resolved. This pass is
-  // idempotent and intentionally fatal on failure so boot never continues
-  // with OAuth credentials left in plaintext.
-  try {
-    autoEncryptLegacyOAuthSecrets(database);
-  } catch (err) {
-    console.error(
-      `[oauth-encryption] FATAL: failed to auto-encrypt legacy OAuth secrets: ${(err as Error).message}`,
-    );
-    throw err;
-  }
-
-  // Auto-encrypt any legacy plaintext secrets that predate the encryption
-  // feature. Runs after all compatibility guards; failures are fatal because
-  // continuing would leave secrets at rest in plaintext — the opposite of the
-  // guarantee this feature provides.
-  try {
-    autoEncryptLegacyPlaintextSecrets(database, dbPath, { createBackup: !userProvidedKey });
-  } catch (err) {
-    console.error(
-      `[secrets] FATAL: failed to auto-encrypt legacy secrets: ${(err as Error).message}`,
-    );
-    throw err;
-  }
-
-  // Retire the legacy SCRIPT_CREDENTIAL_BINDINGS swarm-config blob: promote any
-  // remaining entries to relational rows so the credential broker is
-  // relational-only. Idempotent; failures are fatal because a silently-dropped
-  // binding would leave scripts unable to authenticate.
-  try {
-    migrateLegacyCredentialBindingBlob(database);
-  } catch (err) {
-    console.error(
-      `[credential-bindings] FATAL: failed to migrate legacy credential binding blob: ${(err as Error).message}`,
-    );
-    throw err;
-  }
-
-  return db;
-}
-
-export function getDb(path?: string): Database {
-  if (!db) {
-    return initDb(path ?? process.env.DATABASE_PATH);
-  }
-  return db;
-}
-
-export function closeDb(): void {
-  if (db) {
-    db.close();
-    db = null;
-  }
-  sqliteVecAvailable = false;
-}
-
-// Async seam over the shared connection. The client resolves the underlying
-// handle per operation via getDb(), so close/reopen cycles need no reset.
-let dbClientInstance: DbClient | null = null;
-
-export function getDbClient(): DbClient {
-  if (!dbClientInstance) {
-    dbClientInstance = createBunSqliteClient(() => getDb());
-  }
-  return dbClientInstance;
 }
 
 // ============================================================================
@@ -520,1080 +429,9 @@ const BUDGETED_IDENTITY_FIELDS: BudgetedIdentityField[] = [
   "toolsMd",
 ];
 
-function ensureAgentProfileColumns(database: Database): void {
-  const existingColumns = new Set(
-    database
-      .prepare<{ name: string }, []>("PRAGMA table_info(agents)")
-      .all()
-      .map((row) => row.name),
-  );
-
-  for (const column of VERSIONABLE_FIELDS) {
-    if (!existingColumns.has(column)) {
-      try {
-        database.run(`ALTER TABLE agents ADD COLUMN ${column} TEXT`);
-      } catch (error) {
-        console.error(`[Migration] Failed to add missing agents.${column} column`, error);
-        throw error;
-      }
-    }
-  }
-}
-
-export function computeContentHash(content: string): string {
-  const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(content);
-  return hasher.digest("hex");
-}
-
-type ContextVersionRow = {
-  id: string;
-  agentId: string;
-  field: string;
-  content: string;
-  version: number;
-  changeSource: string;
-  changedByAgentId: string | null;
-  changeReason: string | null;
-  contentHash: string;
-  previousVersionId: string | null;
-  createdAt: string;
-};
-
-function rowToContextVersion(row: ContextVersionRow): ContextVersion {
-  return {
-    id: row.id,
-    agentId: row.agentId,
-    field: row.field as VersionableField,
-    content: row.content,
-    version: row.version,
-    changeSource: row.changeSource as ChangeSource,
-    changedByAgentId: row.changedByAgentId,
-    changeReason: row.changeReason,
-    contentHash: row.contentHash,
-    previousVersionId: row.previousVersionId,
-    createdAt: row.createdAt,
-  };
-}
-
-export async function createContextVersion(params: {
-  agentId: string;
-  field: VersionableField;
-  content: string;
-  version: number;
-  changeSource: ChangeSource;
-  changedByAgentId?: string | null;
-  changeReason?: string | null;
-  contentHash: string;
-  previousVersionId?: string | null;
-}): Promise<ContextVersion> {
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  const row = await getDbClient().get<ContextVersionRow>(
-    `INSERT INTO context_versions (id, agentId, field, content, version, changeSource, changedByAgentId, changeReason, contentHash, previousVersionId, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-    [
-      id,
-      params.agentId,
-      params.field,
-      params.content,
-      params.version,
-      params.changeSource,
-      params.changedByAgentId ?? null,
-      params.changeReason ?? null,
-      params.contentHash,
-      params.previousVersionId ?? null,
-      now,
-    ],
-  );
-
-  if (!row) throw new Error("Failed to create context version");
-  return rowToContextVersion(row);
-}
-
-export async function getLatestContextVersion(
-  agentId: string,
-  field: VersionableField,
-): Promise<ContextVersion | null> {
-  const row = await getDbClient().get<ContextVersionRow>(
-    `SELECT * FROM context_versions WHERE agentId = ? AND field = ? ORDER BY version DESC LIMIT 1`,
-    [agentId, field],
-  );
-
-  return row ? rowToContextVersion(row) : null;
-}
-
-export async function getContextVersion(id: string): Promise<ContextVersion | null> {
-  const row = await getDbClient().get<ContextVersionRow>(
-    `SELECT * FROM context_versions WHERE id = ?`,
-    [id],
-  );
-
-  return row ? rowToContextVersion(row) : null;
-}
-
-export async function getContextVersionHistory(params: {
-  agentId: string;
-  field?: VersionableField;
-  limit?: number;
-}): Promise<ContextVersion[]> {
-  const limit = params.limit ?? 10;
-
-  if (params.field) {
-    const rows = await getDbClient().query<ContextVersionRow>(
-      `SELECT * FROM context_versions WHERE agentId = ? AND field = ? ORDER BY version DESC LIMIT ?`,
-      [params.agentId, params.field, limit],
-    );
-    return rows.map(rowToContextVersion);
-  }
-
-  const rows = await getDbClient().query<ContextVersionRow>(
-    `SELECT * FROM context_versions WHERE agentId = ? ORDER BY createdAt DESC LIMIT ?`,
-    [params.agentId, limit],
-  );
-  return rows.map(rowToContextVersion);
-}
-
-/**
- * Seed v1 context versions for existing agents that don't have any versions yet.
- * Called during migration.
- */
-function seedContextVersions(): void {
-  const database = getDb();
-  const agents = database
-    .prepare<
-      {
-        id: string;
-        soulMd: string | null;
-        identityMd: string | null;
-        toolsMd: string | null;
-        claudeMd: string | null;
-        setupScript: string | null;
-        heartbeatMd: string | null;
-      },
-      []
-    >(`SELECT id, soulMd, identityMd, toolsMd, claudeMd, setupScript, heartbeatMd FROM agents`)
-    .all();
-
-  for (const agent of agents) {
-    for (const field of VERSIONABLE_FIELDS) {
-      const content = agent[field];
-      if (!content) continue;
-
-      // Check if a version already exists for this agent+field
-      const existing = database
-        .prepare<{ id: string }, [string, string]>(
-          `SELECT id FROM context_versions WHERE agentId = ? AND field = ? LIMIT 1`,
-        )
-        .get(agent.id, field);
-      if (existing) continue;
-
-      const id = crypto.randomUUID();
-      const hash = computeContentHash(content);
-      const now = new Date().toISOString();
-
-      database
-        .prepare(
-          `INSERT INTO context_versions (id, agentId, field, content, version, changeSource, contentHash, createdAt)
-           VALUES (?, ?, ?, ?, 1, 'system', ?, ?)`,
-        )
-        .run(id, agent.id, field, content, hash, now);
-    }
-  }
-}
-
-// ============================================================================
-// Agent Queries
-// ============================================================================
-
-type AgentRow = {
-  id: string;
-  name: string;
-  isLead: number;
-  status: AgentStatus;
-  description: string | null;
-  role: string | null;
-  capabilities: string | null;
-  maxTasks: number | null;
-  emptyPollCount: number | null;
-  claudeMd: string | null;
-  soulMd: string | null;
-  identityMd: string | null;
-  setupScript: string | null;
-  toolsMd: string | null;
-  heartbeatMd: string | null;
-  lastActivityAt: string | null;
-  provider: string | null;
-  createdAt: string;
-  lastUpdatedAt: string;
-  /** JSON array of env-var names; populated only when status is `waiting_for_credentials`. */
-  credentialMissing: string | null;
-  /** Phase 1.5: per-agent harness provider pushed on worker registration. */
-  harness_provider: string | null;
-  /** Migration 055: worker-self-reported credential snapshot (JSON of AgentCredStatus). NULL = unreported. */
-  cred_status: string | null;
-  /** Migration 119: custom avatar (JSON of AgentAvatar). NULL = deterministic hash-derived fallback. */
-  avatar: string | null;
-};
-
-/** Safe-parse the `avatar` JSON column. Malformed/invalid content (e.g. a
- * hand-edited row, or a future downgrade) falls back to `null` so rendering
- * always has a deterministic path — never throws. */
-function parseAgentAvatar(raw: string | null): AgentAvatar | null {
-  if (!raw) return null;
-  try {
-    const parsed = AgentAvatarSchema.safeParse(JSON.parse(raw));
-    return parsed.success ? parsed.data : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Map an agent row to the `Agent` shape. When `slim` is true the six identity
- * markdown blobs (`claudeMd`/`soulMd`/`identityMd`/`toolsMd`/`heartbeatMd`/
- * `setupScript`) are omitted — they bloat list responses by ~16 KB/agent and
- * are never needed at the swarm-overview level. Fetch them via
- * `GET /api/agents/{id}` when required.
- */
-function rowToAgent(row: AgentRow, slim = false): Agent {
-  const base: Agent = {
-    id: row.id,
-    name: row.name,
-    isLead: row.isLead === 1,
-    status: row.status,
-    description: row.description ?? undefined,
-    role: row.role ?? undefined,
-    capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
-    maxTasks: row.maxTasks ?? 1,
-    emptyPollCount: row.emptyPollCount ?? 0,
-    lastActivityAt: row.lastActivityAt ?? undefined,
-    provider: (row.provider as ProviderName | null) ?? undefined,
-    harnessProvider: (row.harness_provider as ProviderName | null) ?? null,
-    createdAt: row.createdAt,
-    lastUpdatedAt: row.lastUpdatedAt,
-    credentialMissing: row.credentialMissing
-      ? (JSON.parse(row.credentialMissing) as string[])
-      : null,
-    credStatus: row.cred_status ? (JSON.parse(row.cred_status) as AgentCredStatus) : null,
-    avatar: parseAgentAvatar(row.avatar),
-  };
-  if (slim) return base;
-  return {
-    ...base,
-    claudeMd: row.claudeMd ?? undefined,
-    soulMd: row.soulMd ?? undefined,
-    identityMd: row.identityMd ?? undefined,
-    setupScript: row.setupScript ?? undefined,
-    toolsMd: row.toolsMd ?? undefined,
-    heartbeatMd: row.heartbeatMd ?? undefined,
-  };
-}
-
-/**
- * Phase 3 of the worker credential safe-loop plan.
- *
- * `ready=true` clears the waiting state — the agent transitions to `idle`
- * and the dispatcher will start handing it tasks again.
- *
- * `ready=false` parks the agent on `waiting_for_credentials` with the env-var
- * names it's blocked on. The capacity dispatch query already filters
- * `status === 'idle'` so the new value is implicitly excluded with no other
- * code change.
- */
-export async function updateAgentCredentialState(
-  agentId: string,
-  ready: boolean,
-  missing: string[] | null,
-): Promise<Agent | null> {
-  const prev = await getAgentById(agentId);
-  const status: AgentStatus = ready ? "idle" : "waiting_for_credentials";
-  const missingJson = ready ? null : missing && missing.length > 0 ? JSON.stringify(missing) : null;
-  const row = await getDbClient().get<AgentRow>(
-    "UPDATE agents SET status = ?, credentialMissing = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING *",
-    [status, missingJson, agentId],
-  );
-  // Only clear the accumulated empty-poll count on a genuine recovery
-  // (waiting_for_credentials -> ready), so routine post-task `ready:true`
-  // reports don't clobber a legitimately accumulated count and defeat the
-  // MAX_EMPTY_POLLS polling gate.
-  if (ready && prev?.status === "waiting_for_credentials") await resetEmptyPollCount(agentId);
-  return row ? rowToAgent(row) : null;
-}
-
-/**
- * Record which env vars a worker is missing without touching status — the
- * logical status is derived from runtime readiness in multi-runtime mode.
- */
-export async function updateAgentCredentialMissing(
-  agentId: string,
-  missing: string[] | null,
-): Promise<void> {
-  const json = missing && missing.length > 0 ? JSON.stringify(missing) : null;
-  await getDbClient().run(
-    "UPDATE agents SET credentialMissing = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-    [json, agentId],
-  );
-}
-
-export async function createAgent(
-  agent: Omit<Agent, "id" | "createdAt" | "lastUpdatedAt"> & { id?: string },
-): Promise<Agent> {
-  const id = agent.id ?? crypto.randomUUID();
-  const maxTasks = agent.maxTasks ?? 1;
-  const row = await getDbClient().get<AgentRow>(
-    "INSERT INTO agents (id, name, isLead, status, maxTasks, provider, harness_provider, createdAt, lastUpdatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *",
-    [
-      id,
-      agent.name,
-      agent.isLead ? 1 : 0,
-      agent.status,
-      maxTasks,
-      agent.provider ?? null,
-      agent.harnessProvider ?? null,
-    ],
-  );
-  if (!row) throw new Error("Failed to create agent");
-  try {
-    await installSystemDefaultSkillsForAgent(id);
-  } catch (err) {
-    console.warn(
-      "[db] Failed to install system-default skills for new agent:",
-      (err as Error).message,
-    );
-  }
-  try {
-    await createLogEntry({ eventType: "agent_joined", agentId: id, newValue: agent.status });
-  } catch {}
-  return rowToAgent(row);
-}
-
-export async function getAgentById(id: string): Promise<Agent | null> {
-  const row = await getDbClient().get<AgentRow>("SELECT * FROM agents WHERE id = ?", [id]);
-  return row ? rowToAgent(row) : null;
-}
-
-export async function getAllAgents(opts?: { slim?: boolean }): Promise<Agent[]> {
-  const rows = await getDbClient().query<AgentRow>("SELECT * FROM agents ORDER BY name");
-  return rows.map((row) => rowToAgent(row, opts?.slim ?? false));
-}
-
-export async function getLeadAgent(): Promise<Agent | null> {
-  const leads = (await getAllAgents()).filter((a) => a.isLead);
-  // Prefer a usable (non-offline) lead so callers route to one that can actually
-  // poll — e.g. an old offline lead must not shadow a live replacement. Falls
-  // back to any lead (incl. offline) so existing "is there a lead at all?"
-  // semantics are preserved; callers that require a live lead must check
-  // `status` themselves (see escalateUnreclaimedResumes).
-  return leads.find((a) => a.status !== "offline") ?? leads[0] ?? null;
-}
-
-export async function updateAgentStatus(id: string, status: AgentStatus): Promise<Agent | null> {
-  const oldAgent = await getAgentById(id);
-  const row = await getDbClient().get<AgentRow>(
-    "UPDATE agents SET status = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING *",
-    [status, id],
-  );
-  if (row && oldAgent) {
-    try {
-      await createLogEntry({
-        eventType: "agent_status_change",
-        agentId: id,
-        oldValue: oldAgent.status,
-        newValue: status,
-      });
-    } catch {}
-  }
-  return row ? rowToAgent(row) : null;
-}
-
-export async function updateAgentMaxTasks(id: string, maxTasks: number): Promise<Agent | null> {
-  const row = await getDbClient().get<AgentRow>(
-    `UPDATE agents SET maxTasks = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? RETURNING *`,
-    [maxTasks, id],
-  );
-  return row ? rowToAgent(row) : null;
-}
-
-export async function updateAgentProvider(
-  id: string,
-  provider: ProviderName,
-): Promise<Agent | null> {
-  const row = await getDbClient().get<AgentRow>(
-    `UPDATE agents SET provider = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? RETURNING *`,
-    [provider, id],
-  );
-  return row ? rowToAgent(row) : null;
-}
-
-/**
- * Phase 1.5 (cloud-personalization): set the per-agent `harness_provider`
- * column. Pass `null` to clear. Validation against the canonical provider
- * list happens at the API layer via `ProviderNameSchema`.
- *
- * Returns the updated row, or null if the agent does not exist.
- */
-export async function setAgentHarnessProvider(
-  id: string,
-  provider: ProviderName | null,
-): Promise<Agent | null> {
-  const row = await getDbClient().get<AgentRow>(
-    `UPDATE agents SET harness_provider = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? RETURNING *`,
-    [provider, id],
-  );
-  return row ? rowToAgent(row) : null;
-}
-
-/**
- * Migration 055 — write the worker-self-reported credential snapshot.
- * Pass `null` to clear (e.g. on agent re-registration). Validation against
- * the JSON shape happens at the API layer via `AgentCredStatusSchema`.
- *
- * Worker reports this alongside the existing `updateAgentCredentialState`
- * call; we keep the writes in two functions so the dispatch pattern stays
- * one-row-one-fact, and the PATCH handler can choose which to call based
- * on which fields the request body carried.
- */
-export async function updateAgentCredStatus(
-  id: string,
-  credStatus: AgentCredStatus | null,
-): Promise<Agent | null> {
-  const json = credStatus ? JSON.stringify(credStatus) : null;
-  const row = await getDbClient().get<AgentRow>(
-    `UPDATE agents SET cred_status = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? RETURNING *`,
-    [json, id],
-  );
-  return row ? rowToAgent(row) : null;
-}
-
-/**
- * Migration 055 — read all agents whose `harness_provider` matches a given
- * provider, with their reported `cred_status`. Used by the credential-status
- * API endpoint to roll up "is this provider working across the fleet?".
- *
- * Agents with NULL `cred_status` (never reported, or CRED_CHECK_DISABLE=1)
- * are still returned — the caller surfaces them as "unreported".
- */
-export async function listAgentsWithCredStatusByProvider(provider: string): Promise<Agent[]> {
-  const rows = await getDbClient().query<AgentRow>(
-    `SELECT * FROM agents WHERE harness_provider = ? ORDER BY name`,
-    [provider],
-  );
-  return rows.map((row) => rowToAgent(row));
-}
-
-/**
- * Phase 1.5 (cloud-personalization): aggregate count of registered agents
- * by `harness_provider`. NULL rows (agents that registered before the
- * migration or never pushed a value) are excluded — they show up in the
- * total agent count but not here.
- *
- * Used by future fleet displays. Not consumed in this phase.
- */
-export async function getAgentHarnessProviders(): Promise<
-  Array<{ provider: string; count: number }>
-> {
-  const rows = await getDbClient().query<{ provider: string; count: number }>(
-    `SELECT harness_provider AS provider, COUNT(*) AS count
-       FROM agents
-       WHERE harness_provider IS NOT NULL
-       GROUP BY harness_provider
-       ORDER BY harness_provider`,
-  );
-  return rows.map((r) => ({ provider: r.provider, count: r.count }));
-}
-
-export async function updateAgentActivity(id: string): Promise<void> {
-  await getDbClient().run(
-    `UPDATE agents SET lastActivityAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?`,
-    [id],
-  );
-}
-
-// ============================================================================
-// Agent Poll Tracking Functions
-// ============================================================================
-
-/** Maximum consecutive empty polls before agent should stop polling */
-export const MAX_EMPTY_POLLS = 2;
-
-/**
- * Increment the empty poll count for an agent.
- * Returns the new count after incrementing.
- */
-export async function incrementEmptyPollCount(agentId: string): Promise<number> {
-  const row = await getDbClient().get<{ emptyPollCount: number }>(
-    `UPDATE agents
-       SET emptyPollCount = emptyPollCount + 1,
-           lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ?
-       RETURNING emptyPollCount`,
-    [agentId],
-  );
-  return row?.emptyPollCount ?? 0;
-}
-
-/**
- * Reset the empty poll count for an agent to zero.
- * Called when a task is assigned or agent re-registers.
- */
-export async function resetEmptyPollCount(agentId: string): Promise<void> {
-  await getDbClient().run(
-    `UPDATE agents
-     SET emptyPollCount = 0,
-         lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE id = ?`,
-    [agentId],
-  );
-}
-
-/**
- * Check if an agent has exceeded the maximum empty poll count.
- */
-export async function shouldBlockPolling(agentId: string): Promise<boolean> {
-  const agent = await getAgentById(agentId);
-  return (agent?.emptyPollCount ?? 0) >= MAX_EMPTY_POLLS;
-}
-
-export async function deleteAgent(id: string): Promise<boolean> {
-  const agent = await getAgentById(id);
-  if (agent) {
-    try {
-      await createLogEntry({ eventType: "agent_left", agentId: id, oldValue: agent.status });
-    } catch {}
-  }
-  const result = await getDbClient().run("DELETE FROM agents WHERE id = ?", [id]);
-  return result.changes > 0;
-}
-
-// ============================================================================
-// Agent Capacity Functions
-// ============================================================================
-
-/**
- * Get the count of active (in_progress) tasks for an agent.
- * Used to determine current capacity usage.
- */
-/**
- * Tasks occupying one of the agent's concurrency slots.
- *
- * A claimed offer counts too — omitting it let a second concurrent poll take
- * another task past the limit. It is counted only through `offeredTo`, the
- * agent actually reviewing it: `agentId` on an offer may still be the lead
- * that created it, which would otherwise consume the lead's own capacity.
- */
-export async function getActiveTaskCount(agentId: string): Promise<number> {
-  const result = await getDbClient().get<{ count: number }>(
-    `SELECT COUNT(*) as count FROM agent_tasks
-     WHERE (agentId = ? AND status = 'in_progress')
-        OR (offeredTo = ? AND status = 'reviewing')`,
-    [agentId, agentId],
-  );
-  return result?.count ?? 0;
-}
-
-/**
- * Check if an agent has capacity to accept more tasks.
- */
-export async function hasCapacity(agentId: string): Promise<boolean> {
-  const agent = await getAgentById(agentId);
-  if (!agent) return false;
-  const activeCount = await getActiveTaskCount(agentId);
-  return activeCount < (agent.maxTasks ?? 1);
-}
-
-/**
- * Get remaining capacity (available task slots) for an agent.
- */
-export async function getRemainingCapacity(agentId: string): Promise<number> {
-  const agent = await getAgentById(agentId);
-  if (!agent) return 0;
-  const activeCount = await getActiveTaskCount(agentId);
-  return Math.max(0, (agent.maxTasks ?? 1) - activeCount);
-}
-
-/**
- * Update agent status based on current capacity.
- * Agent is 'busy' when any tasks are in progress, 'idle' when none.
- * Does not modify 'offline' status.
- */
-export async function updateAgentStatusFromCapacity(agentId: string): Promise<void> {
-  const agent = await getAgentById(agentId);
-  if (!agent || agent.status === "offline") return;
-  // `waiting_for_credentials` is owned by the worker's credential-wait
-  // tick — task-completion shouldn't accidentally promote a blocked agent
-  // back to idle.
-  if (agent.status === "waiting_for_credentials") return;
-
-  const activeCount = await getActiveTaskCount(agentId);
-  const newStatus = activeCount > 0 ? "busy" : "idle";
-
-  if (agent.status !== newStatus) {
-    await updateAgentStatus(agentId, newStatus);
-  }
-}
-
-// ============================================================================
-// Routing Affinity (interrupted/pooled task role & capability gating)
-// ============================================================================
-
-/**
- * Kill-switch for the pool eligibility gate (`isAgentEligibleForTask` and its
- * callers: `claimTask`, `assignUnassignedTaskPending`,
- * `getUnassignedTaskIdsForAgent`). ON by default. Set to `0` to restore
- * pre-affinity behavior verbatim — mirrors the `HEARTBEAT_PIN_*_RESUME`
- * rollback convention. A function (read dynamically), not a module-load-time
- * const, so it can be toggled mid-test (see `isGracefulResumePinEnabled` in
- * src/tasks/worker-follow-up.ts for the same pattern).
- */
-export function isPoolAffinityEnforcementEnabled(): boolean {
-  return isEnvFlagEnabled("POOL_AFFINITY_ENFORCEMENT", true);
-}
-
-/**
- * Snapshot an agent's role/harness/capabilities into a `RoutingAffinity`
- * blob, for stamping onto a continuation task (resume, retry) at the moment
- * of interruption. Returns `null` when the agent row is already gone —
- * callers fall back to the parent's own (inherited) `routingAffinity` via
- * `createTaskExtended`'s parentTaskId inheritance block.
- */
-export async function buildRoutingAffinityFromAgent(
-  agentId: string,
-): Promise<RoutingAffinity | null> {
-  const agent = await getAgentById(agentId);
-  if (!agent) return null;
-  return {
-    sourceAgentId: agent.id,
-    role: agent.role,
-    harnessProvider: agent.harnessProvider ?? agent.provider ?? undefined,
-    capabilities: agent.capabilities ?? [],
-  };
-}
-
-/**
- * The single eligibility gate every pool consumer (poll auto-claim,
- * `task-action claim`, `autoAssignPoolTasks`) MUST use before handing a task
- * to an agent. Exact-match on the snapshotted role string (no keyword
- * taxonomy in v1); `harnessProvider` is informational only and never
- * enforced (native session resume is deprecated). Missing role data on
- * either side is treated as INELIGIBLE — never fail-open to "anyone" — so a
- * capability-only requirement (no `role` set) can only ever be claimed by
- * its `sourceAgentId`, and otherwise queues until the starvation escalation
- * hands it to the Lead.
- */
-export function isAgentEligibleForTask(
-  agent: Pick<Agent, "id" | "role" | "capabilities">,
-  task: Pick<AgentTask, "routingAffinity">,
-): boolean {
-  if (!isPoolAffinityEnforcementEnabled()) return true;
-
-  const affinity = task.routingAffinity;
-  if (!affinity) return true; // Untagged task — unchanged behavior.
-
-  if (affinity.sourceAgentId && affinity.sourceAgentId === agent.id) return true; // Own work.
-
-  if (!agent.role || !affinity.role) return false; // Missing role data — no fail-open.
-  if (agent.role !== affinity.role) return false;
-
-  const requiredCapabilities = affinity.capabilities ?? [];
-  if (requiredCapabilities.length > 0) {
-    const agentCapabilities = new Set(agent.capabilities ?? []);
-    if (!requiredCapabilities.every((cap) => agentCapabilities.has(cap))) return false;
-  }
-
-  return true;
-}
-
 // ============================================================================
 // AgentTask Queries
 // ============================================================================
-
-type AgentTaskRow = {
-  id: string;
-  key: string;
-  agentId: string | null;
-  creatorAgentId: string | null;
-  task: string;
-  title: string | null;
-  status: AgentTaskStatus;
-  source: AgentTaskSource;
-  taskType: string | null;
-  tags: string | null;
-  priority: number;
-  dependsOn: string | null;
-  offeredTo: string | null;
-  offeredAt: string | null;
-  acceptedAt: string | null;
-  rejectionReason: string | null;
-  slackChannelId: string | null;
-  slackThreadTs: string | null;
-  slackTriggerMessageTs: string | null;
-  slackUserId: string | null;
-  slackReplySent: number;
-  slackProgressMessageTs: string | null;
-  slackTreeRootMessageTs: string | null;
-  vcsProvider: string | null;
-  vcsRepo: string | null;
-  vcsEventType: string | null;
-  vcsNumber: number | null;
-  vcsCommentId: number | null;
-  vcsAuthor: string | null;
-  vcsUrl: string | null;
-  vcsInstallationId: number | null;
-  vcsNodeId: string | null;
-  agentmailInboxId: string | null;
-  agentmailMessageId: string | null;
-  agentmailThreadId: string | null;
-  mentionMessageId: string | null;
-  mentionChannelId: string | null;
-  dir: string | null;
-  parentTaskId: string | null;
-  claudeSessionId: string | null;
-  model: string | null;
-  modelTier: string | null;
-  effort: string | null;
-  scheduleId: string | null;
-  workflowRunId: string | null;
-  workflowRunStepId: string | null;
-  outputSchema: string | null;
-  followUpConfig: string | null;
-  contextKey: string | null;
-  createdAt: string;
-  lastUpdatedAt: string;
-  finishedAt: string | null;
-  notifiedAt: string | null;
-  failureReason: string | null;
-  output: string | null;
-  progress: string | null;
-  compactionCount: number | null;
-  peakContextPercent: number | null;
-  peakContextTokens: number | null;
-  contextWindowSize: number | null;
-  was_paused: number;
-  credentialKeySuffix: string | null;
-  credentialKeyType: string | null;
-  requestedByUserId: string | null;
-  requestedByUserIdInherited: number;
-  swarmVersion: string | null;
-  provider: string | null;
-  providerMeta: string | null;
-  harnessVariant: string | null;
-  harnessVariantMeta: string | null;
-  totalCostUsd?: number | null;
-  routingAffinity: string | null;
-};
-
-function rowToAgentTask(row: AgentTaskRow): AgentTask {
-  let followUpConfig: FollowUpConfig | undefined;
-  if (row.followUpConfig) {
-    try {
-      const parsed = FollowUpConfigSchema.safeParse(JSON.parse(row.followUpConfig));
-      if (parsed.success) {
-        followUpConfig = parsed.data;
-      } else {
-        console.warn(
-          `[db] Ignoring invalid agent_tasks.followUpConfig for task ${row.id}:`,
-          parsed.error.message,
-        );
-      }
-    } catch (error) {
-      console.warn(
-        `[db] Ignoring malformed agent_tasks.followUpConfig for task ${row.id}:`,
-        error instanceof Error ? error.message : String(error),
-      );
-      followUpConfig = undefined;
-    }
-  }
-
-  let routingAffinity: RoutingAffinity | undefined;
-  if (row.routingAffinity) {
-    try {
-      const parsed = RoutingAffinitySchema.safeParse(JSON.parse(row.routingAffinity));
-      if (parsed.success) {
-        routingAffinity = parsed.data;
-      } else {
-        console.warn(
-          `[db] Ignoring invalid agent_tasks.routingAffinity for task ${row.id}:`,
-          parsed.error.message,
-        );
-      }
-    } catch (error) {
-      console.warn(
-        `[db] Ignoring malformed agent_tasks.routingAffinity for task ${row.id}:`,
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-  }
-
-  return {
-    id: row.id,
-    key: row.key,
-    agentId: row.agentId,
-    creatorAgentId: row.creatorAgentId ?? undefined,
-    task: row.task,
-    title: row.title ?? undefined,
-    status: row.status,
-    source: row.source,
-    taskType: row.taskType ?? undefined,
-    tags: row.tags ? JSON.parse(row.tags) : [],
-    priority: row.priority ?? 50,
-    dependsOn: row.dependsOn ? JSON.parse(row.dependsOn) : [],
-    offeredTo: row.offeredTo ?? undefined,
-    offeredAt: row.offeredAt ?? undefined,
-    acceptedAt: row.acceptedAt ?? undefined,
-    rejectionReason: row.rejectionReason ?? undefined,
-    slackChannelId: row.slackChannelId ?? undefined,
-    slackThreadTs: row.slackThreadTs ?? undefined,
-    slackTriggerMessageTs: row.slackTriggerMessageTs ?? undefined,
-    slackUserId: row.slackUserId ?? undefined,
-    slackReplySent: !!row.slackReplySent,
-    slackProgressMessageTs: row.slackProgressMessageTs ?? undefined,
-    slackTreeRootMessageTs: row.slackTreeRootMessageTs ?? undefined,
-    vcsProvider: (row.vcsProvider as "github" | "gitlab" | null) ?? undefined,
-    vcsRepo: row.vcsRepo ?? undefined,
-    vcsEventType: row.vcsEventType ?? undefined,
-    vcsNumber: row.vcsNumber ?? undefined,
-    vcsCommentId: row.vcsCommentId ?? undefined,
-    vcsAuthor: row.vcsAuthor ?? undefined,
-    vcsUrl: row.vcsUrl ?? undefined,
-    vcsInstallationId: row.vcsInstallationId ?? undefined,
-    vcsNodeId: row.vcsNodeId ?? undefined,
-    agentmailInboxId: row.agentmailInboxId ?? undefined,
-    agentmailMessageId: row.agentmailMessageId ?? undefined,
-    agentmailThreadId: row.agentmailThreadId ?? undefined,
-    mentionMessageId: row.mentionMessageId ?? undefined,
-    mentionChannelId: row.mentionChannelId ?? undefined,
-    dir: row.dir ?? undefined,
-    parentTaskId: row.parentTaskId ?? undefined,
-    claudeSessionId: row.claudeSessionId ?? undefined,
-    model: row.model ?? undefined,
-    modelTier: parseModelTier(row.modelTier) ?? undefined,
-    effort: ReasoningEffortSchema.safeParse(row.effort).success
-      ? (row.effort as ReasoningEffort)
-      : undefined,
-    scheduleId: row.scheduleId ?? undefined,
-    workflowRunId: row.workflowRunId ?? undefined,
-    workflowRunStepId: row.workflowRunStepId ?? undefined,
-    outputSchema: row.outputSchema ? JSON.parse(row.outputSchema) : undefined,
-    followUpConfig,
-    contextKey: row.contextKey ?? undefined,
-    compactionCount: row.compactionCount ?? undefined,
-    peakContextPercent: row.peakContextPercent ?? undefined,
-    peakContextTokens: row.peakContextTokens ?? undefined,
-    contextWindowSize: row.contextWindowSize ?? undefined,
-    createdAt: row.createdAt,
-    lastUpdatedAt: row.lastUpdatedAt,
-    finishedAt: row.finishedAt ?? undefined,
-    notifiedAt: row.notifiedAt ?? undefined,
-    failureReason: row.failureReason ?? undefined,
-    output: row.output ?? undefined,
-    progress: row.progress ?? undefined,
-    wasPaused: !!row.was_paused,
-    credentialKeySuffix: row.credentialKeySuffix ?? undefined,
-    credentialKeyType: row.credentialKeyType ?? undefined,
-    requestedByUserId: row.requestedByUserId ?? undefined,
-    swarmVersion: row.swarmVersion ?? undefined,
-    provider: (row.provider as ProviderName | null) ?? undefined,
-    providerMeta: parseProviderMeta(row.provider as ProviderName | null, row.providerMeta),
-    harnessVariant: row.harnessVariant ?? undefined,
-    harnessVariantMeta: row.harnessVariantMeta ? JSON.parse(row.harnessVariantMeta) : undefined,
-    totalCostUsd: row.totalCostUsd ?? undefined,
-    routingAffinity,
-  };
-}
-
-/**
- * Slim list-row mapper — truncates the `task` text to a bounded preview and
- * drops completion/integration/context blobs (`output`, `failureReason`,
- * `providerMeta`, all `vcs*`/`slack*`/`agentmail*`/`credential*`/`mention*` and
- * context-window fields). The preview is long enough for pool-triage; the full
- * brief is on `get-task-details` / `GET /api/tasks/{id}`.
- */
-function rowToAgentTaskSummary(row: AgentTaskRow): AgentTaskSummary {
-  const t = rowToAgentTask(row);
-  return {
-    id: t.id,
-    key: t.key,
-    agentId: t.agentId,
-    creatorAgentId: t.creatorAgentId,
-    task: previewText(t.task, TASK_PREVIEW_LENGTH),
-    title: t.title,
-    status: t.status,
-    source: t.source,
-    taskType: t.taskType,
-    tags: t.tags,
-    priority: t.priority,
-    dependsOn: t.dependsOn,
-    offeredTo: t.offeredTo,
-    acceptedAt: t.acceptedAt,
-    parentTaskId: t.parentTaskId,
-    scheduleId: t.scheduleId,
-    model: t.model,
-    modelTier: t.modelTier,
-    effort: t.effort,
-    provider: t.provider,
-    requestedByUserId: t.requestedByUserId,
-    progress: t.progress,
-    createdAt: t.createdAt,
-    lastUpdatedAt: t.lastUpdatedAt,
-    finishedAt: t.finishedAt,
-    peakContextPercent: t.peakContextPercent,
-    totalCostUsd: t.totalCostUsd,
-  };
-}
-
-export async function createTask(
-  agentId: string,
-  task: string,
-  options?: {
-    source?: AgentTaskSource;
-    slackChannelId?: string;
-    slackThreadTs?: string;
-    slackUserId?: string;
-  },
-): Promise<AgentTask> {
-  const id = crypto.randomUUID();
-  const source = options?.source ?? "mcp";
-  const row = await getDbClient().get<AgentTaskRow>(
-    `INSERT INTO agent_tasks (id, "key", agentId, task, status, source, slackChannelId, slackThreadTs, slackUserId, swarmVersion, createdAt, lastUpdatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING *`,
-    [
-      id,
-      defaultAssetKey("task", id),
-      agentId,
-      task,
-      "pending",
-      source,
-      options?.slackChannelId ?? null,
-      options?.slackThreadTs ?? null,
-      options?.slackUserId ?? null,
-      pkg.version,
-    ],
-  );
-  if (!row) throw new Error("Failed to create task");
-  try {
-    await createLogEntry({
-      eventType: "task_created",
-      agentId,
-      taskId: id,
-      newValue: "pending",
-      metadata: { source },
-    });
-  } catch {}
-  return rowToAgentTask(row);
-}
-
-export async function getPendingTaskForAgent(agentId: string): Promise<AgentTask | null> {
-  // Get all pending tasks for this agent, ordered by priority (desc) then creation time (asc)
-  const rows = await getDbClient().query<AgentTaskRow>(
-    "SELECT * FROM agent_tasks WHERE agentId = ? AND status = 'pending' ORDER BY priority DESC, createdAt ASC",
-    [agentId],
-  );
-
-  // Find the first task whose dependencies are met
-  for (const row of rows) {
-    const task = rowToAgentTask(row);
-    const { ready } = await checkDependencies(task.id);
-    if (ready) {
-      return task;
-    }
-  }
-
-  return null;
-}
-
-export async function assignUnassignedTaskPending(
-  taskId: string,
-  agentId: string,
-): Promise<AgentTask | null> {
-  // Eligibility pre-check (routing affinity) — defense in depth for the
-  // heartbeat's `autoAssignPoolTasks`, which already filters candidates via
-  // `isAgentEligibleForTask` before calling this, but any other caller gets
-  // the same guard for free.
-  if (isPoolAffinityEnforcementEnabled()) {
-    const task = await getTaskById(taskId);
-    const agent = await getAgentById(agentId);
-    if (task && agent && !isAgentEligibleForTask(agent, task)) {
-      try {
-        await createLogEntry({
-          eventType: "task_claim_rejected_affinity",
-          agentId,
-          taskId,
-          metadata: {
-            agentRole: agent.role ?? null,
-            requiredRole: task.routingAffinity?.role ?? null,
-          },
-        });
-      } catch {}
-      return null;
-    }
-  }
-
-  const now = new Date().toISOString();
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET agentId = ?, status = 'pending', lastUpdatedAt = ?
-       WHERE id = ? AND status = 'unassigned' RETURNING *`,
-    [agentId, now, taskId],
-  );
-
-  if (row) {
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        agentId,
-        taskId,
-        oldValue: "unassigned",
-        newValue: "pending",
-        metadata: { pendingDispatch: true },
-      });
-    } catch {}
-  }
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function startTask(taskId: string): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(taskId);
-  if (!oldTask) return null;
-
-  // Guard: never revive tasks that are already in a terminal state
-  if (isTerminalTaskStatus(oldTask.status)) {
-    return null;
-  }
-
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET status = 'in_progress', lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded') RETURNING *`,
-    [taskId],
-  );
-  if (row && oldTask) {
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId,
-        agentId: row.agentId ?? undefined,
-        oldValue: oldTask.status,
-        newValue: "in_progress",
-      });
-    } catch {}
-  }
-  const result = row ? rowToAgentTask(row) : null;
-  // Fire-and-forget: notify lifecycle subscribers (e.g. GitHub eyes reaction)
-  if (result && oldTask.status !== "in_progress") {
-    emitTaskStarted(result);
-  }
-  return result;
-}
-
-export async function getTaskById(id: string): Promise<AgentTask | null> {
-  const row = await getDbClient().get<AgentTaskRow>("SELECT * FROM agent_tasks WHERE id = ?", [id]);
-  return row ? rowToAgentTask(row) : null;
-}
 
 export async function getSlackRenderV2ActivatedAt(): Promise<string | null> {
   const row = await getDbClient().get<{ activated_at: string }>(
@@ -1615,7 +453,29 @@ export async function ensureSlackRenderV2Activation(): Promise<string> {
   return persisted;
 }
 
+export async function getSlackDelegationActivatedAt(): Promise<string | null> {
+  const row = await getDbClient().get<{ delegation_activated_at: string | null }>(
+    `SELECT delegation_activated_at FROM slack_render_v2_state WHERE id = 1`,
+  );
+  return row?.delegation_activated_at ?? null;
+}
+
+export async function ensureSlackDelegationActivation(): Promise<string> {
+  const activatedAt = new Date().toISOString();
+  await getDbClient().run(
+    `INSERT INTO slack_render_v2_state (id, activated_at, delegation_activated_at)
+     VALUES (1, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       delegation_activated_at = COALESCE(slack_render_v2_state.delegation_activated_at, excluded.delegation_activated_at)`,
+    [activatedAt, activatedAt],
+  );
+  const persisted = await getSlackDelegationActivatedAt();
+  if (!persisted) throw new Error("Failed to persist Slack render v2 delegation activation");
+  return persisted;
+}
+
 export type SlackMessageKind = "tree" | "outcome" | "agent";
+export type SlackConclusionKind = "complete" | "timeout";
 
 export interface SlackMessageRecord {
   id: string;
@@ -1628,6 +488,17 @@ export interface SlackMessageRecord {
   permalink?: string;
   finalizedAt?: string;
   streamChunksAppended: number;
+  conclusionKind?: SlackConclusionKind;
+  /** Set once a deferral card has been rewritten into its resolved state. */
+  deferralResolvedAt?: string;
+  /** Set with `deferralResolvedAt` when the rewrite was given up on. */
+  deferralAbandonedAt?: string;
+  /** Failed delivery attempts for this outcome card, across restarts. */
+  deliveryAttempts: number;
+  /** Set once the renderer gave up on delivering this outcome card. */
+  deliveryAbandonedAt?: string;
+  /** Last Slack verdict for the card, "<code>: <messages>", 500 chars max. */
+  deliveryLastError?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -1636,6 +507,11 @@ const PENDING_SLACK_MESSAGE_TS_PREFIX = "pending:";
 
 export function isPendingSlackMessage(record: SlackMessageRecord): boolean {
   return record.ts.startsWith(PENDING_SLACK_MESSAGE_TS_PREFIX);
+}
+
+/** True when the renderer must not touch this card again: delivered, or given up on. */
+export function isSettledSlackMessage(record: SlackMessageRecord): boolean {
+  return !!record.finalizedAt || !!record.deliveryAbandonedAt;
 }
 
 type SlackMessageRow = {
@@ -1649,6 +525,12 @@ type SlackMessageRow = {
   permalink: string | null;
   finalized_at: string | null;
   stream_chunks_appended: number;
+  conclusion_kind: SlackConclusionKind | null;
+  deferral_resolved_at: string | null;
+  deferral_abandoned_at: string | null;
+  delivery_attempts: number;
+  delivery_abandoned_at: string | null;
+  delivery_last_error: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -1665,6 +547,12 @@ function rowToSlackMessage(row: SlackMessageRow): SlackMessageRecord {
     permalink: row.permalink ?? undefined,
     finalizedAt: row.finalized_at ?? undefined,
     streamChunksAppended: row.stream_chunks_appended,
+    conclusionKind: row.conclusion_kind ?? undefined,
+    deferralResolvedAt: row.deferral_resolved_at ?? undefined,
+    deferralAbandonedAt: row.deferral_abandoned_at ?? undefined,
+    deliveryAttempts: row.delivery_attempts,
+    deliveryAbandonedAt: row.delivery_abandoned_at ?? undefined,
+    deliveryLastError: row.delivery_last_error ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1680,6 +568,7 @@ export async function recordSlackMessage(input: {
   permalink?: string;
   finalized?: boolean;
   streamChunksAppended?: number;
+  conclusionKind?: SlackConclusionKind;
   actorId?: string;
 }): Promise<SlackMessageRecord> {
   const id = crypto.randomUUID();
@@ -1687,8 +576,8 @@ export async function recordSlackMessage(input: {
   const row = await getDbClient().get<SlackMessageRow>(
     `INSERT INTO slack_messages (
          id, context_key, channel_id, thread_ts, ts, kind, task_id, permalink,
-         finalized_at, stream_chunks_appended, created_at, updated_at, created_by, updated_by
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         finalized_at, stream_chunks_appended, conclusion_kind, created_at, updated_at, created_by, updated_by
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(channel_id, ts) DO UPDATE SET
          context_key = excluded.context_key,
          kind = excluded.kind,
@@ -1699,6 +588,7 @@ export async function recordSlackMessage(input: {
            excluded.stream_chunks_appended,
            slack_messages.stream_chunks_appended
          ),
+         conclusion_kind = COALESCE(excluded.conclusion_kind, slack_messages.conclusion_kind),
          updated_at = excluded.updated_at,
          updated_by = excluded.updated_by
        RETURNING *`,
@@ -1713,6 +603,7 @@ export async function recordSlackMessage(input: {
       input.permalink ?? null,
       input.finalized ? now : null,
       input.streamChunksAppended ?? 0,
+      input.conclusionKind ?? null,
       now,
       now,
       input.actorId ?? null,
@@ -1793,6 +684,7 @@ export async function updateSlackMessageRecord(
     permalink?: string;
     finalized?: boolean;
     streamChunksAppended?: number;
+    conclusionKind?: SlackConclusionKind;
     actorId?: string;
     touchUpdatedAt?: boolean;
   },
@@ -1803,6 +695,7 @@ export async function updateSlackMessageRecord(
          permalink = COALESCE(?, permalink),
          finalized_at = CASE WHEN ? = 1 THEN COALESCE(finalized_at, ?) ELSE finalized_at END,
          stream_chunks_appended = COALESCE(?, stream_chunks_appended),
+         conclusion_kind = COALESCE(?, conclusion_kind),
          updated_at = CASE WHEN ? = 1 THEN ? ELSE updated_at END,
          updated_by = COALESCE(?, updated_by)
        WHERE id = ?
@@ -1812,6 +705,7 @@ export async function updateSlackMessageRecord(
       updates.finalized ? 1 : 0,
       now,
       updates.streamChunksAppended ?? null,
+      updates.conclusionKind ?? null,
       updates.touchUpdatedAt === false ? 0 : 1,
       now,
       updates.actorId ?? null,
@@ -1868,6 +762,96 @@ export async function getSlackOutcomeMessage(taskId: string): Promise<SlackMessa
   return row ? rowToSlackMessage(row) : null;
 }
 
+/**
+ * Deferral outcome cards whose wake-up task has since reached a terminal
+ * state, and which have not been rewritten into that resolved state yet.
+ *
+ * The join is `agent_tasks.parentTaskId` — `defer-task` sets it on the
+ * schedule and `createStandaloneScheduleTask` passes it through, so the
+ * wake-up task points back at the task whose card announced the wait.
+ * `deferredAt` (not the `deferred` tag) identifies the deferring task,
+ * because the wake-up task inherits the tag.
+ */
+export async function getResolvableDeferralOutcomes(
+  limit = 50,
+): Promise<{ card: SlackMessageRecord; deferredTaskId: string; wakeTaskId: string }[]> {
+  const rows = await getDbClient().query<SlackMessageRow & { wake_task_id: string }>(
+    `SELECT card.*, wake.id AS wake_task_id
+       FROM slack_messages card
+       JOIN agent_tasks deferred ON deferred.id = card.task_id
+       JOIN agent_tasks wake ON wake.parentTaskId = deferred.id AND wake.taskType = 'deferred'
+       WHERE card.kind = 'outcome'
+         AND card.finalized_at IS NOT NULL
+         AND card.deferral_resolved_at IS NULL
+         AND card.ts NOT LIKE 'pending:%'
+         AND deferred.deferredAt IS NOT NULL
+         AND wake.status IN ('completed', 'failed', 'cancelled')
+       ORDER BY wake.finishedAt ASC
+       LIMIT ?`,
+    [limit],
+  );
+  return rows.map((row) => ({
+    card: rowToSlackMessage(row),
+    deferredTaskId: row.task_id!,
+    wakeTaskId: row.wake_task_id,
+  }));
+}
+
+/**
+ * Mark a deferral card as resolved, so the resolution pass skips it after.
+ * `abandoned` records that the rewrite was given up on, which hands the
+ * answer back to the wake-up's own outcome card.
+ */
+export async function markSlackDeferralResolved(
+  id: string,
+  options: { abandoned?: boolean } = {},
+): Promise<void> {
+  const now = new Date().toISOString();
+  await getDbClient().run(
+    "UPDATE slack_messages SET deferral_resolved_at = ?, deferral_abandoned_at = ? WHERE id = ?",
+    [now, options.abandoned ? now : null, id],
+  );
+}
+
+export async function noteSlackOutcomeDeliveryFailure(
+  taskId: string,
+  lastError: string,
+): Promise<SlackMessageRecord | null> {
+  const now = new Date().toISOString();
+  const row = await getDbClient().get<SlackMessageRow>(
+    `UPDATE slack_messages SET
+         delivery_attempts = delivery_attempts + 1,
+         delivery_last_error = ?,
+         updated_at = ?
+       WHERE task_id = ? AND kind = 'outcome' AND delivery_abandoned_at IS NULL
+       RETURNING *`,
+    [lastError.slice(0, 500), now, taskId],
+  );
+  return row ? rowToSlackMessage(row) : null;
+}
+
+/**
+ * Give up on the card. Returns the row only on the NULL -> set transition, so
+ * exactly one caller (one process, one tick) sees a non-null result and may
+ * post the "Couldn't deliver" warning.
+ */
+export async function abandonSlackOutcomeDelivery(
+  taskId: string,
+  lastError: string,
+): Promise<SlackMessageRecord | null> {
+  const now = new Date().toISOString();
+  const row = await getDbClient().get<SlackMessageRow>(
+    `UPDATE slack_messages SET
+         delivery_abandoned_at = ?,
+         delivery_last_error = ?,
+         updated_at = ?
+       WHERE task_id = ? AND kind = 'outcome' AND delivery_abandoned_at IS NULL
+       RETURNING *`,
+    [now, lastError.slice(0, 500), now, taskId],
+  );
+  return row ? rowToSlackMessage(row) : null;
+}
+
 export async function getSlackTreeMessages(): Promise<SlackMessageRecord[]> {
   const rows = await getDbClient().query<SlackMessageRow>(
     `SELECT tree.*
@@ -1887,7 +871,7 @@ export async function getSlackTreeMessages(): Promise<SlackMessageRecord[]> {
              SELECT 1 FROM slack_messages outcome
              WHERE outcome.kind = 'outcome'
              AND outcome.task_id = task.id
-             AND outcome.finalized_at IS NOT NULL
+             AND (outcome.finalized_at IS NOT NULL OR outcome.delivery_abandoned_at IS NOT NULL)
            )
          )
          OR
@@ -1913,7 +897,7 @@ export async function getSlackTreeMessages(): Promise<SlackMessageRecord[]> {
            AND outcome.thread_ts = tree.thread_ts
            AND task.createdAt >= state.activated_at
            AND (
-             outcome.finalized_at IS NULL
+             (outcome.finalized_at IS NULL AND outcome.delivery_abandoned_at IS NULL)
              OR outcome.updated_at > tree.updated_at
            )
          )
@@ -1947,6 +931,44 @@ export async function getSlackTasksInThread(
   return rows.map(rowToAgentTask);
 }
 
+/**
+ * Slack threads with an open human request raised by one of their own tasks
+ * (`request-human-input`): the swarm cannot go on until a person answers.
+ * A request past its `expiresAt` is about to become a timeout follow-up, so
+ * it no longer counts as waiting.
+ */
+export async function listSlackThreadsAwaitingHuman(): Promise<
+  Array<{ channelId: string; threadTs: string }>
+> {
+  return getDbClient().query<{ channelId: string; threadTs: string }>(
+    `SELECT DISTINCT task.slackChannelId AS channelId, task.slackThreadTs AS threadTs
+       FROM approval_requests request
+       JOIN agent_tasks task ON task.id = request.sourceTaskId
+       WHERE request.status = 'pending'
+       AND (request.expiresAt IS NULL OR request.expiresAt > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       AND task.slackChannelId IS NOT NULL
+       AND task.slackThreadTs IS NOT NULL`,
+  );
+}
+
+export async function isSlackThreadAwaitingHuman(
+  channelId: string,
+  threadTs: string,
+): Promise<boolean> {
+  const row = await getDbClient().get<{ waiting: number }>(
+    `SELECT 1 AS waiting
+       FROM approval_requests request
+       JOIN agent_tasks task ON task.id = request.sourceTaskId
+       WHERE request.status = 'pending'
+       AND (request.expiresAt IS NULL OR request.expiresAt > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+       AND task.slackChannelId = ?
+       AND task.slackThreadTs = ?
+       LIMIT 1`,
+    [channelId, threadTs],
+  );
+  return !!row;
+}
+
 export async function markTaskSlackReplySent(taskId: string): Promise<void> {
   await getDbClient().run(`UPDATE agent_tasks SET slackReplySent = 1 WHERE id = ?`, [taskId]);
 }
@@ -1975,126 +997,10 @@ export async function setSlackMessageTracking(
   await getDbClient().run(`UPDATE agent_tasks SET ${sets.join(", ")} WHERE id = ?`, args);
 }
 
-export async function getChildTasks(parentTaskId: string): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT * FROM agent_tasks WHERE parentTaskId = ? ORDER BY createdAt ASC, rowid ASC`,
-    [parentTaskId],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Returns true if `parentId` has at least one non-terminal child task with
- * `taskType = 'resume'`. Used by the heartbeat sweep as an idempotency guard:
- * if a prior sweep tick already created a resume follow-up for this parent,
- * don't create a duplicate.
- *
- * **Filters by taskType = 'resume'** specifically. A parent task can also
- * have ordinary non-terminal delegation children (`send-task` auto-defaults
- * `parentTaskId` to the caller's current task — see src/tools/send-task.ts).
- * Treating those as "already resumed" would incorrectly skip the resume
- * path for a crashed worker that had delegated subtasks (PR #594 review).
- */
-export async function hasNonTerminalResumeChild(parentId: string): Promise<boolean> {
-  const row = await getDbClient().get(
-    `SELECT 1 FROM agent_tasks
-       WHERE parentTaskId = ?
-         AND taskType = 'resume'
-         AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
-       LIMIT 1`,
-    [parentId],
-  );
-  return row !== undefined && row !== null;
-}
-
-/**
- * True when a non-terminal `reroute-decision` child exists for `parentId`.
- *
- * Mirrors {@link hasNonTerminalResumeChild} but filters on
- * `taskType = 'reroute-decision'` — the Lead-owned re-delegation decision
- * created when a pinned crash-recovery resume is never reclaimed (DES-523).
- * Makes escalation idempotent: a later heartbeat sweep must not create a second
- * decision for the same original task. We filter on the taskType marker
- * specifically (not any child) so ordinary delegation / completion follow-up
- * children of the original cannot suppress a needed decision, and nothing else
- * is mistaken for one.
- */
-export async function hasNonTerminalRerouteDecisionChild(parentId: string): Promise<boolean> {
-  const row = await getDbClient().get<Record<string, number>>(
-    `SELECT 1 FROM agent_tasks
-       WHERE parentTaskId = ?
-         AND taskType = 'reroute-decision'
-         AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
-       LIMIT 1`,
-    [parentId],
-  );
-  return row !== undefined && row !== null;
-}
-
-export async function updateTaskClaudeSessionId(
-  taskId: string,
-  claudeSessionId: string,
-  provider?: ProviderName,
-  providerMeta?: Record<string, unknown>,
-  model?: string,
-  harnessVariant?: string,
-  harnessVariantMeta?: Record<string, unknown>,
-): Promise<AgentTask | null> {
-  const setClauses = ["claudeSessionId = ?", "lastUpdatedAt = ?"];
-  const params: (string | null)[] = [claudeSessionId, new Date().toISOString()];
-
-  if (provider !== undefined) {
-    setClauses.push("provider = ?");
-    params.push(provider);
-  }
-  if (providerMeta !== undefined) {
-    setClauses.push("providerMeta = ?");
-    params.push(JSON.stringify(providerMeta));
-  }
-  if (model !== undefined) {
-    setClauses.push("model = ?");
-    params.push(model);
-  }
-  if (harnessVariant !== undefined) {
-    setClauses.push("harnessVariant = ?");
-    params.push(harnessVariant);
-  }
-  if (harnessVariantMeta !== undefined) {
-    setClauses.push("harnessVariantMeta = ?");
-    params.push(JSON.stringify(harnessVariantMeta));
-  }
-
-  params.push(taskId);
-
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET ${setClauses.join(", ")} WHERE id = ? RETURNING *`,
-    params,
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Sets or clears a task's display title (session rename). Trims the input and
- * normalizes an empty string to NULL (clear). Deliberately does NOT touch
- * `lastUpdatedAt` — a rename is not activity, and the sessions sidebar sorts
- * on chain-wide max `lastUpdatedAt`, so bumping it here would reorder the list.
- */
-export async function updateTaskTitle(
-  taskId: string,
-  title: string | null,
-): Promise<AgentTask | null> {
-  const normalized = title === null ? null : title.trim() || null;
-  const row = await getDbClient().get<AgentTaskRow>(
-    "UPDATE agent_tasks SET title = ? WHERE id = ? RETURNING *",
-    [normalized, taskId],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
 export async function updateTaskVcs(
   taskId: string,
   vcs: {
-    vcsProvider: "github" | "gitlab";
+    vcsProvider: "github" | "gitlab" | "azure-devops";
     vcsRepo: string;
     vcsNumber: number;
     vcsUrl: string;
@@ -2115,1394 +1021,6 @@ export async function updateTaskVcs(
     }
     return updated;
   });
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function getTasksByAgentId(agentId: string): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    "SELECT * FROM agent_tasks WHERE agentId = ? ORDER BY createdAt DESC",
-    [agentId],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Get the most recently updated in-progress task for an agent.
- * Used as a fallback when X-Source-Task-Id header is missing (e.g. lead agent HITL requests).
- *
- * Note: if agent has multiple in-progress tasks, returns the most recently
- * updated one. This is a best-effort fallback — the X-Source-Task-Id header
- * is the authoritative source when available.
- */
-export async function getAgentCurrentTask(agentId: string): Promise<AgentTask | null> {
-  const row = await getDbClient().get<AgentTaskRow>(
-    "SELECT * FROM agent_tasks WHERE agentId = ? AND status = 'in_progress' ORDER BY lastUpdatedAt DESC LIMIT 1",
-    [agentId],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function getTasksByStatus(status: AgentTaskStatus): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    "SELECT * FROM agent_tasks WHERE status = ? ORDER BY createdAt DESC",
-    [status],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Find a task by VCS repo and issue/PR/MR number.
- * Returns the most recent non-terminal task for this VCS entity.
- *
- * Terminal exclusion MUST stay in lock-step with `TERMINAL_TASK_STATUSES`
- * in `src/types.ts`. SQL strings can't import a TS const — if you add a
- * new terminal status, grep for `NOT IN ('completed'` across this file.
- */
-export async function findTaskByVcs(vcsRepo: string, vcsNumber: number): Promise<AgentTask | null> {
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE vcsRepo = ? AND vcsNumber = ?
-       AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
-       ORDER BY createdAt DESC
-       LIMIT 1`,
-    [vcsRepo, vcsNumber],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-/** @deprecated Use findTaskByVcs instead */
-export const findTaskByGitHub = findTaskByVcs;
-
-export interface TaskFilters {
-  /** Single status (back-compat) OR array of statuses (multi-status filter). */
-  status?: AgentTaskStatus | AgentTaskStatus[];
-  agentId?: string;
-  search?: string;
-  // New filters
-  unassigned?: boolean;
-  offeredTo?: string;
-  readyOnly?: boolean;
-  taskType?: string;
-  tags?: string[];
-  scheduleId?: string;
-  /** Exact canonical asset namespace. */
-  key?: string;
-  /** Canonical namespace subtree prefix. */
-  keyPrefix?: string;
-  /** Filter to tasks whose `source` is in this list. Empty/undefined → no filter. */
-  source?: AgentTaskSource[];
-  /** ISO 8601 timestamp; only return tasks where createdAt >= this. */
-  createdAfter?: string;
-  /** ISO 8601 timestamp; only return tasks where createdAt < this. */
-  createdBefore?: string;
-  /** Only return tasks requested by this canonical user. NULL rows are excluded. */
-  requestedByUserId?: string;
-  /** When set, restrict to rows where `requestedByUserId` IS NULL. Takes priority over `requestedByUserId`. */
-  requestedByUserIdIsNull?: boolean;
-  /** Sort list rows for either table freshness or timeline paging. */
-  orderBy?: "lastUpdatedAt" | "createdAt";
-  limit?: number;
-  offset?: number;
-  includeHeartbeat?: boolean;
-}
-
-export function getAllTasks(filters?: TaskFilters): Promise<AgentTask[]>;
-export function getAllTasks(
-  filters: TaskFilters | undefined,
-  opts: { slim: true },
-): Promise<AgentTaskSummary[]>;
-export async function getAllTasks(
-  filters?: TaskFilters,
-  opts?: { slim?: boolean },
-): Promise<AgentTask[] | AgentTaskSummary[]> {
-  const conditions: string[] = [];
-  const params: (string | AgentTaskStatus)[] = [];
-
-  if (filters?.status) {
-    if (Array.isArray(filters.status)) {
-      if (filters.status.length === 1) {
-        conditions.push("status = ?");
-        params.push(filters.status[0]!);
-      } else if (filters.status.length > 1) {
-        const placeholders = filters.status.map(() => "?").join(", ");
-        conditions.push(`status IN (${placeholders})`);
-        for (const s of filters.status) params.push(s);
-      }
-    } else {
-      conditions.push("status = ?");
-      params.push(filters.status);
-    }
-  }
-
-  if (filters?.agentId) {
-    conditions.push("agentId = ?");
-    params.push(filters.agentId);
-  }
-
-  if (filters?.search) {
-    conditions.push("(task LIKE ? OR id LIKE ?)");
-    params.push(`%${filters.search}%`, `%${filters.search}%`);
-  }
-
-  // New filters
-  if (filters?.unassigned) {
-    conditions.push("(agentId IS NULL OR status = 'unassigned')");
-  }
-
-  if (filters?.offeredTo) {
-    conditions.push("offeredTo = ?");
-    params.push(filters.offeredTo);
-  }
-
-  if (filters?.taskType) {
-    conditions.push("taskType = ?");
-    params.push(filters.taskType);
-  }
-
-  if (filters?.tags && filters.tags.length > 0) {
-    // Match any of the tags
-    const tagConditions = filters.tags.map(() => "tags LIKE ?");
-    conditions.push(`(${tagConditions.join(" OR ")})`);
-    for (const tag of filters.tags) {
-      params.push(`%"${tag}"%`);
-    }
-  }
-
-  if (filters?.scheduleId) {
-    conditions.push("scheduleId = ?");
-    params.push(filters.scheduleId);
-  }
-
-  if (filters?.key) {
-    conditions.push('"key" = ?');
-    params.push(normalizeAssetKey(filters.key));
-  } else if (filters?.keyPrefix) {
-    conditions.push(`"key" LIKE ? ESCAPE '\\'`);
-    params.push(assetKeyPrefixPattern(filters.keyPrefix));
-  }
-
-  if (filters?.source && filters.source.length > 0) {
-    const placeholders = filters.source.map(() => "?").join(", ");
-    conditions.push(`source IN (${placeholders})`);
-    for (const s of filters.source) params.push(s);
-  }
-
-  if (filters?.createdAfter) {
-    conditions.push("createdAt >= ?");
-    params.push(filters.createdAfter);
-  }
-
-  if (filters?.createdBefore) {
-    conditions.push("createdAt < ?");
-    params.push(filters.createdBefore);
-  }
-
-  if (filters?.requestedByUserIdIsNull) {
-    conditions.push("requestedByUserId IS NULL");
-  } else if (filters?.requestedByUserId) {
-    conditions.push("requestedByUserId = ?");
-    params.push(filters.requestedByUserId);
-  }
-
-  // Exclude system/heartbeat tasks by default. The flag is still called
-  // `includeHeartbeat` for backward compat with existing API callers, but we
-  // also gate boot-triage + heartbeat-checklist behind it since those are
-  // equally noisy in the dashboard task list.
-  if (!filters?.includeHeartbeat) {
-    conditions.push(
-      "(IFNULL(taskType, '') NOT IN ('heartbeat', 'heartbeat-checklist', 'boot-triage') AND tags NOT LIKE '%\"heartbeat\"%')",
-    );
-  }
-
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const limit = filters?.limit ?? 25;
-  const offset = filters?.offset ?? 0;
-  const orderBy =
-    filters?.orderBy === "createdAt"
-      ? "createdAt DESC, rowid DESC"
-      : "lastUpdatedAt DESC, priority DESC";
-  const query = `SELECT agent_tasks.*,
-    (SELECT SUM(totalCostUsd) FROM session_costs WHERE session_costs.taskId = agent_tasks.id) AS totalCostUsd
-    FROM agent_tasks ${whereClause}
-    ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}`;
-
-  const rows = await getDbClient().query<AgentTaskRow>(query, params);
-
-  // Filter for ready tasks (dependencies met) if requested. Both the full and
-  // the slim row shapes carry `id` + `dependsOn`, so the same predicate works.
-  const filterReady = async <T extends { id: string; dependsOn: string[] }>(
-    items: T[],
-  ): Promise<T[]> => {
-    const readyFlags = await Promise.all(
-      items.map(async (task) => {
-        if (!task.dependsOn || task.dependsOn.length === 0) return true;
-        return (await checkDependencies(task.id)).ready;
-      }),
-    );
-    return items.filter((_, i) => readyFlags[i]);
-  };
-
-  if (opts?.slim) {
-    let tasks = rows.map(rowToAgentTaskSummary);
-    if (filters?.readyOnly) tasks = await filterReady(tasks);
-    return tasks;
-  }
-
-  let tasks = rows.map(rowToAgentTask);
-  if (filters?.readyOnly) tasks = await filterReady(tasks);
-  return tasks;
-}
-
-/**
- * Get total count of tasks matching the given filters (ignoring limit).
- * Used alongside getAllTasks to display accurate total counts in UI.
- */
-export async function getTasksCount(
-  filters?: Omit<TaskFilters, "limit" | "readyOnly">,
-): Promise<number> {
-  const conditions: string[] = [];
-  const params: (string | AgentTaskStatus)[] = [];
-
-  if (filters?.status) {
-    if (Array.isArray(filters.status)) {
-      if (filters.status.length === 1) {
-        conditions.push("status = ?");
-        params.push(filters.status[0]!);
-      } else if (filters.status.length > 1) {
-        const placeholders = filters.status.map(() => "?").join(", ");
-        conditions.push(`status IN (${placeholders})`);
-        for (const s of filters.status) params.push(s);
-      }
-    } else {
-      conditions.push("status = ?");
-      params.push(filters.status);
-    }
-  }
-
-  if (filters?.agentId) {
-    conditions.push("agentId = ?");
-    params.push(filters.agentId);
-  }
-
-  if (filters?.search) {
-    conditions.push("(task LIKE ? OR id LIKE ?)");
-    params.push(`%${filters.search}%`, `%${filters.search}%`);
-  }
-
-  if (filters?.unassigned) {
-    conditions.push("(agentId IS NULL OR status = 'unassigned')");
-  }
-
-  if (filters?.offeredTo) {
-    conditions.push("offeredTo = ?");
-    params.push(filters.offeredTo);
-  }
-
-  if (filters?.taskType) {
-    conditions.push("taskType = ?");
-    params.push(filters.taskType);
-  }
-
-  if (filters?.tags && filters.tags.length > 0) {
-    const tagConditions = filters.tags.map(() => "tags LIKE ?");
-    conditions.push(`(${tagConditions.join(" OR ")})`);
-    for (const tag of filters.tags) {
-      params.push(`%"${tag}"%`);
-    }
-  }
-
-  if (filters?.scheduleId) {
-    conditions.push("scheduleId = ?");
-    params.push(filters.scheduleId);
-  }
-
-  if (filters?.key) {
-    conditions.push('"key" = ?');
-    params.push(normalizeAssetKey(filters.key));
-  } else if (filters?.keyPrefix) {
-    conditions.push(`"key" LIKE ? ESCAPE '\\'`);
-    params.push(assetKeyPrefixPattern(filters.keyPrefix));
-  }
-
-  if (filters?.source && filters.source.length > 0) {
-    const placeholders = filters.source.map(() => "?").join(", ");
-    conditions.push(`source IN (${placeholders})`);
-    for (const s of filters.source) params.push(s);
-  }
-
-  if (filters?.createdAfter) {
-    conditions.push("createdAt >= ?");
-    params.push(filters.createdAfter);
-  }
-
-  if (filters?.createdBefore) {
-    conditions.push("createdAt < ?");
-    params.push(filters.createdBefore);
-  }
-
-  if (filters?.requestedByUserIdIsNull) {
-    conditions.push("requestedByUserId IS NULL");
-  } else if (filters?.requestedByUserId) {
-    conditions.push("requestedByUserId = ?");
-    params.push(filters.requestedByUserId);
-  }
-
-  // Exclude system/heartbeat tasks by default. The flag is still called
-  // `includeHeartbeat` for backward compat with existing API callers, but we
-  // also gate boot-triage + heartbeat-checklist behind it since those are
-  // equally noisy in the dashboard task list.
-  if (!filters?.includeHeartbeat) {
-    conditions.push(
-      "(IFNULL(taskType, '') NOT IN ('heartbeat', 'heartbeat-checklist', 'boot-triage') AND tags NOT LIKE '%\"heartbeat\"%')",
-    );
-  }
-
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const query = `SELECT COUNT(*) as count FROM agent_tasks ${whereClause}`;
-
-  const result = await getDbClient().get<{ count: number }>(query, params);
-
-  return result?.count ?? 0;
-}
-
-/**
- * Get task statistics (counts by status) without any limit.
- * This is more efficient than fetching all tasks for stats purposes.
- */
-export async function getTaskStats(): Promise<{
-  total: number;
-  unassigned: number;
-  offered: number;
-  reviewing: number;
-  pending: number;
-  in_progress: number;
-  paused: number;
-  completed: number;
-  failed: number;
-}> {
-  const row = await getDbClient().get<{
-    total: number;
-    unassigned: number;
-    offered: number;
-    reviewing: number;
-    pending: number;
-    in_progress: number;
-    paused: number;
-    completed: number;
-    failed: number;
-  }>(
-    `SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'unassigned' THEN 1 ELSE 0 END) as unassigned,
-        SUM(CASE WHEN status = 'offered' THEN 1 ELSE 0 END) as offered,
-        SUM(CASE WHEN status = 'reviewing' THEN 1 ELSE 0 END) as reviewing,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
-        SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END) as paused,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
-      FROM agent_tasks`,
-  );
-
-  return (
-    row ?? {
-      total: 0,
-      unassigned: 0,
-      offered: 0,
-      reviewing: 0,
-      pending: 0,
-      in_progress: 0,
-      paused: 0,
-      completed: 0,
-      failed: 0,
-    }
-  );
-}
-
-export async function getCompletedSlackTasks(): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE slackChannelId IS NOT NULL
-       AND status IN ('completed', 'failed')
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 200`,
-  );
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Get tasks that were recently finished (completed/failed) by workers (non-lead agents).
- * Used by leads to know when workers complete tasks.
- */
-export async function getRecentlyFinishedWorkerTasks(): Promise<AgentTask[]> {
-  // Query for finished tasks that haven't been notified yet
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT t.* FROM agent_tasks t
-       LEFT JOIN agents a ON t.agentId = a.id
-       WHERE t.status IN ('completed', 'failed')
-       AND t.finishedAt IS NOT NULL
-       AND t.notifiedAt IS NULL
-       AND (a.isLead = 0 OR a.isLead IS NULL)
-       ORDER BY t.finishedAt DESC LIMIT 50`,
-  );
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Atomically mark finished tasks as notified.
- * Sets notifiedAt timestamp to prevent returning them in future polls.
- */
-export async function markTasksNotified(taskIds: string[]): Promise<number> {
-  if (taskIds.length === 0) return 0;
-
-  const now = new Date().toISOString();
-  const placeholders = taskIds.map(() => "?").join(",");
-
-  const result = await getDbClient().run(
-    `UPDATE agent_tasks SET notifiedAt = ?
-     WHERE id IN (${placeholders}) AND notifiedAt IS NULL`,
-    [now, ...taskIds],
-  );
-
-  return result.changes;
-}
-
-/**
- * Reset notifiedAt for tasks, allowing them to be re-delivered on next poll.
- * Used when a trigger was consumed but the session that should process it failed.
- * This prevents permanent notification loss from the mark-before-process race.
- */
-export async function resetTasksNotified(taskIds: string[]): Promise<number> {
-  if (taskIds.length === 0) return 0;
-
-  const placeholders = taskIds.map(() => "?").join(",");
-
-  const result = await getDbClient().run(
-    `UPDATE agent_tasks SET notifiedAt = NULL
-     WHERE id IN (${placeholders}) AND notifiedAt IS NOT NULL`,
-    taskIds,
-  );
-
-  return result.changes;
-}
-
-export async function getInProgressSlackTasks(): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE slackChannelId IS NOT NULL
-       AND status = 'in_progress'
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 200`,
-  );
-  return rows.map(rowToAgentTask);
-}
-
-export async function getSlackTasksMissingTree(): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT task.* FROM agent_tasks task
-       JOIN slack_render_v2_state state ON state.id = 1
-       WHERE task.source = 'slack'
-       AND task.slackChannelId IS NOT NULL
-       AND task.slackThreadTs IS NOT NULL
-       AND task.createdAt >= state.activated_at
-       AND task.status NOT IN ('backlog', 'unassigned', 'superseded')
-       AND NOT EXISTS (
-         SELECT 1 FROM agent_tasks earlier
-         WHERE earlier.source = 'slack'
-         AND earlier.slackChannelId = task.slackChannelId
-         AND earlier.slackThreadTs = task.slackThreadTs
-         AND earlier.createdAt < state.activated_at
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM slack_messages tree
-         WHERE tree.kind = 'tree'
-         AND tree.channel_id = task.slackChannelId
-         AND tree.thread_ts = task.slackThreadTs
-       )
-       ORDER BY task.lastUpdatedAt DESC
-       LIMIT 200`,
-  );
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Return sibling tasks for a given cross-ingress context key, optionally
- * filtered by status. The returned shape mirrors getInProgressSlackTasks for
- * consistency; callers can narrow further in TypeScript.
- *
- * See src/tasks/context-key.ts for the key schema.
- */
-export async function getInProgressTasksByContextKey(
-  contextKey: string,
-  statuses: AgentTaskStatus[] = ["pending", "in_progress", "offered", "paused"],
-): Promise<AgentTask[]> {
-  if (!contextKey || statuses.length === 0) return [];
-  const placeholders = statuses.map(() => "?").join(",");
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE contextKey = ?
-       AND status IN (${placeholders})
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 200`,
-    [contextKey, ...statuses],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-export type ExistingTrackerContextWorkReason = "active_task" | "linked_open_pr";
-
-export type ExistingTrackerContextWork = {
-  task: AgentTask;
-  reason: ExistingTrackerContextWorkReason;
-};
-
-const LINEAR_TRACKER_CONTEXT_KEY_PREFIX = "task:trackers:linear:";
-
-function isLinearTrackerContextKey(contextKey: string | null | undefined): contextKey is string {
-  return !!contextKey && contextKey.startsWith(LINEAR_TRACKER_CONTEXT_KEY_PREFIX);
-}
-
-/**
- * Return existing work for a Linear tracker key before creating another task.
- *
- * Active means any non-terminal task. A completed task with persisted VCS PR/MR
- * metadata is also treated as existing work because the task can be complete
- * while the PR is still awaiting review/merge.
- */
-export async function findExistingLinearTrackerContextWork(
-  contextKey: string | null | undefined,
-): Promise<ExistingTrackerContextWork | null> {
-  if (!isLinearTrackerContextKey(contextKey)) return null;
-
-  const activeRow = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE contextKey = ?
-       AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 1`,
-    [contextKey],
-  );
-  if (activeRow) {
-    return { task: rowToAgentTask(activeRow), reason: "active_task" };
-  }
-
-  const linkedPrRow = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE contextKey = ?
-       AND status = 'completed'
-       AND vcsProvider IS NOT NULL
-       AND vcsRepo IS NOT NULL
-       AND vcsNumber IS NOT NULL
-       AND vcsUrl IS NOT NULL
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 1`,
-    [contextKey],
-  );
-  if (linkedPrRow) {
-    return { task: rowToAgentTask(linkedPrRow), reason: "linked_open_pr" };
-  }
-
-  return null;
-}
-
-export async function getLatestTaskByContextKey(contextKey: string): Promise<AgentTask | null> {
-  if (!contextKey) return null;
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE contextKey = ?
-       ORDER BY createdAt DESC
-       LIMIT 1`,
-    [contextKey],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function getLatestScriptRunStepTaskByContextKey(
-  contextKey: string,
-): Promise<AgentTask | null> {
-  if (!contextKey) return null;
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE contextKey = ?
-       AND taskType = 'script-run-step'
-       ORDER BY createdAt DESC, rowid DESC
-       LIMIT 1`,
-    [contextKey],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Find the most recent agent associated with a specific Slack thread.
- * No status filter — returns the last agent that touched this thread regardless of task state.
- * This is intentional: follow-up messages should route to the same agent even after task completion.
- * Callers (e.g. assistant.ts) apply their own status checks (e.g. agent.status !== "offline").
- */
-export async function getAgentWorkingOnThread(
-  channelId: string,
-  threadTs: string,
-): Promise<Agent | null> {
-  const taskRow = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE source = 'slack'
-       AND slackChannelId = ?
-       AND slackThreadTs = ?
-       ORDER BY createdAt DESC
-       LIMIT 1`,
-    [channelId, threadTs],
-  );
-
-  if (taskRow?.agentId) return getAgentById(taskRow.agentId);
-
-  return null;
-}
-
-/**
- * Find the latest active (in_progress or pending) task in a specific Slack thread.
- * Used for dependency chaining in additive Slack buffer.
- */
-export async function getLatestActiveTaskInThread(
-  channelId: string,
-  threadTs: string,
-): Promise<AgentTask | null> {
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE source = 'slack'
-       AND slackChannelId = ?
-       AND slackThreadTs = ?
-       AND status IN ('in_progress', 'pending')
-       ORDER BY createdAt DESC, rowid DESC
-       LIMIT 1`,
-    [channelId, threadTs],
-  );
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Find the latest task assigned to a lead agent in a specific Slack thread.
- * Source is deliberately restricted to Slack ingress so inherited worker-task
- * metadata cannot become the thread's steering target.
- */
-export async function getLatestLeadTaskInThread(
-  channelId: string,
-  threadTs: string,
-): Promise<AgentTask | null> {
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT t.*
-       FROM agent_tasks t
-       JOIN agents a ON a.id = t.agentId
-       WHERE t.source = 'slack'
-         AND t.slackChannelId = ?
-         AND t.slackThreadTs = ?
-         AND a.isLead = 1
-       ORDER BY t.createdAt DESC, t.rowid DESC
-       LIMIT 1`,
-    [channelId, threadTs],
-  );
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Find the most recent task in a Slack thread, regardless of source or status.
- * Unlike getAgentWorkingOnThread (which filters source='slack'), this finds ALL tasks
- * including worker tasks that inherited Slack metadata via parentTaskId.
- */
-export async function getMostRecentTaskInThread(
-  channelId: string,
-  threadTs: string,
-): Promise<AgentTask | null> {
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE slackChannelId = ?
-       AND slackThreadTs = ?
-       ORDER BY createdAt DESC
-       LIMIT 1`,
-    [channelId, threadTs],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function findCompletedTaskInThread(
-  channelId: string,
-  threadTs: string,
-  windowMinutes: number,
-): Promise<AgentTask | null> {
-  const since = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE slackChannelId = ?
-       AND slackThreadTs = ?
-       AND status = 'completed'
-       AND lastUpdatedAt > ?
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 1`,
-    [channelId, threadTs, since],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Find the most recent CANCELLED task in a Slack thread. Used by the
- * follow-up re-delegation guard so a cancellation (worker SIGTERM,
- * runner-side abort, swarm-events tool-loop abort) doesn't permanently
- * jam re-dispatch when an earlier sibling task in the same thread also
- * completed.
- *
- * Matches both:
- *   - `status = 'cancelled'` (the canonical terminal state from cancelTask)
- *   - `status = 'failed'` with a failureReason that starts with "cancelled"
- *     or "exit 130" or contains "cancelled" (the codex-adapter abort path
- *     emits `failureReason: "cancelled"` and exits 130).
- */
-export async function findRecentCancelledTaskInThread(
-  channelId: string,
-  threadTs: string,
-  windowMinutes: number,
-): Promise<AgentTask | null> {
-  const since = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
-  const row = await getDbClient().get<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE slackChannelId = ?
-       AND slackThreadTs = ?
-       AND lastUpdatedAt > ?
-       AND (
-         status = 'cancelled'
-         OR (
-           status = 'failed'
-           AND failureReason IS NOT NULL
-           AND (
-             failureReason LIKE 'cancelled%'
-             OR failureReason LIKE 'exit 130%'
-             OR failureReason LIKE '%cancelled%'
-           )
-         )
-       )
-       ORDER BY lastUpdatedAt DESC
-       LIMIT 1`,
-    [channelId, threadTs, since],
-  );
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function completeTask(id: string, output?: string): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(id);
-  if (!oldTask) return null;
-
-  // Idempotency guard: don't re-complete a task already in a terminal state.
-  // Mirrors cancelTask. Prevents duplicate task.completed events, duplicate
-  // log entries, and duplicate follow-up tasks when multiple sessions race.
-  if (isTerminalTaskStatus(oldTask.status)) {
-    return null;
-  }
-
-  const row = await getDbClient().transaction(async () => {
-    const finishedAt = new Date().toISOString();
-    // The status predicate re-checks the idempotency guard atomically: the
-    // await between the guard read above and this write lets a racing
-    // terminal transition (e.g. heartbeat failTask) land first.
-    let completed = await getDbClient().get<AgentTaskRow>(
-      `UPDATE agent_tasks SET status = ?, finishedAt = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded') RETURNING *`,
-      ["completed", finishedAt, id],
-    );
-    if (!completed) return null;
-
-    if (output) {
-      completed = await getDbClient().get<AgentTaskRow>(
-        "UPDATE agent_tasks SET output = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING *",
-        [scrubSecrets(output), id],
-      );
-    }
-    if (completed) {
-      await reconcileTaskPullRequestAttachments(id, completed.agentId, [
-        completed.output,
-        completed.vcsProvider === "github" ? completed.vcsUrl : null,
-      ]);
-    }
-    return completed;
-  });
-  if (!row) return null;
-
-  if (row && oldTask) {
-    emitTaskLifecycleTelemetryAfterCommit(
-      "completed",
-      {
-        taskId: id,
-        source: oldTask.source,
-        ...taskContextForTelemetry(oldTask),
-        agentId: row.agentId ?? undefined,
-        durationMs: row.createdAt ? Date.now() - new Date(row.createdAt).getTime() : undefined,
-      },
-      (task) => task?.status === "completed",
-    );
-
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId: id,
-        agentId: row.agentId ?? undefined,
-        oldValue: oldTask.status,
-        newValue: "completed",
-      });
-    } catch {}
-    getDbClient().afterCommit(() => {
-      import("../workflows/event-bus")
-        .then(({ workflowEventBus }) => {
-          workflowEventBus.emit("task.completed", {
-            taskId: id,
-            output,
-            agentId: row.agentId,
-            workflowRunId: row.workflowRunId,
-            workflowRunStepId: row.workflowRunStepId,
-          });
-        })
-        .catch((err) =>
-          console.error(
-            "[db] task.completed event not emitted:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
-    });
-    try {
-      await promotePendingSteeringForTask(id, "Task completed before steering was delivered");
-    } catch (error) {
-      console.error(
-        "[completeTask] pending steering promotion error:",
-        scrubSecrets(error instanceof Error ? error.message : String(error)),
-      );
-    }
-  }
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function failTask(id: string, reason: string): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(id);
-  if (!oldTask) return null;
-
-  // Idempotency guard: don't re-fail a task already in a terminal state.
-  // Mirrors cancelTask / completeTask. Prevents duplicate task.failed events
-  // and duplicate follow-up tasks when multiple sessions race.
-  if (isTerminalTaskStatus(oldTask.status)) {
-    return null;
-  }
-
-  const finishedAt = new Date().toISOString();
-  const scrubbedReason = scrubSecrets(reason);
-  // Status predicate re-checks the idempotency guard atomically (a racing
-  // terminal transition can land during the await above).
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET status = 'failed', failureReason = ?, finishedAt = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded') RETURNING *`,
-    [scrubbedReason, finishedAt, id],
-  );
-  if (row && oldTask) {
-    emitTaskLifecycleTelemetryAfterCommit(
-      "failed",
-      {
-        taskId: id,
-        source: oldTask.source,
-        ...taskContextForTelemetry(oldTask),
-        agentId: row.agentId ?? undefined,
-        durationMs: row.createdAt ? Date.now() - new Date(row.createdAt).getTime() : undefined,
-      },
-      (task) => task?.status === "failed",
-    );
-
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId: id,
-        agentId: row.agentId ?? undefined,
-        oldValue: oldTask.status,
-        newValue: "failed",
-        metadata: { reason: scrubbedReason },
-      });
-    } catch {}
-    getDbClient().afterCommit(() => {
-      import("../workflows/event-bus")
-        .then(({ workflowEventBus }) => {
-          workflowEventBus.emit("task.failed", {
-            taskId: id,
-            failureReason: reason,
-            agentId: row.agentId,
-            workflowRunId: row.workflowRunId,
-            workflowRunStepId: row.workflowRunStepId,
-          });
-        })
-        .catch((err) =>
-          console.error(
-            "[db] task.failed event not emitted:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
-    });
-    try {
-      await promotePendingSteeringForTask(id, "Task failed before steering was delivered");
-    } catch (error) {
-      console.error(
-        "[failTask] pending steering promotion error:",
-        scrubSecrets(error instanceof Error ? error.message : String(error)),
-      );
-    }
-
-    // Cascade-fail any non-terminal tasks that depend on this one.
-    // The cascade is recursive (transitive closure) and cycle-safe.
-    try {
-      await cascadeFailDependents(id, "failed");
-    } catch (err) {
-      console.error("[failTask] cascade-fail dependents error:", err);
-    }
-  }
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Replace result text on an already-terminal task without replaying terminal
- * side effects or moving any lifecycle timestamps. Callers must opt in to
- * this narrow escape hatch; ordinary completion remains first-call-wins.
- */
-export async function overwriteTerminalTaskResultText(
-  id: string,
-  patch: { output?: string; failureReason?: string },
-): Promise<AgentTask | null> {
-  const task = await getTaskById(id);
-  if (!task || !isTerminalTaskStatus(task.status)) return null;
-
-  const output = patch.output !== undefined ? scrubSecrets(patch.output) : (task.output ?? null);
-  const failureReason =
-    patch.failureReason !== undefined
-      ? scrubSecrets(patch.failureReason)
-      : (task.failureReason ?? null);
-  const row = await getDbClient().transaction(async () => {
-    const updated =
-      (await getDbClient().get<AgentTaskRow>(
-        `UPDATE agent_tasks SET output = ?, failureReason = ?
-         WHERE id = ? AND status IN ('completed', 'failed', 'cancelled', 'superseded')
-         RETURNING *`,
-        [output, failureReason, id],
-      )) ?? null;
-    if (updated && patch.output !== undefined) {
-      await reconcileTaskPullRequestAttachments(id, updated.agentId, [
-        updated.output,
-        updated.vcsProvider === "github" ? updated.vcsUrl : null,
-      ]);
-    }
-    return updated;
-  });
-
-  return row ? rowToAgentTask(row) : task;
-}
-
-export async function cancelTask(id: string, reason?: string): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(id);
-  if (!oldTask) return null;
-
-  // Only cancel tasks that are not already in a terminal state
-  if (isTerminalTaskStatus(oldTask.status)) {
-    return null;
-  }
-
-  const finishedAt = new Date().toISOString();
-  const cancelReason = reason ?? "Cancelled by user";
-  // Status predicate re-checks the idempotency guard atomically (a racing
-  // terminal transition can land during the await above).
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET status = 'cancelled', failureReason = ?, finishedAt = ?, lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded') RETURNING *`,
-    [cancelReason, finishedAt, id],
-  );
-
-  if (row && oldTask) {
-    emitTaskLifecycleTelemetryAfterCommit(
-      "cancelled",
-      {
-        taskId: id,
-        source: oldTask.source,
-        agentId: oldTask.agentId ?? undefined,
-        previousStatus: oldTask.status,
-        durationMs: oldTask.createdAt
-          ? Date.now() - new Date(oldTask.createdAt).getTime()
-          : undefined,
-      },
-      (task) => task?.status === "cancelled",
-    );
-
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId: id,
-        agentId: row.agentId ?? undefined,
-        oldValue: oldTask.status,
-        newValue: "cancelled",
-        metadata: reason ? { reason } : undefined,
-      });
-    } catch {}
-    getDbClient().afterCommit(() => {
-      import("../workflows/event-bus")
-        .then(({ workflowEventBus }) => {
-          workflowEventBus.emit("task.cancelled", {
-            taskId: id,
-            agentId: row.agentId,
-            workflowRunId: row.workflowRunId,
-            workflowRunStepId: row.workflowRunStepId,
-          });
-        })
-        .catch((err) =>
-          console.error(
-            "[db] task.cancelled event not emitted:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
-    });
-    try {
-      await promotePendingSteeringForTask(id, "Task was cancelled before steering was delivered");
-    } catch (error) {
-      console.error(
-        "[cancelTask] pending steering promotion error:",
-        scrubSecrets(error instanceof Error ? error.message : String(error)),
-      );
-    }
-
-    try {
-      await cascadeFailDependents(id, "cancelled");
-    } catch (err) {
-      console.error("[cancelTask] cascade-fail dependents error:", err);
-    }
-  }
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Supersede a task: mark it as `superseded` (terminal) so a fresh "resume"
- * follow-up task can pick up where it left off. Used by the graceful-shutdown
- * path and the `POST /api/tasks/:id/supersede` route. Returns null if the task
- * is already terminal (mirrors `completeTask` / `cancelTask` idempotency).
- *
- * Writes a `task_superseded` agent_log with `{ reason, resumeTaskId }` payload
- * and emits a `task.superseded` workflow event. The caller is responsible for
- * creating the resume follow-up (via `createResumeFollowUp`) and passing the
- * resulting id as `resumeTaskId`.
- */
-export async function supersedeTask(
-  id: string,
-  args: { reason: string; resumeTaskId: string | null },
-): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(id);
-  if (!oldTask) return null;
-
-  // Idempotency guard: don't re-supersede a task already in a terminal state.
-  if (isTerminalTaskStatus(oldTask.status)) {
-    return null;
-  }
-
-  const finishedAt = new Date().toISOString();
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks
-       SET status = 'superseded',
-           finishedAt = ?,
-           lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
-       RETURNING *`,
-    [finishedAt, id],
-  );
-
-  if (row && oldTask) {
-    emitTaskLifecycleTelemetryAfterCommit(
-      "superseded",
-      {
-        taskId: id,
-        source: oldTask.source,
-        ...taskContextForTelemetry(oldTask),
-        agentId: row.agentId ?? undefined,
-        reason: args.reason,
-        durationMs: oldTask.createdAt
-          ? Date.now() - new Date(oldTask.createdAt).getTime()
-          : undefined,
-      },
-      (task) => task?.status === "superseded",
-    );
-
-    try {
-      await createLogEntry({
-        eventType: "task_superseded",
-        taskId: id,
-        agentId: row.agentId ?? undefined,
-        oldValue: oldTask.status,
-        newValue: "superseded",
-        metadata: { reason: args.reason, resumeTaskId: args.resumeTaskId },
-      });
-    } catch {}
-    getDbClient().afterCommit(() => {
-      import("../workflows/event-bus")
-        .then(({ workflowEventBus }) => {
-          workflowEventBus.emit("task.superseded", {
-            taskId: id,
-            reason: args.reason,
-            resumeTaskId: args.resumeTaskId,
-            agentId: row.agentId,
-            workflowRunId: row.workflowRunId,
-            workflowRunStepId: row.workflowRunStepId,
-          });
-        })
-        .catch((err) =>
-          console.error(
-            "[db] task.superseded event not emitted:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
-    });
-
-    try {
-      await cascadeFailDependents(id, "superseded");
-    } catch (err) {
-      console.error("[supersedeTask] cascade-fail dependents error:", err);
-    }
-  }
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-export async function backfillSupersedeTaskResumeTaskId(
-  taskId: string,
-  resumeTaskId: string,
-): Promise<boolean> {
-  const row = await getDbClient().get<{ id: string; metadata: string | null }>(
-    `SELECT id, metadata
-       FROM agent_log
-       WHERE taskId = ? AND eventType = 'task_superseded'
-       ORDER BY createdAt DESC
-       LIMIT 1`,
-    [taskId],
-  );
-  if (!row) return false;
-
-  let metadata: Record<string, unknown> = {};
-  if (row.metadata) {
-    try {
-      metadata = JSON.parse(row.metadata) as Record<string, unknown>;
-    } catch {
-      metadata = {};
-    }
-  }
-  metadata.resumeTaskId = resumeTaskId;
-
-  const result = await getDbClient().run("UPDATE agent_log SET metadata = ? WHERE id = ?", [
-    JSON.stringify(metadata),
-    row.id,
-  ]);
-  return result.changes > 0;
-}
-
-/**
- * Pause a task that is currently in progress.
- * Used during graceful shutdown to allow tasks to resume after container restart.
- * Unlike failTask, paused tasks retain their agent assignment and can be resumed.
- */
-export async function pauseTask(id: string): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(id);
-  if (!oldTask) return null;
-
-  // Only pause tasks that are in progress
-  if (oldTask.status !== "in_progress") {
-    return null;
-  }
-
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks
-       SET status = 'paused',
-           was_paused = 1,
-           lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status = 'in_progress'
-       RETURNING *`,
-    [id],
-  );
-
-  if (row && oldTask) {
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId: id,
-        agentId: row.agentId ?? undefined,
-        oldValue: oldTask.status,
-        newValue: "paused",
-        metadata: { pausedForShutdown: true },
-      });
-    } catch {}
-  }
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Resume a paused task - transitions it back to in_progress.
- * Called when worker restarts and picks up paused work.
- */
-export async function resumeTask(taskId: string): Promise<AgentTask | null> {
-  const oldTask = await getTaskById(taskId);
-  if (!oldTask || oldTask.status !== "paused") return null;
-
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks
-       SET status = 'in_progress',
-           was_paused = 1,
-           lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? AND status = 'paused'
-       RETURNING *`,
-    [taskId],
-  );
-
-  if (row && oldTask) {
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId,
-        agentId: row.agentId ?? undefined,
-        oldValue: "paused",
-        newValue: "in_progress",
-        metadata: { resumed: true },
-      });
-    } catch {}
-  }
-
-  return row ? rowToAgentTask(row) : null;
-}
-
-/**
- * Get paused tasks for a specific agent.
- * Used on startup to resume tasks that were interrupted by deployment.
- * Returns tasks ordered by creation time (oldest first for FIFO).
- */
-export async function getPausedTasksForAgent(agentId: string): Promise<AgentTask[]> {
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE agentId = ? AND status = 'paused'
-       ORDER BY createdAt ASC, rowid ASC`,
-    [agentId],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-export async function getOrphanedInProgressTasksForAgent(
-  agentId: string,
-  minAgeSeconds = 60,
-): Promise<AgentTask[]> {
-  const cutoff = new Date(Date.now() - minAgeSeconds * 1000).toISOString();
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT t.* FROM agent_tasks t
-       LEFT JOIN active_sessions s ON s.taskId = t.id
-       WHERE t.agentId = ?
-         AND t.status = 'in_progress'
-         AND t.claudeSessionId IS NULL
-         AND t.lastUpdatedAt < ?
-         AND s.id IS NULL
-         AND t.finishedAt IS NULL
-       ORDER BY t.createdAt ASC, t.rowid ASC`,
-    [agentId, cutoff],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-export async function resetOrphanedInProgressTasksForAgent(
-  agentId: string,
-  minAgeSeconds = 60,
-): Promise<AgentTask[]> {
-  const cutoff = new Date(Date.now() - minAgeSeconds * 1000).toISOString();
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `UPDATE agent_tasks
-       SET status = 'pending',
-           lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id IN (
-         SELECT t.id FROM agent_tasks t
-         LEFT JOIN active_sessions s ON s.taskId = t.id
-         WHERE t.agentId = ?
-           AND t.status = 'in_progress'
-           AND t.claudeSessionId IS NULL
-           AND t.lastUpdatedAt < ?
-           AND s.id IS NULL
-           AND t.finishedAt IS NULL
-       )
-       RETURNING *`,
-    [agentId, cutoff],
-  );
-
-  for (const row of rows) {
-    try {
-      await createLogEntry({
-        eventType: "task_status_change",
-        taskId: row.id,
-        agentId,
-        oldValue: "in_progress",
-        newValue: "pending",
-        metadata: { orphanedInProgressRecovery: true },
-      });
-    } catch {}
-  }
-
-  return rows.map(rowToAgentTask);
-}
-
-/**
- * Get recently cancelled tasks for an agent.
- * Used by hooks to detect task cancellation and stop the worker loop.
- * Returns tasks cancelled within the last 5 minutes.
- */
-export async function getRecentlyCancelledTasksForAgent(agentId: string): Promise<AgentTask[]> {
-  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  const rows = await getDbClient().query<AgentTaskRow>(
-    `SELECT * FROM agent_tasks
-       WHERE agentId = ?
-       AND status = 'cancelled'
-       AND finishedAt > ?
-       ORDER BY finishedAt DESC`,
-    [agentId, fiveMinutesAgo],
-  );
-  return rows.map(rowToAgentTask);
-}
-
-export async function deleteTask(id: string): Promise<boolean> {
-  const result = await getDbClient().run("DELETE FROM agent_tasks WHERE id = ?", [id]);
-  return result.changes > 0;
-}
-
-export async function updateTaskProgress(id: string, progress: string): Promise<AgentTask | null> {
-  const scrubbedProgress = scrubSecrets(progress);
-  const row = await getDbClient().get<AgentTaskRow>(
-    `UPDATE agent_tasks SET progress = ?,
-       status = CASE WHEN status IN ('completed', 'failed', 'cancelled', 'superseded') THEN status ELSE 'in_progress' END,
-       lastUpdatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ? RETURNING *`,
-    [scrubbedProgress, id],
-  );
-  if (row) {
-    try {
-      await createLogEntry({
-        eventType: "task_progress",
-        taskId: id,
-        agentId: row.agentId ?? undefined,
-        newValue: scrubbedProgress,
-      });
-    } catch {}
-    getDbClient().afterCommit(() => {
-      import("../workflows/event-bus")
-        .then(({ workflowEventBus }) => {
-          workflowEventBus.emit("task.progress", {
-            taskId: id,
-            progress: scrubbedProgress,
-            agentId: row.agentId,
-          });
-        })
-        .catch((err) =>
-          console.error(
-            "[db] task.progress event not emitted:",
-            scrubSecrets(err instanceof Error ? err.message : String(err)),
-          ),
-        );
-    });
-  }
   return row ? rowToAgentTask(row) : null;
 }
 
@@ -4359,6 +1877,7 @@ type TaskSteeringMessageRow = {
   status: string;
   delivered_mode: string | null;
   source: string;
+  sender_name?: string | null;
   created_by_kind: string;
   created_by_user_id: string | null;
   created_by_agent_id: string | null;
@@ -4369,7 +1888,20 @@ type TaskSteeringMessageRow = {
   handled_note: string | null;
 };
 
+// Resolve names in the API so workers need no database access or identity lookups.
+const STEERING_MESSAGE_SELECT = `SELECT m.*,
+  CASE m.created_by_kind WHEN 'user' THEN u.name WHEN 'agent' THEN a.name END AS sender_name
+  FROM task_steering_messages m
+  LEFT JOIN users u ON m.created_by_kind = 'user' AND u.id = m.created_by_user_id
+  LEFT JOIN agents a ON m.created_by_kind = 'agent' AND a.id = m.created_by_agent_id`;
+
 function rowToSteeringMessage(row: TaskSteeringMessageRow): SteeringMessage {
+  const senderId =
+    row.created_by_kind === "user" ? row.created_by_user_id : row.created_by_agent_id;
+  const senderLabel =
+    row.created_by_kind === "system"
+      ? "system"
+      : `${row.sender_name?.trim() || senderId || "Unknown"} (${row.created_by_kind})`;
   return {
     id: row.id,
     taskId: row.task_id,
@@ -4378,6 +1910,7 @@ function rowToSteeringMessage(row: TaskSteeringMessageRow): SteeringMessage {
     status: row.status as SteeringStatus,
     deliveredMode: (row.delivered_mode as SteerMode | null) ?? undefined,
     source: row.source as SteeringSource,
+    senderLabel,
     createdByKind: row.created_by_kind as SteeringMessage["createdByKind"],
     createdByUserId: row.created_by_user_id ?? undefined,
     createdByAgentId: row.created_by_agent_id ?? undefined,
@@ -4436,7 +1969,7 @@ export async function createSteeringMessage(
     });
   } catch {}
 
-  return rowToSteeringMessage(row);
+  return (await getSteeringMessageById(id))!;
 }
 
 export async function getSteeringMessagesForTask(
@@ -4445,15 +1978,15 @@ export async function getSteeringMessagesForTask(
 ): Promise<SteeringMessage[]> {
   const rows = opts?.status
     ? await getDbClient().query<TaskSteeringMessageRow>(
-        `SELECT * FROM task_steering_messages
-           WHERE task_id = ? AND status = ?
-           ORDER BY created_at ASC, rowid ASC`,
+        `${STEERING_MESSAGE_SELECT}
+           WHERE m.task_id = ? AND m.status = ?
+           ORDER BY m.created_at ASC, m.rowid ASC`,
         [taskId, opts.status],
       )
     : await getDbClient().query<TaskSteeringMessageRow>(
-        `SELECT * FROM task_steering_messages
-           WHERE task_id = ?
-           ORDER BY created_at ASC, rowid ASC`,
+        `${STEERING_MESSAGE_SELECT}
+           WHERE m.task_id = ?
+           ORDER BY m.created_at ASC, m.rowid ASC`,
         [taskId],
       );
   return rows.map(rowToSteeringMessage);
@@ -4461,8 +1994,8 @@ export async function getSteeringMessagesForTask(
 
 export async function getSteeringMessageById(id: string): Promise<SteeringMessage | null> {
   const row = await getDbClient().get<TaskSteeringMessageRow>(
-    `SELECT * FROM task_steering_messages
-       WHERE id = ?`,
+    `${STEERING_MESSAGE_SELECT}
+       WHERE m.id = ?`,
     [id],
   );
   return row ? rowToSteeringMessage(row) : null;
@@ -4474,8 +2007,7 @@ export async function getPendingSteeringForTask(taskId: string): Promise<Steerin
 
 export async function getPendingSteeringForAgent(agentId: string): Promise<SteeringMessage[]> {
   const rows = await getDbClient().query<TaskSteeringMessageRow>(
-    `SELECT m.*
-       FROM task_steering_messages m
+    `${STEERING_MESSAGE_SELECT}
        JOIN agent_tasks t ON t.id = m.task_id
        WHERE t.agentId = ? AND m.status = 'pending'
        ORDER BY m.created_at ASC, m.rowid ASC`,
@@ -4513,7 +2045,7 @@ export async function markSteeringDelivered(
     } catch {}
   }
 
-  return row ? rowToSteeringMessage(row) : null;
+  return row ? await getSteeringMessageById(id) : null;
 }
 
 export async function markSteeringHandled(
@@ -4529,7 +2061,7 @@ export async function markSteeringHandled(
        RETURNING *`,
     [note ?? null, id],
   );
-  return row ? rowToSteeringMessage(row) : null;
+  return row ? await getSteeringMessageById(id) : null;
 }
 
 export async function markSteeringPromoted(
@@ -4544,7 +2076,7 @@ export async function markSteeringPromoted(
        RETURNING *`,
     [promotedTaskId, id],
   );
-  return row ? rowToSteeringMessage(row) : null;
+  return row ? await getSteeringMessageById(id) : null;
 }
 
 export async function cancelPendingSteeringForTask(taskId: string): Promise<number> {
@@ -4671,6 +2203,17 @@ export async function getLogsByTaskId(taskId: string, limit = 200): Promise<Agen
   return rows.map(rowToAgentLog);
 }
 
+export async function getLogsByTaskIdAndEventType(
+  taskId: string,
+  eventType: AgentLogEventType,
+): Promise<AgentLog[]> {
+  const rows = await getDbClient().query<AgentLogRow>(
+    "SELECT * FROM agent_log WHERE taskId = ? AND eventType = ? ORDER BY createdAt ASC",
+    [taskId, eventType],
+  );
+  return rows.map(rowToAgentLog);
+}
+
 export async function getLogsByTaskIdChronological(taskId: string): Promise<AgentLog[]> {
   const rows = await getDbClient().query<AgentLogRow>(
     "SELECT * FROM agent_log WHERE taskId = ? ORDER BY createdAt ASC",
@@ -4749,6 +2292,103 @@ export async function findRecentSimilarTasks(opts: {
   return rows.map(rowToAgentTask);
 }
 
+type RoutingDecisionWorkerStatus = {
+  agentId: string;
+  status: AgentStatus;
+  activeTaskCount: number;
+  openTaskCount: number;
+};
+
+type RoutingDecisionCandidate = {
+  taskId: string;
+  agentId: string;
+};
+
+type RoutingDecisionSnapshot = {
+  capturedAt: string;
+  workerStatuses: RoutingDecisionWorkerStatus[];
+  continuityCandidates: {
+    samePr: RoutingDecisionCandidate | null;
+    sameThread: RoutingDecisionCandidate | null;
+    sameRepo: RoutingDecisionCandidate | null;
+  };
+};
+
+const ROUTING_HOLDER_SQL = `CASE
+  WHEN status IN ('draft', 'offered', 'reviewing') AND offeredTo IS NOT NULL THEN offeredTo
+  ELSE COALESCE(agentId, offeredTo)
+END`;
+
+async function findLatestRoutingCandidate(
+  where: string,
+  params: Array<string | number>,
+): Promise<RoutingDecisionCandidate | null> {
+  const row = await getDbClient().get<RoutingDecisionCandidate>(
+    `SELECT id AS taskId, ${ROUTING_HOLDER_SQL} AS agentId
+       FROM agent_tasks
+       WHERE ${where}
+         AND ${ROUTING_HOLDER_SQL} IN (SELECT id FROM agents WHERE isLead = 0)
+       ORDER BY createdAt DESC, rowid DESC
+       LIMIT 1`,
+    params,
+  );
+  return row ?? null;
+}
+
+async function captureRoutingDecisionSnapshot(
+  options: CreateTaskOptions,
+): Promise<RoutingDecisionSnapshot> {
+  const workerStatuses = await getDbClient().query<RoutingDecisionWorkerStatus>(
+    `SELECT agent.id AS agentId, agent.status,
+         COUNT(task.id) AS openTaskCount,
+         SUM(CASE WHEN task.status IN ('in_progress', 'reviewing') THEN 1 ELSE 0 END) AS activeTaskCount
+       FROM agents agent
+       LEFT JOIN agent_tasks task ON
+         (task.agentId = agent.id OR task.offeredTo = agent.id)
+         AND task.status NOT IN ('completed', 'failed', 'cancelled', 'superseded')
+       WHERE agent.isLead = 0
+       GROUP BY agent.id, agent.status
+       ORDER BY agent.id`,
+  );
+
+  const samePr =
+    options.vcsRepo && options.vcsNumber != null
+      ? await findLatestRoutingCandidate("vcsRepo = ? AND vcsNumber = ?", [
+          options.vcsRepo,
+          options.vcsNumber,
+        ])
+      : null;
+
+  let sameThread: RoutingDecisionCandidate | null = null;
+  if (options.slackChannelId && options.slackThreadTs) {
+    sameThread = await findLatestRoutingCandidate("slackChannelId = ? AND slackThreadTs = ?", [
+      options.slackChannelId,
+      options.slackThreadTs,
+    ]);
+  } else if (options.agentmailThreadId) {
+    sameThread = await findLatestRoutingCandidate("agentmailThreadId = ?", [
+      options.agentmailThreadId,
+    ]);
+  }
+
+  const sameRepo = options.vcsRepo
+    ? await findLatestRoutingCandidate("vcsRepo = ?", [options.vcsRepo])
+    : null;
+
+  return {
+    capturedAt: new Date().toISOString(),
+    workerStatuses,
+    continuityCandidates: { samePr, sameThread, sameRepo },
+  };
+}
+
+function logRoutingDecisionFailure(taskId: string, stage: "capture" | "write", error: unknown) {
+  console.warn(
+    `[routing-decision] Failed to ${stage} snapshot for task ${taskId}:`,
+    scrubSecrets(error instanceof Error ? error.message : String(error)),
+  );
+}
+
 export async function createTaskExtended(
   task: string,
   options?: CreateTaskOptions,
@@ -4761,16 +2401,43 @@ export async function createTaskExtended(
   // coerce: a bad shape throws before anything reaches the INSERT; absent
   // fields keep the `??` defaults at the bind site below.
   options = CreateTaskOptionsSchema.parse(options ?? {});
+  if (
+    options.inheritParentRoutingAffinity === false &&
+    options.routingAffinity?.leadOnly !== true
+  ) {
+    throw new Error(
+      "Disabling parent routing-affinity inheritance requires an explicit Lead-only control-plane affinity.",
+    );
+  }
   let requestedByUserIdInherited = false;
+  // True only when `options.routingAffinity` ends up populated purely via
+  // the plain parent-fallback inherit below (child declared no affinity of
+  // its own, the parent wasn't lead-only, AND the parent's affinity actually
+  // carries a `sourceAgentId`/`role` identity — the shape only
+  // `buildRoutingAffinityFromAgent` produces). That shape is PROVENANCE — a
+  // record of where the continuation came from — not a requirement any
+  // caller declared. It must never gate the direct-assignment/offer
+  // enforcement further down; only an explicit caller-declared requirement
+  // (`send-task`/`task-action`'s `{ leadOnly, capabilities }`, which never
+  // carries `sourceAgentId`/`role`), or a lead-only ratchet, does. See #1276
+  // (3c857542) for the ratchet this must NOT weaken, and the Superagent P1
+  // finding on #1340 for why `leadOnly` alone isn't a sufficient gate.
+  let routingAffinityIsInheritedProvenance = false;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const status: AgentTaskStatus = options?.offeredTo
-    ? "offered"
-    : options?.agentId
-      ? "pending"
-      : options?.status === "backlog"
-        ? "backlog"
-        : "unassigned";
+  // `status: "draft"` wins over offeredTo/agentId — a draft task keeps its
+  // intended owner/offer for when it's promoted (#1240), but must not be
+  // dispatch-eligible while attachments are still uploading.
+  const status: AgentTaskStatus =
+    options?.status === "draft"
+      ? "draft"
+      : options?.offeredTo
+        ? "offered"
+        : options?.agentId
+          ? "pending"
+          : options?.status === "backlog"
+            ? "backlog"
+            : "unassigned";
 
   // Inherit Slack/AgentMail metadata from parent task (unless explicitly overridden)
   if (options?.parentTaskId) {
@@ -4905,11 +2572,65 @@ export async function createTaskExtended(
       if (parent.contextKey && !options.contextKey) {
         options.contextKey = parent.contextKey;
       }
-      if (parent.followUpConfig && !options.followUpConfig) {
+      // followUpConfig is opt-in: only a continuation of the same work carries
+      // the creator's onCompleted/onFailed forward. Lead follow-ups, new
+      // delegations and thread replies all pass parentTaskId too, and
+      // inheriting there spread one task's instructions down the thread.
+      if (
+        parent.followUpConfig &&
+        !options.followUpConfig &&
+        options.inheritParentFollowUpConfig === true
+      ) {
         options.followUpConfig = parent.followUpConfig;
       }
-      if (parent.routingAffinity && !options.routingAffinity) {
-        options.routingAffinity = parent.routingAffinity;
+      if (parent.routingAffinityInvalid && options.inheritParentRoutingAffinity !== false) {
+        // Never let a corrupt parent affinity create an apparently untagged
+        // continuation. This is a fail-closed quarantine, including recovery.
+        throw new Error(`Cannot continue task ${parent.id}: routing affinity is invalid.`);
+      }
+      if (parent.routingAffinity && options.inheritParentRoutingAffinity !== false) {
+        // Privilege cannot be shed by a continuation. A child can narrow or
+        // replace ordinary routing provenance, but a Lead-only parent always
+        // stamps Lead-only onto the child (including callers that supplied
+        // requiredCapabilities and therefore built a fresh affinity object).
+        if (!options.routingAffinity) {
+          options.routingAffinity = parent.routingAffinity;
+          // A non-lead-only parent's affinity, inherited here only because
+          // the child supplied nothing of its own, is provenance — not a
+          // requirement — ONLY when it actually IS a provenance snapshot.
+          // `buildRoutingAffinityFromAgent` (session-resume) always stamps
+          // `sourceAgentId` and `role` together; neither `send-task` nor
+          // `task-action`'s `requiredCapabilities`/`leadOnly` requirement
+          // ever exposes either field to a caller (see their zod schemas —
+          // both build `{ leadOnly, capabilities }` only). So a caller can
+          // declare a non-lead-only capability requirement (`leadOnly:
+          // false, capabilities: [...]`) with neither `sourceAgentId` nor
+          // `role` set, and that must keep gating direct assignment/offer on
+          // a continuation exactly as it did on the parent — see the
+          // Superagent P1 finding on PR #1340 (inherited-affinity
+          // provenance-vs-requirement confusion). Gate on the presence of
+          // either identity field, not on `leadOnly` alone. A lead-only
+          // parent's affinity is always a requirement (the ratchet), so it's
+          // excluded below regardless.
+          routingAffinityIsInheritedProvenance =
+            !parent.routingAffinity.leadOnly &&
+            (!!parent.routingAffinity.sourceAgentId || !!parent.routingAffinity.role);
+        } else if (parent.routingAffinity.leadOnly) {
+          // Child-supplied affinity may add requirements, but never remove an
+          // authorization-affecting requirement inherited from a Lead-only
+          // parent. This includes public continuations that default their
+          // requiredCapabilities to an empty array.
+          options.routingAffinity = {
+            ...options.routingAffinity,
+            capabilities: [
+              ...new Set([
+                ...(parent.routingAffinity.capabilities ?? []),
+                ...(options.routingAffinity.capabilities ?? []),
+              ]),
+            ],
+            leadOnly: true,
+          };
+        }
       }
     }
   }
@@ -4991,6 +2712,50 @@ export async function createTaskExtended(
     }
   }
 
+  // Direct assignment and offers bypass the pool claim gate, so enforce the
+  // complete structured affinity here. This is after parent inheritance so
+  // continuations cannot shed a Lead-only boundary or its capabilities.
+  // Exception: an affinity that is pure inherited PROVENANCE (see
+  // `routingAffinityIsInheritedProvenance` above) describes where this
+  // continuation came from, not a requirement anyone declared for it — an
+  // explicit direct assignment/offer is the caller overriding routing, and
+  // provenance must not veto that override. A caller-declared requirement
+  // (explicit `leadOnly`/`capabilities`, or a lead-only ratchet) still gates
+  // as before.
+  const targetAgentId = options.agentId ?? options.offeredTo;
+  // Extension identities (`ext:<name>`, role "extension") are API principals,
+  // never executors. This is the shared chokepoint for every creation path
+  // (send-task, POST /api/tasks, schedules, workflow agent-task nodes, script
+  // runs, apps, Slack fan-out, pre.task.create hook rewrites).
+  for (const id of new Set([options.agentId, options.offeredTo])) {
+    if (!id) continue;
+    const target = await getAgentById(id);
+    if (target && isExtensionAgent(target)) {
+      throw new ExtensionAgentAssignmentError(target);
+    }
+  }
+  if (options.routingAffinity && targetAgentId && !routingAffinityIsInheritedProvenance) {
+    const target = await getAgentById(targetAgentId);
+    if (!target || !isAgentEligibleForTask(target, { routingAffinity: options.routingAffinity })) {
+      try {
+        await createLogEntry({
+          eventType: "task_authorization_rejected",
+          agentId: options.creatorAgentId,
+          metadata: {
+            leadOnly: options.routingAffinity.leadOnly === true,
+            targetAgentId,
+            decision: "reject_ineligible_assignment",
+          },
+        });
+      } catch {}
+      throw new Error(
+        options.routingAffinity.leadOnly
+          ? `Lead-only task routing affinity does not authorize assignment or offer to agent "${targetAgentId}".`
+          : `Task routing affinity does not authorize assignment or offer to agent "${targetAgentId}".`,
+      );
+    }
+  }
+
   const auditUserId = getCurrentRequestUserId() ?? null;
   const assetKey = normalizeAssetKey(options?.key ?? defaultAssetKey("task", id));
   // The Linear tracker dedup guard and the INSERT commit as one unit. Two
@@ -5009,17 +2774,34 @@ export async function createTaskExtended(
       : await findExistingLinearTrackerContextWork(options?.contextKey);
     if (existingTrackerWork) return { existing: existingTrackerWork };
 
+    let routingDecisionSnapshot: RoutingDecisionSnapshot | null = null;
+    try {
+      routingDecisionSnapshot = await captureRoutingDecisionSnapshot(options);
+    } catch (error) {
+      logRoutingDecisionFailure(id, "capture", error);
+    }
+
+    const isHumanFree = await classifyTaskHumanFree({
+      taskType: options?.taskType,
+      tags: JSON.stringify(options?.tags ?? []),
+      source: options?.source ?? "mcp",
+      requestedByUserId: options?.requestedByUserId,
+      requestedByUserIdInherited,
+      parentTaskId: options?.parentTaskId,
+      workflowRunId: options?.workflowRunId,
+    });
+
     const inserted = await getDbClient().get<AgentTaskRow>(
       `INSERT INTO agent_tasks (
-        id, "key", agentId, creatorAgentId, task, status, source,
+        id, "key", agentId, creatorAgentId, task, status, source, routing_reason, routing_source, routing_note,
         taskType, tags, priority, dependsOn, offeredTo, offeredAt,
         slackChannelId, slackThreadTs, slackTriggerMessageTs, slackUserId,
         vcsProvider, vcsRepo, vcsEventType, vcsNumber, vcsCommentId, vcsAuthor, vcsUrl,
         vcsInstallationId, vcsNodeId,
         agentmailInboxId, agentmailMessageId, agentmailThreadId,
         mentionMessageId, mentionChannelId, dir, parentTaskId, model, modelTier, effort, scheduleId,
-        workflowRunId, workflowRunStepId, outputSchema, followUpConfig, requestedByUserId, requestedByUserIdInherited, contextKey, routingAffinity, swarmVersion, createdAt, lastUpdatedAt, created_by, updated_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        workflowRunId, workflowRunStepId, outputSchema, followUpConfig, requestedByUserId, requestedByUserIdInherited, contextKey, routingAffinity, swarmVersion, createdAt, lastUpdatedAt, created_by, updated_by, isHumanFree
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       [
         id,
         assetKey,
@@ -5028,6 +2810,9 @@ export async function createTaskExtended(
         task,
         status,
         options?.source ?? "mcp",
+        options?.routingReason ?? null,
+        options?.routingSource ?? null,
+        options?.routingNote ?? null,
         options?.taskType ?? null,
         JSON.stringify(options?.tags ?? []),
         options?.priority ?? 50,
@@ -5071,9 +2856,32 @@ export async function createTaskExtended(
         now,
         auditUserId,
         auditUserId,
+        isHumanFree ? 1 : 0,
       ],
     );
     if (!inserted) throw new Error("Failed to create task");
+
+    if (routingDecisionSnapshot) {
+      try {
+        await getDbClient().run(
+          `INSERT INTO routing_decisions (
+             task_id, selected_agent_id, captured_at, worker_statuses,
+             continuity_candidates, created_by, updated_by
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            id,
+            options.offeredTo ?? options.agentId ?? null,
+            routingDecisionSnapshot.capturedAt,
+            JSON.stringify(routingDecisionSnapshot.workerStatuses),
+            JSON.stringify(routingDecisionSnapshot.continuityCandidates),
+            auditUserId,
+            auditUserId,
+          ],
+        );
+      } catch (error) {
+        logRoutingDecisionFailure(id, "write", error);
+      }
+    }
     return { row: inserted };
   });
 
@@ -5091,7 +2899,13 @@ export async function createTaskExtended(
       agentId: options?.creatorAgentId,
       taskId: id,
       newValue: status,
-      metadata: { source: options?.source ?? "mcp" },
+      metadata: {
+        source: options?.source ?? "mcp",
+        leadOnly: options?.routingAffinity?.leadOnly === true,
+        authorization: options?.routingAffinity?.leadOnly
+          ? { decision: "authorized", targetAgentId: options.agentId ?? options.offeredTo ?? null }
+          : undefined,
+      },
     });
   } catch {}
 
@@ -5102,9 +2916,12 @@ export async function createTaskExtended(
       source: row.source,
       ...taskContextForTelemetry(rowToAgentTask(row)),
       hasParent: !!row.parentTaskId,
+      has_repo: !!row.vcsRepo,
       priority: row.priority,
     },
     (task) => task !== null,
+    // The human who asked (a pseudonymous user_ref), null for system tasks.
+    row.requestedByUserId,
   );
 
   getDbClient().afterCommit(() => {
@@ -5132,21 +2949,22 @@ export async function createTaskExtended(
 }
 
 export async function claimTask(taskId: string, agentId: string): Promise<AgentTask | null> {
-  // Eligibility pre-check (routing affinity): static per (agent, task), so
-  // pre-filtering here does NOT reopen the claim race — the atomic UPDATE
-  // below still arbitrates concurrent claims by eligible agents.
-  if (isPoolAffinityEnforcementEnabled()) {
+  // Static per (agent, task), so this pre-check does not reopen the atomic
+  // claim race. It always applies to lead-only authorization.
+  {
     const task = await getTaskById(taskId);
     const agent = await getAgentById(agentId);
-    if (task && agent && !isAgentEligibleForTask(agent, task)) {
+    if (task && (!agent || !isAgentEligibleForTask(agent, task))) {
       try {
         await createLogEntry({
           eventType: "task_claim_rejected_affinity",
           agentId,
           taskId,
           metadata: {
-            agentRole: agent.role ?? null,
+            agentRole: agent?.role ?? null,
             requiredRole: task.routingAffinity?.role ?? null,
+            leadOnly: task.routingAffinity?.leadOnly === true,
+            agentIsLead: agent?.isLead ?? false,
           },
         });
       } catch {}
@@ -5216,6 +3034,28 @@ export async function releaseTask(taskId: string): Promise<AgentTask | null> {
 export async function acceptTask(taskId: string, agentId: string): Promise<AgentTask | null> {
   const task = await getTaskById(taskId);
   if (!task) return null;
+  const agent = await getAgentById(agentId);
+  // Extension identities never take work, including offers left over from
+  // before creation-time rejection existed.
+  if (isExtensionAgent(agent)) return null;
+  if (
+    (task.routingAffinity?.leadOnly || task.routingAffinityInvalid) &&
+    (!agent || !isAgentEligibleForTask(agent, task))
+  ) {
+    try {
+      await createLogEntry({
+        eventType: "task_claim_rejected_affinity",
+        agentId,
+        taskId,
+        metadata: {
+          leadOnly: true,
+          agentIsLead: agent?.isLead ?? false,
+          decision: "reject_offer_accept",
+        },
+      });
+    } catch {}
+    return null;
+  }
   // Accept both 'offered' and 'reviewing' statuses
   if (!(task.status === "offered" || task.status === "reviewing") || task.offeredTo !== agentId)
     return null;
@@ -5338,6 +3178,87 @@ export async function moveTaskFromBacklog(taskId: string): Promise<AgentTask | n
 }
 
 /**
+ * Promote a task out of `draft` status into whichever status it should have
+ * had at creation time — `offered` if it was offered to an agent, `pending`
+ * if it has an owning agent (the common UI-composer case, which defaults to
+ * Lead), otherwise `unassigned`. `draft` exists solely to keep a task
+ * dispatch-ineligible while its UI-uploaded attachments are still in flight
+ * (#1240); this is the promote half of that window. Called once the upload
+ * batch settles — success, partial failure, or total failure all promote, a
+ * draft is never left stranded by upload errors — or by
+ * `promoteAbandonedDraftTasks` for drafts nobody ever promoted.
+ */
+export async function promoteDraftTask(taskId: string): Promise<AgentTask | null> {
+  const now = new Date().toISOString();
+  const row = await getDbClient().get<AgentTaskRow>(
+    `UPDATE agent_tasks
+       SET status = CASE
+           WHEN offeredTo IS NOT NULL THEN 'offered'
+           WHEN agentId IS NOT NULL THEN 'pending'
+           ELSE 'unassigned'
+         END,
+         lastUpdatedAt = ?
+       WHERE id = ? AND status = 'draft'
+       RETURNING *`,
+    [now, taskId],
+  );
+
+  if (row) {
+    try {
+      await createLogEntry({
+        eventType: "task_status_change",
+        taskId,
+        agentId: row.agentId ?? undefined,
+        oldValue: "draft",
+        newValue: row.status,
+      });
+    } catch {}
+  }
+
+  return row ? rowToAgentTask(row) : null;
+}
+
+/**
+ * Mark a draft as still being worked on, so `promoteAbandonedDraftTasks`
+ * (which goes by `lastUpdatedAt`) doesn't promote it while an upload batch
+ * that outlasts the sweep window is still running. No-op once promoted.
+ */
+export async function refreshDraftTaskLease(taskId: string): Promise<void> {
+  await getDbClient().run(
+    "UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ? AND status = 'draft'",
+    [new Date().toISOString(), taskId],
+  );
+}
+
+/**
+ * Heartbeat sweep: promote drafts abandoned mid-upload (tab closed, network
+ * dropped) instead of leaving them permanently dispatch-ineligible — the
+ * composer's UI-driven promote (`promoteDraftTask`) never fires if the user
+ * never comes back. Same target-status logic, applied in bulk by elapsed
+ * time. Default 5 minutes is well above the tens-of-seconds worst-case
+ * upload-batch duration seen against slow storage (#1226) while still
+ * surfacing an abandoned session to its owner promptly.
+ */
+export async function promoteAbandonedDraftTasks(timeoutMinutes: number = 5): Promise<number> {
+  const cutoffTime = new Date(Date.now() - timeoutMinutes * 60 * 1000).toISOString();
+  const now = new Date().toISOString();
+
+  const result = await getDbClient().run(
+    `UPDATE agent_tasks
+       SET status = CASE
+           WHEN offeredTo IS NOT NULL THEN 'offered'
+           WHEN agentId IS NOT NULL THEN 'pending'
+           ELSE 'unassigned'
+         END,
+         lastUpdatedAt = ?
+       WHERE status = 'draft' AND lastUpdatedAt < ?`,
+    [now, cutoffTime],
+  );
+
+  return result.changes;
+}
+
+/**
  * Release tasks that have been in 'reviewing' status for too long.
  * Returns them to 'offered' status for retry.
  */
@@ -5406,6 +3327,26 @@ export async function claimOfferedTask(taskId: string, agentId: string): Promise
   const task = await getTaskById(taskId);
   if (!task) return null;
   if (task.status !== "offered" || task.offeredTo !== agentId) return null;
+  const agent = await getAgentById(agentId);
+  if (isExtensionAgent(agent)) return null;
+  if (
+    (task.routingAffinity?.leadOnly || task.routingAffinityInvalid) &&
+    (!agent || !isAgentEligibleForTask(agent, task))
+  ) {
+    try {
+      await createLogEntry({
+        eventType: "task_claim_rejected_affinity",
+        agentId,
+        taskId,
+        metadata: {
+          leadOnly: true,
+          agentIsLead: agent?.isLead ?? false,
+          decision: "reject_offer_claim",
+        },
+      });
+    } catch {}
+    return null;
+  }
 
   const now = new Date().toISOString();
   const row = await getDbClient().get<AgentTaskRow>(
@@ -5468,9 +3409,15 @@ const ELIGIBILITY_SCAN_CAP = Number(process.env.ELIGIBILITY_SCAN_CAP) || 500;
  * JSON-parsing `routingAffinity` in SQL) until `limit` eligible tasks are
  * found or the pool is exhausted, capped at `ELIGIBILITY_SCAN_CAP` rows
  * scanned so a pool full of ineligible tasks can't turn every poll into an
- * unbounded scan.
+ * unbounded scan. `accept` adds a caller-side filter (e.g. harness model
+ * compatibility) that runs inside the scan, so rejected rows do not use up
+ * the `limit`.
  */
-export async function getUnassignedTaskIdsForAgent(agentId: string, limit = 10): Promise<string[]> {
+export async function getUnassignedTaskIdsForAgent(
+  agentId: string,
+  limit = 10,
+  accept?: (task: AgentTask) => boolean | Promise<boolean>,
+): Promise<string[]> {
   const agent = await getAgentById(agentId);
   if (!agent) return [];
 
@@ -5487,7 +3434,7 @@ export async function getUnassignedTaskIdsForAgent(agentId: string, limit = 10):
 
     for (const row of rows) {
       const task = rowToAgentTask(row);
-      if (isAgentEligibleForTask(agent, task)) {
+      if (isAgentEligibleForTask(agent, task) && (!accept || (await accept(task)))) {
         eligible.push(task.id);
         if (eligible.length >= limit) break;
       }
@@ -5621,14 +3568,90 @@ export async function updateAgentProfile(
     avatar?: AgentAvatar | null;
   },
   meta?: VersionMeta,
+  guard?: {
+    /** Per-field compare-and-set token; see {@link ProfileExpectedHashes}. */
+    expectedHashes?: ProfileExpectedHashes;
+    /** Called once per field dropped because its expected hash was stale. */
+    onConflict?: (conflict: ProfileSyncConflict) => void;
+    /** Only the extension identity lifecycle may grant the reserved extension role. */
+    allowExtensionRole?: boolean;
+  },
 ): Promise<Agent | null> {
   return await getDbClient().transaction(async (tx) => {
     // Get current agent state for version comparison
     const current = await tx.get<AgentRow>("SELECT * FROM agents WHERE id = ?", [id]);
     if (!current) return null;
 
+    const roleViolation = reservedRoleViolation(current.role, updates.role, {
+      allowExtensionRole: guard?.allowExtensionRole,
+    });
+    if (roleViolation) throw new ReservedAgentRoleError(roleViolation);
+
+    // Compare with the old metadata before replacing it. Persist refreshed defaults
+    // atomically so both running workers and restarted workers see matching blobs.
+    const previous = rowToAgent(current);
+    const next = {
+      name: updates.name ?? previous.name,
+      description: updates.description ?? previous.description,
+      role: updates.role ?? previous.role,
+      capabilities: updates.capabilities ?? previous.capabilities,
+    };
+    const metadataChanged =
+      next.name !== previous.name ||
+      next.description !== previous.description ||
+      next.role !== previous.role ||
+      JSON.stringify(next.capabilities) !== JSON.stringify(previous.capabilities);
+    if (metadataChanged) {
+      updates = { ...updates };
+      if (
+        updates.identityMd === undefined &&
+        previous.identityMd &&
+        matchesDefaultIdentityMd(previous.identityMd, previous)
+      ) {
+        updates.identityMd = generateDefaultIdentityMd(next);
+      }
+      if (
+        updates.claudeMd === undefined &&
+        previous.claudeMd &&
+        matchesDefaultClaudeMd(previous.claudeMd, previous)
+      ) {
+        updates.claudeMd = generateDefaultClaudeMd(next);
+      }
+    }
+
+    // Compare-and-set. A writer that edits a copy of a field (a session's
+    // materialized CLAUDE.md) sends the hash that copy was based on. If the DB
+    // moved since — a sibling session's sync, an `update-profile` — the copy is
+    // stale and writing it would revert the newer value, so the field is dropped
+    // (no version, no column write). An edit on top of the current value applies,
+    // including a deliberate revert to an earlier version. Without a token the
+    // write is unconditional, as before.
+    //
+    // Runs BEFORE the budget check: a stale copy of an older, longer value must be
+    // dropped, not rejected — a budget rejection throws and would also roll back
+    // the other fields of the same update.
+    const writable = { ...updates };
+    for (const field of VERSIONABLE_FIELDS) {
+      const expectedHash = guard?.expectedHashes?.[field];
+      if (expectedHash === undefined) continue;
+      if (writable[field] === undefined || writable[field] === null) continue;
+
+      const currentHash = computeContentHash(current[field] ?? "");
+      if (currentHash === expectedHash) continue;
+
+      console.warn(
+        `[profile-sync] agent ${id}: ${field} dropped — based on ${expectedHash.slice(0, 12)}, DB is at ${currentHash.slice(0, 12)}`,
+      );
+      delete writable[field];
+      guard?.onConflict?.({ field, expectedHash, currentHash });
+    }
+
+    if (writable.heartbeatMd !== undefined) {
+      validateHeartbeatExpiry(current.heartbeatMd ?? "", writable.heartbeatMd);
+    }
+
     for (const field of BUDGETED_IDENTITY_FIELDS) {
-      const nextValue = updates[field];
+      const nextValue = writable[field];
       if (nextValue === undefined) continue;
 
       const result = checkIdentityFieldBudget({
@@ -5653,9 +3676,9 @@ export async function updateAgentProfile(
       if (existingAgent) throw new Error("Agent name already exists");
     }
 
-    // Create context versions for changed fields
+    // Create context versions for changed fields (stale copies already dropped)
     for (const field of VERSIONABLE_FIELDS) {
-      const newValue = updates[field];
+      const newValue = writable[field];
       if (newValue === undefined || newValue === null) continue;
 
       const currentValue = current[field] ?? "";
@@ -5712,12 +3735,12 @@ export async function updateAgentProfile(
         updates.description ?? null,
         updates.role ?? null,
         updates.capabilities ? JSON.stringify(updates.capabilities) : null,
-        updates.claudeMd ?? null,
-        updates.soulMd ?? null,
-        updates.identityMd ?? null,
-        updates.setupScript ?? null,
-        updates.toolsMd ?? null,
-        updates.heartbeatMd ?? null,
+        writable.claudeMd ?? null,
+        writable.soulMd ?? null,
+        writable.identityMd ?? null,
+        writable.setupScript ?? null,
+        writable.toolsMd ?? null,
+        writable.heartbeatMd ?? null,
         avatarProvided ? 1 : 0,
         avatarJson,
         now,
@@ -5916,6 +3939,8 @@ export async function postMessage(
 
       const task = await createTaskExtended(taskDescription, {
         agentId: mentionedAgentId, // Direct assignment
+        routingReason: "human_pinned",
+        routingSource: "engine_default",
         creatorAgentId: agentId ?? undefined,
         source: "mcp",
         taskType: "task",
@@ -6733,6 +4758,8 @@ export interface CreateSessionCostInput {
    *  - 'pricing-table'  — value recomputed by the API from `pricing` rows.
    *  - 'unpriced'       — recompute attempted but no matching pricing rows;
    *                       `totalCostUsd` is whatever the worker submitted.
+   *  - 'estimated'      — fallback token counts priced at an assumed model
+   *                       (amp with a failed thread export).
    */
   costSource?: SessionCostSource;
   harnessCostUsd?: number | null;
@@ -6903,6 +4930,8 @@ export interface SessionCostSummaryTotals {
   excludedCostUsd: number;
   /** Distinct tasks behind `excludedCostUsd` — surfaced so the UI can name the exclusion count, not just wave at a percentage. */
   excludedTaskCount: number;
+  /** API-priced cost of sessions whose task ran on a subscription credential (`SUBSCRIPTION_KEY_TYPES`). */
+  subscriptionCostUsd: number;
 }
 
 export interface SessionCostDailyRow {
@@ -6911,6 +4940,34 @@ export interface SessionCostDailyRow {
   inputTokens: number;
   outputTokens: number;
   sessions: number;
+  /** Part of `costUsd` that ran on a subscription credential. */
+  subscriptionCostUsd: number;
+}
+
+/**
+ * How a credential's plan is known, strongest first: picked on the dashboard,
+ * reported by a worker (Codex JWT), or estimated from rate-limit utilization.
+ */
+export type PlanSource = "manual" | "detected" | "estimated";
+
+/** Spend per credential, for the subscription vs API comparison. */
+export interface SessionCostByCredentialRow {
+  /** `null` when the task recorded no credential (or the session has no task). */
+  keyType: string | null;
+  keySuffix: string | null;
+  /** Label set on the API Keys page. */
+  name: string | null;
+  /** Billed as a flat subscription (`SUBSCRIPTION_KEY_TYPES`) rather than per token. */
+  subscription: boolean;
+  /** Plan id from `SUBSCRIPTION_PLANS`, or null when unknown. */
+  plan: string | null;
+  planSource: PlanSource | null;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  sessions: number;
+  firstSessionAt: string;
+  lastSessionAt: string;
 }
 
 export interface SessionCostByAgentRow {
@@ -6935,59 +4992,12 @@ export interface SessionCostByUserRow {
 /** `opts.userId` sentinel selecting spend with no human requester. */
 export const UNATTRIBUTED_USER_ID = "unattributed";
 
-// Structurally-human-free tasks and their descendants. An explicitly supplied
-// requester is a human handoff and stops propagation; a requester copied from
-// the parent does not.
-const HUMAN_FREE_TASKS_CTE = `human_free_tasks(id) AS (
-        SELECT task.id
-        FROM agent_tasks task
-        LEFT JOIN agent_tasks parent ON parent.id = task.parentTaskId
-        WHERE COALESCE(task.taskType, '') IN ('heartbeat', 'heartbeat-checklist', 'boot-triage')
-          OR COALESCE(task.tags, '[]') LIKE '%"heartbeat"%'
-          OR (COALESCE(task.source, '') = 'schedule' AND task.requestedByUserId IS NULL)
-          OR (
-            task.parentTaskId IS NULL
-            AND COALESCE(task.source, '') = 'workflow'
-            AND task.requestedByUserId IS NULL
-            AND EXISTS (
-              SELECT 1
-              FROM workflow_runs run
-              WHERE run.id = task.workflowRunId
-                AND run.triggerType = 'schedule'
-                AND run.created_by IS NULL
-            )
-          )
-          OR (
-            COALESCE(task.source, '') = 'system'
-            AND parent.id IS NOT NULL
-            AND parent.requestedByUserId IS NULL
-          )
-
-        UNION
-
-        SELECT child.id
-        FROM agent_tasks child
-        JOIN human_free_tasks parent ON child.parentTaskId = parent.id
-        WHERE child.requestedByUserId IS NULL
-          OR child.requestedByUserIdInherited = 1
-      )`;
-const HUMAN_FREE_SQL = "EXISTS (SELECT 1 FROM human_free_tasks WHERE id = t.id)";
-const ROOT_HUMAN_FREE_SQL = `(
-        COALESCE(t.taskType, '') IN ('heartbeat', 'heartbeat-checklist', 'boot-triage')
-        OR COALESCE(t.tags, '[]') LIKE '%"heartbeat"%'
-        OR (COALESCE(t.source, '') = 'schedule' AND t.requestedByUserId IS NULL)
-        OR (
-          COALESCE(t.source, '') = 'workflow'
-          AND t.requestedByUserId IS NULL
-          AND EXISTS (
-            SELECT 1
-            FROM workflow_runs run
-            WHERE run.id = t.workflowRunId
-              AND run.triggerType = 'schedule'
-              AND run.created_by IS NULL
-          )
-        )
-      )`;
+/**
+ * True for a session whose task is structurally human-free (`isHumanFree`, set
+ * when the task is created; rule in `src/be/db/tasks/human-free.ts`). A session
+ * with no task row is not human-free.
+ */
+const HUMAN_FREE_SQL = "(COALESCE(t.isHumanFree, 0) = 1)";
 
 export async function getSessionCostSummary(opts: {
   startDate?: string;
@@ -7001,21 +5011,21 @@ export async function getSessionCostSummary(opts: {
   daily: SessionCostDailyRow[];
   byAgent: SessionCostByAgentRow[];
   byUser: SessionCostByUserRow[];
+  byCredential: SessionCostByCredentialRow[];
 }> {
   // `session_costs` deliberately carries no `userId` column — a task can be
   // re-attributed after the fact, so the human requester is resolved by joining
   // through the task (same shape as `getDailySpendForUser`). Every column is
   // `sc.`-qualified because `createdAt`/`agentId` exist on both sides.
-  const from = "FROM session_costs sc LEFT JOIN agent_tasks t ON t.id = sc.taskId";
+  // INDEXED BY: without ANALYZE statistics (production has none) the planner
+  // probes tasks through the primary key and reads each full row, which follows
+  // the task's overflow pages. The covering index answers the same probe from
+  // the index alone (migration 182).
+  const from =
+    "FROM session_costs sc LEFT JOIN agent_tasks t INDEXED BY idx_agent_tasks_usage_cover ON t.id = sc.taskId";
+  // Only a user filter reads the task, and the join adds no rows (task id is unique).
+  const agentFrom = opts.userId === undefined ? "FROM session_costs sc" : from;
 
-  // Structurally-human-free: the swarm maintaining itself, with no human
-  // requester by construction — heartbeat/boot-triage tasks, scheduled runs
-  // without a human creator (including workflow roots launched by such a
-  // schedule), and `source='system'` follow-ups whose parent itself has no
-  // human requester. That classification propagates through descendants while
-  // they remain unattributed, so autonomous fan-out cannot leak back into the
-  // denominator. An explicitly attributed child is an independent handoff and
-  // stops propagation down that branch.
   const conditions: string[] = [];
   const params: string[] = [];
 
@@ -7039,6 +5049,7 @@ export async function getSessionCostSummary(opts: {
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const subscriptionSql = `t.credentialKeyType IN (${SUBSCRIPTION_KEY_TYPES.map((k) => `'${k}'`).join(", ")})`;
 
   // Totals
   type TotalsRow = {
@@ -7053,11 +5064,11 @@ export async function getSessionCostSummary(opts: {
     attributableCostUsd: number;
     excludedCostUsd: number;
     excludedTaskCount: number;
+    subscriptionCostUsd: number;
   };
 
   const totalsRow = await getDbClient().get<TotalsRow>(
-    `WITH RECURSIVE ${HUMAN_FREE_TASKS_CTE}
-      SELECT
+    `SELECT
         COALESCE(SUM(sc.totalCostUsd), 0) as totalCostUsd,
         COALESCE(SUM(sc.inputTokens), 0) as totalInputTokens,
         COALESCE(SUM(sc.outputTokens), 0) as totalOutputTokens,
@@ -7071,7 +5082,9 @@ export async function getSessionCostSummary(opts: {
           THEN sc.totalCostUsd ELSE 0 END), 0) as attributableCostUsd,
         COALESCE(SUM(CASE WHEN ${HUMAN_FREE_SQL}
           THEN sc.totalCostUsd ELSE 0 END), 0) as excludedCostUsd,
-        COUNT(DISTINCT CASE WHEN ${HUMAN_FREE_SQL} THEN t.id END) as excludedTaskCount
+        COUNT(DISTINCT CASE WHEN ${HUMAN_FREE_SQL} THEN t.id END) as excludedTaskCount,
+        COALESCE(SUM(CASE WHEN ${subscriptionSql}
+          THEN sc.totalCostUsd ELSE 0 END), 0) as subscriptionCostUsd
       ${from} ${where}`,
     params,
   );
@@ -7095,6 +5108,7 @@ export async function getSessionCostSummary(opts: {
         attributableCostUsd: 0,
         excludedCostUsd: 0,
         excludedTaskCount: 0,
+        subscriptionCostUsd: 0,
       };
 
   // Daily breakdown
@@ -7107,14 +5121,16 @@ export async function getSessionCostSummary(opts: {
       inputTokens: number;
       outputTokens: number;
       sessions: number;
+      subscriptionCostUsd: number;
     }>(
-      `WITH RECURSIVE ${HUMAN_FREE_TASKS_CTE}
-        SELECT
+      `SELECT
           DATE(sc.createdAt) as date,
           COALESCE(SUM(sc.totalCostUsd), 0) as costUsd,
           COALESCE(SUM(sc.inputTokens), 0) as inputTokens,
           COALESCE(SUM(sc.outputTokens), 0) as outputTokens,
-          COUNT(*) as sessions
+          COUNT(*) as sessions,
+          COALESCE(SUM(CASE WHEN ${subscriptionSql} THEN sc.totalCostUsd ELSE 0 END), 0)
+            as subscriptionCostUsd
         ${from} ${where}
         GROUP BY DATE(sc.createdAt)
         ORDER BY date ASC`,
@@ -7133,15 +5149,14 @@ export async function getSessionCostSummary(opts: {
       sessions: number;
       durationMs: number;
     }>(
-      `WITH RECURSIVE ${HUMAN_FREE_TASKS_CTE}
-        SELECT
+      `SELECT
           sc.agentId as agentId,
           COALESCE(SUM(sc.totalCostUsd), 0) as costUsd,
           COALESCE(SUM(sc.inputTokens), 0) as inputTokens,
           COALESCE(SUM(sc.outputTokens), 0) as outputTokens,
           COUNT(*) as sessions,
           COALESCE(SUM(sc.durationMs), 0) as durationMs
-        ${from} ${where}
+        ${agentFrom} ${where}
         GROUP BY sc.agentId
         ORDER BY costUsd DESC`,
       params,
@@ -7153,8 +5168,7 @@ export async function getSessionCostSummary(opts: {
   let byUser: SessionCostByUserRow[] = [];
   if (groupBy === "user" || groupBy === "both") {
     byUser = await getDbClient().query<SessionCostByUserRow>(
-      `WITH RECURSIVE ${HUMAN_FREE_TASKS_CTE}
-        SELECT
+      `SELECT
           CASE WHEN ${HUMAN_FREE_SQL} THEN NULL ELSE t.requestedByUserId END as userId,
           COALESCE(SUM(sc.totalCostUsd), 0) as costUsd,
           COALESCE(SUM(sc.inputTokens), 0) as inputTokens,
@@ -7168,7 +5182,82 @@ export async function getSessionCostSummary(opts: {
     );
   }
 
-  return { totals, daily, byAgent, byUser };
+  let byCredential: SessionCostByCredentialRow[] = [];
+  if (groupBy === "both") {
+    type CredentialRow = Omit<
+      SessionCostByCredentialRow,
+      "name" | "subscription" | "plan" | "planSource"
+    >;
+    const rows = await getDbClient().query<CredentialRow>(
+      `SELECT
+          t.credentialKeyType as keyType,
+          t.credentialKeySuffix as keySuffix,
+          COALESCE(SUM(sc.totalCostUsd), 0) as costUsd,
+          COALESCE(SUM(sc.inputTokens), 0) as inputTokens,
+          COALESCE(SUM(sc.outputTokens), 0) as outputTokens,
+          COUNT(*) as sessions,
+          MIN(sc.createdAt) as firstSessionAt,
+          MAX(sc.createdAt) as lastSessionAt
+        ${from} ${where}
+        GROUP BY t.credentialKeyType, t.credentialKeySuffix
+        ORDER BY costUsd DESC`,
+      params,
+    );
+    const labels = await getCredentialLabels();
+    byCredential = rows.map((row) => {
+      const label =
+        row.keyType && row.keySuffix
+          ? labels.get(credentialKey(row.keyType, row.keySuffix))
+          : undefined;
+      return {
+        ...row,
+        name: label?.name ?? null,
+        subscription: row.keyType !== null && SUBSCRIPTION_KEY_TYPES.includes(row.keyType),
+        plan: label?.plan ?? null,
+        planSource: label?.planSource ?? null,
+      };
+    });
+  }
+
+  return { totals, daily, byAgent, byUser, byCredential };
+}
+
+function credentialKey(keyType: string, keySuffix: string): string {
+  return `${keyType}:${keySuffix}`;
+}
+
+/**
+ * Name and plan per credential (keyType + keySuffix), merged over its scope
+ * rows. A manual plan wins over a detected one.
+ */
+async function getCredentialLabels(): Promise<
+  Map<string, { name: string | null; plan: string | null; planSource: PlanSource | null }>
+> {
+  const rows = await getDbClient().query<{
+    keyType: string;
+    keySuffix: string;
+    name: string | null;
+    plan: string | null;
+    planSource: PlanSource | null;
+  }>(
+    `SELECT keyType, keySuffix, name, plan, planSource FROM api_key_status
+      ORDER BY CASE planSource WHEN 'manual' THEN 0 WHEN 'detected' THEN 1 WHEN 'estimated' THEN 2 ELSE 3 END,
+        updatedAt DESC`,
+  );
+  const labels = new Map<
+    string,
+    { name: string | null; plan: string | null; planSource: PlanSource | null }
+  >();
+  for (const row of rows) {
+    const key = credentialKey(row.keyType, row.keySuffix);
+    const seen = labels.get(key);
+    if (!seen) {
+      labels.set(key, { name: row.name, plan: row.plan, planSource: row.planSource });
+    } else if (!seen.name && row.name) {
+      seen.name = row.name;
+    }
+  }
+  return labels;
 }
 
 // --- Per-person attribution (four-metric view) ---
@@ -7201,7 +5290,7 @@ export interface AttributionByPersonRow {
  * a composite score. Scope is root tasks (`problemsInitiated`/`problemsShipped`)
  * or the person's entire task tree (`*Reached`); `requestedByUserId IS NULL`
  * (autonomous work) and structurally-human-free rows with a stale/inherited
- * requester (see `HUMAN_FREE_SQL` in `getSessionCostSummary`) are excluded —
+ * requester (`agent_tasks.isHumanFree`, see `src/be/db/tasks/human-free.ts`) are excluded —
  * neither belongs to a person.
  *
  * "Problems shipped" detection walks each root's full task tree, preferring a
@@ -7245,18 +5334,20 @@ export async function getAttributionByPerson(opts: {
 
   type RootRow = { userId: string; initiated: number; shipped: number };
   const rootRows = await getDbClient().query<RootRow>(
-    `WITH RECURSIVE selected_roots(id, requestedByUserId, status, output) AS (
-        SELECT t.id, t.requestedByUserId, t.status, t.output
+    `WITH RECURSIVE selected_roots(id, requestedByUserId, status) AS (
+        SELECT t.id, t.requestedByUserId, t.status
         FROM agent_tasks t
-        ${where} AND t.parentTaskId IS NULL AND NOT ${ROOT_HUMAN_FREE_SQL}
+        ${where} AND t.parentTaskId IS NULL AND t.isHumanFree = 0
       ),
-      task_tree(rootId, taskId, output) AS (
-        SELECT id, id, output
+      -- Ids only: carrying each descendant's \`output\` through the recursion copied
+      -- every task's text into the queue. The output fallback below reads it by id.
+      task_tree(rootId, taskId) AS (
+        SELECT id, id
         FROM selected_roots
 
         UNION ALL
 
-        SELECT tree.rootId, child.id, child.output
+        SELECT tree.rootId, child.id
         FROM agent_tasks child
         JOIN task_tree tree ON child.parentTaskId = tree.taskId
       ),
@@ -7289,8 +5380,11 @@ export async function getAttributionByPerson(opts: {
 
         SELECT tree.rootId
         FROM task_tree tree
-        WHERE tree.output LIKE '%github.com/%/pull/%'
-           OR tree.output LIKE '%/-/merge_requests/%'
+        -- CROSS JOIN pins the order (tree outer, task by id). Left to itself the
+        -- planner scans every task's output and probes the tree instead.
+        CROSS JOIN agent_tasks described ON described.id = tree.taskId
+        WHERE described.output LIKE '%github.com/%/pull/%'
+           OR described.output LIKE '%/-/merge_requests/%'
       )
       SELECT
         t.requestedByUserId as userId,
@@ -7309,63 +5403,13 @@ export async function getAttributionByPerson(opts: {
     surfacesReached: number;
   };
   const reachRows = await getDbClient().query<ReachRow>(
-    `WITH RECURSIVE report_tasks AS (
-        SELECT t.*
-        FROM agent_tasks t
-        ${where}
-      ),
-      task_ancestry(
-        taskId, id, parentTaskId, requestedByUserId, requestedByUserIdInherited,
-        taskType, tags, source, workflowRunId
-      ) AS (
-        SELECT
-          id, id, parentTaskId, requestedByUserId, requestedByUserIdInherited,
-          taskType, tags, source, workflowRunId
-        FROM report_tasks
-
-        UNION ALL
-
-        SELECT
-          child.taskId, parent.id, parent.parentTaskId, parent.requestedByUserId,
-          parent.requestedByUserIdInherited, parent.taskType, parent.tags,
-          parent.source, parent.workflowRunId
-        FROM agent_tasks parent
-        JOIN task_ancestry child ON parent.id = child.parentTaskId
-        WHERE child.requestedByUserId IS NULL
-          OR child.requestedByUserIdInherited = 1
-      ),
-      human_free_report_tasks(id) AS (
-        SELECT DISTINCT ancestor.taskId
-        FROM task_ancestry ancestor
-        LEFT JOIN agent_tasks parent ON parent.id = ancestor.parentTaskId
-        WHERE COALESCE(ancestor.taskType, '') IN ('heartbeat', 'heartbeat-checklist', 'boot-triage')
-          OR COALESCE(ancestor.tags, '[]') LIKE '%"heartbeat"%'
-          OR (COALESCE(ancestor.source, '') = 'schedule' AND ancestor.requestedByUserId IS NULL)
-          OR (
-            ancestor.parentTaskId IS NULL
-            AND COALESCE(ancestor.source, '') = 'workflow'
-            AND ancestor.requestedByUserId IS NULL
-            AND EXISTS (
-              SELECT 1
-              FROM workflow_runs run
-              WHERE run.id = ancestor.workflowRunId
-                AND run.triggerType = 'schedule'
-                AND run.created_by IS NULL
-            )
-          )
-          OR (
-            COALESCE(ancestor.source, '') = 'system'
-            AND parent.id IS NOT NULL
-            AND parent.requestedByUserId IS NULL
-          )
-      )
-      SELECT
+    `SELECT
         t.requestedByUserId as userId,
         COUNT(DISTINCT t.agentId) as agentsReached,
         COUNT(DISTINCT t.vcsRepo) as reposReached,
         COUNT(DISTINCT t.source) as surfacesReached
-      FROM report_tasks t
-      WHERE NOT EXISTS (SELECT 1 FROM human_free_report_tasks WHERE id = t.id)
+      FROM agent_tasks t
+      ${where} AND t.isHumanFree = 0
       GROUP BY t.requestedByUserId`,
     params,
   );
@@ -7737,6 +5781,9 @@ type ScheduledTaskRow = {
   lastRunAt: string | null;
   nextRunAt: string | null;
   createdByAgentId: string | null;
+  parentTaskId: string | null;
+  requestedDelayMs: number | null;
+  requestedRunAt: string | null;
   timezone: string;
   consecutiveErrors: number | null;
   lastErrorAt: string | null;
@@ -7748,6 +5795,9 @@ type ScheduledTaskRow = {
   workflowId: string | null;
   scriptName: string | null;
   scriptArgs: string | null;
+  params: string;
+  requiredParams: string;
+  requires: string;
   createdAt: string;
   lastUpdatedAt: string;
   created_by: string | null;
@@ -7760,9 +5810,6 @@ type ScheduledTaskRow = {
 // while keeping list payloads small.
 /** Preview length for a schedule's `taskTemplate`. */
 const SCHEDULE_TEMPLATE_PREVIEW_LENGTH = 280;
-/** Preview length for a task's `task` text (pool-triage needs to read it). */
-const TASK_PREVIEW_LENGTH = 300;
-
 /** Truncate text for a list-row preview. Appends an ellipsis when clipped. */
 function previewText(text: string | null | undefined, maxChars: number): string {
   const s = text ?? "";
@@ -7786,6 +5833,9 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
     lastRunAt: normalizeDate(row.lastRunAt) ?? undefined,
     nextRunAt: normalizeDate(row.nextRunAt) ?? undefined,
     createdByAgentId: row.createdByAgentId ?? undefined,
+    parentTaskId: row.parentTaskId ?? undefined,
+    requestedDelayMs: row.requestedDelayMs ?? undefined,
+    requestedRunAt: normalizeDate(row.requestedRunAt) ?? undefined,
     timezone: row.timezone,
     consecutiveErrors: row.consecutiveErrors ?? 0,
     lastErrorAt: normalizeDate(row.lastErrorAt) ?? undefined,
@@ -7797,6 +5847,9 @@ function rowToScheduledTask(row: ScheduledTaskRow): ScheduledTask {
     workflowId: row.workflowId ?? undefined,
     scriptName: row.scriptName ?? undefined,
     scriptArgs: row.scriptArgs ? JSON.parse(row.scriptArgs) : undefined,
+    params: JSON.parse(row.params) as Record<string, unknown>,
+    requiredParams: JSON.parse(row.requiredParams) as string[],
+    requires: JSON.parse(row.requires) as AutomationIntegrationId[],
     createdAt: normalizeDateRequired(row.createdAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
     createdBy: row.created_by ?? undefined,
@@ -7932,6 +5985,15 @@ export interface CreateScheduledTaskData {
   enabled?: boolean;
   nextRunAt?: string;
   createdByAgentId?: string;
+  /** Only `defer-task` sets this — the task the schedule's run continues. */
+  parentTaskId?: string;
+  /**
+   * Only `defer-task` sets these — the delay the caller actually asked for,
+   * kept because the scheduler clears `nextRunAt` once a one_time schedule
+   * fires. Write-once provenance; nothing reads them to decide when to run.
+   */
+  requestedDelayMs?: number;
+  requestedRunAt?: string;
   timezone?: string;
   model?: string;
   modelTier?: ModelTier;
@@ -7940,6 +6002,9 @@ export interface CreateScheduledTaskData {
   workflowId?: string;
   scriptName?: string;
   scriptArgs?: Record<string, unknown>;
+  params?: Record<string, unknown>;
+  requiredParams?: string[];
+  requires?: AutomationIntegrationId[];
   createdBy?: string;
 }
 
@@ -7951,10 +6016,12 @@ export async function createScheduledTask(data: CreateScheduledTaskData): Promis
     `INSERT INTO scheduled_tasks (
         id, "key", name, description, cronExpression, intervalMs, taskTemplate,
         taskType, tags, priority, targetAgentId, enabled, nextRunAt,
-        createdByAgentId, timezone, model, modelTier, scheduleType, targetType,
-        workflowId, scriptName, scriptArgs, createdAt, lastUpdatedAt,
+        createdByAgentId, parentTaskId, requestedDelayMs, requestedRunAt,
+        timezone, model, modelTier, scheduleType,
+        targetType, workflowId, scriptName, scriptArgs, params, requiredParams, requires,
+        createdAt, lastUpdatedAt,
         created_by, updated_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [
       id,
       normalizeAssetKey(data.key ?? defaultAssetKey("schedule", id)),
@@ -7970,6 +6037,9 @@ export async function createScheduledTask(data: CreateScheduledTaskData): Promis
       data.enabled !== false ? 1 : 0,
       data.nextRunAt ?? null,
       data.createdByAgentId ?? null,
+      data.parentTaskId ?? null,
+      data.requestedDelayMs ?? null,
+      data.requestedRunAt ?? null,
       data.timezone ?? "UTC",
       data.model ?? null,
       data.modelTier ?? null,
@@ -7978,6 +6048,9 @@ export async function createScheduledTask(data: CreateScheduledTaskData): Promis
       data.workflowId ?? null,
       data.scriptName ?? null,
       data.scriptArgs !== undefined ? JSON.stringify(data.scriptArgs) : "{}",
+      JSON.stringify(data.params ?? {}),
+      JSON.stringify(data.requiredParams ?? []),
+      JSON.stringify(data.requires ?? []),
       now,
       now,
       data.createdBy ?? null,
@@ -8014,6 +6087,9 @@ export interface UpdateScheduledTaskData {
   workflowId?: string | null;
   scriptName?: string | null;
   scriptArgs?: Record<string, unknown> | null;
+  params?: Record<string, unknown>;
+  requiredParams?: string[];
+  requires?: AutomationIntegrationId[];
   lastUpdatedAt?: string;
   updatedBy?: string;
 }
@@ -8121,6 +6197,18 @@ export async function updateScheduledTask(
   if (data.scriptArgs !== undefined) {
     updates.push("scriptArgs = ?");
     params.push(data.scriptArgs === null ? null : JSON.stringify(data.scriptArgs));
+  }
+  if (data.params !== undefined) {
+    updates.push("params = ?");
+    params.push(JSON.stringify(data.params));
+  }
+  if (data.requiredParams !== undefined) {
+    updates.push("requiredParams = ?");
+    params.push(JSON.stringify(data.requiredParams));
+  }
+  if (data.requires !== undefined) {
+    updates.push("requires = ?");
+    params.push(JSON.stringify(data.requires));
   }
   if (data.updatedBy !== undefined) {
     updates.push("updated_by = ?");
@@ -8388,10 +6476,10 @@ export async function getInjectableGlobalConfigs(): Promise<SwarmConfig[]> {
   const rows = await getDbClient().query<SwarmConfigRow>(
     `SELECT * FROM swarm_config
        WHERE scope = 'global'
-         AND UPPER(key) NOT IN ('API_KEY', 'SECRETS_ENCRYPTION_KEY')
+         AND UPPER(key) NOT IN ('API_KEY', 'SECRETS_ENCRYPTION_KEY', 'CORS_ALLOW_ANY_ORIGIN', 'EXTENSION_ALLOW_LEAD_ACTIVATION')
        ORDER BY key ASC`,
   );
-  return rows.map(rowToSwarmConfig);
+  return rows.filter((row) => !isInternalConfigKey(row.key)).map(rowToSwarmConfig);
 }
 
 /**
@@ -8526,6 +6614,20 @@ export async function upsertSwarmConfig(data: {
   }
 
   return config;
+}
+
+/** Emit a built-in integration only once for this persisted installation. */
+export async function emitBuiltInIntegrationConnectedOnce(
+  provider: "github" | "slack",
+): Promise<void> {
+  try {
+    const key = `telemetry.integration.${provider}.emitted`;
+    if ((await getSwarmConfigs({ scope: "global", key })).length > 0) return;
+    if (!emitIntegrationConnected(_resolveIntegrationType(provider), provider, true)) return;
+    await upsertSwarmConfig({ scope: "global", key, value: "true" });
+  } catch {
+    // Telemetry must never break integration startup.
+  }
 }
 
 /**
@@ -9189,6 +7291,9 @@ type WorkflowRow = {
   cooldown: string | null;
   input: string | null;
   triggerSchema: string | null;
+  params: string;
+  requiredParams: string;
+  requires: string;
   dir: string | null;
   vcs_repo: string | null;
   createdByAgentId: string | null;
@@ -9212,6 +7317,9 @@ function rowToWorkflow(row: WorkflowRow): Workflow {
     triggerSchema: row.triggerSchema
       ? (JSON.parse(row.triggerSchema) as Record<string, unknown>)
       : undefined,
+    params: JSON.parse(row.params) as Record<string, unknown>,
+    requiredParams: JSON.parse(row.requiredParams) as string[],
+    requires: JSON.parse(row.requires) as AutomationIntegrationId[],
     dir: row.dir ?? undefined,
     vcsRepo: row.vcs_repo ?? undefined,
     createdByAgentId: row.createdByAgentId ?? undefined,
@@ -9232,17 +7340,22 @@ export async function createWorkflow(
     cooldown?: CooldownConfig;
     input?: Record<string, InputValue>;
     triggerSchema?: Record<string, unknown>;
+    params?: Record<string, unknown>;
+    requiredParams?: string[];
+    requires?: AutomationIntegrationId[];
     dir?: string;
     vcsRepo?: string;
     createdByAgentId?: string;
     createdBy?: string;
+    /** Defaults to true. Extensions create their workflows disabled. */
+    enabled?: boolean;
   },
   source?: "api" | "mcp",
 ): Promise<Workflow> {
   const id = crypto.randomUUID();
   const row = await getDbClient().get<WorkflowRow>(
-    `INSERT INTO workflows (id, "key", name, description, definition, triggers, cooldown, input, triggerSchema, dir, vcs_repo, createdByAgentId, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    `INSERT INTO workflows (id, "key", name, description, definition, triggers, cooldown, input, triggerSchema, params, requiredParams, requires, dir, vcs_repo, createdByAgentId, created_by, updated_by, enabled)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     [
       id,
       normalizeAssetKey(data.key ?? defaultAssetKey("workflow", id)),
@@ -9253,20 +7366,32 @@ export async function createWorkflow(
       data.cooldown ? JSON.stringify(data.cooldown) : null,
       data.input ? JSON.stringify(data.input) : null,
       data.triggerSchema ? JSON.stringify(data.triggerSchema) : null,
+      JSON.stringify(data.params ?? {}),
+      JSON.stringify(data.requiredParams ?? []),
+      JSON.stringify(data.requires ?? []),
       data.dir ?? null,
       data.vcsRepo ?? null,
       data.createdByAgentId ?? null,
       data.createdBy ?? null,
       data.createdBy ?? null,
+      data.enabled === false ? 0 : 1,
     ],
   );
   if (!row) throw new Error("Failed to create workflow");
   const workflow = rowToWorkflow(row);
-  telemetry.workflow("created", {
-    workflowId: workflow.id,
-    nodeCount: workflow.definition.nodes.length,
-    ...(source ? { source } : {}),
-  });
+  // afterCommit: a caller's transaction that rolls back must not report the workflow.
+  const requestUserId = getCurrentRequestUserId();
+  getDbClient().afterCommit(() =>
+    telemetry.workflow(
+      "created",
+      {
+        workflowId: workflow.id,
+        nodeCount: workflow.definition.nodes.length,
+        ...(source ? { via: source } : {}),
+      },
+      { userId: requestUserId ?? null },
+    ),
+  );
   return workflow;
 }
 
@@ -9372,6 +7497,9 @@ export async function updateWorkflow(
     cooldown?: CooldownConfig | null;
     input?: Record<string, InputValue> | null;
     triggerSchema?: Record<string, unknown> | null;
+    params?: Record<string, unknown>;
+    requiredParams?: string[];
+    requires?: AutomationIntegrationId[];
     dir?: string | null;
     vcsRepo?: string | null;
     updatedBy?: string;
@@ -9415,6 +7543,18 @@ export async function updateWorkflow(
     updates.push("triggerSchema = ?");
     params.push(data.triggerSchema ? JSON.stringify(data.triggerSchema) : null);
   }
+  if (data.params !== undefined) {
+    updates.push("params = ?");
+    params.push(JSON.stringify(data.params));
+  }
+  if (data.requiredParams !== undefined) {
+    updates.push("requiredParams = ?");
+    params.push(JSON.stringify(data.requiredParams));
+  }
+  if (data.requires !== undefined) {
+    updates.push("requires = ?");
+    params.push(JSON.stringify(data.requires));
+  }
   if (data.dir !== undefined) {
     updates.push("dir = ?");
     params.push(data.dir ?? null);
@@ -9439,7 +7579,19 @@ export async function updateWorkflow(
 }
 
 export async function deleteWorkflow(id: string, source?: "api" | "mcp"): Promise<boolean> {
+  // One transaction: the stored human-free flags must never lag the deleted runs
+  // (a scheduled workflow root is human-free only while its run row exists).
+  return await getDbClient().transaction(() => deleteWorkflowRows(id, source));
+}
+
+async function deleteWorkflowRows(id: string, source?: "api" | "mcp"): Promise<boolean> {
   const client = getDbClient();
+  const linkedTaskIds = (
+    await client.query<{ id: string }>(
+      `SELECT id FROM agent_tasks WHERE workflowRunId IN (SELECT id FROM workflow_runs WHERE workflowId = ?)`,
+      [id],
+    )
+  ).map((row) => row.id);
   // Cascade delete in FK-safe order:
   // 1. Unlink agent_tasks (they reference steps and runs)
   await client.run(
@@ -9453,14 +7605,20 @@ export async function deleteWorkflow(id: string, source?: "api" | "mcp"): Promis
   );
   // 3. Delete runs (they reference workflow)
   await client.run("DELETE FROM workflow_runs WHERE workflowId = ?", [id]);
+  await reclassifyTaskHumanFree(linkedTaskIds);
   // 4. Delete workflow
   const result = await client.run("DELETE FROM workflows WHERE id = ?", [id]);
   const deleted = result.changes > 0;
   if (deleted) {
-    telemetry.workflow("deleted", {
-      workflowId: id,
-      ...(source ? { source } : {}),
-    });
+    // afterCommit: a caller's transaction that rolls back must not report the delete.
+    const requestUserId = getCurrentRequestUserId();
+    getDbClient().afterCommit(() =>
+      telemetry.workflow(
+        "deleted",
+        { workflowId: id, ...(source ? { via: source } : {}) },
+        { userId: requestUserId ?? null },
+      ),
+    );
   }
   return deleted;
 }
@@ -9490,7 +7648,8 @@ type WorkflowRunRow = {
   status: string;
   triggerType: string;
   triggerData: string | null;
-  context: string | null;
+  /** Absent from list rows: see `WORKFLOW_RUN_SUMMARY_COLUMNS`. */
+  context?: string | null;
   error: string | null;
   created_by: string | null;
   startedAt: string;
@@ -9545,6 +7704,7 @@ export async function getWorkflowRun(id: string): Promise<WorkflowRun | null> {
 
 function emitWorkflowTerminalTelemetry(run: WorkflowRun): void {
   if (run.status !== "completed" && run.status !== "failed") return;
+  const status = run.status;
 
   // afterCommit (not queueMicrotask): under an async client transaction,
   // microtasks drain before COMMIT, so the verify read below could observe
@@ -9554,9 +7714,9 @@ function emitWorkflowTerminalTelemetry(run: WorkflowRun): void {
   // crashing the process as an unhandled rejection.
   getDbClient().afterCommit(async () => {
     const latest = await getWorkflowRun(run.id);
-    if (!latest || latest.status !== run.status) return;
+    if (!latest || latest.status !== status) return;
     const steps = await getWorkflowRunStepsByRunId(run.id);
-    telemetry.workflow(run.status, {
+    telemetry.workflow(status, {
       workflowId: run.workflowId,
       durationMs: run.startedAt ? Date.now() - new Date(run.startedAt).getTime() : undefined,
       stepsCompleted: steps.filter((step) => step.status === "completed").length,
@@ -9618,7 +7778,17 @@ export type WorkflowRunListOptions = {
   status?: WorkflowRunStatus;
   limit?: number;
   offset?: number;
+  /**
+   * Read the run `context`. Off by default: it is the one large column, and
+   * `getWorkflowRun` serves it for a single run.
+   */
+  includeContext?: boolean;
 };
+
+// Everything but `context`. `triggerData` stays: it is small, and stored
+// scripts read it off list rows (dedupe by trigger, failure reports).
+const WORKFLOW_RUN_SUMMARY_COLUMNS =
+  "id, workflowId, status, triggerType, triggerData, error, created_by, startedAt, lastUpdatedAt, finishedAt";
 
 export type WorkflowRunPage = {
   runs: WorkflowRun[];
@@ -9651,8 +7821,9 @@ export async function listWorkflowRuns(
     params.push(options.offset);
   }
 
+  const columns = options.includeContext ? "*" : WORKFLOW_RUN_SUMMARY_COLUMNS;
   const rows = await getDbClient().query<WorkflowRunRow>(
-    `SELECT * FROM workflow_runs
+    `SELECT ${columns} FROM workflow_runs
        WHERE ${conditions.join(" AND ")}
        ORDER BY startedAt DESC, id DESC${pagination}`,
     params,
@@ -9680,7 +7851,7 @@ export async function countWorkflowRuns(
 export async function listWorkflowRunsPage(
   workflowId: string,
   options: Required<Pick<WorkflowRunListOptions, "limit" | "offset">> &
-    Pick<WorkflowRunListOptions, "status">,
+    Pick<WorkflowRunListOptions, "status" | "includeContext">,
 ): Promise<WorkflowRunPage> {
   const runs = await listWorkflowRuns(workflowId, options);
   const total = await countWorkflowRuns(workflowId, { status: options.status });
@@ -9912,11 +8083,13 @@ export async function getLastRunStart(workflowId: string): Promise<WorkflowRun |
 export async function getRetryableSteps(): Promise<WorkflowRunStep[]> {
   const now = new Date().toISOString();
   const rows = await getDbClient().query<WorkflowRunStepRow>(
-    `SELECT * FROM workflow_run_steps
-       WHERE status = 'failed'
-         AND nextRetryAt IS NOT NULL
-         AND nextRetryAt <= ?
-       ORDER BY nextRetryAt ASC`,
+    `SELECT s.* FROM workflow_run_steps s
+       JOIN workflow_runs r ON r.id = s.runId
+       WHERE s.status = 'failed'
+         AND s.nextRetryAt IS NOT NULL
+         AND s.nextRetryAt <= ?
+         AND r.status IN ('running', 'waiting', 'failed')
+       ORDER BY s.nextRetryAt ASC`,
     [now],
   );
   return rows.map(rowToWorkflowRunStep);
@@ -9968,6 +8141,37 @@ export async function getLatestStepForNode(
     [runId, nodeId],
   );
   return row ? rowToWorkflowRunStep(row) : null;
+}
+
+/**
+ * The node's latest step when it already covers the current predecessor
+ * completions: it is running, waiting or completed, and no predecessor has
+ * completed a step inserted after it. A loop iteration always has a newer
+ * predecessor completion, so it never matches. Ordered by rowid, which
+ * follows insert order; startedAt can tie within a millisecond.
+ */
+export async function getCurrentStepForNode(
+  runId: string,
+  nodeId: string,
+  predecessorIds: string[],
+): Promise<WorkflowRunStep | null> {
+  const row = await getDbClient().get<WorkflowRunStepRow>(
+    "SELECT * FROM workflow_run_steps WHERE runId = ? AND nodeId = ? ORDER BY rowid DESC LIMIT 1",
+    [runId, nodeId],
+  );
+  if (!row || !["running", "waiting", "completed"].includes(row.status)) return null;
+  if (predecessorIds.length > 0) {
+    const newer = await getDbClient().get<{ found: number }>(
+      `SELECT 1 AS found FROM workflow_run_steps
+         WHERE runId = ? AND status = 'completed'
+           AND nodeId IN (${predecessorIds.map(() => "?").join(", ")})
+           AND rowid > (SELECT rowid FROM workflow_run_steps WHERE id = ?)
+         LIMIT 1`,
+      [runId, ...predecessorIds, row.id],
+    );
+    if (newer) return null;
+  }
+  return rowToWorkflowRunStep(row);
 }
 
 // --- Workflow Version History ---
@@ -10416,7 +8620,13 @@ export async function deletePage(id: string): Promise<boolean> {
     await tx.run("DELETE FROM user_favorites WHERE itemType = 'page' AND itemId = ?", [id]);
     await tx.run("DELETE FROM kv_entries WHERE namespace = ?", [`task:page:${id}`]);
     // ON DELETE CASCADE on page_versions.pageId handles history cleanup.
-    return await tx.run("DELETE FROM pages WHERE id = ?", [id]);
+    const deleted = await tx.run("DELETE FROM pages WHERE id = ?", [id]);
+    if (deleted.changes > 0) {
+      getDbClient().afterCommit(() =>
+        realtimeBus.publish("room:namespace-deleted", `task:page:${id}`),
+      );
+    }
+    return deleted;
   });
   return result.changes > 0;
 }
@@ -11264,10 +9474,12 @@ export interface ApprovalRequest {
   workflowRunStepId: string | null;
   sourceTaskId: string | null;
   approvers: unknown;
-  status: "pending" | "approved" | "rejected" | "timeout";
+  status: "pending" | "approved" | "rejected" | "timeout" | "cancelled";
   responses: unknown | null;
+  approvals: ApprovalVote[] | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
+  resolutionReason: string | null;
   timeoutSeconds: number | null;
   expiresAt: string | null;
   notificationChannels: unknown[] | null;
@@ -11286,8 +9498,11 @@ interface ApprovalRequestRow {
   approvers: string;
   status: string;
   responses: string | null;
+  approvals: string | null;
   resolvedBy: string | null;
   resolvedAt: string | null;
+  resolutionReason: string | null;
+  cancellationNotificationClaims: string | null;
   timeoutSeconds: number | null;
   expiresAt: string | null;
   notificationChannels: string | null;
@@ -11307,8 +9522,10 @@ function rowToApprovalRequest(row: ApprovalRequestRow): ApprovalRequest {
     approvers: JSON.parse(row.approvers),
     status: row.status as ApprovalRequest["status"],
     responses: row.responses ? JSON.parse(row.responses) : null,
+    approvals: row.approvals ? JSON.parse(row.approvals) : null,
     resolvedBy: row.resolvedBy,
     resolvedAt: normalizeDate(row.resolvedAt),
+    resolutionReason: row.resolutionReason,
     timeoutSeconds: row.timeoutSeconds,
     expiresAt: normalizeDate(row.expiresAt),
     notificationChannels: row.notificationChannels ? JSON.parse(row.notificationChannels) : null,
@@ -11329,32 +9546,55 @@ export async function createApprovalRequest(data: {
   timeoutSeconds?: number;
   notificationChannels?: unknown[];
   createdBy?: string;
+  requireActionableWorkflow?: boolean;
 }): Promise<ApprovalRequest> {
   const now = new Date().toISOString();
   const expiresAt = data.timeoutSeconds
     ? new Date(Date.now() + data.timeoutSeconds * 1000).toISOString()
     : null;
 
-  const row = await getDbClient().get<ApprovalRequestRow>(
-    `INSERT INTO approval_requests (id, title, questions, workflowRunId, workflowRunStepId, sourceTaskId, approvers, timeoutSeconds, expiresAt, notificationChannels, created_by, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  const row = await getDbClient().transaction(async () => {
+    let status: ApprovalRequest["status"] = "pending";
+    let resolutionReason: string | null = null;
+    if (data.requireActionableWorkflow && data.workflowRunId && data.workflowRunStepId) {
+      const run = await getWorkflowRun(data.workflowRunId);
+      const step = await getWorkflowRunStep(data.workflowRunStepId);
+      if (!run || (run.status !== "running" && run.status !== "waiting")) {
+        status = "cancelled";
+        resolutionReason = run?.error ?? `Workflow run is ${run?.status ?? "missing"}`;
+      } else if (!step || step.runId !== run.id || step.status !== "running") {
+        status = "cancelled";
+        resolutionReason = `Human-in-the-loop step is ${step?.status ?? "missing"}`;
+      }
+    }
+
+    return getDbClient().get<ApprovalRequestRow>(
+      `INSERT INTO approval_requests
+         (id, title, questions, workflowRunId, workflowRunStepId, sourceTaskId,
+          approvers, status, resolutionReason, resolvedAt, timeoutSeconds, expiresAt,
+          notificationChannels, created_by, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        RETURNING *`,
-    [
-      data.id,
-      data.title,
-      JSON.stringify(data.questions),
-      data.workflowRunId ?? null,
-      data.workflowRunStepId ?? null,
-      data.sourceTaskId ?? null,
-      JSON.stringify(data.approvers),
-      data.timeoutSeconds ?? null,
-      expiresAt,
-      data.notificationChannels ? JSON.stringify(data.notificationChannels) : null,
-      data.createdBy ?? null,
-      now,
-      now,
-    ],
-  );
+      [
+        data.id,
+        data.title,
+        JSON.stringify(data.questions),
+        data.workflowRunId ?? null,
+        data.workflowRunStepId ?? null,
+        data.sourceTaskId ?? null,
+        JSON.stringify(data.approvers),
+        status,
+        resolutionReason,
+        status === "cancelled" ? now : null,
+        data.timeoutSeconds ?? null,
+        expiresAt,
+        data.notificationChannels ? JSON.stringify(data.notificationChannels) : null,
+        data.createdBy ?? null,
+        now,
+        now,
+      ],
+    );
+  });
 
   return rowToApprovalRequest(row!);
 }
@@ -11372,25 +9612,191 @@ export async function resolveApprovalRequest(
   data: {
     status: "approved" | "rejected" | "timeout";
     responses?: unknown;
+    approvals?: ApprovalVote[];
     resolvedBy?: string;
+    resolutionReason?: string;
   },
+  options?: { requireActionableWorkflow?: boolean },
 ): Promise<ApprovalRequest | null> {
   const now = new Date().toISOString();
+  const actionableWorkflowClause = options?.requireActionableWorkflow
+    ? `AND (
+         workflowRunId IS NULL
+         OR (
+           EXISTS (
+             SELECT 1 FROM workflow_runs
+             WHERE id = approval_requests.workflowRunId
+               AND status IN ('running', 'waiting')
+           )
+           AND EXISTS (
+           SELECT 1 FROM workflow_run_steps
+             WHERE id = approval_requests.workflowRunStepId
+               AND runId = approval_requests.workflowRunId
+               AND status = 'waiting'
+           )
+         )
+       )`
+    : "";
   const row = await getDbClient().get<ApprovalRequestRow>(
     `UPDATE approval_requests
-       SET status = ?, responses = ?, resolvedBy = ?, resolvedAt = ?, updatedAt = ?
+       SET status = ?, responses = ?, approvals = COALESCE(?, approvals), resolvedBy = ?,
+           resolutionReason = ?, resolvedAt = ?, updatedAt = ?
        WHERE id = ? AND status = 'pending'
+         ${actionableWorkflowClause}
        RETURNING *`,
     [
       data.status,
       data.responses ? JSON.stringify(data.responses) : null,
+      data.approvals ? JSON.stringify(data.approvals) : null,
       data.resolvedBy ?? null,
+      data.resolutionReason ?? null,
       now,
       now,
       id,
     ],
   );
   return row ? rowToApprovalRequest(row) : null;
+}
+
+// Cancels 1 pending request. The `status = 'pending'` guard lets a concurrent
+// human answer win; null means the row was not pending.
+export async function cancelApprovalRequestById(
+  id: string,
+  data: { reason: string; resolvedBy: string | null },
+): Promise<ApprovalRequest | null> {
+  const now = new Date().toISOString();
+  const row = await getDbClient().get<ApprovalRequestRow>(
+    `UPDATE approval_requests
+       SET status = 'cancelled', resolutionReason = ?, resolvedBy = ?, resolvedAt = ?, updatedAt = ?
+       WHERE id = ? AND status = 'pending'
+       RETURNING *`,
+    [data.reason, data.resolvedBy, now, now, id],
+  );
+  return row ? rowToApprovalRequest(row) : null;
+}
+
+export async function cancelPendingApprovalRequestsForRun(
+  workflowRunId: string,
+  reason: string,
+): Promise<ApprovalRequest[]> {
+  const now = new Date().toISOString();
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `UPDATE approval_requests
+       SET status = 'cancelled', resolutionReason = ?, resolvedAt = ?, updatedAt = ?
+       WHERE workflowRunId = ? AND status = 'pending'
+       RETURNING *`,
+    [reason, now, now, workflowRunId],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+export async function listCancelledApprovalRequestsForRun(
+  workflowRunId: string,
+): Promise<ApprovalRequest[]> {
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `SELECT * FROM approval_requests
+       WHERE workflowRunId = ? AND status = 'cancelled'`,
+    [workflowRunId],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+export async function listCancelledApprovalRequestsForStep(
+  workflowRunStepId: string,
+): Promise<ApprovalRequest[]> {
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `SELECT * FROM approval_requests
+       WHERE workflowRunStepId = ? AND status = 'cancelled'`,
+    [workflowRunStepId],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+export async function claimApprovalCancellationNotification(
+  id: string,
+  notificationKey: string,
+): Promise<{ approval: ApprovalRequest; leaseToken: string } | null> {
+  return getDbClient().transaction(async () => {
+    const row = await getDbClient().get<ApprovalRequestRow>(
+      "SELECT * FROM approval_requests WHERE id = ? AND status = 'cancelled'",
+      [id],
+    );
+    if (!row) return null;
+    const claims = row.cancellationNotificationClaims
+      ? (JSON.parse(row.cancellationNotificationClaims) as Record<
+          string,
+          "delivered" | { claimedAt: string; leaseToken: string }
+        >)
+      : {};
+    const existing = claims[notificationKey];
+    if (existing === "delivered") return null;
+    if (
+      existing &&
+      typeof existing !== "string" &&
+      Date.now() - new Date(existing.claimedAt).getTime() < 60_000
+    ) {
+      return null;
+    }
+
+    const now = new Date().toISOString();
+    const leaseToken = crypto.randomUUID();
+    claims[notificationKey] = { claimedAt: now, leaseToken };
+    await getDbClient().run(
+      `UPDATE approval_requests
+         SET cancellationNotificationClaims = ?, updatedAt = ?
+         WHERE id = ? AND status = 'cancelled'`,
+      [JSON.stringify(claims), now, id],
+    );
+    return { approval: rowToApprovalRequest(row), leaseToken };
+  });
+}
+
+export async function completeApprovalCancellationNotificationClaim(
+  id: string,
+  notificationKey: string,
+  leaseToken: string,
+): Promise<void> {
+  await updateApprovalCancellationNotificationClaim(id, notificationKey, leaseToken, "delivered");
+}
+
+export async function releaseApprovalCancellationNotificationClaim(
+  id: string,
+  notificationKey: string,
+  leaseToken: string,
+): Promise<void> {
+  await updateApprovalCancellationNotificationClaim(id, notificationKey, leaseToken, null);
+}
+
+async function updateApprovalCancellationNotificationClaim(
+  id: string,
+  notificationKey: string,
+  leaseToken: string,
+  value: "delivered" | null,
+): Promise<void> {
+  await getDbClient().transaction(async () => {
+    const row = await getDbClient().get<{ claims: string | null }>(
+      "SELECT cancellationNotificationClaims AS claims FROM approval_requests WHERE id = ?",
+      [id],
+    );
+    const claims = row?.claims
+      ? (JSON.parse(row.claims) as Record<
+          string,
+          "delivered" | { claimedAt: string; leaseToken: string }
+        >)
+      : {};
+    const current = claims[notificationKey];
+    if (!current || typeof current === "string" || current.leaseToken !== leaseToken) {
+      return;
+    }
+    if (value === null) delete claims[notificationKey];
+    else claims[notificationKey] = value;
+    await getDbClient().run(
+      `UPDATE approval_requests
+         SET cancellationNotificationClaims = ?, updatedAt = ?
+         WHERE id = ? AND status = 'cancelled'`,
+      [JSON.stringify(claims), new Date().toISOString(), id],
+    );
+  });
 }
 
 export async function updateApprovalRequestNotifications(
@@ -11404,32 +9810,14 @@ export async function updateApprovalRequestNotifications(
   );
 }
 
-export async function listApprovalRequests(filters?: {
-  status?: string;
-  workflowRunId?: string;
-  limit?: number;
-}): Promise<ApprovalRequest[]> {
-  const conditions: string[] = [];
-  const params: (string | number)[] = [];
-
-  if (filters?.status) {
-    conditions.push("status = ?");
-    params.push(filters.status);
-  }
-  if (filters?.workflowRunId) {
-    conditions.push("workflowRunId = ?");
-    params.push(filters.workflowRunId);
-  }
-
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const limit = filters?.limit ?? 100;
-  params.push(limit);
-
+export async function listApprovalRequests(
+  filters?: ApprovalRequestListFilters,
+): Promise<ApprovalRequest[]> {
+  const { sql, params } = approvalRequestListClause(filters);
   const rows = await getDbClient().query<ApprovalRequestRow>(
-    `SELECT * FROM approval_requests ${where} ORDER BY createdAt DESC LIMIT ?`,
+    `SELECT * FROM approval_requests ${sql}`,
     params,
   );
-
   return rows.map(rowToApprovalRequest);
 }
 
@@ -11472,13 +9860,34 @@ export async function getApprovalRequestByStepId(stepId: string): Promise<Approv
   return row ? rowToApprovalRequest(row) : null;
 }
 
-// TODO: Wire into a periodic cron/sweep to auto-timeout expired approval requests (Phase 2)
-export async function getExpiredPendingApprovals(): Promise<ApprovalRequest[]> {
+// Called by timeoutExpiredApprovalRequests in src/be/approval-sweeps.ts on each heartbeat tick.
+export async function getExpiredPendingApprovals(opts?: {
+  now?: string;
+}): Promise<ApprovalRequest[]> {
   const rows = await getDbClient().query<ApprovalRequestRow>(
     `SELECT * FROM approval_requests
        WHERE status = 'pending'
          AND expiresAt IS NOT NULL
-         AND expiresAt < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+         AND expiresAt < ?
+       ORDER BY expiresAt ASC`,
+    [opts?.now ?? new Date().toISOString()],
+  );
+  return rows.map(rowToApprovalRequest);
+}
+
+// Pending requests with no explicit deadline created before `cutoff`. Served
+// by idx_approval_requests_pending_created (migration 166). Called by
+// autoCancelStaleApprovalRequests in src/be/approval-sweeps.ts.
+export async function getStaleApprovalRequests(opts: {
+  cutoff: string;
+}): Promise<ApprovalRequest[]> {
+  const rows = await getDbClient().query<ApprovalRequestRow>(
+    `SELECT * FROM approval_requests
+       WHERE status = 'pending'
+         AND expiresAt IS NULL
+         AND createdAt < ?
+       ORDER BY createdAt ASC`,
+    [opts.cutoff],
   );
   return rows.map(rowToApprovalRequest);
 }
@@ -11972,6 +10381,8 @@ export interface SkillInsert {
   disableModelInvocation?: boolean;
   userInvocable?: boolean;
   systemDefault?: boolean;
+  /** Defaults to true. Extensions create their skills disabled. */
+  isEnabled?: boolean;
 }
 
 /**
@@ -11989,7 +10400,7 @@ export async function createSkill(data: SkillInsert): Promise<Skill> {
         sourceUrl, sourceRepo, sourcePath, sourceBranch, sourceHash, isComplex,
         allowedTools, model, effort, context, agent, disableModelInvocation, userInvocable,
         version, isEnabled, systemDefault, createdAt, lastUpdatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?) RETURNING *`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?) RETURNING *`,
     [
       id,
       data.name,
@@ -12011,6 +10422,7 @@ export async function createSkill(data: SkillInsert): Promise<Skill> {
       data.agent ?? null,
       data.disableModelInvocation ? 1 : 0,
       data.userInvocable === false ? 0 : 1,
+      data.isEnabled === false ? 0 : 1,
       data.systemDefault ? 1 : 0,
       now,
       now,
@@ -12021,9 +10433,23 @@ export async function createSkill(data: SkillInsert): Promise<Skill> {
   return rowToSkill(row);
 }
 
+/** Optional skill fields; `updateSkill` writes null to clear them. */
+type NullableSkillField =
+  | "allowedTools"
+  | "model"
+  | "effort"
+  | "context"
+  | "agent"
+  | "sourceUrl"
+  | "sourceRepo"
+  | "sourcePath"
+  | "sourceHash";
+
 export async function updateSkill(
   id: string,
-  updates: Partial<SkillInsert> & { isEnabled?: boolean; lastFetchedAt?: string },
+  updates: Partial<Omit<SkillInsert, NullableSkillField>> & {
+    [K in NullableSkillField]?: string | null;
+  } & { isEnabled?: boolean; lastFetchedAt?: string },
 ): Promise<Skill | null> {
   const existing = await getSkillById(id);
   if (!existing) return null;
@@ -12334,11 +10760,16 @@ export async function searchSkills(
   limit = 20,
   includeContent = true,
 ): Promise<Skill[]> {
-  const term = `%${query}%`;
+  const tokens = query.split(/\s+/).filter(Boolean);
   const columns = includeContent === false ? SKILL_SLIM_COLUMNS : "*";
+  const searchClauses = tokens.map(() => "(name LIKE ? OR description LIKE ? OR content LIKE ?)");
+  const params = tokens.flatMap((token) => {
+    const term = `%${token}%`;
+    return [term, term, term];
+  });
   const rows = await getDbClient().query<SkillRow>(
-    `SELECT ${columns} FROM skills WHERE (name LIKE ? OR description LIKE ?) AND isEnabled = 1 ORDER BY name ASC LIMIT ?`,
-    [term, term, limit],
+    `SELECT ${columns} FROM skills WHERE ${[...searchClauses, "isEnabled = 1"].join(" AND ")} ORDER BY name ASC LIMIT ?`,
+    [...params, limit],
   );
   return rows.map(rowToSkill);
 }
@@ -12553,6 +10984,18 @@ export async function createMcpServer(data: McpServerInsert): Promise<McpServer>
 
   if (!row) throw new Error("Failed to create MCP server");
   return rowToMcpServer(row);
+}
+
+/** Shared by HTTP and MCP-tool creation paths so each new server emits once. */
+export async function emitMcpServerConnectedTelemetry(): Promise<void> {
+  try {
+    const row = await getDbClient().get<{ count: number }>(
+      "SELECT COUNT(*) as count FROM mcp_servers",
+    );
+    emitIntegrationConnected("other", undefined, row?.count === 1);
+  } catch {
+    // Telemetry must never break MCP server creation.
+  }
 }
 
 export async function updateMcpServer(
@@ -12988,6 +11431,16 @@ export interface ApiKeyStatus {
   provider: string;
   /** Latest provider-emitted rate-limit window snapshots, keyed by window type. */
   rateLimitWindows: RateLimitWindowTelemetry;
+  /** Subscription plan id (`SUBSCRIPTION_PLANS`), when known. */
+  plan: string | null;
+  planSource: PlanSource | null;
+  /** When the CLI last rejected a model with `credits_required` on this key. */
+  lastSeatMismatchAt: string | null;
+  /** Model family of that rejection (`fable`, `opus`, ...). */
+  lastSeatMismatchModel: string | null;
+  /** Auth failures in a row since the last success or clear. */
+  consecutiveAuthFailures: number;
+  lastAuthFailureAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -13011,43 +11464,115 @@ function rowToApiKeyStatus(row: ApiKeyStatusRow): ApiKeyStatus {
   return { ...row, rateLimitWindows: parseRateLimitWindowsJson(row.rateLimitWindows) };
 }
 
+export interface AvailableKeyIndicesResult {
+  availableIndices: number[];
+  /** Indices excluded only by an active model-scoped window block (not key-wide). */
+  modelBlockedIndices: number[];
+  /** ISO of the earliest resetsAt among modelBlockedIndices, or null when none. */
+  earliestModelResetAt: string | null;
+  /** Indices excluded because the key's subscription plan cannot run the model family. */
+  seatBlockedIndices: number[];
+  authFailureFence: number; // highest `authFailureSeq` among these rows
+}
+
 /**
  * Get available (non-rate-limited) key indices for a credential type.
  * Automatically clears expired rate limits before returning.
+ *
+ * When `modelFamily` has a weekly window (fable/opus/sonnet), a key whose
+ * `rateLimitWindows` carries an active rejected window for that family is
+ * excluded from `availableIndices` and reported in `modelBlockedIndices`
+ * instead — the key itself stays `available` for every other model. A key
+ * whose `plan` cannot run the family (`planAllowsModelFamily`) is excluded
+ * and reported in `seatBlockedIndices`, also when it is key-wide or
+ * model-window blocked; a seat block has no reset time.
  */
 export async function getAvailableKeyIndices(
   keyType: string,
   totalKeys: number,
   scope = "global",
   scopeId: string | null = null,
-): Promise<number[]> {
+  modelFamily?: ModelFamily,
+): Promise<AvailableKeyIndicesResult> {
   const now = new Date().toISOString();
+  const nowMs = Date.now();
   const client = getDbClient();
   const effectiveScopeId = scopeId ?? "";
 
-  // Auto-clear expired rate limits
+  // Auto-clear expired rate limits. Never an auth bench: only `clearAuthBench` lifts it.
   await client.run(
     `UPDATE api_key_status
      SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
      WHERE keyType = ? AND scope = ? AND scopeId = ?
-       AND status = 'rate_limited' AND rateLimitedUntil IS NOT NULL AND rateLimitedUntil <= ?`,
-    [now, keyType, scope, effectiveScopeId, now],
+       AND status = 'rate_limited' AND rateLimitedUntil <= ? AND consecutiveAuthFailures < ?`,
+    [now, keyType, scope, effectiveScopeId, now, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
   );
 
-  // Get currently rate-limited key indices
-  const rateLimited = await client.query<{ keyIndex: number }>(
-    `SELECT keyIndex FROM api_key_status
-       WHERE keyType = ? AND scope = ? AND scopeId = ?
-         AND status = 'rate_limited'`,
+  const rows = await client.query<{
+    keyIndex: number;
+    status: string;
+    rateLimitWindows: string | null;
+    plan: string | null;
+    authFailureSeq: number;
+  }>(
+    `SELECT keyIndex, status, rateLimitWindows, plan, authFailureSeq FROM api_key_status
+       WHERE keyType = ? AND scope = ? AND scopeId = ?`,
     [keyType, scope, effectiveScopeId],
   );
 
-  const blockedIndices = new Set(rateLimited.map((r) => r.keyIndex));
-  const available: number[] = [];
-  for (let i = 0; i < totalKeys; i++) {
-    if (!blockedIndices.has(i)) available.push(i);
+  const blockedIndices = new Set(
+    rows.filter((r) => r.status === "rate_limited").map((r) => r.keyIndex),
+  );
+
+  const modelBlockedIndices: number[] = [];
+  let earliestModelResetsAtSec: number | undefined;
+  if (modelFamily) {
+    for (const row of rows) {
+      // A key already blocked key-wide doesn't need a separate model-block
+      // entry — it's excluded from availableIndices either way, and
+      // modelBlockedIndices means "excluded only by a model-scoped block".
+      if (blockedIndices.has(row.keyIndex)) continue;
+      const block = activeModelBlock(
+        parseRateLimitWindowsJson(row.rateLimitWindows),
+        modelFamily,
+        nowMs,
+      );
+      if (!block) continue;
+      modelBlockedIndices.push(row.keyIndex);
+      if (earliestModelResetsAtSec === undefined || block.resetsAt < earliestModelResetsAtSec) {
+        earliestModelResetsAtSec = block.resetsAt;
+      }
+    }
   }
-  return available;
+  const modelBlockedSet = new Set(modelBlockedIndices);
+
+  // A seat block is a plan fact: report it even when the key is also key-wide
+  // or model-window blocked, or the temporary block hides it from admission
+  // and the fallback pick can select a key that cannot run the model.
+  const seatBlockedIndices: number[] = [];
+  if (modelFamily) {
+    for (const row of rows) {
+      if (!planAllowsModelFamily(row.plan, modelFamily)) seatBlockedIndices.push(row.keyIndex);
+    }
+  }
+  const seatBlockedSet = new Set(seatBlockedIndices);
+
+  const availableIndices: number[] = [];
+  for (let i = 0; i < totalKeys; i++) {
+    if (blockedIndices.has(i) || modelBlockedSet.has(i) || seatBlockedSet.has(i)) continue;
+    availableIndices.push(i);
+  }
+
+  return {
+    availableIndices,
+    modelBlockedIndices,
+    seatBlockedIndices,
+    earliestModelResetAt:
+      earliestModelResetsAtSec !== undefined
+        ? new Date(earliestModelResetsAtSec * 1000).toISOString()
+        : null,
+    authFailureFence: Math.max(0, ...rows.map((r) => r.authFailureSeq)),
+  };
 }
 
 /**
@@ -13060,7 +11585,9 @@ export async function recordKeyUsage(
   taskId: string | null,
   scope = "global",
   scopeId: string | null = null,
-): Promise<void> {
+  /** Plan id the worker detected on the credential (for example from the Codex JWT). */
+  plan: string | null = null,
+): Promise<{ planChanged: boolean }> {
   const now = new Date().toISOString();
   const client = getDbClient();
   const effectiveScopeId = scopeId ?? "";
@@ -13082,6 +11609,18 @@ export async function recordKeyUsage(
     [keyType, keySuffix, keyIndex, scope, effectiveScopeId, now, provider, now],
   );
 
+  // A detected plan replaces an estimate, never a plan the operator picked.
+  let planChanged = false;
+  if (plan) {
+    const result = await client.run(
+      `UPDATE api_key_status SET plan = ?, planSource = 'detected'
+         WHERE keyType = ? AND keySuffix = ? AND COALESCE(planSource, '') != 'manual'
+           AND (plan IS NOT ? OR planSource IS NOT 'detected')`,
+      [plan, keyType, keySuffix, plan],
+    );
+    planChanged = result.changes > 0;
+  }
+
   // Record which key was used on the task
   if (taskId) {
     await client.run(
@@ -13089,11 +11628,38 @@ export async function recordKeyUsage(
       [keySuffix, keyType, taskId],
     );
   }
+  return { planChanged };
 }
 
 /**
- * Mark a key as rate-limited with a retry-after timestamp.
+ * Set the subscription plan of a credential on all its scope rows, as picked
+ * by the operator. `null` removes the manual choice, so the next detection
+ * applies again. Returns false when no row exists for the credential.
  */
+export async function setApiKeyPlan(
+  keyType: string,
+  keySuffix: string,
+  plan: string | null,
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = plan
+    ? await getDbClient().run(
+        `UPDATE api_key_status SET plan = ?, planSource = 'manual', updatedAt = ?
+           WHERE keyType = ? AND keySuffix = ?`,
+        [plan, now, keyType, keySuffix],
+      )
+    : await getDbClient().run(
+        `UPDATE api_key_status
+           SET plan = CASE WHEN planSource = 'manual' THEN NULL ELSE plan END,
+               planSource = CASE WHEN planSource = 'manual' THEN NULL ELSE planSource END,
+               updatedAt = ?
+           WHERE keyType = ? AND keySuffix = ?`,
+        [now, keyType, keySuffix],
+      );
+  return result.changes > 0;
+}
+
+/** Mark a key as rate-limited until a retry-after timestamp; never shortens an auth-failure bench. */
 export async function markKeyRateLimited(
   keyType: string,
   keySuffix: string,
@@ -13111,7 +11677,7 @@ export async function markKeyRateLimited(
        ON CONFLICT(keyType, keySuffix, scope, scopeId)
        DO UPDATE SET
          status = 'rate_limited',
-         rateLimitedUntil = excluded.rateLimitedUntil,
+         rateLimitedUntil = CASE WHEN status = 'rate_limited' AND consecutiveAuthFailures >= ${CODEX_AUTH_FAILURE_BENCH_THRESHOLD} THEN MAX(COALESCE(rateLimitedUntil, ''), excluded.rateLimitedUntil) ELSE excluded.rateLimitedUntil END,
          lastRateLimitAt = excluded.lastRateLimitAt,
          rateLimitCount = rateLimitCount + 1,
          keyIndex = excluded.keyIndex,
@@ -13120,6 +11686,98 @@ export async function markKeyRateLimited(
   );
 }
 
+export interface KeyAuthFailureResult {
+  consecutiveAuthFailures: number;
+  benched: boolean;
+  rateLimitedUntil: string | null;
+}
+
+/** Count an auth failure, ordered by `authFailureSeq`; at the threshold, bench (extend only). */
+export async function recordKeyAuthFailure(
+  keyType: string,
+  keySuffix: string,
+  keyIndex: number,
+  scope = "global",
+  scopeId: string | null = null,
+): Promise<KeyAuthFailureResult> {
+  const effectiveScopeId = scopeId ?? "";
+  const provider = deriveProviderFromKeyType(keyType);
+  return await getDbClient().transaction(async (tx) => {
+    const now = new Date().toISOString();
+    const source = "report-auth-failure";
+    const row = await tx.get<{ consecutiveAuthFailures: number; rateLimitedUntil: string | null }>(
+      `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, status, consecutiveAuthFailures, lastAuthFailureAt, authFailureSeq, provider, updatedAt)
+         VALUES (?, ?, ?, ?, ?, 'available', 1, ?, (SELECT COALESCE(MAX(authFailureSeq), 0) + 1 FROM api_key_status), ?, ?)
+         ON CONFLICT(keyType, keySuffix, scope, scopeId)
+         DO UPDATE SET
+           consecutiveAuthFailures = consecutiveAuthFailures + 1,
+           lastAuthFailureAt = excluded.lastAuthFailureAt, authFailureSeq = excluded.authFailureSeq,
+           keyIndex = excluded.keyIndex, updatedAt = excluded.updatedAt
+         RETURNING consecutiveAuthFailures, rateLimitedUntil`,
+      [keyType, keySuffix, keyIndex, scope, effectiveScopeId, now, provider, now],
+    );
+    if (!row) throw new Error("Failed to record auth failure");
+    const { consecutiveAuthFailures } = row;
+    if (consecutiveAuthFailures < CODEX_AUTH_FAILURE_BENCH_THRESHOLD) {
+      return { consecutiveAuthFailures, benched: false, rateLimitedUntil: row.rateLimitedUntil };
+    }
+    let benchedUntil = new Date(Date.parse(now) + CODEX_AUTH_FAILURE_BENCH_MS).toISOString();
+    if (row.rateLimitedUntil && Date.parse(row.rateLimitedUntil) > Date.parse(benchedUntil)) {
+      benchedUntil = row.rateLimitedUntil;
+    }
+    await tx.run(
+      `UPDATE api_key_status
+         SET status = 'rate_limited', rateLimitedUntil = ?, lastRateLimitAt = ?,
+             rateLimitCount = rateLimitCount + 1, updatedAt = ?
+         WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?`,
+      [benchedUntil, now, now, keyType, keySuffix, scope, effectiveScopeId],
+    );
+    await upsertKv({
+      namespace: CODEX_AUTH_WATCH_NAMESPACE,
+      key: codexAuthBenchMarkerKey(keySuffix),
+      valueType: "json",
+      value: { keyIndex, keyType, benchedAt: now, benchedUntil, lastFailAt: now, source },
+      expiresAt: Date.parse(benchedUntil) + 86_400_000,
+    });
+    return { consecutiveAuthFailures, benched: true, rateLimitedUntil: benchedUntil };
+  });
+}
+
+/**
+ * Merges reported window snapshots into the stored ones, one window type at a
+ * time. A reported entry replaces the stored entry unless the stored entry was
+ * observed strictly later (`lastSeenAt`), so an older `allowed` snapshot that
+ * arrives after a terminal rejection cannot reopen an exhausted window. An
+ * unparseable `lastSeenAt` on either side falls back to "reported wins".
+ */
+function mergeRateLimitWindowTelemetry(
+  stored: RateLimitWindowTelemetry,
+  reported: RateLimitWindowTelemetry,
+): RateLimitWindowTelemetry {
+  const merged: RateLimitWindowTelemetry = { ...stored };
+  for (const [type, entry] of Object.entries(reported)) {
+    const current = merged[type];
+    const currentSeenMs = current ? Date.parse(current.lastSeenAt) : Number.NaN;
+    const reportedSeenMs = Date.parse(entry.lastSeenAt);
+    if (
+      Number.isFinite(currentSeenMs) &&
+      Number.isFinite(reportedSeenMs) &&
+      currentSeenMs > reportedSeenMs
+    ) {
+      continue;
+    }
+    merged[type] = entry;
+  }
+  return merged;
+}
+
+/**
+ * Persists reported window snapshots for a key. Admission
+ * (`getAvailableKeyIndices`) reads these windows, so the read-merge-write
+ * runs in one `BEGIN IMMEDIATE` transaction: two concurrent reports for the
+ * same key (e.g. a Fable and an Opus rejection) both survive instead of the
+ * later write dropping the earlier one.
+ */
 export async function recordKeyRateLimitWindows(
   keyType: string,
   keySuffix: string,
@@ -13127,34 +11785,81 @@ export async function recordKeyRateLimitWindows(
   windows: RateLimitWindowTelemetry,
   scope = "global",
   scopeId: string | null = null,
-): Promise<void> {
-  if (Object.keys(windows).length === 0) return;
+): Promise<{ planChanged: boolean }> {
+  if (Object.keys(windows).length === 0) return { planChanged: false };
 
   const now = new Date().toISOString();
   const effectiveScopeId = scopeId ?? "";
   const provider = deriveProviderFromKeyType(keyType);
-  const client = getDbClient();
-  const existing = await client.get<{ rateLimitWindows: string | null }>(
-    `SELECT rateLimitWindows FROM api_key_status
-       WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?`,
-    [keyType, keySuffix, scope, effectiveScopeId],
-  );
-  const serialized = JSON.stringify({
-    ...parseRateLimitWindowsJson(existing?.rateLimitWindows),
-    ...windows,
+  const merged = await getDbClient().transaction(async (tx) => {
+    const existing = await tx.get<{ rateLimitWindows: string | null }>(
+      `SELECT rateLimitWindows FROM api_key_status
+         WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?`,
+      [keyType, keySuffix, scope, effectiveScopeId],
+    );
+    const mergedWindows = mergeRateLimitWindowTelemetry(
+      parseRateLimitWindowsJson(existing?.rateLimitWindows),
+      windows,
+    );
+    const serialized = JSON.stringify(mergedWindows);
+
+    await tx.run(
+      `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, rateLimitWindows, provider, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(keyType, keySuffix, scope, scopeId)
+         DO UPDATE SET
+           rateLimitWindows = excluded.rateLimitWindows,
+           keyIndex = excluded.keyIndex,
+           provider = excluded.provider,
+           updatedAt = excluded.updatedAt`,
+      [keyType, keySuffix, keyIndex, scope, effectiveScopeId, serialized, provider, now],
+    );
+    return mergedWindows;
   });
 
-  await client.run(
-    `INSERT INTO api_key_status (keyType, keySuffix, keyIndex, scope, scopeId, rateLimitWindows, provider, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(keyType, keySuffix, scope, scopeId)
-       DO UPDATE SET
-         rateLimitWindows = excluded.rateLimitWindows,
-         keyIndex = excluded.keyIndex,
-         provider = excluded.provider,
-         updatedAt = excluded.updatedAt`,
-    [keyType, keySuffix, keyIndex, scope, effectiveScopeId, serialized, provider, now],
+  const planChanged =
+    keyType === "CLAUDE_CODE_OAUTH_TOKEN" && (await refreshEstimatedClaudePlan(keySuffix, merged));
+  return { planChanged };
+}
+
+const WEEK_SECONDS = 7 * 24 * 3600;
+
+/**
+ * Estimate the plan of a Claude credential from its 7-day window (see
+ * `estimateClaudePlan`), unless a stronger source already set it. Returns
+ * true when the stored plan changed.
+ */
+async function refreshEstimatedClaudePlan(
+  keySuffix: string,
+  windows: RateLimitWindowTelemetry,
+): Promise<boolean> {
+  const week = windows.seven_day;
+  if (!week?.utilization || !week.resetsAt) return false;
+  const client = getDbClient();
+  const stronger = await client.get<{ found: number }>(
+    `SELECT 1 as found FROM api_key_status
+       WHERE keyType = 'CLAUDE_CODE_OAUTH_TOKEN' AND keySuffix = ? AND planSource IN ('manual', 'detected')
+       LIMIT 1`,
+    [keySuffix],
   );
+  if (stronger) return false;
+  const windowStart = new Date((week.resetsAt - WEEK_SECONDS) * 1000).toISOString();
+  const spend = await client.get<{ spendUsd: number }>(
+    `SELECT COALESCE(SUM(sc.totalCostUsd), 0) as spendUsd
+       FROM session_costs sc JOIN agent_tasks t ON t.id = sc.taskId
+       WHERE t.credentialKeyType = 'CLAUDE_CODE_OAUTH_TOKEN' AND t.credentialKeySuffix = ?
+         AND sc.createdAt >= ?`,
+    [keySuffix, windowStart],
+  );
+  const plan = estimateClaudePlan(week.utilization, spend?.spendUsd ?? 0);
+  if (!plan) return false;
+  const result = await client.run(
+    `UPDATE api_key_status SET plan = ?, planSource = 'estimated'
+       WHERE keyType = 'CLAUDE_CODE_OAUTH_TOKEN' AND keySuffix = ?
+         AND COALESCE(planSource, 'estimated') = 'estimated' AND plan IS NOT ?`,
+    [plan, keySuffix, plan],
+  );
+  return result.changes > 0;
 }
 
 /**
@@ -13179,24 +11884,48 @@ export async function setApiKeyName(
 }
 
 /**
- * Clear a stale rate-limit record after a successful use proves the key is healthy.
+ * Clear a stale rate-limit record after a successful use proves the key is healthy. With
+ * `clearAuthBench` + `authFence` (the `authFailureFence` read before the task or credential write),
+ * also lift an auth bench, reset the count and delete the Codex bench marker, but never for a
+ * failure recorded after the fence. `keyIndex` (slot re-login) also retires the slot's other logins.
  */
 export async function clearKeyRateLimit(
   keyType: string,
   keySuffix: string,
   scope = "global",
   scopeId: string | null = null,
+  opts: { clearAuthBench?: boolean; keyIndex?: number; authFence?: number } = {},
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const effectiveScopeId = scopeId ?? "";
-  const result = await getDbClient().run(
-    `UPDATE api_key_status
-       SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
-       WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?
-         AND status = 'rate_limited'`,
-    [now, keyType, keySuffix, scope, effectiveScopeId],
-  );
-  return result.changes > 0;
+  const { keyIndex = -1, authFence = null } = opts;
+  const clearAuthBench = opts.clearAuthBench === true && authFence !== null;
+  const key = [keyType, keySuffix, scope, effectiveScopeId];
+  return await getDbClient().transaction(async (tx) => {
+    const result = await tx.run(
+      `UPDATE api_key_status
+         SET status = 'available', rateLimitedUntil = NULL, updatedAt = ?
+         WHERE keyType = ? AND keySuffix = ? AND scope = ? AND scopeId = ?
+           AND status = 'rate_limited' AND ((? AND authFailureSeq <= ?) OR consecutiveAuthFailures < ?)`,
+      [now, ...key, clearAuthBench ? 1 : 0, authFence, CODEX_AUTH_FAILURE_BENCH_THRESHOLD],
+    );
+    const cleared = result.changes > 0;
+    if (!clearAuthBench) return cleared;
+    const lifted = await tx.query<{ keySuffix: string }>(
+      `UPDATE api_key_status SET consecutiveAuthFailures = 0, updatedAt = ?1,
+           status = CASE WHEN keySuffix = ?2 THEN status ELSE 'available' END, rateLimitedUntil = CASE WHEN keySuffix = ?2 THEN rateLimitedUntil END
+         WHERE keyType = ?3 AND scope = ?4 AND scopeId = ?5 AND (consecutiveAuthFailures > 0 OR status = 'rate_limited')
+           AND ((keySuffix = ?2 AND authFailureSeq <= ?7) OR (keySuffix != ?2 AND keyIndex = ?6)) RETURNING keySuffix`,
+      [now, keySuffix, keyType, scope, effectiveScopeId, keyIndex, authFence],
+    );
+    const retired = lifted.filter((row) => row.keySuffix !== keySuffix);
+    if (keyType === "CODEX_OAUTH") {
+      for (const suffix of [...(cleared ? [keySuffix] : []), ...retired.map((r) => r.keySuffix)]) {
+        await deleteKv(CODEX_AUTH_WATCH_NAMESPACE, codexAuthBenchMarkerKey(suffix));
+      }
+    }
+    return cleared || retired.length > 0;
+  });
 }
 
 /**
@@ -13358,6 +12087,8 @@ export async function createUser(data: {
     ],
   );
   if (!row) throw new Error("Failed to create user");
+  // The org's email domain may come from this user (debounced, post-commit).
+  getDbClient().afterCommit(scheduleOrgDomainRecompute);
   return rowToUser(row);
 }
 
@@ -13430,6 +12161,7 @@ export async function updateUser(
     `UPDATE users SET ${sets.join(", ")} WHERE id = ? RETURNING *`,
     params,
   );
+  if (row) getDbClient().afterCommit(scheduleOrgDomainRecompute);
   return row ? rowToUser(row) : null;
 }
 
@@ -13494,6 +12226,21 @@ export async function deleteUser(id: string, replacementUserId?: string): Promis
          )`,
     );
     const replacement = replacementUserId ?? null;
+    // The human-free rule only asks whether a task's requester or its workflow
+    // run's creator is NULL, so only clearing them (no replacement) can change a
+    // stored flag. Gather the tasks now: after the rewrite nothing identifies
+    // them. The workflow branch covers roots whose requester was never set.
+    const reclassifySeedIds: string[] = replacementUserId
+      ? []
+      : (
+          await tx.query<{ id: string }>(
+            `SELECT id FROM agent_tasks WHERE requestedByUserId = ?
+             UNION
+             SELECT id FROM agent_tasks
+             WHERE workflowRunId IN (SELECT id FROM workflow_runs WHERE created_by = ?)`,
+            [id, id],
+          )
+        ).map((row) => row.id);
     for (const reference of references) {
       const table = quoteSqlIdentifier(reference.tableName);
       const column = quoteSqlIdentifier(reference.columnName);
@@ -13521,7 +12268,10 @@ export async function deleteUser(id: string, replacementUserId?: string): Promis
       );
     }
 
+    await reclassifyTaskHumanFree(reclassifySeedIds);
+
     const result = await tx.run("DELETE FROM users WHERE id = ?", [id]);
+    if (result.changes > 0) getDbClient().afterCommit(scheduleOrgDomainRecompute);
     return result.changes > 0;
   });
 }
@@ -13539,6 +12289,7 @@ interface InboxItemStateRow {
   snoozeUntil: string | null;
   dismissedAt: string | null;
   doneAt: string | null;
+  readAt: string | null;
   createdAt: string;
   lastUpdatedAt: string;
 }
@@ -13553,6 +12304,7 @@ function rowToInboxItemState(row: InboxItemStateRow): InboxItemState {
     snoozeUntil: row.snoozeUntil ?? undefined,
     dismissedAt: row.dismissedAt ?? undefined,
     doneAt: row.doneAt ?? undefined,
+    readAt: row.readAt ?? undefined,
     createdAt: row.createdAt,
     lastUpdatedAt: row.lastUpdatedAt,
   };
@@ -13591,22 +12343,27 @@ export async function upsertInboxState(opts: {
   snoozeUntil?: string;
   dismissedAt?: string;
   doneAt?: string;
+  /** First-viewed timestamp. Sticky: once set, later calls never clear or move it. */
+  readAt?: string;
 }): Promise<InboxItemState> {
   const now = new Date().toISOString();
   // Auto-derive timestamps from status when not explicitly provided.
   const dismissedAt = opts.dismissedAt ?? (opts.status === "dismissed" ? now : null);
   const doneAt = opts.doneAt ?? (opts.status === "done" ? now : null);
   const snoozeUntil = opts.snoozeUntil ?? null;
+  const readAt = opts.readAt ?? null;
 
-  // SQLite upsert via UNIQUE(userId, itemType, itemId).
+  // SQLite upsert via UNIQUE(userId, itemType, itemId). readAt is sticky: the
+  // first non-null value written wins on every subsequent conflict.
   const row = await getDbClient().get<InboxItemStateRow>(
-    `INSERT INTO inbox_item_state (userId, itemType, itemId, status, snoozeUntil, dismissedAt, doneAt, createdAt, lastUpdatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO inbox_item_state (userId, itemType, itemId, status, snoozeUntil, dismissedAt, doneAt, readAt, createdAt, lastUpdatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(userId, itemType, itemId) DO UPDATE SET
          status = excluded.status,
          snoozeUntil = excluded.snoozeUntil,
          dismissedAt = excluded.dismissedAt,
          doneAt = excluded.doneAt,
+         readAt = COALESCE(inbox_item_state.readAt, excluded.readAt),
          lastUpdatedAt = excluded.lastUpdatedAt
        RETURNING *`,
     [
@@ -13617,6 +12374,7 @@ export async function upsertInboxState(opts: {
       snoozeUntil,
       dismissedAt,
       doneAt,
+      readAt,
       now,
       now,
     ],
@@ -13833,9 +12591,9 @@ export async function listTaskTemplates(opts?: {
 // ============================================================================
 
 /**
- * Walk the parent→child chain rooted at `rootTaskId` via recursive CTE.
- * Returns the chain ordered by `createdAt` (so the root is first; siblings
- * appear in creation order; grand-children after their parents).
+ * Walk the chain rooted at `rootTaskId`, ordered by `createdAt` (root first; `rowid` breaks
+ * ties as idx_agent_tasks_created did). `CROSS JOIN` keeps the chain as the outer loop: with
+ * a plain JOIN, SQLite scanned all of agent_tasks to skip the sort.
  */
 export async function getRootTaskChain(rootTaskId: string): Promise<AgentTask[]> {
   const rows = await getDbClient().query<AgentTaskRow>(
@@ -13845,9 +12603,9 @@ export async function getRootTaskChain(rootTaskId: string): Promise<AgentTask[]>
          SELECT t.id FROM agent_tasks t
          JOIN chain c ON t.parentTaskId = c.id
        )
-       SELECT t.* FROM agent_tasks t
-       JOIN chain ON chain.id = t.id
-       ORDER BY t.createdAt`,
+       SELECT t.* FROM chain
+       CROSS JOIN agent_tasks t ON t.id = chain.id
+       ORDER BY t.createdAt, t.rowid`,
     [rootTaskId],
   );
   return rows.map(rowToAgentTask);
@@ -13892,6 +12650,12 @@ interface ListRecentSessionsOpts {
   q?: string;
   /** When set, restrict to root tasks where `requestedByUserId` equals this value. NULL rows are excluded. */
   requestedByUserId?: string;
+  /**
+   * When set, restrict to root tasks whose `contextKey` starts with this
+   * literal prefix (`%`, `_` and `\` are escaped). Powers the UI contextual
+   * session panel's per-page dropdown.
+   */
+  contextKeyPrefix?: string;
   /** When true, return slim `SessionListItemSummary` rows (default: full). */
   slim?: boolean;
 }
@@ -13926,6 +12690,10 @@ export async function listRecentSessions(
   if (requestedByUserId) {
     conditions.push("r.requestedByUserId = ?");
     params.push(requestedByUserId);
+  }
+  if (opts?.contextKeyPrefix) {
+    conditions.push(`r.contextKey LIKE ? ESCAPE '\\'`);
+    params.push(literalPrefixPattern(opts.contextKeyPrefix));
   }
   params.push(limit, offset);
 
@@ -13963,7 +12731,7 @@ export async function listRecentSessions(
        FROM agent_tasks r
        JOIN agg a ON a.root_id = r.id
        LEFT JOIN latest_status ls ON ls.root_id = r.id
-       ORDER BY a.lastActivityAt DESC
+       ORDER BY a.lastActivityAt DESC, r.createdAt DESC, r.id DESC
        LIMIT ? OFFSET ?`,
     params,
   );
@@ -13998,7 +12766,7 @@ export async function listRecentSessions(
  * a plain count, no recursive chain walk needed.
  */
 export async function countSessions(
-  opts?: Pick<ListRecentSessionsOpts, "source" | "q" | "requestedByUserId">,
+  opts?: Pick<ListRecentSessionsOpts, "source" | "q" | "requestedByUserId" | "contextKeyPrefix">,
 ): Promise<number> {
   const sources = opts?.source?.filter((s) => s.length > 0) ?? [];
   const q = opts?.q?.trim();
@@ -14019,6 +12787,10 @@ export async function countSessions(
   if (requestedByUserId) {
     conditions.push("requestedByUserId = ?");
     params.push(requestedByUserId);
+  }
+  if (opts?.contextKeyPrefix) {
+    conditions.push(`contextKey LIKE ? ESCAPE '\\'`);
+    params.push(literalPrefixPattern(opts.contextKeyPrefix));
   }
 
   const row = await getDbClient().get<{ count: number }>(
@@ -14512,6 +13284,21 @@ export async function getLiveAgentCounts(minutes: number = 5): Promise<{
 }
 
 /**
+ * Leads and workers that can take work right now (status idle or busy). Used
+ * by the onboarding signals: the step 6 agents readout uses the same rule,
+ * while the `/status` heartbeat window (`lastActivityAt`) lags for idle agents.
+ */
+export async function getReadyAgentCounts(): Promise<{ leads: number; workers: number }> {
+  const row = await getDbClient().get<{ leads: number | null; workers: number | null }>(
+    `SELECT SUM(CASE WHEN isLead = 1 THEN 1 ELSE 0 END) AS leads,
+            SUM(CASE WHEN isLead = 0 THEN 1 ELSE 0 END) AS workers
+       FROM agents
+      WHERE status IN ('idle', 'busy') AND ${NOT_EXTENSION_AGENT_SQL}`,
+  );
+  return { leads: row?.leads ?? 0, workers: row?.workers ?? 0 };
+}
+
+/**
  * Aggregate activity numbers for `GET /status`'s `activity` block.
  * - `agents_online` / `leads_online`: heartbeated within the last 5 minutes.
  * - `recent_tasks_count`: agent_tasks rows created in the last 24 hours.
@@ -14556,9 +13343,10 @@ export async function getSwarmMetrics(): Promise<SwarmMetrics> {
 
   const groupCounts = async (
     table: string,
+    where?: string,
   ): Promise<{ total: number; by_status: Record<string, number> }> => {
     const rows = await client.query<{ status: string; count: number }>(
-      `SELECT status, COUNT(*) AS count FROM ${table} GROUP BY status`,
+      `SELECT status, COUNT(*) AS count FROM ${table}${where ? ` WHERE ${where}` : ""} GROUP BY status`,
     );
     const by_status: Record<string, number> = {};
     let total = 0;
@@ -14580,7 +13368,7 @@ export async function getSwarmMetrics(): Promise<SwarmMetrics> {
 
   return {
     tasks: await groupCounts("agent_tasks"),
-    agents: await groupCounts("agents"),
+    agents: await groupCounts("agents", NOT_EXTENSION_AGENT_SQL),
     workflows: { total: workflowRow?.total ?? 0, enabled: workflowRow?.enabled ?? 0 },
     pages: { total: pagesRow?.count ?? 0 },
     sessions: { active: sessionsRow?.count ?? 0 },
@@ -14877,41 +13665,95 @@ export async function incrKv(namespace: string, key: string, by: number): Promis
 }
 
 /**
+ * Smallest string greater than every string that starts with `prefix`, in
+ * code-point order (which is SQLite's BINARY order over UTF-8). `null` means
+ * no upper bound exists (the prefix is all U+10FFFF).
+ */
+export function kvPrefixUpperBound(prefix: string): string | null {
+  const codePoints = Array.from(prefix);
+  while (codePoints.length > 0) {
+    const last = codePoints.pop()!.codePointAt(0)!;
+    if (last < 0x10ffff) {
+      const next = last + 1 === 0xd800 ? 0xe000 : last + 1;
+      return codePoints.join("") + String.fromCodePoint(next);
+    }
+  }
+  return null;
+}
+
+/**
+ * Key-prefix predicate as a range on the (namespace, key) primary key.
+ * `key LIKE 'p%'` cannot use that index (LIKE is case-insensitive, the PK is
+ * BINARY), so it scanned every row of the namespace. A range seeks straight
+ * to the prefix and matches it exactly (case-sensitive).
+ */
+function kvPrefixCondition(prefix: string | undefined): { sql: string; params: string[] } {
+  if (prefix === undefined || prefix.length === 0) return { sql: "", params: [] };
+  const upper = kvPrefixUpperBound(prefix);
+  return upper === null
+    ? { sql: "AND key >= ?", params: [prefix] }
+    : { sql: "AND key >= ? AND key < ?", params: [prefix, upper] };
+}
+
+/** Top-level JSON field equality, evaluated in SQLite before rows reach JS. */
+export type KvJsonFieldEquals = { field: string; value: string | number | boolean };
+
+function kvJsonFieldConditions(filters: KvJsonFieldEquals[] | undefined): {
+  sql: string;
+  params: (string | number | boolean)[];
+} {
+  const parts: string[] = [];
+  const params: (string | number | boolean)[] = [];
+  for (const filter of filters ?? []) {
+    // JSON path quoting has no escape for these characters.
+    if (/["\\]/.test(filter.field)) {
+      throw new Error(`unsupported JSON field name: ${filter.field}`);
+    }
+    // Only safe integers compare exactly: SQLite parses a stored literal like
+    // 1000000000000000100 as an exact INTEGER (and fractions with its own
+    // float parser) while the bound JS number is a double, so SQL could drop
+    // a row that JS `===` matches. Other numbers are left to the caller.
+    if (typeof filter.value === "number" && !Number.isSafeInteger(filter.value)) continue;
+    // json_valid guards the corrupt rows decodeKvRow tolerates: json_extract
+    // would abort the whole query on one of them.
+    parts.push(
+      "AND (CASE WHEN value_type = 'json' AND json_valid(value) THEN json_extract(value, ?) END) = ?",
+    );
+    params.push(`$."${filter.field}"`, filter.value);
+  }
+  return { sql: parts.join(" "), params };
+}
+
+/**
  * List entries in a namespace, optionally filtered by prefix. Expired rows
  * are filtered out by the SELECT (no inline DELETE — listing should be a
  * stable cursor; sweeping happens on point-reads instead).
+ *
+ * `jsonFieldEquals` narrows the rows in SQL so non-matching values are never
+ * decoded. SQL equality is looser than JS `===` (JSON `true` equals `1`) and
+ * numbers that are not safe integers are not filtered at all, so callers that
+ * need exact semantics re-check the decoded values.
  *
  * `limit` is capped by the caller (HTTP enforces ≤1000); helper does no extra
  * bounds-check beyond what SQL accepts.
  */
 export async function listKv(
   namespace: string,
-  opts: { prefix?: string; limit: number; offset: number },
+  opts: { prefix?: string; limit: number; offset: number; jsonFieldEquals?: KvJsonFieldEquals[] },
 ): Promise<KvEntry[]> {
   const now = Date.now();
-  if (opts.prefix !== undefined && opts.prefix.length > 0) {
-    // LIKE-escape `\` `%` `_` so a user-supplied prefix can't run wildcards.
-    const escaped = opts.prefix.replace(/[\\%_]/g, "\\$&");
-    const rows = await getDbClient().query<KvRow>(
-      `SELECT namespace, key, value, value_type, expires_at, created_at, updated_at
-           FROM kv_entries
-          WHERE namespace = ?
-            AND (expires_at IS NULL OR expires_at > ?)
-            AND key LIKE ? ESCAPE '\\'
-          ORDER BY key
-          LIMIT ? OFFSET ?`,
-      [namespace, now, `${escaped}%`, opts.limit, opts.offset],
-    );
-    return rows.map(decodeKvRow);
-  }
+  const prefix = kvPrefixCondition(opts.prefix);
+  const json = kvJsonFieldConditions(opts.jsonFieldEquals);
   const rows = await getDbClient().query<KvRow>(
     `SELECT namespace, key, value, value_type, expires_at, created_at, updated_at
          FROM kv_entries
         WHERE namespace = ?
           AND (expires_at IS NULL OR expires_at > ?)
+          ${prefix.sql}
+          ${json.sql}
         ORDER BY key
         LIMIT ? OFFSET ?`,
-    [namespace, now, opts.limit, opts.offset],
+    [namespace, now, ...prefix.params, ...json.params, opts.limit, opts.offset],
   );
   return rows.map(decodeKvRow);
 }
@@ -14922,22 +13764,13 @@ export async function listKv(
  */
 export async function countKv(namespace: string, opts: { prefix?: string }): Promise<number> {
   const now = Date.now();
-  if (opts.prefix !== undefined && opts.prefix.length > 0) {
-    const escaped = opts.prefix.replace(/[\\%_]/g, "\\$&");
-    const row = await getDbClient().get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM kv_entries
-          WHERE namespace = ?
-            AND (expires_at IS NULL OR expires_at > ?)
-            AND key LIKE ? ESCAPE '\\'`,
-      [namespace, now, `${escaped}%`],
-    );
-    return row?.n ?? 0;
-  }
+  const prefix = kvPrefixCondition(opts.prefix);
   const row = await getDbClient().get<{ n: number }>(
     `SELECT COUNT(*) AS n FROM kv_entries
         WHERE namespace = ?
-          AND (expires_at IS NULL OR expires_at > ?)`,
-    [namespace, now],
+          AND (expires_at IS NULL OR expires_at > ?)
+          ${prefix.sql}`,
+    [namespace, now, ...prefix.params],
   );
   return row?.n ?? 0;
 }

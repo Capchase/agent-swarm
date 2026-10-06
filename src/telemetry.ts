@@ -3,12 +3,41 @@
  *
  * - Opt-out via ANONYMIZED_TELEMETRY=false
  * - Fire-and-forget: never throws, never blocks
- * - No external dependencies (uses global fetch + node:crypto)
+ * - No DB and no external services (global fetch + node:crypto only)
  * - Importable from both API server and workers
+ * - Every event is schema_version 2: a top-level `context` identity envelope
+ *   plus properties typed against the proxy's event catalog
+ *   (`src/telemetry-contract`). An event or property that is not in the
+ *   catalog fails `tsc`, and the proxy rejects it at ingest.
  */
 import { randomUUID } from "node:crypto";
 import pkg from "../package.json";
+import { isSlackConfigured } from "./slack/config";
+import {
+  buildContext,
+  mintOrgId,
+  normalizeProperties,
+  type TelemetryActor,
+  type TelemetryUserRole,
+  validOrgDomain,
+  validOrgId,
+} from "./telemetry-context";
+import type { PropsFor, TelemetryEventName } from "./telemetry-contract";
 import { isEnvFlagEnabled } from "./utils/env-flag";
+import { getCurrentRequestUserId } from "./utils/request-auth-context";
+
+export type { TelemetryActor } from "./telemetry-context";
+
+type SwarmEventName = TelemetryEventName<"agent-swarm">;
+/** `started` for `server.started`: the event names of one family, without the prefix. */
+type EventSuffix<Prefix extends string> = SwarmEventName extends infer E
+  ? E extends `${Prefix}.${infer Suffix}`
+    ? Suffix
+    : never
+  : never;
+type FamilyProps<Prefix extends string, S extends string> = PropsFor<
+  Extract<SwarmEventName, `${Prefix}.${S}`>
+>;
 
 const TELEMETRY_ENDPOINT = "https://proxy.desplega.sh/v1/events";
 const PRODUCT = "agent-swarm";
@@ -16,6 +45,13 @@ const TIMEOUT_MS = 5_000;
 
 let installationId: string | null = null;
 let installedAt: string | null = null;
+/** Org ID resolved at init (env, then `telemetry_org_id`). `SWARM_ORG_ID` is re-read per event. */
+let cachedOrgId: string | undefined;
+/** Email domain of the org's admin, set by the API server (`setTelemetryOrgDomain`). */
+let cachedOrgDomain: string | undefined;
+let roleResolver: ((userId: string) => TelemetryUserRole | undefined) | null = null;
+let identityReloader: (() => Promise<void>) | null = null;
+let lastIdentityLoadAt = 0;
 let source = "unknown";
 let cachedIsCloud = false;
 let cachedIsE2b = false;
@@ -25,7 +61,8 @@ let cachedHasEmailChannel = false;
 let cachedInstallMethod = "manual";
 let cachedInstallPreset: string | undefined;
 
-function isEnabled(): boolean {
+/** Effective opt-out state: `ANONYMIZED_TELEMETRY` (default on). Read at call time. */
+export function isTelemetryEnabled(): boolean {
   return isEnvFlagEnabled("ANONYMIZED_TELEMETRY", true);
 }
 
@@ -116,6 +153,119 @@ export function _resolveInstallMethod(raw: string | undefined | null, isE2b: boo
  */
 const KNOWN_INSTALL_PRESETS = new Set(["dev", "content", "research", "solo", "custom"]);
 
+export type IntegrationType =
+  | "code_repo"
+  | "comms"
+  | "task_manager"
+  | "information_management"
+  | "other";
+
+export type IntegrationProvider =
+  | "github"
+  | "gitlab"
+  | "bitbucket"
+  | "slack"
+  | "email"
+  | "kapso"
+  | "discord"
+  | "telegram"
+  | "whatsapp"
+  | "linear"
+  | "jira"
+  | "asana"
+  | "trello"
+  | "google_drive"
+  | "notion"
+  | "dropbox"
+  | "confluence";
+
+const KNOWN_INTEGRATION_TYPES = new Set<IntegrationType>([
+  "code_repo",
+  "comms",
+  "task_manager",
+  "information_management",
+  "other",
+]);
+
+const INTEGRATION_PROVIDERS = new Map<
+  string,
+  { provider: IntegrationProvider; type: IntegrationType }
+>([
+  ["github", { provider: "github", type: "code_repo" }],
+  ["github.com", { provider: "github", type: "code_repo" }],
+  ["api.github.com", { provider: "github", type: "code_repo" }],
+  ["gitlab", { provider: "gitlab", type: "code_repo" }],
+  ["gitlab.com", { provider: "gitlab", type: "code_repo" }],
+  ["bitbucket", { provider: "bitbucket", type: "code_repo" }],
+  ["bitbucket.org", { provider: "bitbucket", type: "code_repo" }],
+  ["api.bitbucket.org", { provider: "bitbucket", type: "code_repo" }],
+  ["slack", { provider: "slack", type: "comms" }],
+  ["slack.com", { provider: "slack", type: "comms" }],
+  ["api.slack.com", { provider: "slack", type: "comms" }],
+  ["email", { provider: "email", type: "comms" }],
+  ["kapso", { provider: "kapso", type: "comms" }],
+  ["kapso.ai", { provider: "kapso", type: "comms" }],
+  ["api.kapso.ai", { provider: "kapso", type: "comms" }],
+  ["discord", { provider: "discord", type: "comms" }],
+  ["discord.com", { provider: "discord", type: "comms" }],
+  ["telegram", { provider: "telegram", type: "comms" }],
+  ["telegram.org", { provider: "telegram", type: "comms" }],
+  ["api.telegram.org", { provider: "telegram", type: "comms" }],
+  ["whatsapp", { provider: "whatsapp", type: "comms" }],
+  ["whatsapp.com", { provider: "whatsapp", type: "comms" }],
+  ["linear", { provider: "linear", type: "task_manager" }],
+  ["linear.app", { provider: "linear", type: "task_manager" }],
+  ["api.linear.app", { provider: "linear", type: "task_manager" }],
+  ["jira", { provider: "jira", type: "task_manager" }],
+  ["asana", { provider: "asana", type: "task_manager" }],
+  ["asana.com", { provider: "asana", type: "task_manager" }],
+  ["app.asana.com", { provider: "asana", type: "task_manager" }],
+  ["trello", { provider: "trello", type: "task_manager" }],
+  ["trello.com", { provider: "trello", type: "task_manager" }],
+  ["api.trello.com", { provider: "trello", type: "task_manager" }],
+  ["google_drive", { provider: "google_drive", type: "information_management" }],
+  ["gdrive", { provider: "google_drive", type: "information_management" }],
+  ["drive.google.com", { provider: "google_drive", type: "information_management" }],
+  ["notion", { provider: "notion", type: "information_management" }],
+  ["notion.so", { provider: "notion", type: "information_management" }],
+  ["api.notion.com", { provider: "notion", type: "information_management" }],
+  ["dropbox", { provider: "dropbox", type: "information_management" }],
+  ["dropbox.com", { provider: "dropbox", type: "information_management" }],
+  ["api.dropboxapi.com", { provider: "dropbox", type: "information_management" }],
+  ["confluence", { provider: "confluence", type: "information_management" }],
+]);
+
+function integrationProviderEntry(
+  providerSlug: string | null | undefined,
+): { provider: IntegrationProvider; type: IntegrationType } | undefined {
+  const raw = providerSlug?.trim().toLowerCase();
+  if (!raw) return undefined;
+
+  let candidate = raw;
+  try {
+    candidate = new URL(raw).hostname.toLowerCase();
+  } catch {
+    // A provider slug or bare hostname is already in lookup-ready form. Also
+    // accept the common git@host:owner/repo SSH shorthand used for repo URLs.
+    const sshHost = raw.match(/^[^@]+@([^:]+):/)?.[1];
+    if (sshHost) candidate = sshHost;
+  }
+  if (candidate.startsWith("www.")) candidate = candidate.slice(4);
+  return INTEGRATION_PROVIDERS.get(candidate);
+}
+
+/** Resolve free-form provider/host input to the closed telemetry category set. */
+export function _resolveIntegrationType(providerSlug: string | null | undefined): IntegrationType {
+  return integrationProviderEntry(providerSlug)?.type ?? "other";
+}
+
+/** Return a provider only when the raw value matched the closed allowlist. */
+export function _resolveIntegrationProvider(
+  providerSlug: string | null | undefined,
+): IntegrationProvider | undefined {
+  return integrationProviderEntry(providerSlug)?.provider;
+}
+
 /**
  * Validate `INSTALL_PRESET` against the wizard's known preset IDs.
  *
@@ -156,9 +306,7 @@ export function _hasEmbeddingKey(env: NodeJS.ProcessEnv = process.env): boolean 
  * Exported for tests; not part of the public API.
  */
 export function _hasSlackChannel(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (
-    !!(env.SLACK_BOT_TOKEN && env.SLACK_APP_TOKEN) && !isEnvFlagEnabled("SLACK_DISABLE", false, env)
-  );
+  return isSlackConfigured(env);
 }
 
 /**
@@ -198,7 +346,7 @@ export async function initTelemetry(
   setConfig: (key: string, value: string) => Promise<void> | void,
   options: InitTelemetryOptions = {},
 ): Promise<void> {
-  if (!isEnabled()) return;
+  if (!isTelemetryEnabled()) return;
   source = sourceId;
   const generateIfMissing = options.generateIfMissing === true;
 
@@ -249,6 +397,112 @@ export async function initTelemetry(
     }
     // else: leave installationId = null; track() will no-op
   }
+
+  if (installationId) {
+    await loadOrgIdentity(getConfig, setConfig, generateIfMissing);
+    if (!generateIfMissing) {
+      // Workers cannot mint an org ID and the API server updates the org
+      // domain while they run, so they re-read both through the same
+      // config reader: soon after boot while the org ID is missing, hourly after.
+      identityReloader = () => loadOrgIdentity(getConfig, setConfig, false);
+      lastIdentityLoadAt = Date.now();
+    }
+  }
+}
+
+const ORG_IDENTITY_RETRY_MS = 60_000;
+const ORG_IDENTITY_REFRESH_MS = 60 * 60_000;
+
+/**
+ * Resolve the org ID and the org email domain.
+ *
+ * The org ID is `SWARM_ORG_ID` when it is a valid ID (cloud sets it), else the
+ * one persisted as `swarm_config.telemetry_org_id`, else (API server only) a
+ * newly minted `org_<16 hex>` that is persisted next to the installation ID.
+ * The API server also persists a valid `SWARM_ORG_ID`, so workers, which never
+ * see that env var, send the same org ID.
+ */
+async function loadOrgIdentity(
+  getConfig: (key: string) => Promise<string | undefined> | string | undefined,
+  setConfig: (key: string, value: string) => Promise<void> | void,
+  generateIfMissing: boolean,
+): Promise<void> {
+  const rawEnvOrg = process.env.SWARM_ORG_ID?.trim();
+  const envOrg = validOrgId(rawEnvOrg);
+  if (rawEnvOrg && !envOrg && generateIfMissing) {
+    console.log(
+      "telemetry: SWARM_ORG_ID is not org_<16 hex> or org_<27 alphanumerics>; using a derived org ID",
+    );
+  }
+
+  let stored: string | undefined;
+  try {
+    stored = validOrgId(await getConfig("telemetry_org_id"));
+  } catch {
+    // Config unreadable: fall through with what the env gives us.
+  }
+
+  if (generateIfMissing) {
+    const wanted = envOrg ?? stored ?? mintOrgId();
+    if (wanted !== stored) {
+      try {
+        await setConfig("telemetry_org_id", wanted);
+      } catch {
+        // Not persisted: this session still sends `wanted`, like the ephemeral install ID.
+      }
+    }
+    cachedOrgId = wanted;
+  } else {
+    cachedOrgId = envOrg ?? stored;
+  }
+
+  try {
+    cachedOrgDomain = validOrgDomain(await getConfig("telemetry_org_domain"));
+  } catch {
+    // Keep the previous value.
+  }
+}
+
+/** The current org ID: a valid `SWARM_ORG_ID` (re-read per event) or the resolved one. */
+function currentOrgId(): string | undefined {
+  return validOrgId(process.env.SWARM_ORG_ID) ?? cachedOrgId;
+}
+
+function maybeRefreshOrgIdentity(): void {
+  if (!identityReloader) return;
+  const now = Date.now();
+  const interval = currentOrgId() ? ORG_IDENTITY_REFRESH_MS : ORG_IDENTITY_RETRY_MS;
+  if (now - lastIdentityLoadAt < interval) return;
+  lastIdentityLoadAt = now;
+  identityReloader().catch(() => {});
+}
+
+/** API server only: publish the org admin's email domain (never the email). */
+export function setTelemetryOrgDomain(domain: string | null | undefined): void {
+  cachedOrgDomain = validOrgDomain(domain);
+}
+
+/**
+ * API server only: how to look up a user's role for `context.user_role`
+ * without an await. The resolver must be synchronous and cache-backed.
+ */
+export function setTelemetryRoleResolver(
+  resolver: ((userId: string) => TelemetryUserRole | undefined) | null,
+): void {
+  roleResolver = resolver;
+}
+
+/**
+ * True when `track()` would send: telemetry is on, an install ID exists and an
+ * org ID resolved. Emitters that record "already sent" state check this first.
+ */
+export function isTelemetryReady(): boolean {
+  return isTelemetryEnabled() && installationId !== null && currentOrgId() !== undefined;
+}
+
+/** The install ID, or null before `initTelemetry` resolved one (or after opt-out). */
+export function getTelemetryInstallationId(): string | null {
+  return installationId;
 }
 
 /**
@@ -277,10 +531,12 @@ async function tryPersistInstalledAt(
   }
 }
 
-interface TrackOptions {
-  event: string;
-  properties?: Record<string, unknown>;
+export interface TrackOptions<E extends SwarmEventName> {
+  event: E;
+  properties: PropsFor<E>;
   metadata?: Record<string, unknown>;
+  /** Who caused the event. Omit for system events (`user_ref` is then null). */
+  actor?: TelemetryActor;
 }
 
 /**
@@ -319,19 +575,63 @@ function getTelemetryEnvironment(): string {
   return "production";
 }
 
-/** Fire-and-forget telemetry event. Never throws, never blocks. */
-export function track(options: TrackOptions): void {
-  if (!isEnabled() || !installationId) return;
+/**
+ * Fire-and-forget telemetry event. Never throws, never blocks.
+ *
+ * Sends `schema_version: 2`: a `context` identity envelope (org, pseudonymous
+ * user, plan, deployment, version) and catalog-typed `properties`. Drops the
+ * event (rather than sending a half-identified one) until an org ID exists.
+ */
+export function track<E extends SwarmEventName>(options: TrackOptions<E>): void {
+  emit(
+    options.event,
+    options.properties as Record<string, unknown>,
+    options.metadata,
+    options.actor,
+  );
+}
+
+/** The untyped sender behind `track` and the typed `telemetry.*` wrappers. */
+function emit(
+  event: string,
+  properties: Record<string, unknown>,
+  metadata?: Record<string, unknown>,
+  actor?: TelemetryActor,
+): void {
+  if (!isTelemetryEnabled() || !installationId) return;
+  maybeRefreshOrgIdentity();
+  const orgId = currentOrgId();
+  if (!orgId) return;
   try {
+    const isCloud = cachedIsCloud || isCloudDeployment();
+    const orgIdentity = getOrgIdentity();
+    const userId = actor?.userId?.trim() || undefined;
     const payload = {
+      schema_version: 2 as const,
       product: PRODUCT,
-      event: options.event,
+      event,
       occurred_at: new Date().toISOString(),
       source,
       actor_mode: "anonymous" as const,
       actor_anonymous_id: installationId,
-      properties: {
-        ...(options.properties ?? {}),
+      context: buildContext({
+        orgId,
+        orgName: orgIdentity.organization_name,
+        orgDomain: cachedOrgDomain,
+        installationId,
+        actor: userId ? { userId, role: actor?.role ?? roleResolver?.(userId) ?? null } : undefined,
+        isCloud,
+        isE2b: cachedIsE2b,
+        swarmVersion: pkg.version,
+        installMethod: cachedInstallMethod,
+        installPreset: cachedInstallPreset,
+        // Stays null until the dashboard reports where the visitor came from.
+        acquisitionSource: null,
+      }),
+      properties: normalizeProperties(event, {
+        ...properties,
+        // Legacy keys, kept during the v1 window so dashboards that still read
+        // properties_json keep working; v2 carries the same facts in `context`.
         // Cloud-cohort signal. Two independent signals OR'd together:
         // `cachedIsCloud` (MCP_BASE_URL points at a host we own, resolved at
         // init time) catches self-host operators who point their swarm at
@@ -348,7 +648,7 @@ export function track(options: TrackOptions): void {
         // caller-supplied keys can never spoof the cohort classification.
         // The hostname is intentionally NOT included — telemetry must stay
         // anonymous, and the boolean is sufficient to split cloud vs self-host.
-        is_cloud: cachedIsCloud || isCloudDeployment(),
+        is_cloud: isCloud,
         is_e2b: cachedIsE2b,
         swarmVersion: pkg.version,
         // Instrumentation-gap closure (2026-07-29): activation-funnel signals.
@@ -360,17 +660,16 @@ export function track(options: TrackOptions): void {
         has_email_channel: cachedHasEmailChannel,
         has_notification_channel: cachedHasSlackChannel || cachedHasEmailChannel,
         install_method: cachedInstallMethod,
-      },
+      }),
       metadata: {
         transport: "https",
-        schema_version: 1,
         environment: getTelemetryEnvironment(),
         is_cloud: isCloudDeployment(),
-        ...getOrgIdentity(),
+        ...orgIdentity,
         // Optional — only present when known, same pattern as organization_*.
         ...(cachedInstallPreset ? { install_preset: cachedInstallPreset } : {}),
         ...(installedAt ? { install_created_at: installedAt } : {}),
-        ...options.metadata,
+        ...metadata,
       },
     };
     fetch(TELEMETRY_ENDPOINT, {
@@ -399,6 +698,16 @@ export function _resetTelemetryStateForTests(): void {
   cachedHasEmailChannel = false;
   cachedInstallMethod = "manual";
   cachedInstallPreset = undefined;
+  cachedOrgId = undefined;
+  cachedOrgDomain = undefined;
+  roleResolver = null;
+  identityReloader = null;
+  lastIdentityLoadAt = 0;
+}
+
+/** Test-only: read the org ID resolved at init. */
+export function _getOrgIdForTests(): string | undefined {
+  return cachedOrgId;
 }
 
 /** Test-only: read the resolved install ID. */
@@ -412,42 +721,115 @@ export function _getInstalledAtForTests(): string | null {
 }
 
 export const telemetry = {
-  taskEvent(
-    event: string,
-    props: {
-      taskId: string;
-      source?: string;
-      durationMs?: number;
-      hasParent?: boolean;
-      agentId?: string;
-      priority?: number;
-      [k: string]: unknown;
-    },
+  taskEvent<S extends EventSuffix<"task">>(
+    event: S,
+    props: FamilyProps<"task", S>,
+    actor?: TelemetryActor,
   ): void {
-    track({ event: `task.${event}`, properties: props });
+    emit(`task.${event}`, props as Record<string, unknown>, undefined, actor);
   },
 
-  server(event: string, props?: Record<string, unknown>): void {
-    track({ event: `server.${event}`, properties: props ?? {} });
+  server<S extends EventSuffix<"server">>(event: S, props: FamilyProps<"server", S>): void {
+    emit(`server.${event}`, props as Record<string, unknown>, undefined);
   },
 
-  session(event: string, props: { agentId: string; taskId?: string; [k: string]: unknown }): void {
-    track({ event: `session.${event}`, properties: props });
+  session<S extends EventSuffix<"session">>(
+    event: S,
+    props: FamilyProps<"session", S>,
+    actor?: TelemetryActor,
+  ): void {
+    emit(`session.${event}`, props as Record<string, unknown>, undefined, actor);
   },
 
-  schedule(event: string, props: Record<string, unknown>): void {
-    track({ event: `schedule.${event}`, properties: props });
+  schedule<S extends EventSuffix<"schedule">>(event: S, props: FamilyProps<"schedule", S>): void {
+    emit(`schedule.${event}`, props as Record<string, unknown>, undefined);
   },
 
-  workflow(event: string, props: Record<string, unknown>): void {
-    track({ event: `workflow.${event}`, properties: props });
+  workflow<S extends EventSuffix<"workflow">>(
+    event: S,
+    props: FamilyProps<"workflow", S>,
+    actor?: TelemetryActor,
+  ): void {
+    emit(`workflow.${event}`, props as Record<string, unknown>, undefined, actor);
   },
 
-  agent(event: string, props: Record<string, unknown>): void {
-    track({ event: `agent.${event}`, properties: props });
+  agent<S extends EventSuffix<"agent">>(event: S, props: FamilyProps<"agent", S>): void {
+    emit(`agent.${event}`, props as Record<string, unknown>, undefined);
   },
 
-  compaction(event: string, props: Record<string, unknown>): void {
-    track({ event: `compaction.${event}`, properties: props });
+  onboarding<S extends EventSuffix<"onboarding">>(
+    event: S,
+    props: Omit<FamilyProps<"onboarding", S>, "seconds_since_install">,
+    actor?: TelemetryActor,
+  ): void {
+    const installedAtMs = installedAt ? Date.parse(installedAt) : Number.NaN;
+    const secondsSinceInstall = Number.isFinite(installedAtMs)
+      ? Math.max(0, Math.floor((Date.now() - installedAtMs) / 1_000))
+      : undefined;
+    emit(
+      `onboarding.${event}`,
+      {
+        ...props,
+        ...(secondsSinceInstall !== undefined
+          ? { seconds_since_install: secondsSinceInstall }
+          : {}),
+      },
+      undefined,
+      actor,
+    );
+  },
+
+  org<S extends EventSuffix<"org">>(event: S, props: FamilyProps<"org", S>): void {
+    emit(`org.${event}`, props as Record<string, unknown>, undefined);
+  },
+
+  integration(
+    event: "connected",
+    props: { type: IntegrationType; provider?: IntegrationProvider; first_of_type: boolean },
+    actor?: TelemetryActor,
+  ): void {
+    const type = KNOWN_INTEGRATION_TYPES.has(props.type) ? props.type : "other";
+    const provider = props.provider
+      ? integrationProviderEntry(props.provider)?.provider
+      : undefined;
+    emit(
+      `integration.${event}`,
+      { type, ...(provider ? { provider } : {}), first_of_type: props.first_of_type },
+      undefined,
+      actor,
+    );
+  },
+
+  compaction<S extends EventSuffix<"compaction">>(
+    event: S,
+    props: FamilyProps<"compaction", S>,
+  ): void {
+    emit(`compaction.${event}`, props as Record<string, unknown>, undefined);
   },
 };
+
+/**
+ * Emit the connected event while ensuring free-form provider/host input can
+ * never flow into telemetry. Returns false when telemetry is not initialized,
+ * which lets once-per-install callers avoid persisting a marker for a no-op.
+ */
+export function emitIntegrationConnected(
+  type: IntegrationType,
+  providerSlug: string | null | undefined,
+  firstOfType: boolean,
+): boolean {
+  if (!isTelemetryEnabled() || !installationId) return false;
+  const provider = _resolveIntegrationProvider(providerSlug);
+  telemetry.integration(
+    "connected",
+    {
+      type,
+      ...(provider ? { provider } : {}),
+      first_of_type: firstOfType,
+    },
+    // The user whose request connected it, when there is one (a boot-time
+    // built-in connection has none, so user_ref is null).
+    { userId: getCurrentRequestUserId() ?? null },
+  );
+  return true;
+}

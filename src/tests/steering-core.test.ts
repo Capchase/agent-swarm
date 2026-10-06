@@ -144,6 +144,41 @@ describe("task steering core", () => {
     return started!;
   }
 
+  test("sender labels resolve on task reads, worker polls, and lifecycle responses", async () => {
+    const task = await runningTask("pi", "sender labels");
+    const user = await createUser({ name: "Taras" });
+    const unnamed = await createUser({ name: " " });
+    for (const [creator, expected] of [
+      [{ createdByKind: "user", createdByUserId: user.id }, "Taras (user)"],
+      [
+        { createdByKind: "agent", createdByAgentId: agentIds.get("lead")! },
+        "Steering lead (agent)",
+      ],
+      [{ createdByKind: "system" }, "system"],
+      [{ createdByKind: "user", createdByUserId: unnamed.id }, `${unnamed.id} (user)`],
+      [{ createdByKind: "agent", createdByAgentId: "deleted-agent" }, "deleted-agent (agent)"],
+      [{ createdByKind: "user" }, "Unknown (user)"],
+    ] as const) {
+      const message = await createSteeringMessage({
+        taskId: task.id,
+        body: "sender test",
+        mode: "queue",
+        source: "api",
+        ...creator,
+      });
+      expect(message.senderLabel).toBe(expected);
+      expect((await getSteeringMessageById(message.id))?.senderLabel).toBe(expected);
+      const taskRead = await api("GET", `/api/tasks/${task.id}/steering-messages`);
+      expect(taskRead.status).toBe(200);
+      expect(taskRead.body.messages).toContainEqual(
+        expect.objectContaining({ id: message.id, senderLabel: expected }),
+      );
+      expect(await getPendingSteeringForAgent(agentIds.get("pi")!)).toContainEqual(message);
+      expect((await markSteeringDelivered(message.id, "queue"))?.senderLabel).toBe(expected);
+      expect((await markSteeringHandled(message.id))?.senderLabel).toBe(expected);
+    }
+  });
+
   test("row lifecycle transitions pending -> delivered -> handled", async () => {
     const task = await runningTask("pi", "lifecycle");
     const created = await createSteeringMessage({
@@ -193,10 +228,7 @@ describe("task steering core", () => {
     ]);
   });
 
-  test("codex steer requests degrade to queue and stay pending for the hook", async () => {
-    // Codex is queue-capable via harness-side hook delivery: the row must
-    // stay `pending` (never promoted at request time, never dispatched by the
-    // runner) until the codex-hook marks it delivered.
+  test("codex steer requests retain native steer mode until delivery", async () => {
     const task = await runningTask("codex", "codex parent");
     const result = await requestSteering({
       taskId: task.id,
@@ -208,10 +240,10 @@ describe("task steering core", () => {
     });
 
     expect(result).toMatchObject({
-      outcome: "queued",
-      effectiveMode: "queue",
-      degradedFrom: "steer",
+      outcome: "steered",
+      effectiveMode: "steer",
     });
+    expect(result.degradedFrom).toBeUndefined();
     expect(result.promotedTaskId).toBeUndefined();
     expect(await getSteeringMessagesForTask(task.id)).toEqual([
       expect.objectContaining({
@@ -377,7 +409,7 @@ describe("task steering core", () => {
     expect((await getSteeringMessageById(result.steeringMessageId))?.status).toBe("pending");
   });
 
-  test("pending codex tasks queue for hook delivery once the session starts", async () => {
+  test("pending codex tasks queue for delivery once the session starts", async () => {
     const task = await createTaskExtended("pending codex target", {
       agentId: agentIds.get("codex"),
       source: "api",
@@ -416,7 +448,7 @@ describe("task steering core", () => {
 
   test("scrubs secrets before persisting the steering body", async () => {
     const previous = process.env.OPENAI_API_KEY;
-    const secret = "sk-proj-steering-secret-value-1234567890";
+    const secret = "example-steering-secret-value";
     process.env.OPENAI_API_KEY = secret;
     try {
       const task = await runningTask("pi", "secret scrubbing");

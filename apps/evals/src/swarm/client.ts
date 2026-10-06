@@ -1,4 +1,5 @@
-import type { SwarmTask } from "../types.ts";
+import { isEffortLevel } from "../cost/effort.ts";
+import type { HumanQuestion, ReasoningEffortLevel, SwarmTask } from "../types.ts";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "superseded"]);
 
@@ -27,6 +28,21 @@ export interface SessionCostRow {
  * The GET /api/agents subset the roster capture consumes (v7 §10.1 — per the
  * root AgentSchema: src/types.ts + src/http/agents.ts `listAgents`, slim shape).
  */
+/** One question of an approval request (same shape as the scenario-facing type). */
+export type ApprovalQuestionJson = HumanQuestion;
+
+/** Approval request as `GET /api/approval-requests` returns it (full shape). */
+export interface ApprovalRequestJson {
+  id: string;
+  title: string;
+  questions: ApprovalQuestionJson[];
+  sourceTaskId: string | null;
+  status: string;
+  responses: Record<string, unknown> | null;
+  resolvedAt: string | null;
+  createdAt: string;
+}
+
 export interface AgentJson {
   id: string;
   name: string | null;
@@ -40,6 +56,8 @@ export interface AgentJson {
   provider: string | null;
   /** Worker-pushed harness provider; preferred over `provider` for display. */
   harnessProvider: string | null;
+  /** credStatus.latestModel.reasoningEffort: the effort the harness reported applying. */
+  appliedReasoningEffort: ReasoningEffortLevel | null;
 }
 
 function normalizeAgent(raw: Record<string, unknown>): AgentJson {
@@ -54,7 +72,15 @@ function normalizeAgent(raw: Record<string, unknown>): AgentJson {
     lastActivityAt: typeof raw.lastActivityAt === "string" ? raw.lastActivityAt : null,
     provider: typeof raw.provider === "string" ? raw.provider : null,
     harnessProvider: typeof raw.harnessProvider === "string" ? raw.harnessProvider : null,
+    appliedReasoningEffort: appliedEffort(raw.credStatus),
   };
+}
+
+/** `credStatus.latestModel.reasoningEffort`, when the worker reported a valid level. */
+function appliedEffort(credStatus: unknown): ReasoningEffortLevel | null {
+  const latest = (credStatus as { latestModel?: { reasoningEffort?: unknown } } | null)
+    ?.latestModel;
+  return isEffortLevel(latest?.reasoningEffort) ? latest.reasoningEffort : null;
 }
 
 /** Thin authenticated client for one attempt's swarm API. */
@@ -103,7 +129,7 @@ export class SwarmClient {
   }): Promise<SwarmTask> {
     const res = await this.request<Record<string, unknown>>("POST", "/api/tasks", {
       task: opts.task,
-      ...(opts.agentId ? { agentId: opts.agentId } : {}),
+      ...(opts.agentId ? { agentId: opts.agentId, routingReason: "human_pinned" } : {}),
       source: "api",
       ...(opts.dependsOn ? { dependsOn: opts.dependsOn } : {}),
       ...(opts.outputSchema ? { outputSchema: opts.outputSchema } : {}),
@@ -112,6 +138,40 @@ export class SwarmClient {
     if (!task.id)
       throw new Error(`task create returned no id: ${JSON.stringify(res).slice(0, 300)}`);
     return normalizeTask(task);
+  }
+
+  /** Write a member's declared profile (role, description, capabilities). */
+  async updateAgentProfile(
+    agentId: string,
+    profile: { role?: string; description?: string; capabilities?: string[] },
+  ): Promise<void> {
+    await this.request("PUT", `/api/agents/${agentId}/profile`, {
+      ...profile,
+      changeSource: "api",
+      changeReason: "eval scenario profile",
+    });
+  }
+
+  /** Approval requests of the attempt's swarm (fresh DB per attempt), filtered by status. */
+  async listApprovalRequests(status?: string): Promise<ApprovalRequestJson[]> {
+    const query = status ? `?status=${encodeURIComponent(status)}&limit=100` : "?limit=100";
+    const res = await this.request<{ approvalRequests?: ApprovalRequestJson[] }>(
+      "GET",
+      `/api/approval-requests${query}`,
+    );
+    return res.approvalRequests ?? [];
+  }
+
+  /** Answer one approval request. The server creates the requester's hitl-follow-up task. */
+  async respondApprovalRequest(
+    id: string,
+    responses: Record<string, unknown>,
+    respondedBy: string,
+  ): Promise<void> {
+    await this.request("POST", `/api/approval-requests/${id}/respond`, {
+      responses,
+      respondedBy,
+    });
   }
 
   /**
@@ -131,6 +191,28 @@ export class SwarmClient {
       "POST",
       "/api/memory/index",
       body,
+    );
+  }
+
+  /** Upsert an agent-scoped script as `agentId` (the API typechecks + embeds it). */
+  async upsertAgentScript(opts: {
+    agentId: string;
+    name: string;
+    source: string;
+    description: string;
+    intent: string;
+  }): Promise<{ name: string; version: number }> {
+    return this.request<{ name: string; version: number }>(
+      "POST",
+      "/api/scripts/upsert",
+      {
+        name: opts.name,
+        source: opts.source,
+        description: opts.description,
+        intent: opts.intent,
+        scope: "agent",
+      },
+      { "X-Agent-ID": opts.agentId },
     );
   }
 
@@ -203,6 +285,35 @@ export class SwarmClient {
   async listAgents(): Promise<AgentJson[]> {
     const res = await this.request<{ agents?: Record<string, unknown>[] }>("GET", "/api/agents");
     return (res.agents ?? []).map(normalizeAgent);
+  }
+
+  /**
+   * Poll until every task matching `relevant` is terminal (quiescence), or the
+   * deadline passes. Returns the last snapshot plus the ids still open. Used by
+   * scenarios whose lead delegates or defers: the upfront task can go terminal
+   * (e.g. completed via defer-task) while the work it spawned is still running.
+   */
+  async waitForQuiescence(
+    relevant: (task: SwarmTask) => boolean,
+    opts: { deadline: number; intervalMs?: number; signal?: AbortSignal },
+  ): Promise<{ tasks: SwarmTask[]; open: string[] }> {
+    const interval = opts.intervalMs ?? 5_000;
+    let tasks: SwarmTask[] = [];
+    let open: string[] = [];
+    while (true) {
+      if (opts.signal?.aborted) throw new Error("aborted");
+      try {
+        tasks = await this.listAllTasks();
+        open = tasks
+          .filter((t) => relevant(t) && !TERMINAL_STATUSES.has(t.status))
+          .map((t) => t.id);
+        if (open.length === 0) return { tasks, open };
+      } catch {
+        // transient API blip — keep polling until the deadline
+      }
+      if (Date.now() >= opts.deadline) return { tasks, open };
+      await Bun.sleep(interval);
+    }
   }
 
   /**

@@ -33,12 +33,26 @@ export const PERMISSIONS = {
     description: "Cancel any task (beyond tasks the caller created).",
     namespace: "task",
   },
+  "approval.cancel.any": {
+    description: "Cancel a pending approval request.",
+    namespace: "approval",
+  },
+  "approval.respond": {
+    description:
+      "Approve or reject a pending approval request as a person. Agents never hold it; the request's approvers list still applies.",
+    namespace: "approval",
+  },
   "task.steer.any": {
     description: "Steer any task (beyond tasks the caller created).",
     namespace: "task",
   },
   "task.create.own": {
     description: "Create a task the caller owns.",
+    namespace: "task",
+  },
+  "task.requester.assign": {
+    description:
+      "Attribute a new task to a user other than the requester of the caller's own current task.",
     namespace: "task",
   },
   "task.read.own": {
@@ -61,6 +75,11 @@ export const PERMISSIONS = {
     description: "Mutate a task's filesystem artifacts and attachments.",
     namespace: "task",
   },
+  "task.progress.write": {
+    description:
+      "Write a task's progress, status, or output (its assignee, a lead, a human, or anyone while unassigned).",
+    namespace: "task",
+  },
   "favorite.write.own": {
     description: "Set a favorite the caller owns.",
     namespace: "favorite",
@@ -69,13 +88,33 @@ export const PERMISSIONS = {
     description: "Inject a learning into another agent's memory.",
     namespace: "memory",
   },
+  "memory.edit.any": {
+    description: "Edit a memory entry (own entries, or any scope as lead).",
+    namespace: "memory",
+  },
+  "memory.write.consolidated": {
+    description:
+      "Write or move a memory key under a lead-maintained /longterm root (company-story, entities, timeline).",
+    namespace: "memory",
+  },
+  "memory.read.any": {
+    description:
+      "List every agent's memories, beyond the caller's own and swarm-scoped entries (lead, operator, or user).",
+    namespace: "memory",
+  },
   "memory.delete.any": {
-    description: "Delete a memory entry (own entries, or swarm-scoped entries as lead).",
+    description:
+      "Delete a memory entry: own agent-scoped entries; swarm-scoped entries as lead, operator, or user; any entry as operator or user.",
     namespace: "memory",
   },
   "channel.delete": {
     description: "Delete a Slack channel.",
     namespace: "channel",
+  },
+  "repo.merge-policy.write": {
+    description:
+      "Change a repo's allowMerge guideline, which tells agents whether they may merge a PR themselves.",
+    namespace: "repo",
   },
   "integration.kapso.manage": {
     description: "Register or unregister a Kapso inbound number.",
@@ -145,6 +184,16 @@ export const PERMISSIONS = {
     description: "Delete any swarm-config entry.",
     namespace: "config",
   },
+  "models.catalog.write": {
+    description:
+      "Force a model-catalog refresh from models.dev or write/delete model-catalog overlay rows.",
+    namespace: "models",
+  },
+  "models.harness-support.write": {
+    description:
+      "Record whether a pinned harness CLI version accepts a model (a worker reports its own probe results; the operator may correct any row).",
+    namespace: "models",
+  },
   "config.read.secrets": {
     description: "Read unmasked secret config values.",
     namespace: "config",
@@ -197,6 +246,11 @@ export const PERMISSIONS = {
     description: "Update an MCP server the caller does not own.",
     namespace: "mcp-server",
   },
+  "mcp-server.stdio.write": {
+    description:
+      "Create an agent-scope stdio MCP server, or change or enable what a stdio server runs. A stdio server runs a command on the worker.",
+    namespace: "mcp-server",
+  },
   "mcp-server.read.secrets": {
     description: "Read resolved MCP server secret env/header values.",
     namespace: "mcp-server",
@@ -208,6 +262,10 @@ export const PERMISSIONS = {
   "kv.write.any": {
     description: "Write another agent's task:agent: KV namespace.",
     namespace: "kv",
+  },
+  "comb.presence": {
+    description: "Use dashboard presence rooms for Comb drives.",
+    namespace: "comb",
   },
   "page.delete.any": {
     description: "Delete a page the caller does not own.",
@@ -252,6 +310,19 @@ export const PERMISSIONS = {
   "script.api.delete": {
     description: "Delete an external script API endpoint.",
     namespace: "script",
+  },
+  "extension.write": {
+    description: "Install, update, or uninstall a swarm extension.",
+    namespace: "extension",
+  },
+  "extension.activate": {
+    description: "Enable, disable, or activate a version of a swarm extension.",
+    namespace: "extension",
+  },
+  "extension.install.inline": {
+    description:
+      "Install a swarm extension from an inline manifest and files instead of the catalog.",
+    namespace: "extension",
   },
 } as const satisfies Record<string, { description: string; namespace: string }>;
 

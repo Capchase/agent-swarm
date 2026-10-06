@@ -1,9 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import {
+  cancelTask,
+  claimTask,
   closeDb,
   createAgent,
   createTaskExtended,
+  failTask,
   getActiveSessionForTask,
   getDbClient,
   getIdleWorkersWithCapacity,
@@ -18,6 +21,7 @@ import {
   MAX_EMPTY_POLLS,
   resetOrphanedInProgressTasksForAgent,
   startTask,
+  updateAgentProfile,
   updateAgentStatus,
   updateTaskClaudeSessionId,
 } from "../be/db";
@@ -31,6 +35,7 @@ import {
   startHeartbeat,
   stopHeartbeat,
 } from "../heartbeat/heartbeat";
+import { createResumeFollowUp } from "../tasks/worker-follow-up";
 
 const TEST_DB_PATH = "./test-heartbeat.sqlite";
 
@@ -277,6 +282,13 @@ describe("Heartbeat Triage", () => {
   // ==========================================================================
 
   describe("Code-Level Triage", () => {
+    test("reports approval sweep counts in staleCleanup", async () => {
+      const findings = await codeLevelTriage();
+
+      expect(typeof findings.staleCleanup.approvalAutoCancelled).toBe("number");
+      expect(typeof findings.staleCleanup.approvalTimedOut).toBe("number");
+    });
+
     test("auto-supersedes stalled task with no active session (DES-523)", async () => {
       const agent = await createAgent({ name: "dead-worker", isLead: false, status: "busy" });
       const task = await createTaskExtended("Stalled task", { agentId: agent.id });
@@ -490,6 +502,80 @@ describe("Heartbeat Triage", () => {
       expect(findings.stalledTasks.length).toBe(0);
     });
 
+    test("privileged crash recovery reroutes a legacy worker parent to the Lead", async () => {
+      const worker = await createAgent({ name: "misrouted-worker", isLead: false, status: "idle" });
+      const lead = await createAgent({ name: "recovery-lead", isLead: true, status: "idle" });
+      const parent = await createTaskExtended("Merge this PR", { agentId: worker.id });
+      // Simulate a legacy row created before the structured constraint existed.
+      await getDbClient().run(
+        "UPDATE agent_tasks SET status = 'superseded', routingAffinity = ? WHERE id = ?",
+        [JSON.stringify({ sourceAgentId: worker.id, capabilities: [], leadOnly: true }), parent.id],
+      );
+
+      const result = await createResumeFollowUp({ parentId: parent.id, reason: "crash_recovery" });
+      expect(result.kind).toBe("created");
+      if (result.kind !== "created") return;
+      expect(result.task.agentId).toBe(lead.id);
+      expect(result.task.routingAffinity?.leadOnly).toBe(true);
+      const audit = await getDbClient().get<{ metadata: string }>(
+        "SELECT metadata FROM agent_log WHERE taskId = ? AND eventType = 'task_recovery_authorization'",
+        [result.task.id],
+      );
+      expect(audit?.metadata).toContain("rerouted_to_lead");
+    });
+
+    test("privileged crash recovery preserves parent capabilities on an unassigned child", async () => {
+      const worker = await createAgent({
+        name: "capability-source-worker",
+        isLead: false,
+        status: "idle",
+      });
+      const underprivilegedLead = await createAgent({
+        name: "capability-underprivileged-lead",
+        isLead: true,
+        status: "idle",
+      });
+      await updateAgentProfile(worker.id, { capabilities: ["typescript"] });
+      await updateAgentProfile(underprivilegedLead.id, { capabilities: ["typescript"] });
+      const parent = await createTaskExtended("Merge this PR", { agentId: worker.id });
+      // Simulate legacy privileged work whose source snapshot has capabilities
+      // unrelated to its authorization requirement.
+      await getDbClient().run(
+        "UPDATE agent_tasks SET status = 'superseded', routingAffinity = ? WHERE id = ?",
+        [
+          JSON.stringify({ sourceAgentId: worker.id, capabilities: ["merge"], leadOnly: true }),
+          parent.id,
+        ],
+      );
+
+      const result = await createResumeFollowUp({ parentId: parent.id, reason: "crash_recovery" });
+      expect(result.kind).toBe("created");
+      if (result.kind !== "created") return;
+      expect(result.task.status).toBe("unassigned");
+      expect(result.task.routingAffinity).toMatchObject({
+        leadOnly: true,
+        capabilities: ["merge"],
+      });
+      expect(await claimTask(result.task.id, underprivilegedLead.id)).toBeNull();
+    });
+
+    test("privileged recovery retains a safe Lead source pin", async () => {
+      const lead = await createAgent({ name: "source-lead", isLead: true, status: "idle" });
+      const parent = await createTaskExtended("Merge this PR", {
+        agentId: lead.id,
+        routingAffinity: { capabilities: [], leadOnly: true },
+      });
+      await getDbClient().run("UPDATE agent_tasks SET status = 'superseded' WHERE id = ?", [
+        parent.id,
+      ]);
+
+      const result = await createResumeFollowUp({ parentId: parent.id, reason: "crash_recovery" });
+      expect(result.kind).toBe("created");
+      if (result.kind !== "created") return;
+      expect(result.task.agentId).toBe(lead.id);
+      expect(result.task.tags).toContain("crash-recovery-pin");
+    });
+
     test("sets agent to idle after auto-superseding its only task", async () => {
       const agent = await createAgent({ name: "dead-worker", isLead: false, status: "busy" });
       const task = await createTaskExtended("Stalled task", { agentId: agent.id });
@@ -639,6 +725,69 @@ describe("Heartbeat Triage", () => {
       expect(tags).toContain("reboot-retry");
       expect(tags).toContain("auto-generated");
       expect(tags).toContain("reboot-retry-pin");
+    });
+
+    test("reboot recovery reroutes a legacy worker-owned lead-only task to a Lead", async () => {
+      const worker = await createAgent({
+        name: "reboot-misrouted-worker",
+        isLead: false,
+        status: "busy",
+      });
+      const lead = await createAgent({
+        name: "reboot-recovery-lead",
+        isLead: true,
+        status: "idle",
+      });
+      const task = await createTaskExtended("Merge this PR", { agentId: worker.id });
+      await startTask(task.id);
+      await getDbClient().run(
+        "UPDATE agent_tasks SET routingAffinity = ?, lastUpdatedAt = ? WHERE id = ?",
+        [
+          JSON.stringify({ sourceAgentId: worker.id, capabilities: [], leadOnly: true }),
+          new Date(Date.now() - 1000).toISOString(),
+          task.id,
+        ],
+      );
+
+      await runRebootSweep();
+
+      const retryId = getRebootAffectedTasks()[0]?.retryTaskId;
+      const retry = retryId ? await getTaskById(retryId) : null;
+      expect(retry?.agentId).toBe(lead.id);
+      expect(retry?.routingAffinity?.leadOnly).toBe(true);
+      const audit = await getDbClient().get<{ metadata: string }>(
+        "SELECT metadata FROM agent_log WHERE taskId = ? AND eventType = 'task_recovery_authorization'",
+        [retryId],
+      );
+      expect(audit?.metadata).toContain("rerouted_to_lead");
+    });
+
+    test("no-Lead reboot fallback remains claimable after an eligible Lead arrives", async () => {
+      const worker = await createAgent({ name: "no-lead-worker", isLead: false, status: "busy" });
+      const task = await createTaskExtended("Merge this PR", { agentId: worker.id });
+      await startTask(task.id);
+      await getDbClient().run(
+        "UPDATE agent_tasks SET routingAffinity = ?, lastUpdatedAt = ? WHERE id = ?",
+        [
+          JSON.stringify({
+            sourceAgentId: worker.id,
+            role: "worker",
+            capabilities: [],
+            leadOnly: true,
+          }),
+          new Date(Date.now() - 1000).toISOString(),
+          task.id,
+        ],
+      );
+
+      await runRebootSweep();
+      const retryId = getRebootAffectedTasks()[0]?.retryTaskId;
+      const retry = retryId ? await getTaskById(retryId) : null;
+      expect(retry?.status).toBe("unassigned");
+      expect(retry?.routingAffinity?.leadOnly).toBe(true);
+
+      const lead = await createAgent({ name: "arriving-lead", isLead: true, status: "idle" });
+      expect(await claimTask(retryId!, lead.id)).not.toBeNull();
     });
 
     test("falls back to an affinity-stamped pool retry when the agent is at capacity", async () => {
@@ -897,6 +1046,93 @@ describe("Heartbeat Triage", () => {
       expect(retryTask!.priority).toBe(90);
       expect(retryTask!.source).toBe("slack");
     });
+
+    async function sweptTaskWithDependent(taskType?: string) {
+      const agent = await createAgent({ name: "dead-worker", isLead: false, status: "busy" });
+      const other = await createAgent({ name: "dependent-owner", isLead: false, status: "idle" });
+      const parent = await createTaskExtended("Thread root", { agentId: other.id });
+      const swept = await createTaskExtended("Research step", { agentId: agent.id, taskType });
+      await startTask(swept.id);
+      await getDbClient().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [
+        new Date(Date.now() - 1000).toISOString(),
+        swept.id,
+      ]);
+      const done = await createTaskExtended("Already done", { agentId: other.id });
+      await getDbClient().run("UPDATE agent_tasks SET status = 'completed' WHERE id = ?", [
+        done.id,
+      ]);
+      const dependent = await createTaskExtended("Act on the research", {
+        agentId: other.id,
+        dependsOn: [swept.id, done.id],
+        parentTaskId: parent.id,
+        priority: 70,
+        slackChannelId: "C0TEST",
+        slackThreadTs: "1700000000.000100",
+        slackUserId: "U0TEST",
+        followUpConfig: { onCompleted: "Tell the requester" },
+      });
+      return { swept, done, dependent, parent, other };
+    }
+
+    test("reboot sweep re-points a never-started dependent to the retry child instead of failing it", async () => {
+      const { swept, done, dependent, parent, other } = await sweptTaskWithDependent();
+      const cancelled = await createTaskExtended("Cancelled for another reason", {
+        agentId: other.id,
+        dependsOn: [swept.id],
+      });
+      await cancelTask(cancelled.id, "not needed");
+
+      await runRebootSweep();
+
+      expect((await getTaskById(swept.id))?.status).toBe("failed");
+      const retryTaskId = getRebootAffectedTasks()[0]!.retryTaskId;
+      expect(retryTaskId).not.toBeNull();
+
+      const survivor = await getTaskById(dependent.id);
+      expect(survivor?.status).toBe("pending");
+      expect(survivor?.failureReason).toBeFalsy();
+      expect(survivor?.dependsOn).toEqual([retryTaskId!, done.id]);
+      expect(survivor?.agentId).toBe(other.id);
+      expect(survivor?.parentTaskId).toBe(parent.id);
+      expect(survivor?.priority).toBe(70);
+      expect(survivor?.slackChannelId).toBe("C0TEST");
+      expect(survivor?.slackThreadTs).toBe("1700000000.000100");
+      expect(survivor?.slackUserId).toBe("U0TEST");
+      expect(survivor?.followUpConfig).toEqual({ onCompleted: "Tell the requester" });
+
+      const log = await getDbClient().get<{ oldValue: string; newValue: string }>(
+        "SELECT oldValue, newValue FROM agent_log WHERE taskId = ? AND eventType = 'task_dependency_repointed'",
+        [dependent.id],
+      );
+      expect(log).toEqual({ oldValue: swept.id, newValue: retryTaskId! });
+
+      // Already terminal for another reason: untouched.
+      const stillCancelled = await getTaskById(cancelled.id);
+      expect(stillCancelled?.status).toBe("cancelled");
+      expect(stillCancelled?.dependsOn).toEqual([swept.id]);
+    });
+
+    test("reboot sweep without a retry child still cascade-fails dependents", async () => {
+      const { swept, dependent } = await sweptTaskWithDependent("heartbeat-checklist");
+
+      await runRebootSweep();
+
+      expect(getRebootAffectedTasks()[0]!.retryTaskId).toBeNull();
+      const dead = await getTaskById(dependent.id);
+      expect(dead?.status).toBe("failed");
+      expect(dead?.failureReason).toBe(`Blocked dependency ${swept.id.slice(0, 8)} was failed`);
+    });
+
+    test("a non-reboot failure still cascade-fails dependents", async () => {
+      const { swept, dependent } = await sweptTaskWithDependent();
+
+      await failTask(swept.id, "Worker reported an error");
+
+      const dead = await getTaskById(dependent.id);
+      expect(dead?.status).toBe("failed");
+      expect(dead?.failureReason).toBe(`Blocked dependency ${swept.id.slice(0, 8)} was failed`);
+      expect(dead?.dependsOn).toContain(swept.id);
+    });
   });
 
   // ==========================================================================
@@ -943,13 +1179,13 @@ describe("Heartbeat Triage", () => {
           task.id,
         ]);
 
-        // Session with pre-boot heartbeat (stale)
+        // Session with pre-boot heartbeat, stale past the 15 min threshold
         await insertActiveSession({
           agentId: agent.id,
           taskId: task.id,
           triggerType: "task_assigned",
         });
-        const preBootHb = new Date(bootTime - 30_000).toISOString();
+        const preBootHb = new Date(bootTime - 20 * 60_000).toISOString();
         await getDbClient().run("UPDATE active_sessions SET lastHeartbeatAt = ? WHERE taskId = ?", [
           preBootHb,
           task.id,
@@ -1049,7 +1285,7 @@ describe("Heartbeat Triage", () => {
           taskId: staleTask.id,
           triggerType: "task_assigned",
         });
-        const preBootHb = new Date(bootTime - 30_000).toISOString();
+        const preBootHb = new Date(bootTime - 20 * 60_000).toISOString();
         await getDbClient().run("UPDATE active_sessions SET lastHeartbeatAt = ? WHERE taskId = ?", [
           preBootHb,
           staleTask.id,
@@ -1081,6 +1317,74 @@ describe("Heartbeat Triage", () => {
         const affected = getRebootAffectedTasks();
         expect(affected.length).toBe(1);
         expect(affected[0]!.original.id).toBe(staleTask.id);
+      } finally {
+        gs.__runId = original;
+      }
+    });
+
+    test("skips in_progress task claimed after boot even with no session", async () => {
+      const bootTime = Date.now() - 10_000; // booted 10s ago
+      const original = gs.__runId;
+      gs.__runId = `run_${bootTime}`;
+
+      try {
+        const agent = await createAgent({ name: "worker-postboot", isLead: false, status: "busy" });
+        const task = await createTaskExtended("Task claimed after boot", { agentId: agent.id });
+        await startTask(task.id);
+
+        // Claimed 1s ago: after boot, and backdated past the same-ms cutoff of
+        // getStalledInProgressTasks(0). No active session yet: the worker is
+        // still inside the provider spawn.
+        const claimedAt = new Date(Date.now() - 1000).toISOString();
+        await getDbClient().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [
+          claimedAt,
+          task.id,
+        ]);
+
+        await runRebootSweep();
+
+        const updated = await getTaskById(task.id);
+        expect(updated?.status).toBe("in_progress");
+        const retries = await getDbClient().query(
+          "SELECT * FROM agent_tasks WHERE parentTaskId = ?",
+          [task.id],
+        );
+        expect(retries.length).toBe(0);
+        expect(getRebootAffectedTasks().length).toBe(0);
+      } finally {
+        gs.__runId = original;
+      }
+    });
+
+    test("auto-fails in_progress task claimed before boot with no session", async () => {
+      const bootTime = Date.now();
+      const original = gs.__runId;
+      gs.__runId = `run_${bootTime}`;
+
+      try {
+        const agent = await createAgent({
+          name: "worker-preboot-nosession",
+          isLead: false,
+          status: "busy",
+        });
+        const task = await createTaskExtended("Task claimed before boot", { agentId: agent.id });
+        await startTask(task.id);
+
+        const claimedAt = new Date(bootTime - 60_000).toISOString();
+        await getDbClient().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [
+          claimedAt,
+          task.id,
+        ]);
+
+        await runRebootSweep();
+
+        const updated = await getTaskById(task.id);
+        expect(updated?.status).toBe("failed");
+        expect(updated?.failureReason).toContain("reboot sweep");
+        const affected = getRebootAffectedTasks();
+        expect(affected.length).toBe(1);
+        expect(affected[0]!.original.id).toBe(task.id);
+        expect(affected[0]!.retryTaskId).not.toBeNull();
       } finally {
         gs.__runId = original;
       }

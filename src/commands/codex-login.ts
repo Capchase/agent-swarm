@@ -12,8 +12,13 @@
 import { exec } from "node:child_process";
 import { emitKeypressEvents } from "node:readline";
 
+import { deriveCodexKeySuffix } from "../providers/codex-oauth/auth-json.js";
 import { loginCodexOAuth } from "../providers/codex-oauth/flow.js";
-import { loadAllCodexOAuthSlots, storeCodexOAuth } from "../providers/codex-oauth/storage.js";
+import {
+  loadAllCodexOAuthSlots,
+  MAX_CODEX_OAUTH_SLOT,
+  storeCodexOAuth,
+} from "../providers/codex-oauth/storage.js";
 import { getApiKey } from "../utils/api-key";
 
 type PromptTextFn = (label: string, defaultValue: string) => Promise<string>;
@@ -31,10 +36,58 @@ type RunCodexLoginDeps = {
   login?: typeof loginCodexOAuth;
   store?: typeof storeCodexOAuth;
   loadAllSlots?: typeof loadAllCodexOAuthSlots;
+  clearAuthBench?: typeof clearCodexAuthBench;
+  readAuthFence?: typeof readCodexAuthFailureFence;
   log?: (message: string) => void;
   error?: (message: string) => void;
   exit?: (code: number) => void;
 };
+
+/**
+ * Read the API's `authFailureFence` for the Codex pool. `runCodexLogin` reads it
+ * BEFORE it stores the fresh credentials, so the clear below lifts only failures
+ * recorded before that write.
+ */
+export async function readCodexAuthFailureFence(apiUrl: string, apiKey: string): Promise<number> {
+  const resp = await fetch(`${apiUrl}/api/keys/available?keyType=CODEX_OAUTH&totalKeys=1`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!resp.ok) throw new Error(`keys/available returned ${resp.status}`);
+  const data = (await resp.json()) as { authFailureFence?: number };
+  if (typeof data.authFailureFence !== "number") throw new Error("no authFailureFence in response");
+  return data.authFailureFence;
+}
+
+/**
+ * Lift an auth-failure bench on the re-logged key. A fresh login is proof of
+ * health, so it passes `clearAuthBench: true` (the API also deletes the
+ * `codex-auth-watch` bench marker). `authFence` binds the clear to the credential
+ * write: failures recorded after the fresh login survive a late clear. It also
+ * passes the slot, so the API retires a different login that the slot held
+ * before. Returns `true` when a bench was lifted.
+ */
+export async function clearCodexAuthBench(
+  apiUrl: string,
+  apiKey: string,
+  keySuffix: string,
+  slot: number,
+  authFence: number,
+): Promise<boolean> {
+  const resp = await fetch(`${apiUrl}/api/keys/clear-rate-limit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      keyType: "CODEX_OAUTH",
+      keySuffix,
+      clearAuthBench: true,
+      keyIndex: slot,
+      authFence,
+    }),
+  });
+  if (!resp.ok) throw new Error(`clear-rate-limit returned ${resp.status}`);
+  const data = (await resp.json()) as { cleared?: boolean };
+  return data.cleared === true;
+}
 
 type ParsedCodexLoginArgs = {
   apiUrl?: string;
@@ -198,13 +251,13 @@ Deployed Codex workers automatically restore these credentials at boot.
 `);
 }
 
-const MAX_SLOT = 100;
-
 export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}): Promise<void> {
   const resolveConfig = deps.resolveConfig ?? resolveCodexLoginConfig;
   const login = deps.login ?? loginCodexOAuth;
   const store = deps.store ?? storeCodexOAuth;
   const loadAllSlots = deps.loadAllSlots ?? loadAllCodexOAuthSlots;
+  const clearAuthBench = deps.clearAuthBench ?? clearCodexAuthBench;
+  const readAuthFence = deps.readAuthFence ?? readCodexAuthFailureFence;
   const log = deps.log ?? console.log;
   const error = deps.error ?? console.error;
   const exit = deps.exit ?? ((code: number) => process.exit(code));
@@ -222,8 +275,8 @@ export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}
     // Resolve target slot: explicit --slot N, or auto-pick next free.
     let slot: number;
     if (parsedSlot !== undefined) {
-      if (!Number.isInteger(parsedSlot) || parsedSlot < 0 || parsedSlot > MAX_SLOT) {
-        error(`\nError: --slot must be an integer between 0 and ${MAX_SLOT}`);
+      if (!Number.isInteger(parsedSlot) || parsedSlot < 0 || parsedSlot > MAX_CODEX_OAUTH_SLOT) {
+        error(`\nError: --slot must be an integer between 0 and ${MAX_CODEX_OAUTH_SLOT}`);
         exit(1);
         return;
       }
@@ -231,9 +284,9 @@ export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}
     } else {
       const occupied = new Set((await loadAllSlots(apiUrl, apiKey)).map((s) => s.slot));
       let next = 0;
-      while (occupied.has(next) && next <= MAX_SLOT) next++;
-      if (next > MAX_SLOT) {
-        error(`\nError: All credential slots (0-${MAX_SLOT}) are already in use`);
+      while (occupied.has(next) && next <= MAX_CODEX_OAUTH_SLOT) next++;
+      if (next > MAX_CODEX_OAUTH_SLOT) {
+        error(`\nError: All credential slots (0-${MAX_CODEX_OAUTH_SLOT}) are already in use`);
         exit(1);
         return;
       }
@@ -281,10 +334,26 @@ export async function runCodexLogin(args: string[], deps: RunCodexLoginDeps = {}
     log(`  Account ID: ${creds.accountId}`);
     log(`  Expires: ${new Date(creds.expires).toISOString()}`);
 
+    // Read the auth-failure fence before the credential write (see clearCodexAuthBench).
+    const authFence = await readAuthFence(apiUrl, apiKey).catch((err: unknown) => err);
+
     // Store credentials in the swarm API config store
     log("\nStoring credentials in swarm API config store...");
     await store(apiUrl, apiKey, creds, slot);
     log(`Credentials stored successfully in slot ${slot}!`);
+
+    // A re-login returns an auth-benched slot to the pool right away.
+    // Non-fatal: the credentials are stored; a later re-login also lifts it.
+    const keySuffix = deriveCodexKeySuffix(creds.access, creds.accountId);
+    try {
+      if (typeof authFence !== "number") throw authFence;
+      if (await clearAuthBench(apiUrl, apiKey, keySuffix, slot, authFence)) {
+        log(`Lifted the auth-failure bench on key ...${keySuffix}.`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      error(`Warning: could not lift the auth-failure bench on key ...${keySuffix}: ${message}`);
+    }
 
     log("\nDeployed Codex workers will automatically restore these credentials at boot.");
   } catch (err) {

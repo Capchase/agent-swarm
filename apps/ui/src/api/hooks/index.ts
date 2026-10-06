@@ -14,6 +14,7 @@ export {
 } from "./use-agent-activity";
 export {
   useAgent,
+  useAgentRuntime,
   useAgentRuntimeInstances,
   useAgents,
   useUpdateAgentMaxTasks,
@@ -99,7 +100,7 @@ export {
   useUninstallMcpServer,
   useUpdateMcpServer,
 } from "./use-mcp-servers";
-export { useDeleteMemory, useMemoryList } from "./use-memory";
+export { useDeleteMemory, useMemoryChunks, useMemoryKeys, useMemoryList } from "./use-memory";
 export type { MetricDefinitionsFilters } from "./use-metric-definitions";
 export {
   useCreateMetric,
@@ -109,6 +110,7 @@ export {
   useUpdateMetric,
 } from "./use-metric-definitions";
 export { useMetrics } from "./use-metrics";
+export { useModelTiers } from "./use-model-tiers";
 export { useModelsCatalog } from "./use-models-catalog";
 export type { PromptTemplateFilters } from "./use-prompt-templates";
 export {

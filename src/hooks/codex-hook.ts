@@ -3,10 +3,9 @@
 /**
  * Codex lifecycle hook — harness-side steering delivery.
  *
- * Codex has no in-process steering channel: `@openai/codex-sdk` drives
- * `codex exec` with stdin written once and closed, and the app-server's
- * native `turn/steer` is not reachable through the SDK (issue #1034). So
- * delivery happens here instead: this hook runs inside the codex lifecycle
+ * Legacy exec sessions use this hook for queue delivery. App-server sessions
+ * disable this hook because the worker delivers steering through JSON-RPC.
+ * This hook runs inside the codex lifecycle
  * (registered for SessionStart / PostToolUse / Stop via the managed
  * `/etc/codex/requirements.toml` in the worker image), polls the API for
  * pending steering rows, marks them `delivered`, and injects the rendered
@@ -14,16 +13,19 @@
  *
  *   - SessionStart / PostToolUse → `hookSpecificOutput.additionalContext`
  *     (verified to reach the model at codex-cli 0.146.0; PreToolUse drops
- *     additionalContext upstream, so it is deliberately not registered).
+ *     additionalContext upstream, so it never carries steering).
  *   - Stop → `{"decision":"block","reason":...}` so a session about to end
  *     still receives the message and continues to act on it.
+ *
+ * PreToolUse runs the PR body leak guard (`pr-body-guard.ts`) in every
+ * session mode, app-server included. A block exits with code 2 and writes
+ * the reason to stderr, which codex-cli 0.160.0 turns into
+ * "Command blocked by PreToolUse hook: <reason>".
  *
  * One-shot guarantee: a message is included in hook output only after its
  * `/delivered` POST succeeded, so a message is injected at most once. A
  * failed POST leaves the row `pending` for the next lifecycle event; rows a
  * dying session never picks up are promoted by the server's terminal sweep.
- * The runner's dispatch poll skips codex sessions entirely
- * (`ProviderSession.steeringDeliveredExternally`).
  */
 
 import { renderSteeringDelivery } from "../prompts/steering-delivery.ts";
@@ -31,12 +33,16 @@ import type { SteeringMessage } from "../types";
 import { getApiKey } from "../utils/api-key";
 import { getMcpBaseUrl } from "../utils/constants";
 import { isSteeringEnabled } from "../utils/steering-enabled";
+import { guardGhPrBody, type PrBodyGuardDeps } from "./pr-body-guard";
 
 const FETCH_TIMEOUT_MS = 5_000;
 
 export interface CodexHookMessage {
   hook_event_name?: string;
   stop_hook_active?: boolean;
+  cwd?: string;
+  tool_name?: string;
+  tool_input?: unknown;
 }
 
 export interface CodexHookConfig {
@@ -103,7 +109,13 @@ export async function collectDeliverableSteering(
     } catch {
       continue;
     }
-    delivered.push(await renderSteeringDelivery(message.id, message.body));
+    delivered.push(
+      await renderSteeringDelivery(
+        message.id,
+        message.body,
+        message.senderLabel ?? message.createdByKind,
+      ),
+    );
   }
   return delivered;
 }
@@ -119,6 +131,7 @@ export async function handleCodexHookEvent(
   fetchImpl: typeof fetch = fetch,
 ): Promise<Record<string, unknown> | null> {
   const event = msg.hook_event_name;
+  if (env.SWARM_CODEX_APP_SERVER === "1") return null;
   if (!event || !config || !isSteeringEnabled(env)) return null;
   if (event !== "SessionStart" && event !== "PostToolUse" && event !== "Stop") return null;
 
@@ -140,12 +153,27 @@ export async function handleCodexHookEvent(
   };
 }
 
+/** PreToolUse: the PR body leak guard's block reason, or null to allow the call. */
+export async function codexPreToolUseBlock(
+  msg: CodexHookMessage,
+  deps?: PrBodyGuardDeps,
+): Promise<string | null> {
+  if (msg.hook_event_name !== "PreToolUse") return null;
+  return guardGhPrBody(msg.tool_input, msg.cwd ?? process.cwd(), deps);
+}
+
 /** stdin/stdout entry point used by the `codex-hook` CLI command. */
 export async function handleCodexHook(): Promise<void> {
   let msg: CodexHookMessage;
   try {
     msg = (await Bun.stdin.json()) as CodexHookMessage;
   } catch {
+    return;
+  }
+  const block = await codexPreToolUseBlock(msg);
+  if (block) {
+    console.error(block);
+    process.exitCode = 2;
     return;
   }
   try {

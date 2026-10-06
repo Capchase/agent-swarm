@@ -1,5 +1,5 @@
 import { expandServices } from "./service-names.ts";
-import type { OnboardState } from "./types.ts";
+import { BEDROCK_ALPHA_NOTICE, type OnboardState, PROVIDER_LABELS } from "./types.ts";
 
 /**
  * Generate a JSON-serializable manifest object from onboard wizard state.
@@ -14,7 +14,11 @@ export function generateManifest(state: OnboardState): object {
     createdAt: new Date().toISOString(),
     deployType: state.deployType,
     preset: state.presetId,
+    provider: state.provider,
+    providerLabel: PROVIDER_LABELS[state.provider],
+    providerNotice: state.provider === "bedrock" ? BEDROCK_ALPHA_NOTICE : undefined,
     harness: state.harness,
+    containerEngine: state.containerEngine,
     services: expanded.map((svc) => ({
       name: svc.name,
       templateId: svc.entry.template,
@@ -29,6 +33,7 @@ export function generateManifest(state: OnboardState): object {
       gitlab: state.integrations.gitlab,
       sentry: state.integrations.sentry,
     },
+    slackMode: state.slackMode,
     composePath: "./docker-compose.yml",
     envPath: "./.env",
     apiUrl: `http://localhost:${state.apiPort || 3013}`,

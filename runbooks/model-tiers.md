@@ -13,7 +13,7 @@ The supported tiers are:
 | `smart` | Higher-capability model for harder work |
 | `ultra` | Highest-capability model for rare expensive work |
 
-The canonical schema lives in `src/model-tiers.ts` as `ModelTierSchema`.
+The canonical schema lives in `src/types.ts` as `ModelTierSchema`.
 
 ## Default mappings
 
@@ -22,22 +22,43 @@ Each harness/provider maps the same tier to its own concrete model:
 | Harness provider | `smol` | `regular` | `smart` | `ultra` |
 | --- | --- | --- | --- | --- |
 | `claude` | `haiku` | `sonnet` | `opus` | `fable` |
-| `claude-managed` | `claude-haiku-4-5` | `claude-sonnet-4-6` | `claude-opus-4-8` | `claude-fable-5` |
+| `claude-managed` | `claude-haiku-4-5` | `claude-sonnet-5` | `claude-opus-4-8` | `claude-fable-5` |
 | `codex` | `gpt-5.6-luna` | `gpt-5.6-terra` | `gpt-5.6-sol` | `gpt-5.6-sol` |
-| `pi` | `openrouter/deepseek/deepseek-v4-flash` | `openrouter/deepseek/deepseek-v4-flash` | `openrouter/deepseek/deepseek-v4-pro` | `openrouter/anthropic/claude-opus-4.8` |
-| `opencode` | `openrouter/deepseek/deepseek-v4-flash` | `openrouter/deepseek/deepseek-v4-flash` | `openrouter/deepseek/deepseek-v4-pro` | `openrouter/anthropic/claude-opus-4.8` |
+| `pi` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4-pro-0813` | `openrouter/anthropic/claude-opus-5.5` |
+| `dsh` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4-pro-0813` | `openrouter/anthropic/claude-opus-5.5` |
+| `amp` | `low` | `medium` | `high` | `ultra` |
+| `opencode` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4.1-flash` | `openrouter/deepseek/deepseek-v4-pro-0813` | `openrouter/anthropic/claude-opus-5.5` |
+| `cursor` | `gpt-5.4-mini` | `claude-sonnet-5-5` | `claude-opus-5-5` | `claude-fable-5-1` |
 | `devin` | `devin` | `devin` | `devin` | `devin` |
 
 Update `DEFAULT_MODEL_TIER_MAP` and this table together when defaults change.
 
 ## Overrides
 
-Tier mappings can be overridden in the claiming worker's resolved environment:
+Three layers can override the defaults. From highest to lowest:
 
-- `MODEL_TIER_<TIER>` overrides one tier, for example `MODEL_TIER_SMART=gpt-5.6-sol`.
-- `MODEL_TIER_MAP` accepts a JSON object with tier keys, for example `{"smol":"gpt-5.6-luna","smart":"gpt-5.6-sol"}`.
+1. **Worker env.** `MODEL_TIER_<TIER>` (for example `MODEL_TIER_SMART=gpt-5.6-sol`) or `MODEL_TIER_MAP` (JSON with tier keys, for example `{"smol":"gpt-5.6-luna","smart":"gpt-5.6-sol"}`) in the worker's own process env. Direct `MODEL_TIER_<TIER>` wins over `MODEL_TIER_MAP`. The worker sends the parsed values (`{provider: {tier: model}}`, values only) on register (`modelTierOverrides` body field) and on every poll (`X-Model-Tier-Overrides` header, URL-encoded JSON). The server stores them on `agents.modelTierOverrides`.
+2. **Tier config.** Global `swarm_config` keys `MODEL_TIER_<PROVIDER>_<TIER>`, for example `MODEL_TIER_CLAUDE_SMART` or `MODEL_TIER_CLAUDE_MANAGED_ULTRA` (dashes become underscores). Settings → Configuration → Harness lists the `claude` and `codex` keys. The value is validated on write (`src/be/model-tier-keys.ts`).
+3. **Built-in defaults.** `DEFAULT_MODEL_TIER_MAP`, the table above.
 
-Direct `MODEL_TIER_<TIER>` variables win over `MODEL_TIER_MAP`; both win over the built-in defaults.
+Any layer (and a task's `model`) may hold:
+
+- a concrete model id (`claude-opus-5-5`, `gpt-5.6-sol`, `openrouter/deepseek/deepseek-v4-pro`),
+- a CLI alias the harness resolves itself (`opus`, `sonnet`),
+- a moving alias `latest:<anthropic|openai|openrouter>/<target>[@stable|@any]`, resolved by the server against the `model_catalog` table (plus overlay; the vendored snapshot when the table is empty). Grammar: `packages/model-catalog/src/resolve-alias.ts`.
+
+### `latest:` guardrails
+
+- `@stable` (the default channel) skips preview/experimental ids and models released fewer than `MODEL_LATEST_SOAK_DAYS` days ago (default 2, `0` disables the soak). `@any` skips neither.
+- Models without a catalog price are never picked, on either channel.
+- `MODEL_AUTO_UPGRADE=false` freezes each alias at its last recorded resolution. An alias never resolved before still resolves once.
+- Each time an alias resolves to a different model than last time, the server writes a `model_alias_resolutions` row (`alias`, `previousModel`, `newModel`, `changedAt`) and logs one `[model-tiers] alias ... now resolves to ...` line after commit.
+- An alias that resolves to nothing (unknown family, everything filtered) falls through to the next layer.
+- Rollback: one Settings write (a concrete id in `MODEL_TIER_<PROVIDER>_<TIER>`, or `MODEL_AUTO_UPGRADE=false`).
+
+### Default seeds
+
+The defaults stay concrete ids and CLI aliases. `harness_model_support` now guards aliases (an alias skips a model the worker's CLI rejects, see [model-catalog.md](./model-catalog.md)), so an operator can opt a tier into a moving alias with one Settings write: `MODEL_TIER_<PROVIDER>_<TIER>=latest:anthropic/opus@stable`. Shipping `latest:` as the default is a separate decision.
 
 ## Legacy aliases
 
@@ -63,11 +84,51 @@ Tasks, schedules, and workflow `agent-task` nodes store both optional fields:
 - `model`: concrete provider/harness-specific override.
 - `modelTier`: portable tier intent.
 
-Workers resolve the model at claim/spawn time in this order:
+The API server resolves the model when a worker claims the task (`/api/poll`, both the directly-assigned and the pool-claim path; `src/be/model-tier-resolution.ts`), in this order:
 
-1. Use `task.model` when set.
-2. Resolve `task.modelTier` with the claiming worker's `harnessProvider` and env overrides.
-3. Fall back to existing agent/provider config such as `MODEL_OVERRIDE`.
-4. Fall back to the adapter default.
+1. `task.model` → `modelSource = model`.
+2. The claiming worker's env override for its harness provider (`agents.modelTierOverrides`) → `worker-env`.
+3. `swarm_config` `MODEL_TIER_<PROVIDER>_<TIER>` → `tier-config`.
+4. `DEFAULT_MODEL_TIER_MAP` → `tier-default`.
 
-This is deliberate: pool claims, delegations, workflow fan-out, and schedules should resolve against the worker that actually runs the task, not the agent or API process that created it.
+Each layer's value is judged against the claiming worker's harness (see [Harness compatibility](#harness-compatibility)). A worker-env, tier-config or tier-default value that does not run on the harness is skipped with the log line `[model-tiers] <source> value <value> does not run on <harness>; trying next layer`. A task `model` that does not run on it is not skipped: the claim returns `modelUnsupported` with a `[model-harness-mismatch]` reason and the worker fails the task without starting a CLI.
+
+It writes `resolvedModel`, `modelSource` and `modelAlias` (the `latest:` alias, when any) on `agent_tasks` and returns them on the trigger. A task with neither `model` nor `modelTier` records nothing. `modelSource = fallback:cli-unsupported` means the claiming worker's CLI version rejected the model an alias or a tier resolved to, so the newest model of the same family that the CLI has not rejected ran instead (`modelAlias` keeps the alias). An explicit `model: "latest:..."` counts as an alias and falls back the same way. Only a concrete id the task pinned (`model: "claude-opus-5-5"`) fails fast. A tier default that is a Claude CLI shortname (`opus`) is family-matched: if the CLI rejected `opus` itself it falls back to the newest usable `claude-opus-*`; if only a catalog id was rejected, `opus` stays, because the CLI resolves its own shortname. With no usable sibling the resolution stays and the run reports the CLI's error (see `runbooks/model-catalog.md`).
+
+`GET /api/models-catalog/tiers` previews layers 3 and 4 for every provider and tier, with `latest:` aliases resolved against the current catalog and without recording a resolution. It ignores per-worker overrides and per-task models. The dashboard Configuration page uses it for the `MODEL_TIER_*` rows.
+
+The worker still runs `resolveTaskModelSelection` locally. When the server sent a `resolvedModel`, the worker uses it; if its local result differs (for example a stale override sent before a restart, or a tier-config value the worker does not read), it logs `model resolution mismatch ... using server value`. Without a server value (older API) the worker keeps the local order: task `model`, `modelTier` with its env overrides, `MODEL_OVERRIDE`, then the adapter default.
+
+This is deliberate: pool claims, delegations, workflow fan-out, and schedules resolve against the worker that actually runs the task, not the agent or API process that created it. Schedules and workflow steps store only `model`/`modelTier`; each spawned task records its own resolution.
+
+## Explicit model ids are checked
+
+A task, schedule, workflow `agent-task` node or agent runtime `model` must be in the catalog: a catalog id (bare or provider-qualified), a Claude CLI shortname, or a `latest:` alias that resolves. Anything else is rejected where it is written (HTTP 400, tool error, failed node) with a message that names the escape hatch. Escape hatch: `allowCustomModel: true` on `POST /api/tasks`, `send-task`, `task-action` create, `create-schedule`/`update-schedule`/`patch-schedule`, `POST`/`PUT /api/schedules`, the workflow node config, and `allow_custom_model` on `PATCH /api/agents/{id}/runtime`. A custom id is stored as given. Skipped without the flag when the caller names an `acp`, `devin` or `dsh` harness (the catalog does not describe their models). A schedule that already stores a model can be re-saved with it. Claim time does not re-check catalog membership; it re-checks harness compatibility (below). An agent's default model (`MODEL_OVERRIDE`) cannot be a `latest:` alias: put the alias on a task or in a `MODEL_TIER_*` value.
+
+### Harness compatibility
+
+A concrete `model` or `latest:` alias must also run on the harness that will run it. The rule lives in one pure function, `harnessModelMismatch` in `packages/model-catalog/src/harness-models.ts` (re-exported as `harnessModelError` from `src/be/model-validation.ts`). It uses the per-harness catalog rules the harness model lists already use; there is no second list.
+
+| Harness | Catalog section | Accepted `model` values | Accepted `latest:` kinds |
+| --- | --- | --- | --- |
+| `claude` | `anthropic` | an `anthropic` id that passes `isHarnessCatalogModel("claude", id)`, a Claude CLI shortname (`opus`, `sonnet`, ...), an optional `[1m]` suffix | `latest:anthropic/...` |
+| `claude-managed` | `anthropic` | same as `claude` | `latest:anthropic/...` |
+| `codex` | `openai` | an `openai` id that passes `isHarnessCatalogModel("codex", id)` | `latest:openai/...` |
+| `pi`, `opencode` | none pinned | any catalog model, bare or provider-qualified | any |
+| `dsh`, `cursor`, `devin`, `acp` | free-form | any string | any |
+| `amp` | none (`src/utils/amp-models.ts`) | a mode (`low`, `medium`, `high`, `ultra`) or a `provider/model` pin (for example `openai/gpt-5-nano`) | none |
+
+A provider-qualified id on a pinned harness must name the harness section: `anthropic/claude-opus-5-5` runs on `claude`, `openrouter/anthropic/claude-opus-5.5` does not. An id the catalog does not know in any section passes this check (the catalog membership check above decides it). This includes an uncatalogued id in the harness's own namespace: `openai/private-deployment-1` on `codex` passes with `allowCustomModel` and fails without it. A known id that the harness does not run (`openai/gpt-4o` on `codex`) fails even with the flag. A bare shortname such as `opus` on `codex` therefore passes; legacy shortnames become `modelTier` before any create-time check anyway, and `modelTier` is never rejected.
+
+Where the rule applies:
+
+- **Directed task, schedule, workflow node** (the assignee is known): rejected at the write with `Model "<model>" does not run on the <harness> harness of agent "<name>" (<id>). The <harness> harness accepts <section> catalog models, for example: ... Use modelTier ...`. `send-task` judges the parent auto-route target. A schedule whose `targetAgentId` changes re-judges its stored model against the new agent. A workflow save judges `agent-task` nodes (and `foreach` bodies) that set both `model` and `agentId`; the executor judges again at run time.
+- **Pool task** (no assignee): a concrete `model` is accepted only if at least one registered, non-extension agent runs a harness that accepts it; else `Model "<model>" does not run on any registered agent harness (<harnesses>)`. With no registered agents the check passes. At claim, `/api/poll` and the heartbeat auto-assign skip a worker whose harness cannot run the model, so a compatible worker takes the task. The starvation escalation counts only compatible agents as eligible.
+- **Claim backstop**: every claim re-judges the model (tasks created before the guard, reassigned tasks, schedules whose agent changed harness). A pinned task `model` fails fast with `[model-harness-mismatch] Model "<model>" does not run on the <harness> harness of this worker. ...`. The tag is deterministic and is not `[auth-error]`, so failure triage can keep it out of the Codex pool auth signal. No CLI runs, so no `harness_model_support` row is written.
+- **Worker spawn**: the worker judges the final model against its own harness with the runtime catalog. An agent-scope `MODEL_OVERRIDE` from another family is dropped with `[<role>] MODEL_OVERRIDE <model> does not run on the <harness> harness; using the adapter default`. A task model from another family (an older API that sent no `modelUnsupported`) fails the task with the `[model-harness-mismatch]` reason before any spawn. When a worker re-registers with a new harness and its `MODEL_OVERRIDE` does not run on it, the API logs one warning and keeps the row for a human to fix.
+- **Tier config**: a `MODEL_TIER_<PROVIDER>_<TIER>` value that does not run on the key's provider is rejected on write: `Invalid <key>: model "<value>" does not run on the <provider> harness.` Worker env tier overrides are not judged at register; the claim skips them.
+- **`allowCustomModel` limit**: the flag skips the catalog membership check only. It does not let a model the catalog files under another harness family through (`claude-opus-5-5` on `codex` is refused even with the flag), because the flag means "the catalog does not know this id yet".
+
+## Effort levels
+
+The levels an effort picker offers are the levels the API accepts and the harness applies, for one (harness, model): `reasoningLevelsFor` in `packages/model-catalog/src/reasoning.ts`, fed by the catalog's `reasoning` and `reasoning_options`. Claude CLI shortnames resolve to the newest model of their family first, so the tier defaults (`opus`) take effort like `claude-opus-5-5`. A model the catalog lacks, or a non-reasoning model, takes none.

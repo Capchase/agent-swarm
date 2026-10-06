@@ -9,13 +9,16 @@ import {
 } from "node:http";
 import {
   closeDb,
+  createApprovalRequest,
   createUser,
   createWorkflowRun,
   createWorkflowRunStep,
+  getApprovalRequestById,
   getDbClient,
   getWorkflowRun,
   getWorkflowVersions,
   initDb,
+  listWorkflowRuns,
   updateWorkflowRun,
 } from "../be/db";
 import { getPathSegments, parseQueryParams } from "../http/utils";
@@ -33,10 +36,12 @@ import type {
   WorkflowSummary,
   WorkflowVersion,
 } from "../types";
-import { initWorkflows, stopRetryPoller } from "../workflows";
+import { initWorkflows, stopRetryPoller, workflowEventBus } from "../workflows";
 import { listenOnFreePort } from "./test-net";
 
 const TEST_DB_PATH = "./test-workflow-http-v2.sqlite";
+
+const secretRef = (name: string): string => `secret.${name}`;
 
 // ─── Test Server ─────────────────────────────────────────────
 
@@ -101,6 +106,16 @@ async function createTestWorkflow(overrides?: Record<string, unknown>): Promise<
     }),
   });
   return (await res.json()) as Workflow;
+}
+
+async function waitForWorkflowRuns(workflowId: string, count: number): Promise<WorkflowRun[]> {
+  const deadline = Date.now() + 1_000;
+  do {
+    const runs = await listWorkflowRuns(workflowId);
+    if (runs.length === count) return runs;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  } while (Date.now() < deadline);
+  return listWorkflowRuns(workflowId);
 }
 
 // ─── Setup / Teardown ────────────────────────────────────────
@@ -188,10 +203,10 @@ describe("Workflow HTTP API v2", () => {
           name: "full-schema-workflow",
           description: "test",
           definition: simpleDefinition(),
-          triggers: [{ type: "webhook", hmacSecret: "secret-123" }],
+          triggers: [{ type: "webhook", hmacSecret: "example-secret-123" }],
           cooldown: { minutes: 30 },
           // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional — this is the input resolution syntax
-          input: { apiKey: "${API_KEY}", secret: "secret.MY_SECRET", literal: "hello" },
+          input: { apiKey: "${API_KEY}", secret: secretRef("MY_SECRET"), literal: "hello" },
         }),
       });
 
@@ -424,7 +439,11 @@ describe("Workflow HTTP API v2", () => {
 
   describe("PUT /api/workflows/:id (update)", () => {
     test("creates version snapshot on update", async () => {
-      const workflow = await createTestWorkflow();
+      const workflow = await createTestWorkflow({
+        params: { REPO_URL: "acme/widgets" },
+        requiredParams: ["REPO_URL"],
+        requires: ["github"],
+      });
 
       // First update
       const res1 = await fetch(`${baseUrl}/api/workflows/${workflow.id}`, {
@@ -449,18 +468,26 @@ describe("Workflow HTTP API v2", () => {
       expect(versions.find((v) => v.version === 1)?.snapshot.description).toBeUndefined();
       // Version 2 should have "updated once"
       expect(versions.find((v) => v.version === 2)?.snapshot.description).toBe("updated once");
+      expect(versions.find((v) => v.version === 1)?.snapshot.params).toEqual({
+        REPO_URL: "acme/widgets",
+      });
+      expect(versions.find((v) => v.version === 1)?.snapshot.requiredParams).toEqual(["REPO_URL"]);
+      expect(versions.find((v) => v.version === 1)?.snapshot.requires).toEqual(["github"]);
     });
 
-    test("accepts new fields (triggers, cooldown, input)", async () => {
+    test("accepts new fields (triggers, cooldown, input, automation setup)", async () => {
       const workflow = await createTestWorkflow();
 
       const res = await fetch(`${baseUrl}/api/workflows/${workflow.id}`, {
         method: "PUT",
         headers,
         body: JSON.stringify({
-          triggers: [{ type: "webhook", hmacSecret: "new-secret" }],
+          triggers: [{ type: "webhook", hmacSecret: "example-new-secret" }],
           cooldown: { seconds: 30 },
           input: { key: "value" },
+          params: { REPO_URL: "acme/widgets" },
+          requiredParams: ["REPO_URL"],
+          requires: ["github"],
         }),
       });
       expect(res.status).toBe(200);
@@ -469,6 +496,28 @@ describe("Workflow HTTP API v2", () => {
       expect(body.triggers[0]!.type).toBe("webhook");
       expect(body.cooldown).toEqual({ seconds: 30 });
       expect(body.input).toEqual({ key: "value" });
+      expect(body.params).toEqual({ REPO_URL: "acme/widgets" });
+      expect(body.requiredParams).toEqual(["REPO_URL"]);
+      expect(body.requires).toEqual(["github"]);
+    });
+
+    test("PATCH persists automation setup fields", async () => {
+      const workflow = await createTestWorkflow();
+
+      const res = await fetch(`${baseUrl}/api/workflows/${workflow.id}`, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          params: { SLACK_CHANNEL_ID: "C123" },
+          requiredParams: ["SLACK_CHANNEL_ID"],
+          requires: ["slack"],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Workflow;
+      expect(body.params).toEqual({ SLACK_CHANNEL_ID: "C123" });
+      expect(body.requiredParams).toEqual(["SLACK_CHANNEL_ID"]);
+      expect(body.requires).toEqual(["slack"]);
     });
 
     test("rejects invalid definition on update", async () => {
@@ -664,6 +713,30 @@ describe("Workflow HTTP API v2", () => {
     });
   });
 
+  describe("workflow event triggers", () => {
+    test("init registers one slack.message listener across repeated calls", async () => {
+      const workflow = await createTestWorkflow({
+        triggers: [{ type: "event", eventName: "slack.message" }],
+      });
+
+      await initWorkflows();
+      await initWorkflows();
+      workflowEventBus.emit("slack.message", {
+        channel: "C123",
+        text: "service is down",
+        ts: "123.456",
+      });
+
+      const runs = await waitForWorkflowRuns(workflow.id, 1);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.triggerData).toEqual({
+        channel: "C123",
+        text: "service is down",
+        ts: "123.456",
+      });
+    });
+  });
+
   // ─── LIST RUNS ────────────────────────────────────────────
 
   describe("GET /api/workflows/:id/runs", () => {
@@ -680,7 +753,7 @@ describe("Workflow HTTP API v2", () => {
       // List all runs
       const res1 = await fetch(`${baseUrl}/api/workflows/${workflow.id}/runs`, { headers });
       expect(res1.status).toBe(200);
-      const allRuns = (await res1.json()) as WorkflowRun[];
+      const allRuns = ((await res1.json()) as { runs: WorkflowRun[] }).runs;
       expect(allRuns.length).toBeGreaterThanOrEqual(1);
 
       // Filter by status — use a status that likely doesn't match
@@ -688,14 +761,14 @@ describe("Workflow HTTP API v2", () => {
         headers,
       });
       expect(res2.status).toBe(200);
-      const filteredRuns = (await res2.json()) as WorkflowRun[];
+      const filteredRuns = ((await res2.json()) as { runs: WorkflowRun[] }).runs;
       // All returned runs should have the requested status
       for (const run of filteredRuns) {
         expect(run.status).toBe("waiting");
       }
     });
 
-    test("supports deterministic limit/offset pages while preserving the omitted legacy shape", async () => {
+    test("supports deterministic limit/offset pages", async () => {
       const workflow = await createTestWorkflow();
       const runIds = Array.from({ length: 5 }, () => crypto.randomUUID());
       const statuses = ["running", "failed", "running", "failed", "running"] as const;
@@ -709,11 +782,11 @@ describe("Workflow HTTP API v2", () => {
         ]);
       }
 
-      const legacyRes = await fetch(`${baseUrl}/api/workflows/${workflow.id}/runs`, { headers });
-      expect(legacyRes.status).toBe(200);
-      const legacyBody = (await legacyRes.json()) as WorkflowRun[];
-      expect(Array.isArray(legacyBody)).toBe(true);
-      expect(legacyBody.map((run) => run.id)).toEqual([...runIds].reverse());
+      const defaultRes = await fetch(`${baseUrl}/api/workflows/${workflow.id}/runs`, { headers });
+      expect(defaultRes.status).toBe(200);
+      const defaultBody = (await defaultRes.json()) as { runs: WorkflowRun[]; page: unknown };
+      expect(defaultBody.runs.map((run) => run.id)).toEqual([...runIds].reverse());
+      expect(defaultBody.page).toEqual({ limit: 50, offset: 0, total: 5, hasMore: false });
 
       const pageRes = await fetch(`${baseUrl}/api/workflows/${workflow.id}/runs?limit=2&offset=1`, {
         headers,
@@ -754,6 +827,97 @@ describe("Workflow HTTP API v2", () => {
         headers,
       });
       expect(invalidRes.status).toBe(400);
+    });
+
+    test("caps an unpaged request at 50 runs and pages through the rest", async () => {
+      const workflow = await createTestWorkflow();
+      const total = 53;
+      for (let index = 0; index < total; index++) {
+        const id = crypto.randomUUID();
+        await createWorkflowRun({ id, workflowId: workflow.id });
+        await getDbClient().run("UPDATE workflow_runs SET startedAt = ? WHERE id = ?", [
+          new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+          id,
+        ]);
+      }
+
+      const first = (await (
+        await fetch(`${baseUrl}/api/workflows/${workflow.id}/runs`, { headers })
+      ).json()) as {
+        runs: WorkflowRun[];
+        page: {
+          limit: number;
+          offset: number;
+          total: number;
+          hasMore: boolean;
+          nextOffset?: number;
+        };
+      };
+      expect(first.runs).toHaveLength(50);
+      expect(first.page).toEqual({ limit: 50, offset: 0, total, hasMore: true, nextOffset: 50 });
+
+      const second = (await (
+        await fetch(
+          `${baseUrl}/api/workflows/${workflow.id}/runs?offset=${first.page.nextOffset}`,
+          {
+            headers,
+          },
+        )
+      ).json()) as { runs: WorkflowRun[]; page: { hasMore: boolean } };
+      expect(second.runs).toHaveLength(3);
+      expect(second.page.hasMore).toBe(false);
+      expect(new Set([...first.runs, ...second.runs].map((run) => run.id)).size).toBe(total);
+    });
+
+    test("list rows carry triggerData but not context; the detail route serves context", async () => {
+      const workflow = await createTestWorkflow();
+      const run = await createWorkflowRun({
+        id: crypto.randomUUID(),
+        workflowId: workflow.id,
+        triggerData: { topic: "runs" },
+      });
+      await updateWorkflowRun(run.id, { context: { nodeOutput: "x".repeat(50_000) } });
+
+      const body = (await (
+        await fetch(`${baseUrl}/api/workflows/${workflow.id}/runs`, { headers })
+      ).json()) as { runs: Array<Record<string, unknown>> };
+      expect(body.runs).toHaveLength(1);
+      expect(body.runs[0]!.id).toBe(run.id);
+      expect(body.runs[0]!.triggerData).toEqual({ topic: "runs" });
+      expect("context" in body.runs[0]!).toBe(false);
+
+      const detail = (await (
+        await fetch(`${baseUrl}/api/workflow-runs/${run.id}`, { headers })
+      ).json()) as { run: WorkflowRun };
+      expect(detail.run.context).toEqual({ nodeOutput: "x".repeat(50_000) });
+    });
+
+    test("a run page and its count read from the workflow indexes without a sort or cross-workflow scan", async () => {
+      const explain = async (sql: string, params: string[]) =>
+        (await getDbClient().query<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, params))
+          .map((row) => row.detail)
+          .join("\n");
+      const workflowId = crypto.randomUUID();
+
+      const page = await explain(
+        "SELECT id FROM workflow_runs WHERE workflowId = ? ORDER BY startedAt DESC, id DESC LIMIT 50",
+        [workflowId],
+      );
+      expect(page).toContain("idx_workflow_runs_workflow_started");
+      expect(page).not.toContain("USE TEMP B-TREE");
+
+      const filtered = await explain(
+        "SELECT id FROM workflow_runs WHERE workflowId = ? AND status = ? ORDER BY startedAt DESC, id DESC LIMIT 50",
+        [workflowId, "failed"],
+      );
+      expect(filtered).toContain("idx_workflow_runs_workflow_status_started");
+      expect(filtered).not.toContain("USE TEMP B-TREE");
+
+      const count = await explain(
+        "SELECT COUNT(*) FROM workflow_runs WHERE workflowId = ? AND status = ?",
+        [workflowId, "failed"],
+      );
+      expect(count).toContain("COVERING INDEX idx_workflow_runs_workflow_status_started");
     });
 
     test("MCP run listing defaults to bounded slim rows and preserves an explicit full-row opt-in", async () => {
@@ -850,11 +1014,11 @@ describe("Workflow HTTP API v2", () => {
   describe("POST /api/webhooks/:workflowId", () => {
     test("valid HMAC returns 201", async () => {
       const workflow = await createTestWorkflow({
-        triggers: [{ type: "webhook", hmacSecret: "test-secret" }],
+        triggers: [{ type: "webhook", hmacSecret: "example-test-secret" }],
       });
 
       const body = '{"event":"test"}';
-      const hmac = crypto.createHmac("sha256", "test-secret");
+      const hmac = crypto.createHmac("sha256", "example-test-secret");
       hmac.update(body);
       const sig = `sha256=${hmac.digest("hex")}`;
 
@@ -873,7 +1037,7 @@ describe("Workflow HTTP API v2", () => {
 
     test("invalid HMAC returns 401", async () => {
       const workflow = await createTestWorkflow({
-        triggers: [{ type: "webhook", hmacSecret: "test-secret" }],
+        triggers: [{ type: "webhook", hmacSecret: "example-test-secret" }],
       });
 
       const res = await fetch(`${baseUrl}/api/webhooks/${workflow.id}`, {
@@ -964,11 +1128,20 @@ describe("Workflow HTTP API v2", () => {
       await createWorkflowRun({ id: runId, workflowId: workflow.id });
 
       // Create a step in 'running' state
+      const stepId = crypto.randomUUID();
       await createWorkflowRunStep({
-        id: crypto.randomUUID(),
+        id: stepId,
         runId,
         nodeId: "n1",
-        nodeType: "notify",
+        nodeType: "human-in-the-loop",
+      });
+      const approval = await createApprovalRequest({
+        id: crypto.randomUUID(),
+        title: "Approve release",
+        questions: [{ id: "approve", type: "approval", label: "Approve?" }],
+        approvers: { policy: "any" },
+        workflowRunId: runId,
+        workflowRunStepId: stepId,
       });
 
       // Cancel the run
@@ -988,6 +1161,10 @@ describe("Workflow HTTP API v2", () => {
       expect(run.status).toBe("cancelled");
       expect(run.error).toBe("Test cancellation");
       expect(run.finishedAt).toBeDefined();
+      expect(await getApprovalRequestById(approval.id)).toMatchObject({
+        status: "cancelled",
+        resolutionReason: "Test cancellation",
+      });
     });
 
     test("returns 400 for already completed run", async () => {

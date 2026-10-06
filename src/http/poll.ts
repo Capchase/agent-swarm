@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ensure } from "@desplega.ai/business-use";
 import { z } from "zod";
+import { isApiDraining } from "../be/api-drain";
 import { canClaim } from "../be/budget-admission";
 import {
   type BudgetRefusalContext,
@@ -21,16 +22,23 @@ import {
   getUnassignedTaskIdsForAgent,
   getUserById,
   hasCapacity,
+  isExtensionAgent,
   recordBudgetRefusalNotification,
   startTask,
   updateAgentStatusFromCapacity,
   upsertChannelActivityCursor,
 } from "../be/db";
 import { renderIdentity, resolveIdentity } from "../be/identity";
+import {
+  parseModelTierOverridesHeader,
+  recordClaimModelResolution,
+  setAgentModelTierOverrides,
+} from "../be/model-tier-resolution";
+import { poolTaskRunsOnHarness } from "../be/model-validation";
 import { touchRuntimeInstance } from "../be/multi-runtime";
 import { hasCapability } from "../server";
 import { fetchChannelActivity } from "../slack/channel-activity";
-import { telemetry } from "../telemetry";
+import { emitTaskTelemetry, resolveTriggerSurface } from "../telemetry-trigger";
 import {
   AgentTaskSchema,
   BudgetRefusedTriggerSchema,
@@ -94,11 +102,14 @@ const PollTriggerAttachmentSchema = TaskAttachmentSchema.pick({
 // user's identity fields, or (when no `requestedByUserId` is recorded) just a
 // rendered `name` for the UNKNOWN-identity sentinel.
 const PollRequestedBySchema = UserSchema.pick({
+  id: true,
   name: true,
   email: true,
   role: true,
   notes: true,
 }).extend({
+  // Absent for the UNKNOWN-identity sentinel (Slack-only requester, no users row).
+  id: z.string().optional(),
   // Structured communication preferences from `users.metadata.comms`.
   comms: UserCommsPrefsSchema.optional(),
 });
@@ -113,6 +124,9 @@ const PollTaskOfferedTriggerSchema = z.object({
 const PollTaskAssignedTriggerSchema = z.object({
   type: z.literal("task_assigned"),
   taskId: z.string(),
+  // Surface that started the whole task chain (root task's source, mapped to
+  // the telemetry catalog). Workers tag their session telemetry with it.
+  triggerSurface: z.string().optional(),
   task: AgentTaskSchema.extend({
     attachments: z.array(PollTriggerAttachmentSchema),
   }),
@@ -162,9 +176,20 @@ const pollTriggers = route({
   path: "/api/poll",
   pattern: ["api", "poll"],
   summary: "Poll for triggers (tasks, mentions)",
+  description:
+    "While the API is draining after SIGTERM it dispatches nothing: the answer is `{ trigger: null }` " +
+    "and carries `X-Swarm-Draining: 1`, the signal for a worker to hand off in-flight tasks.",
   tags: ["Poll"],
   auth: { apiKey: true, agentId: true },
-  headers: runtimeInstanceHeader("poll for work"),
+  headers: runtimeInstanceHeader("poll for work").extend({
+    "X-Model-Tier-Overrides": z
+      .string()
+      .optional()
+      .describe(
+        "URL-encoded JSON {provider: {tier: model}} of the worker's MODEL_TIER_* env overrides. " +
+          "Stored on the agent row and applied at claim time (modelSource=worker-env).",
+      ),
+  }),
   responses: {
     200: { description: "Trigger data or null", schema: pollResponseSchema },
     400: { description: "Missing X-Agent-ID" },
@@ -195,6 +220,7 @@ async function buildTriggerRequestedBy(task: {
   const user = task.requestedByUserId ? await getUserById(task.requestedByUserId) : undefined;
   if (user) {
     return {
+      id: user.id,
       name: user.name,
       email: user.email,
       role: user.role,
@@ -223,6 +249,22 @@ async function attachmentsForTrigger(
     mimeType: a.mimeType,
     sizeBytes: a.sizeBytes,
   }));
+}
+
+/**
+ * Claim-time model resolution (runbooks/model-tiers.md). Never blocks a claim:
+ * a resolution failure leaves the worker on its own local resolution.
+ */
+async function claimModelFields(
+  task: { id: string; model?: string | null; modelTier?: string | null },
+  agent: Parameters<typeof recordClaimModelResolution>[1],
+): Promise<Awaited<ReturnType<typeof recordClaimModelResolution>>> {
+  try {
+    return await recordClaimModelResolution(task, agent);
+  } catch (error) {
+    console.warn(`[/api/poll] model resolution failed for task ${task.id}:`, error);
+    return {};
+  }
 }
 
 // ─── Cursor Commit Endpoint ─────────────────────────────────────────────────
@@ -262,6 +304,9 @@ export async function handlePoll(
 ): Promise<boolean> {
   const runtimeInstanceId = ((h) => (Array.isArray(h) ? h[0] : h))(
     req.headers["x-runtime-instance-id"],
+  );
+  const modelTierOverrides = parseModelTierOverridesHeader(
+    ((h) => (Array.isArray(h) ? h[0] : h))(req.headers["x-model-tier-overrides"]),
   );
   // Handle cursor commit endpoint
   if (commitCursorsRoute.match(req.method, pathSegments)) {
@@ -306,6 +351,18 @@ export async function handlePoll(
           return { error: "Agent not found", status: 404 };
         }
 
+        // The worker's parsed MODEL_TIER_* env overrides ride on every poll so
+        // claim-time resolution can honor them (no write when unchanged).
+        if (modelTierOverrides) {
+          await setAgentModelTierOverrides(agent.id, modelTierOverrides);
+        }
+
+        // Extension identities authenticate to the API but never execute
+        // work: no offers, no pending assignments, no pool claims.
+        if (isExtensionAgent(agent)) {
+          return { trigger: null };
+        }
+
         // A process whose runtime has been retired must not be handed work: it
         // would execute alongside whatever replaced it. Dispatch is gated on a
         // live runtime identity rather than on X-Agent-ID alone, which only
@@ -316,6 +373,13 @@ export async function handlePoll(
           isMultiRuntimeEnabled() &&
           !(runtimeInstanceId && (await touchRuntimeInstance(runtimeInstanceId, agent.id)))
         ) {
+          return { trigger: null };
+        }
+
+        // A draining API dispatches nothing: offers, assignments and pool claims
+        // wait for the next API. Workers learn to hand off from the
+        // X-Swarm-Draining header the HTTP pipeline adds (src/be/api-drain.ts).
+        if (isApiDraining()) {
           return { trigger: null };
         }
 
@@ -420,7 +484,7 @@ export async function handlePoll(
                 conditions: [{ timeout_ms: 300_000 }], // 5 min: polling interval + queue wait
               });
 
-              telemetry.taskEvent("started", {
+              void emitTaskTelemetry("started", {
                 taskId: pendingTask.id,
                 source: pendingTask.source,
                 agentId: myAgentId,
@@ -430,13 +494,21 @@ export async function handlePoll(
             // Resolve requesting user if available (UNKNOWN sentinel handling
             // lives in buildTriggerRequestedBy).
             const assignedRequestedBy = await buildTriggerRequestedBy(pendingTask);
+            // The surface that started the whole chain, so the worker can tag
+            // its session events with it (workers cannot read the task tree).
+            const assignedTriggerSurface = await resolveTriggerSurface(
+              pendingTask.id,
+              pendingTask.source,
+            );
 
             return {
               trigger: {
                 type: "task_assigned",
                 taskId: pendingTask.id,
+                triggerSurface: assignedTriggerSurface,
                 task: {
                   ...pendingTask,
+                  ...(await claimModelFields(pendingTask, agent)),
                   status: "in_progress",
                   attachments: await attachmentsForTrigger(pendingTask.id),
                 },
@@ -486,7 +558,14 @@ export async function handlePoll(
           // `isAgentEligibleForTask`, so an ineligible task is never even
           // offered to the budget gate below or the claim loop.
           if (await hasCapacity(myAgentId)) {
-            const unassignedIds = await getUnassignedTaskIdsForAgent(myAgentId, 5);
+            // A pool task that pins a model this harness cannot run waits for a compatible
+            // worker (runbooks/model-tiers.md § Harness compatibility). Filter before the
+            // budget gate so an incompatible first candidate never drives a refusal.
+            const harness = agent.harnessProvider ?? agent.provider ?? null;
+            // The filter runs inside the paginated scan, so incompatible rows never use up the limit.
+            const unassignedIds = await getUnassignedTaskIdsForAgent(myAgentId, 5, (task) =>
+              poolTaskRunsOnHarness(task, harness),
+            );
             // Budget admission gate (Phase 3). Pool path is workers-only —
             // per-agent budgets matter most here, but we still check global.
             // Only run the gate when there's at least one candidate task; an
@@ -554,18 +633,27 @@ export async function handlePoll(
                 // Post-commit (see the `started` path above): a rolled-back
                 // claim must not report the task as claimed.
                 getDbClient().afterCommit(() => {
-                  telemetry.taskEvent("claimed", {
+                  void emitTaskTelemetry("claimed", {
                     taskId: claimed.id,
                     source: claimed.source,
                     agentId: myAgentId,
                   });
                 });
                 const claimedRequestedBy = await buildTriggerRequestedBy(claimed);
+                const claimedTriggerSurface = await resolveTriggerSurface(
+                  claimed.id,
+                  claimed.source,
+                );
                 return {
                   trigger: {
                     type: "task_assigned",
                     taskId: claimed.id,
-                    task: { ...claimed, attachments: await attachmentsForTrigger(claimed.id) },
+                    triggerSurface: claimedTriggerSurface,
+                    task: {
+                      ...claimed,
+                      ...(await claimModelFields(claimed, agent)),
+                      attachments: await attachmentsForTrigger(claimed.id),
+                    },
                     ...(claimedRequestedBy && { requestedBy: claimedRequestedBy }),
                   },
                 };
@@ -610,6 +698,7 @@ export async function handlePoll(
     // Throttled to avoid Slack API rate limits (~50 calls/min).
     if (
       result.trigger === null &&
+      !isApiDraining() &&
       process.env.LEAD_MONITOR_CHANNELS === "true" &&
       Date.now() - lastChannelActivityCheckAt >= CHANNEL_ACTIVITY_INTERVAL_MS
     ) {

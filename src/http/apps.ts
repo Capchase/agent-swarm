@@ -1155,9 +1155,20 @@ export async function handleApps(
       json(res, { error: "invalid row query", issues }, 400);
       return true;
     }
-    const rows = (await listAppRows(parsed.params.id, parsed.params.model)).filter((row) =>
-      filters.every((filter) => rowValue(row, filter.column) === filter.value),
-    );
+    // SQL narrows the scan; the `===` re-check keeps the exact filter semantics.
+    const rows = (
+      await listAppRows(
+        parsed.params.id,
+        parsed.params.model,
+        filters.flatMap((filter) =>
+          typeof filter.value === "string" ||
+          typeof filter.value === "number" ||
+          typeof filter.value === "boolean"
+            ? [{ column: filter.column, value: filter.value }]
+            : [],
+        ),
+      )
+    ).filter((row) => filters.every((filter) => rowValue(row, filter.column) === filter.value));
     const sortRaw = parsed.query.sort;
     if (sortRaw) {
       const [column, dir, extra] = sortRaw.split(":");
@@ -1410,14 +1421,20 @@ export async function handleApps(
       action_name: parsed.params.name,
       input_json: JSON.stringify(input),
     });
-    const task = await createTaskWithSiblingAwareness(taskPrompt.text, {
-      source: "api",
-      agentId: action.agentId ?? lead?.id,
-      // App-spawned tasks group under the app's asset namespace so a
-      // swarm-tasks source can pull them back via config.assetKey.
-      key: normalizeAssetKey(`shared/app:${app.id}/action:${parsed.params.name}/`),
-      ...(actor.startsWith("user:") ? { requestedByUserId: actor.slice("user:".length) } : {}),
-    });
+    const task = await createTaskWithSiblingAwareness(
+      taskPrompt.text,
+      {
+        source: "api",
+        agentId: action.agentId ?? lead?.id,
+        routingReason: action.agentId ? "human_pinned" : lead ? "skill" : undefined,
+        routingSource: action.agentId || lead ? "engine_default" : undefined,
+        // App-spawned tasks group under the app's asset namespace so a
+        // swarm-tasks source can pull them back via config.assetKey.
+        key: normalizeAssetKey(`shared/app:${app.id}/action:${parsed.params.name}/`),
+        ...(actor.startsWith("user:") ? { requestedByUserId: actor.slice("user:".length) } : {}),
+      },
+      { origin: "app" },
+    );
     runActionRoute.respond(res, 200, { ok: true, taskId: task.id, status: task.status });
     return true;
   }

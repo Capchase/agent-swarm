@@ -1,4 +1,4 @@
-import { getDbClient, updateWorkflowRun, updateWorkflowRunStep } from "../be/db";
+import { getDbClient, getWorkflowRun, updateWorkflowRun, updateWorkflowRunStep } from "../be/db";
 import type { RetryPolicy } from "../types";
 
 /**
@@ -66,10 +66,15 @@ export async function checkpointStepFailure(
 
   const markRunFailed = options?.markRunFailed ?? true;
   if (markRunFailed) {
-    await updateWorkflowRun(runId, {
-      status: "failed",
-      error: `Step failed: ${error}`,
-      finishedAt: now,
+    // A cancel or finalization that committed while the step ran wins.
+    await getDbClient().transaction(async () => {
+      const run = await getWorkflowRun(runId);
+      if (run?.status !== "running" && run?.status !== "waiting") return;
+      await updateWorkflowRun(runId, {
+        status: "failed",
+        error: `Step failed: ${error}`,
+        finishedAt: now,
+      });
     });
   }
 
@@ -83,16 +88,23 @@ export async function checkpointStepWaiting(
   runId: string,
   stepId: string,
   ctx: Record<string, unknown>,
-): Promise<void> {
-  await getDbClient().transaction(async () => {
-    await updateWorkflowRunStep(stepId, {
-      status: "waiting",
-    });
+): Promise<boolean> {
+  return getDbClient().transaction(async () => {
+    const step = await getDbClient().get<{ id: string }>(
+      `UPDATE workflow_run_steps
+         SET status = 'waiting'
+       WHERE id = ? AND runId = ? AND status = 'running'
+         AND EXISTS (
+           SELECT 1 FROM workflow_runs
+           WHERE id = ? AND status IN ('running', 'waiting')
+         )
+       RETURNING id`,
+      [stepId, runId, runId],
+    );
+    if (!step) return false;
 
-    await updateWorkflowRun(runId, {
-      status: "waiting",
-      context: ctx,
-    });
+    await updateWorkflowRun(runId, { status: "waiting", context: ctx });
+    return true;
   });
 }
 

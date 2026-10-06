@@ -19,6 +19,8 @@ import {
 } from "@/types";
 import { getExecutorRegistry } from "@/workflows";
 import { definitionNodeIds, validateDefinition } from "@/workflows/definition";
+import { workflowModelErrors } from "@/workflows/model-validation";
+import { withSaveWarnings, workflowSaveWarnings } from "@/workflows/readiness";
 import { snapshotAndUpdateWorkflow } from "@/workflows/version";
 
 export const registerUpdateWorkflowTool = (server: McpServer) => {
@@ -36,7 +38,8 @@ export const registerUpdateWorkflowTool = (server: McpServer) => {
         "WEBHOOK VERIFICATION: webhook triggers use hmacSecret for all verification formats. " +
         "Omit verification for legacy HMAC-SHA256 over the raw body with fallback header scanning; " +
         "or set verification to { format: 'hmac-sha256', header }, { format: 'timestamped-hmac-sha256', header, toleranceSeconds? }, " +
-        "or { format: 'token-equality', header }.",
+        "{ format: 'token-equality', header }, or { format: 'standard-webhooks', toleranceSeconds? } " +
+        "(standardwebhooks.com: webhook-id/webhook-timestamp/webhook-signature headers, hmacSecret is the whsec_ signing secret).",
       inputSchema: z.object({
         id: z.string().uuid().describe("Workflow ID to update"),
         key: AssetKeySchema.optional().describe("Move to a logical namespace."),
@@ -47,7 +50,7 @@ export const registerUpdateWorkflowTool = (server: McpServer) => {
           .array(TriggerConfigSchema)
           .optional()
           .describe(
-            "New trigger configurations. Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality.",
+            "New trigger configurations. Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality, standard-webhooks.",
           ),
         cooldown: CooldownConfigSchema.optional()
           .nullable()
@@ -84,6 +87,7 @@ export const registerUpdateWorkflowTool = (server: McpServer) => {
       outputSchema: swarmToolOutputSchema({
         workflow: z.unknown().optional(),
         versionCreated: z.number().optional(),
+        warnings: z.array(z.string()).optional(),
       }),
     },
     async (
@@ -117,6 +121,10 @@ export const registerUpdateWorkflowTool = (server: McpServer) => {
           });
           if (!validation.valid) {
             return toolErr(`Invalid definition: ${validation.errors.join("; ")}`);
+          }
+          const modelErrors = await workflowModelErrors(definition);
+          if (modelErrors.length > 0) {
+            return toolErr(`Invalid definition: ${modelErrors.join("; ")}`);
           }
         }
 
@@ -152,11 +160,16 @@ export const registerUpdateWorkflowTool = (server: McpServer) => {
         const longScriptTimeoutHint = definition
           ? findLongScriptTimeoutHint(definition.nodes)
           : undefined;
-        return toolOk(`Updated workflow "${workflow.name}".`, {
-          details: `Updated workflow "${workflow.name}" (${id}). Version ${version.version} snapshot created.`,
+        const warnings = await workflowSaveWarnings(workflow.definition, getExecutorRegistry());
+        return toolOk(withSaveWarnings(`Updated workflow "${workflow.name}".`, warnings), {
+          details: withSaveWarnings(
+            `Updated workflow "${workflow.name}" (${id}). Version ${version.version} snapshot created.`,
+            warnings,
+          ),
           data: {
             workflow,
             versionCreated: version.version,
+            ...(warnings.length > 0 ? { warnings } : {}),
             ...(longScriptTimeoutHint ? { longScriptTimeoutHint } : {}),
           },
         });

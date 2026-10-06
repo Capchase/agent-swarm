@@ -1,16 +1,22 @@
 import type { ColDef, ICellRendererParams, RowClickedEvent } from "ag-grid-community";
-import { Workflow as WorkflowIcon } from "lucide-react";
+import { Star, Workflow as WorkflowIcon } from "lucide-react";
 import { useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
+import { ALL_WORKFLOW_RUNS_PER_WORKFLOW } from "@/api/client";
 import { useAgents } from "@/api/hooks/use-agents";
 import { useFavoriteToggle } from "@/api/hooks/use-favorites";
 import { useAllWorkflowRuns, useUpdateWorkflow, useWorkflows } from "@/api/hooks/use-workflows";
-import type { WorkflowRun, WorkflowRunStatus, WorkflowSummary } from "@/api/types";
+import type { WorkflowRunStatus, WorkflowRunSummary, WorkflowSummary } from "@/api/types";
+import { useStatusContext } from "@/app/status-context";
+import { findAutomation, NeedsSetupBadge } from "@/components/automations/needs-setup-badge";
 import { DataGrid } from "@/components/shared/data-grid";
 import { EmptyState } from "@/components/shared/empty-state";
 import { FavoriteButton } from "@/components/shared/favorite-button";
+import { FAVORITE_COLUMN } from "@/components/shared/favorite-column";
 import { ListFilterBar } from "@/components/shared/list-filter-bar";
+import { MobileList, MobileListRow } from "@/components/shared/mobile-list";
 import { StatusBadge } from "@/components/shared/status-badge";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/ui/page-header";
 import { SearchableSelect } from "@/components/ui/searchable-select";
@@ -23,7 +29,10 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { readBooleanParam, readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
+import { isAutomationSetupError } from "@/lib/automation-setup";
+import { matchesSearchTerms, searchText } from "@/lib/list-search";
 import { formatElapsed, formatSmartTime } from "@/lib/utils";
 
 function formatDuration(startedAt: string, finishedAt?: string): string {
@@ -49,8 +58,10 @@ export default function WorkflowsPage() {
   const workflowFilter = readStringParam(searchParams, "workflow", "all");
 
   const { data: workflows, isLoading: wfLoading } = useWorkflows();
+  const { data: status } = useStatusContext();
   const { data: agents } = useAgents();
-  const { data: allRuns, isLoading: runsLoading } = useAllWorkflowRuns();
+  const { data: allRunsData, isLoading: runsLoading } = useAllWorkflowRuns();
+  const allRuns = allRunsData?.runs;
   const updateWorkflow = useUpdateWorkflow();
   const favoriteToggle = useFavoriteToggle("workflow");
   const workflowRows = useMemo(() => {
@@ -66,10 +77,23 @@ export default function WorkflowsPage() {
         if (enabledFilter === "disabled" && workflow.enabled) return false;
         if (creatorFilter !== "all" && workflow.createdByAgentId !== creatorFilter) return false;
         if (favoritesOnly && !workflow.favorite) return false;
+        // One search for both widths, so a phone finds the same rows as the grid.
+        if (search.trim()) {
+          return matchesSearchTerms(searchText([workflow.name, workflow.description]), search);
+        }
         return true;
       }),
-    [creatorFilter, enabledFilter, favoritesOnly, workflowRows],
+    [creatorFilter, enabledFilter, favoritesOnly, search, workflowRows],
   );
+  const isMobile = useIsMobile();
+  const needsSetup = useCallback(
+    (workflow: WorkflowSummary) =>
+      findAutomation(status?.automations, "workflow", workflow.key, workflow.name)?.state ===
+      "needs_setup",
+    [status?.automations],
+  );
+  // The Setup column only earns its 190px when some workflow needs setup.
+  const anyNeedsSetup = useMemo(() => workflowRows.some(needsSetup), [needsSetup, workflowRows]);
 
   const workflowMap = useMemo(() => {
     const m = new Map<string, string>();
@@ -88,10 +112,7 @@ export default function WorkflowsPage() {
   const workflowColumns = useMemo<ColDef<WorkflowSummary>[]>(
     () => [
       {
-        headerName: "",
-        width: 52,
-        sortable: false,
-        filter: false,
+        ...FAVORITE_COLUMN,
         cellRenderer: (params: ICellRendererParams<WorkflowSummary>) => {
           const workflow = params.data;
           if (!workflow) return null;
@@ -100,7 +121,10 @@ export default function WorkflowsPage() {
               favorite={workflow.favorite}
               disabled={favoriteToggle.isPending}
               onToggle={() =>
-                favoriteToggle.mutate({ itemId: workflow.id, favorite: !workflow.favorite })
+                favoriteToggle.mutate({
+                  itemId: workflow.id,
+                  favorite: !workflow.favorite,
+                })
               }
             />
           );
@@ -112,7 +136,9 @@ export default function WorkflowsPage() {
         flex: 1,
         minWidth: 200,
         cellRenderer: (params: { value: string }) => (
-          <span className="font-semibold">{params.value}</span>
+          <span className="block truncate font-semibold" title={params.value}>
+            {params.value}
+          </span>
         ),
       },
       {
@@ -124,6 +150,29 @@ export default function WorkflowsPage() {
           <span className="text-muted-foreground truncate">{params.value || "—"}</span>
         ),
       },
+      ...(anyNeedsSetup
+        ? [
+            {
+              headerName: "Setup",
+              width: 190,
+              minWidth: 190,
+              cellRenderer: (params: ICellRendererParams<WorkflowSummary>) => {
+                const workflow = params.data;
+                if (!workflow) return null;
+                return (
+                  <NeedsSetupBadge
+                    automation={findAutomation(
+                      status?.automations,
+                      "workflow",
+                      workflow.key,
+                      workflow.name,
+                    )}
+                  />
+                );
+              },
+            } satisfies ColDef<WorkflowSummary>,
+          ]
+        : []),
       {
         headerName: "Nodes",
         width: 100,
@@ -154,13 +203,13 @@ export default function WorkflowsPage() {
         valueFormatter: (params) => (params.value ? formatSmartTime(params.value) : ""),
       },
     ],
-    [favoriteToggle, handleToggleEnabled],
+    [anyNeedsSetup, favoriteToggle, handleToggleEnabled, status?.automations],
   );
 
   const onWorkflowRowClicked = useCallback(
     (event: RowClickedEvent<WorkflowSummary>) => {
       const target = event.event?.target as HTMLElement | null;
-      if (target?.closest('[data-slot="switch"], button')) return;
+      if (target?.closest('a, [data-slot="switch"], button')) return;
       if (event.data) void navigate(`/workflows/${event.data.id}`);
     },
     [navigate],
@@ -176,7 +225,7 @@ export default function WorkflowsPage() {
     });
   }, [allRuns, statusFilter, workflowFilter]);
 
-  const runColumns = useMemo<ColDef<WorkflowRun>[]>(
+  const runColumns = useMemo<ColDef<WorkflowRunSummary>[]>(
     () => [
       {
         headerName: "Workflow",
@@ -191,9 +240,18 @@ export default function WorkflowsPage() {
         field: "status",
         headerName: "Status",
         width: 130,
-        cellRenderer: (params: { value: WorkflowRunStatus }) => (
-          <StatusBadge status={params.value} />
-        ),
+        cellRenderer: (params: { value: WorkflowRunStatus; data?: WorkflowRunSummary }) =>
+          isAutomationSetupError(params.data?.error) ? (
+            <Badge
+              variant="outline"
+              size="tag"
+              className="border-status-pending/30 text-status-pending-strong"
+            >
+              Needs setup
+            </Badge>
+          ) : (
+            <StatusBadge status={params.value} />
+          ),
       },
       {
         field: "startedAt",
@@ -221,7 +279,7 @@ export default function WorkflowsPage() {
   );
 
   const onRunRowClicked = useCallback(
-    (event: RowClickedEvent<WorkflowRun>) => {
+    (event: RowClickedEvent<WorkflowRunSummary>) => {
       if (event.data) void navigate(`/workflow-runs/${event.data.id}`);
     },
     [navigate],
@@ -316,7 +374,10 @@ export default function WorkflowsPage() {
                   searchPlaceholder="Search creator agents…"
                   options={[
                     { value: "all", label: "All creator agents" },
-                    ...(agents ?? []).map((agent) => ({ value: agent.id, label: agent.name })),
+                    ...(agents ?? []).map((agent) => ({
+                      value: agent.id,
+                      label: agent.name,
+                    })),
                   ]}
                 />
                 <Select
@@ -408,26 +469,107 @@ export default function WorkflowsPage() {
         </div>
 
         <TabsContent value="workflows" className="flex flex-col flex-1 min-h-0 mt-2 gap-3">
-          <DataGrid
-            rowData={filteredWorkflowRows}
-            columnDefs={workflowColumns}
-            quickFilterText={search}
-            onRowClicked={onWorkflowRowClicked}
-            loading={wfLoading}
-            emptyMessage="No workflows match the current filters"
-            paginationQueryKey="workflows"
-          />
+          {isMobile ? (
+            <MobileList
+              label="Workflows"
+              loading={wfLoading}
+              emptyMessage="No workflows match the current filters"
+            >
+              {filteredWorkflowRows.map((workflow) => (
+                <MobileListRow
+                  key={workflow.id}
+                  to={`/workflows/${workflow.id}`}
+                  title={
+                    <>
+                      {workflow.favorite ? (
+                        <Star
+                          className="mr-1 inline size-3 -translate-y-px fill-current text-muted-foreground"
+                          role="img"
+                          aria-label="Favorite"
+                        />
+                      ) : null}
+                      {workflow.name}
+                    </>
+                  }
+                  status={
+                    !workflow.enabled ? (
+                      <Badge variant="outline" size="tag">
+                        Disabled
+                      </Badge>
+                    ) : needsSetup(workflow) ? (
+                      <Badge
+                        variant="outline"
+                        size="tag"
+                        className="border-status-pending/30 text-status-pending-strong"
+                      >
+                        Needs setup
+                      </Badge>
+                    ) : null
+                  }
+                  meta={[
+                    workflow.description,
+                    `${workflow.nodeCount ?? 0} ${workflow.nodeCount === 1 ? "node" : "nodes"}`,
+                  ]}
+                />
+              ))}
+            </MobileList>
+          ) : (
+            <DataGrid
+              rowData={filteredWorkflowRows}
+              columnDefs={workflowColumns}
+              onRowClicked={onWorkflowRowClicked}
+              loading={wfLoading}
+              emptyMessage="No workflows match the current filters"
+              paginationQueryKey="workflows"
+            />
+          )}
         </TabsContent>
 
         <TabsContent value="runs" className="flex flex-col flex-1 min-h-0 mt-2 gap-3">
-          <DataGrid
-            rowData={filteredRuns}
-            columnDefs={runColumns}
-            onRowClicked={onRunRowClicked}
-            loading={runsLoading}
-            emptyMessage="No workflow runs"
-            paginationQueryKey="workflowRuns"
-          />
+          {allRunsData?.capped && (
+            <p className="text-xs text-muted-foreground">
+              Showing the latest {ALL_WORKFLOW_RUNS_PER_WORKFLOW} runs of each workflow. Open a
+              workflow for its full run history.
+            </p>
+          )}
+          {isMobile ? (
+            <MobileList label="Workflow runs" loading={runsLoading} emptyMessage="No workflow runs">
+              {filteredRuns.map((run) => (
+                <MobileListRow
+                  key={run.id}
+                  to={`/workflow-runs/${run.id}`}
+                  live={run.status === "running"}
+                  title={workflowMap.get(run.workflowId) ?? "Unknown"}
+                  status={
+                    isAutomationSetupError(run.error) ? (
+                      <Badge
+                        variant="outline"
+                        size="tag"
+                        className="border-status-pending/30 text-status-pending-strong"
+                      >
+                        Needs setup
+                      </Badge>
+                    ) : (
+                      <StatusBadge status={run.status} />
+                    )
+                  }
+                  meta={[
+                    run.startedAt ? formatSmartTime(run.startedAt) : null,
+                    run.finishedAt ? formatDuration(run.startedAt, run.finishedAt) : null,
+                  ]}
+                />
+              ))}
+            </MobileList>
+          ) : (
+            <DataGrid
+              rowData={filteredRuns}
+              columnDefs={runColumns}
+              onRowClicked={onRunRowClicked}
+              loading={runsLoading}
+              emptyMessage="No workflow runs"
+              paginationQueryKey="workflowRuns"
+            />
+          )}
         </TabsContent>
       </Tabs>
     </div>
