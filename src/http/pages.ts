@@ -660,7 +660,9 @@ export async function handlePages(
     }
     const favoriteScope = (await resolveHttpFavoriteOwner(req, myAgentId))?.scope;
     const [decorated] = await withFavoriteFlags([page], { favoriteScope, itemType: "page" });
-    getPageRoute.respond(res, 200, withShareUrls(decorated ?? page));
+    const body = withShareUrls(decorated ?? page);
+    if (getRequestAuth(req)?.kind === "guest") delete body.passwordHash;
+    getPageRoute.respond(res, 200, body);
     return true;
   }
 

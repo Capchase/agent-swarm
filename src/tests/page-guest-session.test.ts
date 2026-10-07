@@ -178,6 +178,78 @@ describe("proxy allowlist for a guest session", () => {
   });
 });
 
+describe("a password-page guest is isolated from another page", () => {
+  test("cannot read page B's record or KV, and gets its own KV without passwordHash", async () => {
+    const created = await api("/api/pages", {
+      method: "POST",
+      headers: { "X-Agent-ID": agentId },
+      body: JSON.stringify({
+        slug: `pw-${randomUUID().slice(0, 8)}`,
+        title: "Password Page",
+        contentType: "text/html",
+        authMode: "password",
+        password: "open-sesame",
+        body: "<h1>a</h1>",
+      }),
+    });
+    expect(created.status).toBe(201);
+    const pageA = ((await created.json()) as { id: string }).id;
+    const pageB = await createPage();
+    const nsB = `task:page:${pageB}`;
+
+    const seedB = await api("/api/kv/shared", {
+      method: "PUT",
+      headers: { "X-Page-Id": pageB },
+      body: JSON.stringify({ value: "b-value" }),
+    });
+    expect(seedB.status).toBe(200);
+
+    const unlock = await fetch(`${BASE}/p/${pageA}?key=open-sesame`);
+    expect(unlock.status).toBe(200);
+    const cookieA = /page_session=([^;]+)/.exec(unlock.headers.get("set-cookie") ?? "")?.[1];
+    expect(cookieA).toBeTruthy();
+    const asGuest = (path: string, init: RequestInit = {}) =>
+      fetch(`${BASE}/@swarm/api/${path}`, {
+        ...init,
+        headers: {
+          Cookie: `page_session=${cookieA}`,
+          "Content-Type": "application/json",
+          "X-Page-Id": pageB,
+          "X-Agent-ID": agentId,
+        },
+      });
+
+    const putA = await asGuest("kv/shared", {
+      method: "PUT",
+      body: JSON.stringify({ value: "a-value" }),
+    });
+    expect(putA.status).toBe(200);
+
+    expect((await asGuest(`pages/${pageB}`)).status).toBe(403);
+
+    for (const path of ["kv/shared", `kv/_/${encodeURIComponent(nsB)}/shared`]) {
+      const res = await asGuest(path);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        namespace: `task:page:${pageA}`,
+        key: "shared",
+        value: "a-value",
+      });
+    }
+
+    const list = await asGuest(`kv/_/${encodeURIComponent(nsB)}`);
+    expect(list.status).toBe(200);
+    expect(JSON.stringify(await list.json())).not.toContain("b-value");
+
+    const own = await asGuest(`pages/${pageA}`);
+    expect(own.status).toBe(200);
+    expect(await own.json()).not.toHaveProperty("passwordHash");
+
+    const stillB = await api("/api/kv/shared", { headers: { "X-Page-Id": pageB } });
+    expect(await stillB.json()).toMatchObject({ namespace: nsB, value: "b-value" });
+  });
+});
+
 describe("server-side gates deny a guest and keep the operator and user", () => {
   test("config secrets stay masked for a guest, plain for the operator", async () => {
     const guest = await (
