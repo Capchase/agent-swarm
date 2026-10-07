@@ -3,8 +3,9 @@
  * completion line, so an event-loop stall mid-request is visible in the logs
  * (SAV-6951). `HTTP_LOG_REQUEST_START=false` turns the start line off.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+
 import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, test } from "bun:test";
 import { rm, unlink } from "node:fs/promises";
 import type { Subprocess } from "bun";
 import { getFreePort, SERVER_BOOT_HOOK_TIMEOUT_MS, waitForServer } from "./test-net";
