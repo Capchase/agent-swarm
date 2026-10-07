@@ -808,7 +808,7 @@ export async function handlePages(
       auth?.kind === "user"
         ? { uid: auth.userId, name: auth.user.name }
         : auth?.kind === "operator"
-          ? { name: `guest-${randomUUID().slice(0, 8)}` }
+          ? { name: `guest-${randomUUID().slice(0, 8)}`, op: true as const }
           : undefined;
     const cookie = await issuePageSessionCookie(page.id, {
       dev: isDevRequest(req),
