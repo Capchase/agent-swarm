@@ -5,6 +5,8 @@ import {
   closeDb,
   createSessionLogs,
   createTaskExtended,
+  findCitedMemoryIdsInSessionLogs,
+  getDbClient,
   getSessionLogsBySession,
   getSessionLogsByTaskId,
   getTaskById,
@@ -381,5 +383,37 @@ describe("Session Logs API", () => {
       expect(data.logs[0]?.content).toBe('{"type":"system"}');
       expect(data.logs[1]?.content).toBe('{"type":"assistant"}');
     });
+  });
+});
+
+describe("Session log reads (SAV-6951)", () => {
+  test("findCitedMemoryIdsInSessionLogs returns only the IDs a log line contains", async () => {
+    const task = await createTaskExtended("Task for cited memory ids");
+    const cited = "11111111-1111-4111-8111-111111111111";
+    const uncited = "22222222-2222-4222-8222-222222222222";
+    await createSessionLogs({
+      taskId: task.id,
+      sessionId: "cited-session",
+      iteration: 1,
+      cli: "claude",
+      lines: ['{"type":"system"}', `{"type":"assistant","text":"used ${cited}"}`, "plain line"],
+    });
+
+    expect(await findCitedMemoryIdsInSessionLogs(task.id, [cited, uncited])).toEqual([cited]);
+    expect(await findCitedMemoryIdsInSessionLogs(task.id, [])).toEqual([]);
+  });
+
+  test("reading a task's logs in order uses the composite index, not a temp sort", async () => {
+    const rows = await getDbClient().query<{ detail: string }>(
+      "EXPLAIN QUERY PLAN SELECT * FROM session_logs WHERE taskId = ? ORDER BY iteration ASC, lineNumber ASC",
+      ["any-task"],
+    );
+    const details = rows.map((row) => row.detail);
+    expect(
+      details.some((detail) =>
+        detail.includes("USING INDEX idx_session_logs_taskId_iteration_lineNumber"),
+      ),
+    ).toBe(true);
+    expect(details.some((detail) => detail.includes("USE TEMP B-TREE"))).toBe(false);
   });
 });
