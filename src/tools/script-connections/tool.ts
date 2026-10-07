@@ -14,6 +14,32 @@ import { can } from "@/rbac";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import { resolveScopedResourceId, scopedResourceScopeIdSchema } from "@/utils/scoped-resource";
 
+type ConnectionRecord = ReturnType<typeof listScriptConnections>[number];
+type ConnectionSummary = Omit<
+  ConnectionRecord,
+  "openapiSpecJson" | "generatedTypes" | "generatedRuntimeJson"
+> & {
+  openapiSpecBytes: number | null;
+  generatedTypesBytes: number | null;
+  generatedRuntimeBytes: number | null;
+};
+
+// The heavy spec/type/runtime columns can total tens of MB across connections. Returning them
+// in a tool result forces the finalizer to serialize the whole payload (SAV-6951), so the tool
+// reports their sizes instead. The dashboard detail route still serves the full record.
+function summarizeConnection(c: ConnectionRecord): ConnectionSummary {
+  const { openapiSpecJson, generatedTypes, generatedRuntimeJson, ...rest } = c;
+  return {
+    ...rest,
+    openapiSpecBytes: openapiSpecJson?.length ?? null,
+    generatedTypesBytes: generatedTypes?.length ?? null,
+    generatedRuntimeBytes: generatedRuntimeJson?.length ?? null,
+  };
+}
+
+const listSummaries = (): ConnectionSummary[] =>
+  listScriptConnections({ includeDisabled: true, allScopes: true }).map(summarizeConnection);
+
 const scriptConnectionsInputSchema = z.object({
   action: z
     .enum(["list", "upsert-openapi", "upsert-mcp", "upsert-graphql", "refresh", "disable"])
@@ -167,8 +193,9 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
       }
 
       if (args.action === "list") {
-        const connections = listScriptConnections({ includeDisabled: true, allScopes: true });
-        const provenanceLines = connections
+        const records = listScriptConnections({ includeDisabled: true, allScopes: true });
+        const connections = records.map(summarizeConnection);
+        const provenanceLines = records
           .filter((connection) => connection.kind === "openapi" || connection.baseUrl !== null)
           .map(baseUrlProvenanceText);
         return toolOk(`Found ${connections.length} script connection(s).`, {
@@ -182,12 +209,12 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           return toolErr("id is required for disable.", {
             data: {
               yourAgentId: requestInfo.agentId,
-              connections: listScriptConnections({ includeDisabled: true, allScopes: true }),
+              connections: listSummaries(),
             },
           });
         }
         await setScriptConnectionEnabled(args.id, false);
-        const connections = listScriptConnections({ includeDisabled: true, allScopes: true });
+        const connections = listSummaries();
         return toolOk("Script connection disabled.", {
           data: { yourAgentId: requestInfo.agentId, connections },
         });
@@ -198,12 +225,12 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           return toolErr("id is required for refresh.", {
             data: {
               yourAgentId: requestInfo.agentId,
-              connections: listScriptConnections({ includeDisabled: true, allScopes: true }),
+              connections: listSummaries(),
             },
           });
         }
         const refreshed = await refreshScriptConnection(args.id, null, requestInfo.agentId);
-        const connections = listScriptConnections({ includeDisabled: true, allScopes: true });
+        const connections = listSummaries();
         if (!refreshed) {
           return toolErr("Script connection not found.", {
             data: { yourAgentId: requestInfo.agentId, connections },
@@ -223,7 +250,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           return toolErr("slug and mcpServerId are required.", {
             data: {
               yourAgentId: requestInfo.agentId,
-              connections: listScriptConnections({ includeDisabled: true, allScopes: true }),
+              connections: listSummaries(),
             },
           });
         }
@@ -242,7 +269,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           agentId: requestInfo.agentId,
         });
 
-        const connections = listScriptConnections({ includeDisabled: true, allScopes: true });
+        const connections = listSummaries();
         const extras = { data: { yourAgentId: requestInfo.agentId, connections } };
         return connection.generationError
           ? toolErr(`Saved but generation failed: ${connection.generationError}`, extras)
@@ -254,7 +281,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           return toolErr("slug, baseUrl, and allowedHosts are required.", {
             data: {
               yourAgentId: requestInfo.agentId,
-              connections: listScriptConnections({ includeDisabled: true, allScopes: true }),
+              connections: listSummaries(),
             },
           });
         }
@@ -281,7 +308,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           enabled: resolveConnectionEnabled(args, existing),
         });
 
-        const connections = listScriptConnections({ includeDisabled: true, allScopes: true });
+        const connections = listSummaries();
         const extras = { data: { yourAgentId: requestInfo.agentId, connections } };
         return connection.generationError
           ? toolErr(`Saved but generation failed: ${connection.generationError}`, extras)
@@ -294,7 +321,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
           {
             data: {
               yourAgentId: requestInfo.agentId,
-              connections: listScriptConnections({ includeDisabled: true, allScopes: true }),
+              connections: listSummaries(),
             },
           },
         );
@@ -303,7 +330,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
         return toolErr("Provide exactly one OpenAPI spec source.", {
           data: {
             yourAgentId: requestInfo.agentId,
-            connections: listScriptConnections({ includeDisabled: true, allScopes: true }),
+            connections: listSummaries(),
           },
         });
       }
@@ -334,7 +361,7 @@ export const registerScriptConnectionsTool = (server: McpServer) => {
         enabled: resolveConnectionEnabled(args, existing),
       });
 
-      const connections = listScriptConnections({ includeDisabled: true, allScopes: true });
+      const connections = listSummaries();
       const extras = {
         details: baseUrlProvenanceText(connection),
         data: { yourAgentId: requestInfo.agentId, connections },
