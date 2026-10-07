@@ -203,6 +203,7 @@ import { configSecretName, registerStoredSecret } from "./secret-registry";
 import { promotePendingSteeringForTask } from "./steering";
 import { isInternalConfigKey, isReservedConfigKey, reservedKeyError } from "./swarm-config-guard";
 import { emitTaskStarted } from "./task-lifecycle-events";
+import { defineWorkflowPayload, type WorkflowPayloadView } from "./workflow-replay";
 
 export {
   refreshActiveSessionOnActivity,
@@ -7659,6 +7660,8 @@ type WorkflowRunRow = {
   triggerData: string | null;
   /** Absent from list rows: see `WORKFLOW_RUN_SUMMARY_COLUMNS`. */
   context?: string | null;
+  /** Sealed exact `context` (migration 201). Absent from list rows. */
+  context_replay?: string | null;
   error: string | null;
   created_by: string | null;
   startedAt: string;
@@ -7666,19 +7669,28 @@ type WorkflowRunRow = {
   finishedAt: string | null;
 };
 
-function rowToWorkflowRun(row: WorkflowRunRow): WorkflowRun {
-  return {
+/**
+ * `view` picks the `context` copy: `replay` (default) is the exact sealed value
+ * the engine resumes from; `display` is the scrubbed column for API, MCP and UI
+ * responses. See `src/be/workflow-replay.ts`.
+ */
+function rowToWorkflowRun(row: WorkflowRunRow, view: WorkflowPayloadView = "replay"): WorkflowRun {
+  const run: WorkflowRun = {
     id: row.id,
     workflowId: row.workflowId,
     status: row.status as WorkflowRunStatus,
     triggerData: row.triggerData ? JSON.parse(row.triggerData) : undefined,
-    context: row.context ? (JSON.parse(row.context) as Record<string, unknown>) : undefined,
+    context: undefined,
     error: row.error ?? undefined,
     createdBy: row.created_by ?? undefined,
     startedAt: normalizeDateRequired(row.startedAt),
     lastUpdatedAt: normalizeDateRequired(row.lastUpdatedAt),
     finishedAt: normalizeDate(row.finishedAt) ?? undefined,
   };
+  return defineWorkflowPayload(run, "context", row.context, row.context_replay, view, {
+    runId: row.id,
+    target: "its context",
+  });
 }
 
 export async function createWorkflowRun(data: {
@@ -7696,7 +7708,7 @@ export async function createWorkflowRun(data: {
       data.workflowId,
       data.triggerType ?? "manual",
       now,
-      data.triggerData ? JSON.stringify(data.triggerData) : null,
+      data.triggerData ? scrubJsonValue(data.triggerData) : null,
       data.createdBy ?? null,
     ],
   );
@@ -7704,11 +7716,14 @@ export async function createWorkflowRun(data: {
   return rowToWorkflowRun(row);
 }
 
-export async function getWorkflowRun(id: string): Promise<WorkflowRun | null> {
+export async function getWorkflowRun(
+  id: string,
+  view: WorkflowPayloadView = "replay",
+): Promise<WorkflowRun | null> {
   const row = await getDbClient().get<WorkflowRunRow>("SELECT * FROM workflow_runs WHERE id = ?", [
     id,
   ]);
-  return row ? rowToWorkflowRun(row) : null;
+  return row ? rowToWorkflowRun(row, view) : null;
 }
 
 function emitWorkflowTerminalTelemetry(run: WorkflowRun): void {
@@ -7750,12 +7765,15 @@ export async function updateWorkflowRun(
     params.push(data.status);
   }
   if (data.context !== undefined) {
-    updates.push("context = ?");
-    params.push(JSON.stringify(data.context));
+    // Resume/retry/recovery rebuild the live ctx (resolved `secret.*` inputs
+    // included, which are never re-resolved) from the sealed exact copy; the
+    // scrubbed column serves display and SQL filters.
+    updates.push("context = ?", "context_replay = ?");
+    params.push(scrubJsonValue(data.context), sealJson(data.context));
   }
   if (data.error !== undefined) {
     updates.push("error = ?");
-    params.push(data.error);
+    params.push(data.error === null ? null : scrubSecrets(data.error));
   }
   if (data.finishedAt !== undefined) {
     updates.push("finishedAt = ?");
@@ -7837,7 +7855,8 @@ export async function listWorkflowRuns(
        ORDER BY startedAt DESC, id DESC${pagination}`,
     params,
   );
-  return rows.map(rowToWorkflowRun);
+  // List rows are display-only (runs API, list-workflow-runs tool).
+  return rows.map((row) => rowToWorkflowRun(row, "display"));
 }
 
 export async function countWorkflowRuns(
@@ -7890,6 +7909,8 @@ type WorkflowRunStepRow = {
   status: string;
   input: string | null;
   output: string | null;
+  /** Sealed exact `output` (migration 201). */
+  output_replay: string | null;
   error: string | null;
   startedAt: string;
   finishedAt: string | null;
@@ -7901,15 +7922,19 @@ type WorkflowRunStepRow = {
   nextPort: string | null;
 };
 
-function rowToWorkflowRunStep(row: WorkflowRunStepRow): WorkflowRunStep {
-  return {
+/** `view` picks the `output` copy, as in `rowToWorkflowRun`. */
+function rowToWorkflowRunStep(
+  row: WorkflowRunStepRow,
+  view: WorkflowPayloadView = "replay",
+): WorkflowRunStep {
+  const step: WorkflowRunStep = {
     id: row.id,
     runId: row.runId,
     nodeId: row.nodeId,
     nodeType: row.nodeType,
     status: row.status as WorkflowRunStepStatus,
     input: row.input ? JSON.parse(row.input) : undefined,
-    output: row.output ? JSON.parse(row.output) : undefined,
+    output: undefined,
     error: row.error ?? undefined,
     startedAt: normalizeDateRequired(row.startedAt),
     finishedAt: normalizeDate(row.finishedAt) ?? undefined,
@@ -7920,6 +7945,10 @@ function rowToWorkflowRunStep(row: WorkflowRunStepRow): WorkflowRunStep {
     diagnostics: row.diagnostics ?? undefined,
     nextPort: row.nextPort ?? undefined,
   };
+  return defineWorkflowPayload(step, "output", row.output, row.output_replay, view, {
+    runId: row.runId,
+    target: `the output of step ${row.id} (node ${row.nodeId})`,
+  });
 }
 
 export async function createWorkflowRunStep(data: {
@@ -7940,7 +7969,7 @@ export async function createWorkflowRunStep(data: {
       data.nodeId,
       data.nodeType,
       now,
-      data.input ? JSON.stringify(data.input) : null,
+      data.input ? scrubJsonValue(data.input) : null,
       data.idempotencyKey ?? null,
     ],
   );
@@ -7978,12 +8007,14 @@ export async function updateWorkflowRunStep(
     params.push(data.status);
   }
   if (data.output !== undefined) {
-    updates.push("output = ?");
-    params.push(JSON.stringify(data.output));
+    // Scrubbed for display; dedup, convergence and recovery replay the sealed
+    // exact copy into downstream nodes.
+    updates.push("output = ?", "output_replay = ?");
+    params.push(scrubJsonValue(data.output), sealJson(data.output));
   }
   if (data.error !== undefined) {
     updates.push("error = ?");
-    params.push(data.error);
+    params.push(data.error === null ? null : scrubSecrets(data.error));
   }
   if (data.finishedAt !== undefined) {
     updates.push("finishedAt = ?");
@@ -8007,7 +8038,7 @@ export async function updateWorkflowRunStep(
   }
   if (data.diagnostics !== undefined) {
     updates.push("diagnostics = ?");
-    params.push(data.diagnostics);
+    params.push(scrubSecrets(data.diagnostics));
   }
   if (data.nextPort !== undefined) {
     updates.push("nextPort = ?");
@@ -8028,12 +8059,15 @@ export async function updateWorkflowRunStep(
   return row ? rowToWorkflowRunStep(row) : null;
 }
 
-export async function getWorkflowRunStepsByRunId(runId: string): Promise<WorkflowRunStep[]> {
+export async function getWorkflowRunStepsByRunId(
+  runId: string,
+  view: WorkflowPayloadView = "replay",
+): Promise<WorkflowRunStep[]> {
   const rows = await getDbClient().query<WorkflowRunStepRow>(
     "SELECT * FROM workflow_run_steps WHERE runId = ? ORDER BY startedAt ASC",
     [runId],
   );
-  return rows.map(rowToWorkflowRunStep);
+  return rows.map((row) => rowToWorkflowRunStep(row, view));
 }
 
 // --- Stuck Workflow Run Recovery ---
@@ -8101,7 +8135,7 @@ export async function getRetryableSteps(): Promise<WorkflowRunStep[]> {
        ORDER BY s.nextRetryAt ASC`,
     [now],
   );
-  return rows.map(rowToWorkflowRunStep);
+  return rows.map((row) => rowToWorkflowRunStep(row));
 }
 
 export async function getCompletedStepNodeIds(runId: string): Promise<string[]> {
@@ -12263,6 +12297,33 @@ export async function deleteUser(id: string, replacementUserId?: string): Promis
     // Workflow context is persisted JSON rather than a relational column, but
     // it exposes the same requester identity to downstream interpolation. Keep
     // it consistent with workflow_runs.created_by inside this transaction.
+    // The sealed replay copy is what a resume reads, so rewrite it first, while
+    // the scrubbed column still matches the filter.
+    const sealedContexts = await tx.query<{ id: string; context_replay: string }>(
+      `SELECT id, context_replay FROM workflow_runs
+       WHERE context_replay IS NOT NULL
+         AND json_valid(context)
+         AND json_extract(context, '$.swarm.requestedByUserId') = ?`,
+      [id],
+    );
+    for (const row of sealedContexts) {
+      let context: Record<string, unknown>;
+      try {
+        context = openSealedJson(row.context_replay) as Record<string, unknown>;
+      } catch {
+        // Unreadable replay state fails the run on resume
+        // (WorkflowReplayStateError), so the stale id is never replayed.
+        continue;
+      }
+      const swarm = { ...(context.swarm as Record<string, unknown> | undefined) };
+      if (swarm.requestedByUserId !== id) continue;
+      if (replacementUserId) swarm.requestedByUserId = replacementUserId;
+      else delete swarm.requestedByUserId;
+      await tx.run("UPDATE workflow_runs SET context_replay = ? WHERE id = ?", [
+        sealJson({ ...context, swarm }),
+        row.id,
+      ]);
+    }
     if (replacementUserId) {
       await tx.run(
         `UPDATE workflow_runs
