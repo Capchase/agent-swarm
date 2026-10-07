@@ -15,7 +15,7 @@
  * this function assumes the terminal write really happened.
  */
 
-import { getSessionLogsByTaskId } from "@/be/db";
+import { findCitedMemoryIdsInSessionLogs } from "@/be/db";
 import { getEmbeddingProvider, getMemoryStore } from "@/be/memory";
 import { getRetrievalsForTask } from "@/be/memory/raters/retrieval";
 import { runServerRaters } from "@/be/memory/raters/run-server-raters";
@@ -124,8 +124,10 @@ export async function runTaskTerminalEffects(args: {
       if (retrievals.length === 0) return;
 
       const retrievedMemoryIds = retrievals.map((r) => r.memoryId);
-      const logs = await getSessionLogsByTaskId(taskId);
-      const evidence = logs.map((l) => l.content).join("\n");
+      // The only server rater (implicit-citation) tests `evidence.includes(memoryId)`, so
+      // hand it the cited IDs instead of loading every session log line into memory.
+      const cited = await findCitedMemoryIdsInSessionLogs(taskId, retrievedMemoryIds);
+      const evidence = cited.join("\n");
 
       await runServerRaters({
         taskId,
