@@ -1156,6 +1156,15 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}guides/observability-opentelemetry`,
       },
       {
+        key: "HTTP_LOG_REQUEST_START",
+        label: "Log request start",
+        description:
+          "Log a line when an API request starts, before it completes. A request that blocks the event loop then leaves a trace in the logs.",
+        kind: "boolean",
+        defaultValue: "true",
+        restartRequired: true,
+      },
+      {
         key: "ANONYMIZED_TELEMETRY",
         label: "Anonymized telemetry",
         description:
