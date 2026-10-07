@@ -508,10 +508,8 @@ jobs:
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-worker@${{ steps.manifest.outputs.digest }}
 
-  # Dashboard image: the static apps/ui build served by nginx. One job builds both
-  # platforms: the SPA compiles once on the runner's platform (Dockerfile.ui pins the
-  # builder to $BUILDPLATFORM) and the nginx stage only copies files, so arm64 needs
-  # no emulation. Nothing downstream depends on it, so it never blocks a deploy.
+  # One job for both platforms: the builder runs on $BUILDPLATFORM and the nginx
+  # stage only copies files, so arm64 needs no emulation.
   build-and-push-ui:
     runs-on: ubuntu-latest
     needs: [detect-version-change]

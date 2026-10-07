@@ -913,8 +913,6 @@ jobs:
             metric: ""
             timing: docker.evals
             cache-from: ""
-          # Dashboard image (static SPA + nginx). Built here so a Dockerfile.ui or
-          # workspace change cannot break the published image silently.
           - dockerfile: Dockerfile.ui
             target: ""
             metric: ""
