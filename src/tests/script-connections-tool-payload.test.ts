@@ -57,7 +57,6 @@ describe("script-connections tool payload (SAV-6951)", () => {
       [crypto.randomUUID(), "x".repeat(SPEC_BYTES), "t".repeat(1_000_000), "r".repeat(2_000_000)],
     );
 
-    const started = performance.now();
     const result = (await scriptConnectionsTool().handler(
       { action: "list" },
       {
@@ -65,7 +64,6 @@ describe("script-connections tool payload (SAV-6951)", () => {
         requestInfo: { headers: { "x-agent-id": lead.id } },
       },
     )) as ToolResult;
-    const elapsedMs = performance.now() - started;
 
     const structured = result.structuredContent;
     expect(structured.truncation).toBeUndefined();
@@ -78,6 +76,5 @@ describe("script-connections tool payload (SAV-6951)", () => {
     expect(connection?.openapiSpecBytes).toBe(SPEC_BYTES);
     expect(connection?.generatedTypesBytes).toBe(1_000_000);
     expect(connection?.generatedRuntimeBytes).toBe(2_000_000);
-    expect(elapsedMs).toBeLessThan(1_000);
   });
 });

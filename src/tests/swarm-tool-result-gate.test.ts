@@ -489,13 +489,25 @@ describe("finalizeSwarmToolResult", () => {
 
   test("a result above the hard ceiling skips array-preserving truncation and returns fast", async () => {
     const items = Array.from({ length: 30 }, (_, i) => `${i}`.padEnd(1_500_000, "x"));
-    const started = performance.now();
-    const result = await finalizeSwarmToolResult(
-      "some-tool",
-      { ok: true, message: "Retrieved 30 item(s).", data: { items } },
-      { agentId: TEST_AGENT_ID },
-    );
-    const elapsedMs = performance.now() - started;
+    // The skipped path is the one that re-serializes the whole result per binary-search
+    // probe. Count full-size serializations instead of wall-clock time so the check is deterministic.
+    const realStringify = JSON.stringify;
+    let largeSerializations = 0;
+    JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => {
+      const out = realStringify(...args);
+      if (typeof out === "string" && out.length > 1_000_000) largeSerializations++;
+      return out;
+    }) as typeof JSON.stringify;
+    let result: Awaited<ReturnType<typeof finalizeSwarmToolResult>>;
+    try {
+      result = await finalizeSwarmToolResult(
+        "some-tool",
+        { ok: true, message: "Retrieved 30 item(s).", data: { items } },
+        { agentId: TEST_AGENT_ID },
+      );
+    } finally {
+      JSON.stringify = realStringify;
+    }
     const structured = result.structuredContent as {
       truncation: SwarmToolTruncation;
     };
@@ -506,10 +518,9 @@ describe("finalizeSwarmToolResult", () => {
     expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(
       MCP_RESULT_WIRE_LIMIT_BYTES,
     );
-    // Regression guard only. The scrub, serialize and KV-spill passes still run before the
-    // ceiling check (about 1.7 s for this 90 MB wire result); the ceiling removes the
-    // per-probe re-serialization on top of them.
-    expect(elapsedMs).toBeLessThan(5_000);
+    // A fixed number of passes (compose, wire measure, canonical KV payload, KV write),
+    // not one per probe: the binary search would add dozens.
+    expect(largeSerializations).toBeLessThanOrEqual(4);
 
     const key = structured.truncation.fullValueAt.replace(`kv://${TEST_OVERFLOW_NAMESPACE}/`, "");
     expect(await getKv(TEST_OVERFLOW_NAMESPACE, key)).toBeDefined();
