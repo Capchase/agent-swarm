@@ -2264,9 +2264,9 @@ export interface paths {
                         capabilities?: string[];
                         maxTasks?: number;
                         /** @enum {string} */
-                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                         /** @enum {string} */
-                        harness_provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        harness_provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                         runtimeInstanceId?: string;
                         modelTierOverrides?: {
                             [key: string]: {
@@ -2347,7 +2347,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        harness_provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        harness_provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     };
                 };
             };
@@ -2467,7 +2467,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        harness_provider: "claude" | "codex" | "pi" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        harness_provider: "claude" | "codex" | "pi" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                         model?: string | null;
                         /** @default false */
                         allow_custom_model?: boolean;
@@ -3002,9 +3002,9 @@ export interface paths {
                             status: "idle" | "busy" | "offline" | "waiting_for_credentials";
                             missing: string[];
                             /** @enum {string|null} */
-                            provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
+                            provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok" | null;
                             /** @enum {string|null} */
-                            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
+                            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok" | null;
                             credStatus: components["schemas"]["AgentCredStatus"] | null;
                             lastCheckedAt: string;
                         };
@@ -3121,9 +3121,9 @@ export interface paths {
                                 status: "idle" | "busy" | "offline" | "waiting_for_credentials";
                                 missing: string[];
                                 /** @enum {string|null} */
-                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
+                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok" | null;
                                 /** @enum {string|null} */
-                                harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
+                                harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok" | null;
                                 credStatus: components["schemas"]["AgentCredStatus"] | null;
                                 lastCheckedAt: string;
                             }[];
@@ -9856,7 +9856,7 @@ export interface paths {
                         "application/json": {
                             tiers: {
                                 /** @enum {string} */
-                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                 /** @enum {string} */
                                 tier: "smol" | "regular" | "smart" | "ultra";
                                 key: string;
@@ -10885,10 +10885,10 @@ export interface paths {
                                 hint?: string;
                                 action_url?: string;
                                 /** @enum {string} */
-                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                 providers?: {
                                     /** @enum {string} */
-                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                     /** @enum {string} */
                                     state: "unverified" | "configured" | "verified";
                                     workers: number;
@@ -10991,7 +10991,7 @@ export interface paths {
                 content: {
                     "application/json": {
                         /** @enum {string} */
-                        provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     };
                 };
             };
@@ -11150,7 +11150,7 @@ export interface paths {
                             signals: {
                                 providers: {
                                     /** @enum {string} */
-                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                     /** @enum {string} */
                                     state: "unverified" | "configured" | "verified";
                                     workers: number;
@@ -11360,7 +11360,7 @@ export interface paths {
                             signals: {
                                 providers: {
                                     /** @enum {string} */
-                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    provider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                     /** @enum {string} */
                                     state: "unverified" | "configured" | "verified";
                                     workers: number;
@@ -13081,7 +13081,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -13109,7 +13109,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -13172,7 +13172,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                 };
@@ -13224,7 +13224,7 @@ export interface paths {
                 query?: never;
                 header?: never;
                 path: {
-                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
+                    provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     model: string;
                     tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
                     effectiveFrom: string;
@@ -15650,7 +15650,7 @@ export interface paths {
                         }[];
                         isError?: boolean;
                         /** @enum {string} */
-                        provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
+                        provider?: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                         createdAt?: number;
                     };
                 };
@@ -16066,7 +16066,7 @@ export interface paths {
                                     /** @enum {string} */
                                     effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
                                     /** @enum {string} */
-                                    provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                    provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                     requestedByUserId?: string;
                                     progress?: string;
                                     /** Format: date-time */
@@ -18222,7 +18222,7 @@ export interface paths {
                                 /** @enum {string} */
                                 effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
                                 /** @enum {string} */
-                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                                provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                                 requestedByUserId?: string;
                                 progress?: string;
                                 /** Format: date-time */
@@ -18444,7 +18444,7 @@ export interface paths {
                     } | {
                         claudeSessionId: string;
                         /** @enum {string} */
-                        provider?: "claude" | "codex" | "pi" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        provider?: "claude" | "codex" | "pi" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                         model?: string;
                         providerMeta?: {
                             /** @enum {string} */
@@ -19134,7 +19134,7 @@ export interface paths {
                         failureReason?: string;
                         force?: boolean;
                         /** @enum {string} */
-                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+                        provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
                     };
                 };
             };
@@ -23445,7 +23445,7 @@ export interface components {
             requestedByUserId?: string;
             swarmVersion?: string;
             /** @enum {string} */
-            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
             providerMeta?: {
                 [key: string]: unknown;
             };
@@ -23466,7 +23466,7 @@ export interface components {
             sourceAgentId?: string;
             role?: string;
             /** @enum {string} */
-            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
             /** @default [] */
             capabilities: string[];
             leadOnly?: boolean;
@@ -23512,7 +23512,7 @@ export interface components {
              * @default null
              * @enum {string|null}
              */
-            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
+            harnessProvider: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok" | null;
             reportedAt: number;
             /** @enum {string} */
             reasoningEffort?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -23587,9 +23587,9 @@ export interface components {
             /** Format: date-time */
             lastActivityAt?: string;
             /** @enum {string} */
-            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor";
+            provider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok";
             /** @enum {string|null} */
-            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | null;
+            harnessProvider?: "claude" | "codex" | "pi" | "devin" | "claude-managed" | "opencode" | "acp" | "dsh" | "amp" | "cursor" | "grok" | null;
             credentialMissing?: string[] | null;
             credStatus?: components["schemas"]["AgentCredStatus"] | null;
             avatar?: {
@@ -24110,7 +24110,7 @@ export interface components {
         };
         PricingRow: {
             /** @enum {string} */
-            provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor";
+            provider: "claude" | "claude-managed" | "codex" | "pi" | "opencode" | "devin" | "gemini" | "acp" | "dsh" | "amp" | "cursor" | "grok";
             model: string;
             /** @enum {string} */
             tokenClass: "input" | "cached_input" | "output" | "cache_write" | "cache_write_1h" | "web_search" | "runtime_hour" | "acu";
