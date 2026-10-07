@@ -131,7 +131,7 @@ jobs:
           UI=$(match '^(apps/ui/|packages/ui-e2e/|bun\.lock|package\.json$|bunfig\.toml$)')
 
           # dashboard image: everything Dockerfile.ui copies, plus its smoke test.
-          UI_IMAGE=$(match '^(Dockerfile\.ui$|apps/ui/|packages/model-catalog/|src/|package\.json$|bun\.lock|bunfig\.toml$|\.dockerignore$|scripts/smoke-ui-image\.sh$)')
+          UI_IMAGE=$(match '^(Dockerfile\.ui$|apps/ui/|packages/model-catalog/|src/|apps/templates-ui/package\.json$|apps/evals/package\.json$|packages/model-routing/package\.json$|package\.json$|bun\.lock|bunfig\.toml$|\.dockerignore$|scripts/smoke-ui-image\.sh$)')
 
           # workflow template validation: content.md changes in templates/workflows/.
           TEMPLATES_WORKFLOWS=$(match '^(templates/workflows/|scripts/validate-template-workflows\.ts$|src/workflows/definition\.ts$|src/types\.ts$)')

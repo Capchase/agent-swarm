@@ -52,6 +52,7 @@ check "asset gzip" "$(header content-encoding -H 'Accept-Encoding: gzip' "$base$
 check "asset vary" "$(header vary -H 'Accept-Encoding: gzip' "$base$asset")" "Accept-Encoding"
 
 check "missing asset" "$(status "$base/assets/missing-$$.js")" "404"
+check "missing asset not cached" "$(header cache-control "$base/assets/missing-$$.js")" ""
 check "source map denied" "$(status "$base/assets/index.js.map")" "404"
 check "dotfile denied" "$(status "$base/.env")" "404"
 
