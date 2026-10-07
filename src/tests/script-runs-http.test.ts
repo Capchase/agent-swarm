@@ -574,3 +574,28 @@ describe("/api/script-runs HTTP", () => {
     expect(body.run.error).toBe("original failure");
   });
 });
+
+describe("script_runs scriptName index (SAV-6951)", () => {
+  const INDEX = "idx_script_runs_scriptName_startedAt";
+
+  async function plan(sql: string, params: unknown[]): Promise<string[]> {
+    const rows = await getDbClient().query<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, params);
+    return rows.map((row) => row.detail);
+  }
+
+  test("list by scriptName uses the index and no temp sort", async () => {
+    const details = await plan(
+      "SELECT id, agentId, scriptName, kind, status, pid, startedAt, finishedAt, error, last_heartbeat_at, idempotencyKey, requestedByUserId FROM script_runs WHERE scriptName = ? ORDER BY startedAt DESC LIMIT ? OFFSET ?",
+      ["demo", 50, 0],
+    );
+    expect(details.some((detail) => detail.includes(`USING INDEX ${INDEX}`))).toBe(true);
+    expect(details.some((detail) => detail.includes("TEMP B-TREE"))).toBe(false);
+  });
+
+  test("count by scriptName is a covering index search", async () => {
+    const details = await plan("SELECT COUNT(*) AS count FROM script_runs WHERE scriptName = ?", [
+      "demo",
+    ]);
+    expect(details.some((detail) => detail.includes(`USING COVERING INDEX ${INDEX}`))).toBe(true);
+  });
+});
