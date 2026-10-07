@@ -606,6 +606,9 @@ describe("script connections", () => {
       markMigrationApplied(database, "195_approval_request_approvals.sql");
       // 196 alters skills, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "196_skill_invocations.sql");
+      // 200 indexes script_runs and 201 indexes session_logs, which this fixture does not create.
+      markMigrationApplied(database, "200_script_runs_scriptname_startedat_index.sql");
+      markMigrationApplied(database, "201_session_logs_task_iteration_line_index.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
