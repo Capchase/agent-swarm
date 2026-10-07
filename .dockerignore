@@ -76,3 +76,9 @@ apps/evals/evals.db
 apps/evals/evals.db-shm
 apps/evals/evals.db-wal
 apps/evals/evals-replica.db*
+
+# Dashboard sources are in the context for Dockerfile.ui. Keep local installs and
+# builds out so they never shadow the image's own frozen install and build.
+apps/ui/**/node_modules/
+apps/ui/dist/
+apps/ui/test-results/
