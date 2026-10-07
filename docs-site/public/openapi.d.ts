@@ -2475,7 +2475,7 @@ export interface paths {
                         reasoning_effort?: "off" | "low" | "medium" | "high" | "xhigh" | "max" | null;
                         acp?: {
                             /** @enum {string} */
-                            target: "opencode" | "custom";
+                            target: "opencode" | "gemini" | "custom";
                             command?: string | null;
                             args?: string[];
                             envKeys?: string[];
