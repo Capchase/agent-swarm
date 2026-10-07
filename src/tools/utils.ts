@@ -347,6 +347,9 @@ export const NUDGES: Record<string, (result: SwarmToolResult) => string | undefi
 };
 
 export const MCP_RESULT_WIRE_LIMIT_BYTES = 10_000;
+// Above this size, array-preserving truncation (a binary search that re-serializes the full
+// result on every probe) is skipped and only the pointer is returned. SAV-6951.
+export const MCP_RESULT_HARD_CEILING_BYTES = 8 * 1024 * 1024;
 export { MCP_OVERFLOW_NAMESPACE, mcpOverflowNamespace };
 export const MCP_OVERFLOW_TTL_MS = 24 * 60 * 60 * 1_000;
 const MCP_PROSE_PREVIEW_CHARS = 1_200;
@@ -646,6 +649,12 @@ const ctxControlMiddleware: FinalizeMiddleware = async (result, ctx) => {
   if (fullWireBytes <= MCP_RESULT_WIRE_LIMIT_BYTES) {
     return result;
   }
+  const aboveHardCeiling = fullWireBytes > MCP_RESULT_HARD_CEILING_BYTES;
+  if (aboveHardCeiling) {
+    console.warn(
+      `[mcp] tool ${ctx.toolName} returned ${fullWireBytes} bytes; skipping array-preserving truncation above ${MCP_RESULT_HARD_CEILING_BYTES}`,
+    );
+  }
 
   let fullValueAt: string;
   let retrieval: string;
@@ -684,7 +693,9 @@ const ctxControlMiddleware: FinalizeMiddleware = async (result, ctx) => {
   const pointer =
     `Full value: ${fullValueAt}\nRetrieval: ${retrieval}\n` +
     `Truncation: ${JSON.stringify(truncation)}`;
-  const arrayPreservingResult = truncateArraysInPlace(result, truncation, pointer);
+  const arrayPreservingResult = aboveHardCeiling
+    ? undefined
+    : truncateArraysInPlace(result, truncation, pointer);
   if (arrayPreservingResult) return arrayPreservingResult;
 
   const normalizedDetails = result.details?.trim() || undefined;

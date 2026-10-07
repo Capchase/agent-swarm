@@ -7,6 +7,7 @@ import {
   finalizeSwarmToolResult,
   findLongScriptTimeoutHint,
   MCP_OVERFLOW_TTL_MS,
+  MCP_RESULT_HARD_CEILING_BYTES,
   MCP_RESULT_WIRE_LIMIT_BYTES,
   mcpOverflowNamespace,
   SCRIPT_AUTHORING_NUDGE,
@@ -484,6 +485,34 @@ describe("finalizeSwarmToolResult", () => {
       outcome: { data: { messages: typeof messages } };
     };
     expect(canonical.outcome.data.messages).toEqual(messages);
+  });
+
+  test("a result above the hard ceiling skips array-preserving truncation and returns fast", async () => {
+    const items = Array.from({ length: 30 }, (_, i) => `${i}`.padEnd(1_500_000, "x"));
+    const started = performance.now();
+    const result = await finalizeSwarmToolResult(
+      "some-tool",
+      { ok: true, message: "Retrieved 30 item(s).", data: { items } },
+      { agentId: TEST_AGENT_ID },
+    );
+    const elapsedMs = performance.now() - started;
+    const structured = result.structuredContent as {
+      truncation: SwarmToolTruncation;
+    };
+
+    expect(structured.truncation.truncated).toBe(true);
+    expect(structured.truncation.originalBytes).toBeGreaterThan(MCP_RESULT_HARD_CEILING_BYTES);
+    expect(structured).not.toHaveProperty("items");
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(
+      MCP_RESULT_WIRE_LIMIT_BYTES,
+    );
+    // Regression guard only. The scrub, serialize and KV-spill passes still run before the
+    // ceiling check (about 1.7 s for this 90 MB wire result); the ceiling removes the
+    // per-probe re-serialization on top of them.
+    expect(elapsedMs).toBeLessThan(5_000);
+
+    const key = structured.truncation.fullValueAt.replace(`kv://${TEST_OVERFLOW_NAMESPACE}/`, "");
+    expect(await getKv(TEST_OVERFLOW_NAMESPACE, key)).toBeDefined();
   });
 
   test("an oversized scalar sibling cannot make ctx-control drop an array key", async () => {
