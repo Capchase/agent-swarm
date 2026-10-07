@@ -246,12 +246,14 @@ const transportActivity: McpTransportActivity = globalState.__transportActivity 
 const transportActivityUser: McpTransportActivity = globalState.__transportActivityUser ?? {};
 
 // Logged before the handler runs so a request that blocks the event loop still leaves a trace.
-const HTTP_LOG_REQUEST_START = process.env.HTTP_LOG_REQUEST_START !== "false";
+// Read per request: a value saved in the dashboard config reaches process.env only after
+// loadGlobalConfigsIntoEnv runs, which is later than module evaluation of this constant.
+const shouldLogRequestStart = () => process.env.HTTP_LOG_REQUEST_START !== "false";
 
 const httpServer = createHttpServer(async (req, res) => {
   const startTime = performance.now();
   let statusCode = 200;
-  if (HTTP_LOG_REQUEST_START) {
+  if (shouldLogRequestStart()) {
     console.log(`[HTTP] → ${req.method} ${safeRequestUrlForLog(req.url)}`);
   }
 

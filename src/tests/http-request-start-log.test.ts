@@ -4,6 +4,7 @@
  * (SAV-6951). `HTTP_LOG_REQUEST_START=false` turns the start line off.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { rm, unlink } from "node:fs/promises";
 import type { Subprocess } from "bun";
 import { getFreePort, SERVER_BOOT_HOOK_TIMEOUT_MS, waitForServer } from "./test-net";
@@ -20,10 +21,10 @@ interface Api {
 
 const booted: Api[] = [];
 
-async function bootApi(env: Record<string, string>): Promise<Api> {
+async function bootApi(env: Record<string, string>, reuseDbPath?: string): Promise<Api> {
   const port = await getFreePort();
   const stamp = `${Date.now()}-${port}`;
-  const dbPath = `/tmp/test-http-start-log-${stamp}.sqlite`;
+  const dbPath = reuseDbPath ?? `/tmp/test-http-start-log-${stamp}.sqlite`;
   const fsDir = `/tmp/test-http-start-log-fs-${stamp}`;
   const proc = Bun.spawn(["bun", "src/http.ts"], {
     cwd: `${import.meta.dir}/../..`,
@@ -91,5 +92,28 @@ describe("HTTP request-start log", () => {
       expect(lines.some((line) => line.includes("→ 200"))).toBe(true);
     },
     SERVER_BOOT_HOOK_TIMEOUT_MS,
+  );
+
+  test(
+    "a HTTP_LOG_REQUEST_START=false saved in the dashboard config omits the start line",
+    async () => {
+      // First boot migrates the DB; then store the setting and boot again with the env unset.
+      const first = await bootApi({});
+      first.proc.kill("SIGTERM");
+      await first.proc.exited;
+      const db = new Database(first.dbPath);
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT INTO swarm_config (id, scope, scopeId, key, value, isSecret, createdAt, lastUpdatedAt)
+         VALUES (?, 'global', NULL, 'HTTP_LOG_REQUEST_START', 'false', 0, ?, ?)`,
+        [crypto.randomUUID(), now, now],
+      );
+      db.close();
+
+      const lines = await healthLogLines(await bootApi({}, first.dbPath));
+      expect(lines.some((line) => line.startsWith("[HTTP] → GET /health"))).toBe(false);
+      expect(lines.some((line) => line.includes("→ 200"))).toBe(true);
+    },
+    SERVER_BOOT_HOOK_TIMEOUT_MS * 2,
   );
 });
