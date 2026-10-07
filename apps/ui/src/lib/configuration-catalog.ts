@@ -732,6 +732,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}integrations/slack`,
       },
       {
+        key: "SLACK_LOG_LEVEL",
+        label: "Slack SDK log level",
+        description:
+          "Log level of the Slack SDK. debug logs request and response payloads, so keep it at info outside a throwaway debugging session.",
+        kind: "enum",
+        options: ["debug", "info", "warn", "error"],
+        defaultValue: "info",
+        restartRequired: true,
+      },
+      {
         key: "SLACK_ALLOW_DEV_SOCKET_MODE",
         label: "Allow Slack in development",
         description:
