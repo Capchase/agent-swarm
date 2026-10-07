@@ -77,13 +77,24 @@ bun run build   # outputs apps/ui/dist/
 
 Deploy the `dist/` directory to your static host of choice (Vercel, Netlify, nginx, S3 + CDN, ...).
 
-Or run the published image, which serves the same build with nginx on port 8080 (SPA fallback to `index.html`, `/healthz` for probes, runs as non-root and works with a read-only root filesystem):
+Or run the published image. It serves the same build with nginx on port 8080 as a non-root user, answers `/healthz` for probes, and needs only `/tmp` writable:
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/desplega-ai/agent-swarm-ui:<version>
+docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges -p 8080:8080 ghcr.io/desplega-ai/agent-swarm-ui:<version>
 ```
 
-Use the same `<version>` as your API image. Serving the dashboard and the API on one origin (route `/api`, `/p/`, `/@swarm`, `/health` and `/status` to the API, everything else to the dashboard) avoids CORS entirely and lets an SSO proxy such as Cloudflare Access cover both with one session.
+Use the same `<version>` as your API image. The image takes no runtime configuration: `VITE_*` values are compiled in at build time, so enter the API URL and key in the connection panel.
+
+<Callout type="warn" title="Keep Pages off the dashboard origin">
+  The dashboard keeps connection keys in browser storage, and Pages (`/p/*`, `/@swarm/*`) run agent-authored scripts. Never serve Pages from the dashboard's origin, or a page script can read those keys.
+</Callout>
+
+Two layouts work:
+
+- **Separate origins** (simplest): dashboard on `app.example.com`, API on `api.example.com`. Set `CORS_ALLOWED_ORIGINS` on the API to the dashboard origin.
+- **Dashboard and JSON API on one origin**, for example behind an SSO proxy that should cover both with one session. On the dashboard host, route the prefix `/api/` (including the `/api/realtime` WebSocket upgrade) and the exact paths `/health` and `/status` to the API, and everything else to the dashboard. Keep `/p/`, `/@swarm/`, `/mcp`, `/mcp-user` and `/docs` on the API's own host, and keep `PUBLIC_MCP_BASE_URL` pointing there, because page links, OAuth redirects and MCP clients use it. The dashboard's Pages viewer loads pages from the connection URL, so it does not work in this layout; open pages through their links on the API host instead.
+
+The Helm chart and Compose examples do not deploy the dashboard image yet.
 
 For a custom dashboard origin, set `CORS_ALLOWED_ORIGINS` on the API. A custom list replaces the built-in hosted/dev defaults, so include every trusted dashboard origin you use. See the [CORS deployment guide](/docs/guides/kubernetes#cors).
 

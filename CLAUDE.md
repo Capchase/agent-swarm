@@ -79,6 +79,7 @@ Full rules: [runbooks/extensions.md](./runbooks/extensions.md).
 | `bun run docker:build:worker` | Build Docker worker image (full) |
 | `bun run docker:build:worker:slim` | Build slim worker image (`--target worker-slim`, for CI/E2E) |
 | `bun run docker:build:api` | Build API server image |
+| `bun run docker:build:ui` | Build the dashboard image (`Dockerfile.ui`, nginx) |
 | `bun run docs:openapi` | Regenerate `openapi.json` |
 | `bun run docs:business-use` | Regenerate `BUSINESS_USE.md` (requires BU backend) |
 | `bun run build:pi-skills` | Regenerate `plugin/pi-skills/` from `plugin/commands/*.md` |
@@ -346,6 +347,7 @@ Drift checks — run only if you touched the trigger files, MUST commit any rege
 - Edited `templates/extensions/` or `ExtensionManifestSchema`? → `bun run build:extension-catalog && bun run build:extension-schema` and commit both generated files
 - Touched `apps/ui/` — or root `bun.lock`/`package.json`/`bunfig.toml` (ui deps resolve from the root lock)? → `cd apps/ui && bun install --frozen-lockfile && bun run lint && bunx tsc -b` (CI uses `tsc -b`, not `--noEmit`)
 - Touched `Dockerfile` / `Dockerfile.worker` / `apps/evals/Dockerfile` / files they COPY (incl. `bunfig.toml`, member `package.json`s, `.dockerignore`)? → `docker build -f <Dockerfile> .` — CI builds all three images
+- Touched `Dockerfile.ui` / `apps/ui/nginx.conf`? → `bun run docker:build:ui && bash scripts/smoke-ui-image.sh agent-swarm-ui:latest`
 
 Frontend (`apps/ui/`, `apps/templates-ui/`) PRs additionally require screenshots (including static/layout changes) and a recording for interaction/flow changes (navigation, form, modal, drag, animation, or multi-step flow), uploaded to agent-fs with signed URLs in the PR body. This is a reviewer convention, not a CI gate. Commands: the `agent-browser` skill and [LOCAL_TESTING.md § When you need to verify a UI change](./LOCAL_TESTING.md#when-you-need-to-verify-a-ui-change).
 

@@ -34,6 +34,7 @@ CI detects what changed and runs the matching jobs:
 | **OpenAPI Spec Freshness** | `bun run docs:openapi` (must produce zero diff in `openapi.json` AND `docs-site/content/docs/api-reference/`) | Edited an HTTP route or bumped `package.json` `version` without regenerating |
 | **Raw matchRoute check** | `! grep -rn 'matchRoute(' src/http/ --include='*.ts' \| grep -v 'route-def.ts' \| grep -v 'utils.ts'` | Used `matchRoute` directly instead of the `route()` factory |
 | **Docker Build (Dockerfile + Dockerfile.worker slim target + apps/evals/Dockerfile)** | `docker build -f Dockerfile . && docker build -f Dockerfile.worker --target worker-slim . && docker build -f apps/evals/Dockerfile .` | Broken multi-stage build, missing file in the worker context, evals image drifting from the root workspace lockfile. NOTE: the PR gate builds only the worker's `worker-slim` target (fast); `worker-full` is only built on merge by `docker-and-deploy.yml` — if you touched full-only stages (`worker-full-base` / `worker-full`), build the full target locally before merging. The api + worker-slim legs also report uncompressed image sizes to the **ci-metrics** swarm script (sticky "Docker image sizes" PR comment diffing vs main; baseline refreshed by `docker-and-deploy.yml`'s `report-metrics` job; contract doc: `agent-fs cat docs/ci-metrics.md`; secret: `SWARM_CI_METRICS_TOKEN`). Reporting is `continue-on-error` — it can never block the gate |
+| **Dashboard Image** | `docker build -f Dockerfile.ui -t test-ui-image:latest . && bash scripts/smoke-ui-image.sh test-ui-image:latest` | Broken dashboard build, or nginx serving the wrong status, MIME type or headers, or logging a connection key. Runs when `Dockerfile.ui`, `apps/ui/`, `packages/model-catalog/`, `src/` or the workspace manifests change. |
 
 ### When `apps/ui/` or `packages/ui-e2e/` changed (or root `bun.lock` / `package.json` / `bunfig.toml`)
 
@@ -169,6 +170,7 @@ bun run check:extension-schema  || echo "extension manifest schema drift — run
 # PR gate builds the worker's slim target; build the full target too if you
 # touched worker-full-base / worker-full stages.
 docker build -f Dockerfile . && docker build -f Dockerfile.worker --target worker-slim . && docker build -f apps/evals/Dockerfile .
+bun run docker:build:ui && bash scripts/smoke-ui-image.sh agent-swarm-ui:latest
 
 # ui (if you touched apps/ui/ — or root bun.lock/package.json/bunfig.toml, since ui deps resolve from the root lock)
 ( cd apps/ui && bun install --frozen-lockfile && bun run lint && bunx tsc -b )
