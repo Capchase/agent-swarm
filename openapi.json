@@ -755,6 +755,8 @@
             "type": "string",
             "enum": [
               "opencode",
+              "gemini",
+              "copilot",
               "custom"
             ]
           },
@@ -10286,6 +10288,7 @@
                         "enum": [
                           "opencode",
                           "gemini",
+                          "copilot",
                           "custom"
                         ]
                       },
