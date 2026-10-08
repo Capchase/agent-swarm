@@ -613,6 +613,8 @@ describe("script connections", () => {
       // 201 alters workflow_runs and workflow_run_steps, which this
       // migration-112-only fixture does not create.
       markMigrationApplied(database, "201_workflow_replay_columns.sql");
+      // 202 moves rows out of kv_entries, which this migration-112-only fixture does not create.
+      markMigrationApplied(database, "202_codex_oauth_device_flows.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

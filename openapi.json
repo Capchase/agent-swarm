@@ -9640,7 +9640,7 @@
             }
           },
           "400": {
-            "description": "Invalid or disallowed SQL",
+            "description": "Invalid or disallowed SQL, including queries that read credential tables",
             "content": {
               "application/json": {
                 "schema": {
