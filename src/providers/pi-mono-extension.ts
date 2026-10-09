@@ -11,6 +11,7 @@ import { buildRatingsFromLlm, fetchRetrievalsForTask, postRatings } from "../be/
 import { checkToolLoop, clearToolHistory } from "../hooks/tool-loop-detection";
 import { summarizeSession as runSummarize } from "../utils/internal-ai";
 import { getMemoryRaterNames } from "../utils/memory-raters";
+import { getOpenRouterAttributionHeaders } from "../utils/openrouter-base-url";
 import { scrubSecrets } from "../utils/secret-scrubber";
 
 export interface SwarmHooksConfig {
@@ -448,6 +449,13 @@ function sendNudge(pi: Parameters<ExtensionFactory>[0], text: string): void {
 export function createSwarmHooksExtension(config: SwarmHooksConfig): ExtensionFactory {
   return (pi) => {
     let lastContextPostTime = 0;
+
+    pi.on("before_provider_headers", (event, ctx) => {
+      Object.assign(
+        event.headers,
+        getOpenRouterAttributionHeaders(ctx.model?.baseUrl ?? "", config.env),
+      );
+    });
 
     // === session_start → SessionStart ===
     pi.on("session_start", async (_event, _ctx) => {
