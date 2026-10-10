@@ -31,11 +31,12 @@ import {
   ExternalLink,
   Lock,
   Maximize2,
+  MessageSquarePlus,
   Minimize2,
   Printer,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import { api } from "@/api/client";
 import { useFavoriteToggle } from "@/api/hooks/use-favorites";
 import { useFeatureGate } from "@/api/hooks/use-feature-gate";
@@ -51,7 +52,10 @@ import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/ui/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { getConfig } from "@/lib/config";
+import { getPageContext } from "@/lib/page-context";
 import { cn } from "@/lib/utils";
+import { usePageFeedbackBridge } from "./feedback-bridge";
+import { FeedbackConfirmDialog } from "./feedback-confirm-dialog";
 import { JsonPageRenderer } from "./json-page-renderer";
 import { RoomInspector } from "./room-inspector";
 
@@ -96,6 +100,19 @@ function pageFrameQuery(searchParams: URLSearchParams): string {
   }
   const query = forwarded.toString();
   return query ? `?${query}` : "";
+}
+
+/**
+ * Query param that turns on the in-page feedback overlay (served by the API
+ * on `/p/:id`, see `src/artifact-sdk/feedback-overlay.ts`). It is a normal
+ * forwarded param, so the iframe, "Open" and "Full" links all carry it.
+ */
+const FEEDBACK_PARAM = "__swarm-feedback";
+
+/** Mirrors `isPageFeedbackRequested` on the API: present and not `0` / `false`. */
+function isFeedbackOn(searchParams: URLSearchParams): boolean {
+  const value = searchParams.get(FEEDBACK_PARAM);
+  return value !== null && value.toLowerCase() !== "0" && value.toLowerCase() !== "false";
 }
 
 /** SPA route for the page, keeping the forwarded params and toggling `mode=full`. */
@@ -359,9 +376,21 @@ function ArtifactPageError({ message }: { message: string }) {
 
 export default function ArtifactPage() {
   const { id } = useParams<{ id: string }>();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const fullMode = searchParams.get("mode") === "full";
   const frameQuery = pageFrameQuery(searchParams);
+  const feedbackOn = isFeedbackOn(searchParams);
+  const toggleFeedback = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (isFeedbackOn(prev)) next.delete(FEEDBACK_PARAM);
+        else next.set(FEEDBACK_PARAM, "1");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
   const gate = useFeatureGate("1.79.0");
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const needsSlugResolve = !!id && !PAGE_ID_RE.test(id);
@@ -376,6 +405,14 @@ export default function ArtifactPage() {
     retry: false,
   });
   const pageId = needsSlugResolve ? resolvedPage?.id : id;
+  const { pathname } = useLocation();
+  const feedbackBridge = usePageFeedbackBridge({
+    pageId,
+    pageKey: getPageContext({ pathname })?.pageKey,
+    enabled: feedbackOn,
+    apiOrigin: new URL(getAbsoluteApiUrl()).origin,
+    iframeRef,
+  });
   const { data: pageRow } = usePage(pageId);
   const favoriteToggle = useFavoriteToggle("page");
 
@@ -494,6 +531,7 @@ export default function ArtifactPage() {
           </Button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto p-4">{body}</div>
+        <FeedbackConfirmDialog bridge={feedbackBridge} />
       </div>
     );
   }
@@ -517,12 +555,20 @@ export default function ArtifactPage() {
               favoriteToggle.mutate({ itemId: pageId!, favorite: !pageRow?.favorite })
             }
             onExportPdf={handleExportPdf}
+            feedback={
+              // HTML only (JSON pages render in the SPA), and not for password
+              // pages: the unlocked frame keeps the URL it was opened with.
+              data.contentType === "text/html" && data.authMode !== "password"
+                ? { on: feedbackOn, onToggle: toggleFeedback }
+                : undefined
+            }
           />
         }
       />
       <PageSlugLine id={pageId!} />
       <RoomInspector key={pageId} pageId={pageId!} />
       {body}
+      <FeedbackConfirmDialog bridge={feedbackBridge} />
     </div>
   );
 }
@@ -560,6 +606,7 @@ function PageHeaderActions({
   favoriteDisabled,
   onToggleFavorite,
   onExportPdf,
+  feedback,
 }: {
   id: string;
   frameQuery: string;
@@ -568,6 +615,8 @@ function PageHeaderActions({
   favoriteDisabled?: boolean;
   onToggleFavorite: () => void;
   onExportPdf: () => void;
+  /** Feedback-overlay toggle; omitted when the page cannot take feedback. */
+  feedback?: { on: boolean; onToggle: () => void };
 }) {
   // The share link carries the same forwarded params as the iframe, so
   // "Open" keeps whatever filter the page is showing.
@@ -575,6 +624,18 @@ function PageHeaderActions({
   return (
     <div className="flex flex-wrap items-center gap-2">
       <FavoriteButton favorite={favorite} disabled={favoriteDisabled} onToggle={onToggleFavorite} />
+      {feedback ? (
+        <Button
+          variant={feedback.on ? "default" : "outline"}
+          size="sm"
+          aria-pressed={feedback.on}
+          title="Select elements on the page, comment on them, and send the comments to the swarm"
+          onClick={feedback.onToggle}
+        >
+          <MessageSquarePlus className="size-3.5" />
+          Feedback
+        </Button>
+      ) : null}
       <Button asChild variant="outline" size="sm" title="Open the API-served URL in a new tab">
         <a href={href} target="_blank" rel="noreferrer">
           <ExternalLink className="size-3.5" />
