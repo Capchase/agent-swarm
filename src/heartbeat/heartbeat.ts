@@ -56,6 +56,8 @@ import {
   countActiveRuntimeInstancesForAgent,
   expireStaleRuntimeInstances,
 } from "../be/multi-runtime";
+import { getScript } from "../be/scripts/db";
+import { runSavedScriptAsAgent } from "../be/scripts/run-saved";
 import { promotePendingSteeringForTask } from "../be/steering";
 import type { HeartbeatAction, HeartbeatClassification } from "../extensions/contract";
 import { dispatchPre, extensionIdForAgent } from "../extensions/dispatcher";
@@ -257,6 +259,31 @@ function isBootTriageAlways(): boolean {
   return isEnvFlagEnabled("HEARTBEAT_BOOT_TRIAGE_ALWAYS", false);
 }
 
+/**
+ * Wall-clock ceiling for the whole checklist gate call: script lookup,
+ * credential setup, and execution.
+ */
+const HEARTBEAT_CHECKLIST_GATE_TIMEOUT_MS = 60_000;
+let checklistGateTimeoutMs = HEARTBEAT_CHECKLIST_GATE_TIMEOUT_MS;
+
+/**
+ * Name of a global-scope script that decides whether a checklist tick needs
+ * the Lead. Unset or empty turns the gate off.
+ */
+function heartbeatChecklistGateScript(): string | null {
+  return process.env.HEARTBEAT_CHECKLIST_GATE_SCRIPT?.trim() || null;
+}
+
+/**
+ * `shadow` (default) runs the gate and only tags the checklist task with its
+ * verdict. `enforce` skips the task when the gate reports a quiet tick.
+ */
+function heartbeatChecklistGateMode(): "shadow" | "enforce" {
+  return process.env.HEARTBEAT_CHECKLIST_GATE_MODE?.trim().toLowerCase() === "enforce"
+    ? "enforce"
+    : "shadow";
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -320,6 +347,23 @@ export function setBeforeHeartbeatSupersedeForTests(
   hook: ((task: AgentTask) => void | Promise<void>) | null,
 ): void {
   beforeHeartbeatSupersedeForTests = hook;
+}
+
+type ChecklistGateRunner = (
+  scriptName: string,
+  leadAgentId: string,
+  signal: AbortSignal,
+) => Promise<unknown>;
+let checklistGateRunnerForTests: ChecklistGateRunner | null = null;
+
+/** Replace the gate script runner. The runner returns the script's result or throws. */
+export function setChecklistGateRunnerForTests(runner: ChecklistGateRunner | null): void {
+  checklistGateRunnerForTests = runner;
+}
+
+/** Override the gate deadline. `null` restores the 60s default. */
+export function setChecklistGateTimeoutMsForTests(ms: number | null): void {
+  checklistGateTimeoutMs = ms ?? HEARTBEAT_CHECKLIST_GATE_TIMEOUT_MS;
 }
 
 // ============================================================================
@@ -1664,6 +1708,91 @@ export async function getBootTriageFindings(): Promise<BootTriageFindings> {
   };
 }
 
+type ChecklistGateVerdict =
+  | { verdict: "quiet"; reason: string }
+  | { verdict: "wake"; reason: string; summary: string | null }
+  | { verdict: "error"; reason: string };
+
+/**
+ * Look up the global gate script and run it as the Lead. `deps` lets tests
+ * stall credential setup on the real path.
+ */
+export async function defaultChecklistGateRunner(
+  scriptName: string,
+  leadAgentId: string,
+  signal: AbortSignal,
+  deps: Parameters<typeof runSavedScriptAsAgent>[1] = {},
+): Promise<unknown> {
+  const script = await getScript({ name: scriptName, scope: "global" });
+  if (!script) throw new Error(`global script "${scriptName}" not found`);
+  const output = await runSavedScriptAsAgent(
+    {
+      script,
+      input: { leadAgentId },
+      agentId: leadAgentId,
+      timeoutMs: checklistGateTimeoutMs,
+      signal,
+    },
+    deps,
+  );
+  if (output.exitCode !== 0 || output.error || output.runtimeError) {
+    throw new Error(
+      output.runtimeError?.message ?? output.error ?? `script exited with code ${output.exitCode}`,
+    );
+  }
+  return output.result;
+}
+
+/**
+ * Ask the gate script whether this tick needs the Lead. The script returns
+ * `{ quiet: boolean, reason?: string, summary?: string }`. Anything else, and
+ * any failure, is an `error` verdict, which never skips a checklist.
+ *
+ * One deadline covers the whole call, credential setup included. When it
+ * fires, the runner's signal aborts (the script never starts, or is killed)
+ * and the verdict is `error` without waiting for the runner to settle.
+ */
+async function runChecklistGate(
+  scriptName: string,
+  leadAgentId: string,
+): Promise<ChecklistGateVerdict> {
+  const controller = new AbortController();
+  const timeoutMs = checklistGateTimeoutMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const runner = checklistGateRunnerForTests ?? defaultChecklistGateRunner;
+    const run = runner(scriptName, leadAgentId, controller.signal);
+    // A runner that settles after the deadline must not surface as an unhandled rejection.
+    run.catch(() => {});
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`gate timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    const result = (await Promise.race([run, deadline])) as {
+      quiet?: unknown;
+      reason?: unknown;
+      summary?: unknown;
+    } | null;
+    if (!result || typeof result !== "object" || typeof result.quiet !== "boolean") {
+      return { verdict: "error", reason: "result has no boolean `quiet` field" };
+    }
+    const reason = typeof result.reason === "string" ? result.reason.slice(0, 300) : "";
+    if (result.quiet) return { verdict: "quiet", reason };
+    const summary =
+      typeof result.summary === "string" && result.summary.trim()
+        ? result.summary.slice(0, 4000)
+        : null;
+    return { verdict: "wake", reason, summary };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { verdict: "error", reason: scrubSecrets(message).slice(0, 300) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Check HEARTBEAT.md content and create a checklist task for the lead if needed.
  */
@@ -1687,7 +1816,28 @@ export async function checkHeartbeatChecklist(): Promise<void> {
   );
   if (existing) return;
 
-  const systemStatus = await gatherSystemStatus();
+  const gateScript = heartbeatChecklistGateScript();
+  const gateMode = heartbeatChecklistGateMode();
+  const gate = gateScript ? await runChecklistGate(gateScript, lead.id) : null;
+  if (gate) {
+    console.log(
+      `[Heartbeat] Checklist gate "${gateScript}" (${gateMode}): ${gate.verdict}${gate.reason ? ` (${gate.reason})` : ""}`,
+    );
+  }
+  if (gate?.verdict === "quiet" && gateMode === "enforce") {
+    console.log(`[Heartbeat] Checklist skipped for lead ${lead.name}: quiet tick`);
+    return;
+  }
+
+  let systemStatus = await gatherSystemStatus();
+  // Shadow mode leaves the prompt untouched so the Lead's own quiet/non-quiet
+  // outcome stays an independent check on the gate's verdict.
+  if (gateMode === "enforce" && gate?.verdict === "wake" && gate.summary) {
+    const findings = resolveTemplate("heartbeat.checklist.gate_findings", {
+      gate_summary: gate.summary,
+    });
+    if (!findings.skipped && findings.text) systemStatus += `\n\n${findings.text}`;
+  }
 
   const result = resolveTemplate("heartbeat.checklist", {
     system_status: systemStatus,
@@ -1704,7 +1854,7 @@ export async function checkHeartbeatChecklist(): Promise<void> {
     // the swarm's own work, not as a human's MCP usage.
     source: "system",
     taskType: "heartbeat-checklist",
-    tags: ["checklist", "auto-generated"],
+    tags: ["checklist", "auto-generated", ...(gate ? [`heartbeat-gate:${gate.verdict}`] : [])],
     priority: 60,
   });
 
