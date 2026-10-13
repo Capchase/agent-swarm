@@ -637,4 +637,44 @@ describe("send-task re-delegation guard, end to end", () => {
     expect(reset.success).toBe(false);
     expect(reset.message.startsWith("Blocked: re-delegation from follow-up task")).toBe(true);
   });
+
+  /**
+   * At five hops, an override to the first worker is refused. The child without
+   * an override keeps the count: when it fails, its follow-up is at the limit.
+   */
+  async function expectOverrideKeepsHopCount(
+    followUp: AgentTask,
+    first: AgentTask,
+    thread: string,
+  ) {
+    const override = resultOf(
+      await callSendTask(`Retry from the first worker in ${thread}`, followUp.id, first.id),
+    );
+    expect(override.success).toBe(false);
+    expect(override.message).toContain("reset the follow-up hop count");
+
+    const kept = resultOf(await callSendTask(`Retry on the chain in ${thread}`, followUp.id));
+    expect(kept.success).toBe(true);
+    expect(kept.task?.parentTaskId).toBe(followUp.id);
+
+    await failTask(kept.task!.id, "boom");
+    const nextFollowUp = await followUpOf(kept.task!.id, thread);
+    const next = resultOf(
+      await callSendTask(`Retry after the sixth hop in ${thread}`, nextFollowUp.id),
+    );
+    expect(next.success).toBe(false);
+    expect(next.message).toContain("delegation hops");
+  }
+
+  test("a parentTaskId override cannot reset the hop count with no completed work", async () => {
+    const { followUp, first } = await followUpChain(5, "9000.0010", { stepOutcome: "failed" });
+    await expectOverrideKeepsHopCount(followUp, first, "9000.0010");
+  });
+
+  test("a parentTaskId override cannot reset the hop count after a newer cancellation", async () => {
+    const { followUp, first } = await followUpChain(5, "9000.0011", {
+      lastFailureReason: "cancelled by user",
+    });
+    await expectOverrideKeepsHopCount(followUp, first, "9000.0011");
+  });
 });

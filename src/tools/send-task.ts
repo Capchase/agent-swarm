@@ -254,14 +254,20 @@ async function evaluateFollowUpDelegation(sourceTask: AgentTask): Promise<Follow
   const failedParent = parent.status === "failed";
   if (!instructed && !failedParent) return "no-reason";
 
+  const followUpHops = await countFollowUpHops(sourceTask);
+  return followUpHops > MAX_FOLLOW_UP_DELEGATION_HOPS ? "hop-limit" : "allowed";
+}
+
+/** Count the `follow-up` tasks in a task's parent chain, the task included. */
+async function countFollowUpHops(task: AgentTask): Promise<number> {
   let followUpHops = 0;
-  let current: AgentTask | null = sourceTask;
+  let current: AgentTask | null = task;
   for (let step = 0; current && step < 50; step++) {
     if (current.taskType === "follow-up") followUpHops++;
     if (!current.parentTaskId) break;
     current = await getTaskById(current.parentTaskId);
   }
-  return followUpHops > MAX_FOLLOW_UP_DELEGATION_HOPS ? "hop-limit" : "allowed";
+  return followUpHops;
 }
 
 /**
@@ -610,6 +616,7 @@ export async function sendTaskHandler(
     // chain. The creator asked for a next step, or the failed template asks
     // Lead to retry; the hop limit stops a slow follow-up loop. A follow-up at
     // the hop limit is refused before the completion and cancellation checks.
+    // So is a parentTaskId override that would drop follow-ups from the chain.
     //
     // NOTE: `taskType === "resume"` (created by createResumeFollowUp on
     // supersede) is intentionally NOT in this guard — a resume IS the legitimate
@@ -628,10 +635,23 @@ export async function sendTaskHandler(
             message: `Blocked: re-delegation from follow-up task. The follow-up chain reached ${MAX_FOLLOW_UP_DELEGATION_HOPS} delegation hops.`,
           };
         }
-        // The hop count walks parentTaskId, which the caller controls. Only a
-        // child parented on this follow-up keeps the count, so a parentTaskId
-        // override gets no bypass.
-        if (delegation === "allowed" && taskOptions.parentTaskId === sourceTaskId) return null;
+        // The hop count walks parentTaskId, which the caller controls. A
+        // parentTaskId override must keep at least the follow-up's hop count,
+        // so a dispatch from a follow-up can never reset the count.
+        if (taskOptions.parentTaskId !== sourceTaskId) {
+          const overrideParent = taskOptions.parentTaskId
+            ? await getTaskById(taskOptions.parentTaskId)
+            : null;
+          const keptHops = overrideParent ? await countFollowUpHops(overrideParent) : 0;
+          if (keptHops < (await countFollowUpHops(sourceTask))) {
+            return {
+              ok: false,
+              message:
+                "Blocked: re-delegation from follow-up task. The parentTaskId override would reset the follow-up hop count. Omit parentTaskId to parent the task on this follow-up.",
+            };
+          }
+        }
+        if (delegation === "allowed") return null;
         const recentCompleted = await findCompletedTaskInThread(
           sourceTask.slackChannelId,
           sourceTask.slackThreadTs,
