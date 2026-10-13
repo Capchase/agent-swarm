@@ -258,16 +258,23 @@ async function evaluateFollowUpDelegation(sourceTask: AgentTask): Promise<Follow
   return followUpHops > MAX_FOLLOW_UP_DELEGATION_HOPS ? "hop-limit" : "allowed";
 }
 
-/** Count the `follow-up` tasks in a task's parent chain, the task included. */
+/**
+ * Count the `follow-up` tasks in a task's parent chain, the task included. The
+ * walk has no depth limit, because deferred wakes can make a chain arbitrarily
+ * long. `UNION` drops repeated rows, so a parent cycle ends the walk.
+ */
 async function countFollowUpHops(task: AgentTask): Promise<number> {
-  let followUpHops = 0;
-  let current: AgentTask | null = task;
-  for (let step = 0; current && step < 50; step++) {
-    if (current.taskType === "follow-up") followUpHops++;
-    if (!current.parentTaskId) break;
-    current = await getTaskById(current.parentTaskId);
-  }
-  return followUpHops;
+  const row = await getDbClient().get<{ followUpHops: number }>(
+    `WITH RECURSIVE chain(id, parentTaskId, taskType) AS (
+       SELECT id, parentTaskId, taskType FROM agent_tasks WHERE id = ?
+       UNION
+       SELECT t.id, t.parentTaskId, t.taskType
+         FROM agent_tasks t JOIN chain c ON t.id = c.parentTaskId
+     )
+     SELECT COUNT(*) AS followUpHops FROM chain WHERE taskType = 'follow-up'`,
+    [task.id],
+  );
+  return row?.followUpHops ?? 0;
 }
 
 /**

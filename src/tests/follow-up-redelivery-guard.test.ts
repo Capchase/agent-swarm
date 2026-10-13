@@ -602,6 +602,31 @@ describe("send-task re-delegation guard, end to end", () => {
     expect(result.success).toBe(true);
   });
 
+  test("hop limit counts the whole chain past 50 deferred wakes", async () => {
+    const thread = "9000.0012";
+    const { followUp: fifth } = await followUpChain(5, thread, { stepOutcome: "failed" });
+    // Each deferred wake is a new task whose parent is the previous attempt.
+    let parentId = fifth.id;
+    for (let wake = 1; wake <= 50; wake++) {
+      const task = await createTaskExtended(`deferred wake ${wake} in ${thread}`, {
+        agentId: workerId,
+        parentTaskId: parentId,
+        slackChannelId: "C_E2E",
+        slackThreadTs: thread,
+      });
+      parentId = task.id;
+    }
+    await Bun.sleep(5);
+    const last = await workerTask(`final wake in ${thread}`, thread, "failed", {
+      parentTaskId: parentId,
+    });
+    const sixth = await followUpOf(last.id, thread);
+
+    const result = resultOf(await callSendTask("Retry after the deferred wakes", sixth.id));
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("delegation hops");
+  });
+
   test("hop limit holds when the thread has no completed work", async () => {
     const { followUp } = await followUpChain(6, "9000.0007", { stepOutcome: "failed" });
 
