@@ -19,16 +19,23 @@ import {
 } from "../be/db";
 import { registerRequestHumanInputTool } from "../tools/request-human-input";
 
-type Tool = { handler: (args: unknown, extra: unknown) => Promise<CallToolResult> };
+type Tool = {
+  inputSchema: { safeParse: (args: unknown) => { success: boolean } };
+  handler: (args: unknown, extra: unknown) => Promise<CallToolResult>;
+};
 const keys = ["APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS", "APPROVAL_DEFAULT_SLACK_TARGET"];
 const original = keys.map((key) => process.env[key]);
 let tool: Tool;
 let agentId: string;
+let leadId: string;
 
 beforeAll(async () => {
   initDb(":memory:");
   agentId = (await createAgent({ name: "Approval requester", status: "idle", capabilities: [] }))
     .id;
+  leadId = (
+    await createAgent({ name: "Approval lead", status: "idle", capabilities: [], isLead: true })
+  ).id;
   const server = new McpServer({ name: "request-human-input-test", version: "1" });
   registerRequestHumanInputTool(server);
   tool = (server as unknown as { _registeredTools: Record<string, Tool> })._registeredTools[
@@ -48,9 +55,15 @@ afterEach(() => {
 });
 afterAll(() => closeDb());
 
-async function request(overrides: Record<string, unknown> = {}, thread = true, header = true) {
+async function request(
+  overrides: Record<string, unknown> = {},
+  thread = true,
+  header = true,
+  callerId = agentId,
+  success = true,
+) {
   const source = await createTaskExtended("Needs a decision", {
-    agentId,
+    agentId: callerId,
     ...(thread ? { slackChannelId: "C1", slackThreadTs: "1.1", slackUserId: "U1" } : {}),
   });
   await startTask(source.id);
@@ -63,7 +76,7 @@ async function request(overrides: Record<string, unknown> = {}, thread = true, h
     {
       sessionId: crypto.randomUUID(),
       requestInfo: {
-        headers: { "x-agent-id": agentId, ...(header ? { "x-source-task-id": source.id } : {}) },
+        headers: { "x-agent-id": callerId, ...(header ? { "x-source-task-id": source.id } : {}) },
       },
     },
   );
@@ -74,7 +87,8 @@ async function request(overrides: Record<string, unknown> = {}, thread = true, h
     notifiedTarget?: string;
     timeoutSeconds?: number;
   };
-  expect(data.success).toBe(true);
+  expect(data.success).toBe(success);
+  if (!success) return { data, stored: null! };
   const stored = await getApprovalRequestById(data.requestId);
   expect(stored).not.toBeNull();
   return { data, stored: stored! };
@@ -115,8 +129,29 @@ describe("request-human-input owner, notice and timeout", () => {
     expect(JSON.stringify(payload.blocks)).toContain("Deploy with [REDACTED:github_token]");
     expect(JSON.stringify(payload.blocks)).toContain("Approve using [REDACTED:github_token]?");
   });
+  test("non-lead notify is denied before creating or posting an approval", async () => {
+    const { data } = await request({ notify: "CRANDOM" }, true, true, agentId, false);
+    expect(data.message).toContain("lead privileges");
+    expect(data.requestId).toBeUndefined();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+  test.each([
+    "#ops",
+    "channel",
+    "C-lower",
+    "",
+    "U1 ",
+  ])("invalid notify %s fails input validation", (notify) => {
+    expect(
+      tool.inputSchema.safeParse({
+        title: "Deploy",
+        questions: [{ id: "q", type: "approval", label: "Approve?" }],
+        notify,
+      }).success,
+    ).toBe(false);
+  });
   test("caller notify wins over the thread", async () => {
-    await request({ notify: "U9" });
+    await request({ notify: "U9" }, true, true, leadId);
     expect(postMessage.mock.calls[0]![0].channel).toBe("U9");
     expect(postMessage.mock.calls[0]![0].thread_ts).toBeUndefined();
     expect(postMessage.mock.calls[0]![0].text).not.toContain("<@U1>");

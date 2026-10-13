@@ -1530,7 +1530,7 @@ Create an approval request and return at once with the request id and URL. The a
 | `title` | `string` | Yes | - | Title of the approval request |
 | `questions` | `array` | Yes | - | Questions to ask the human |
 | `approvers` | `array` | No | - | Swarm user ids or emails of the people who may answer. When set, only they (or the operator key) can answer. Give this when you know the right owner. |
-| `notify` | `string` | No | - | A Slack channel id (C...) or user id (U...) for the notice. Default: a reply in your task's Slack thread that mentions the requester. |
+| `notify` | `string` | No | - | A Slack channel id (C...) or user id (U...) for the notice. Requires lead privileges. Default: a reply in your task's Slack thread that mentions the requester. |
 | `timeoutSeconds` | `number` | No | - | Default: APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS (86400). After the timeout the request becomes 'timeout' and you get a hitl-follow-up task. 0 in the config means no default timeout; then the request is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7). |
 
 ### cancel-approval-request

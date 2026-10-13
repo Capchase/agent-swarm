@@ -7,10 +7,12 @@ import {
 import { resolveTaskAuditUserId } from "@/be/audit-user";
 import {
   createApprovalRequest,
+  getAgentById,
   getAgentCurrentTask,
   getTaskById,
   updateApprovalRequestNotifications,
 } from "@/be/db";
+import { can } from "@/rbac";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import { getAppUrl } from "@/utils/constants";
 import { scrubSecrets } from "@/utils/secret-scrubber";
@@ -67,10 +69,10 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
           ),
         notify: z
           .string()
-          .min(1)
+          .regex(/^[CDGU][A-Z0-9]+$/)
           .optional()
           .describe(
-            "A Slack channel id (C...) or user id (U...) for the notice. Default: a reply in your task's Slack thread that mentions the requester.",
+            "A Slack channel id (C...) or user id (U...) for the notice. Requires lead privileges. Default: a reply in your task's Slack thread that mentions the requester.",
           ),
         timeoutSeconds: z
           .number()
@@ -95,6 +97,19 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
           'Agent ID not found. The MCP client should define the "X-Agent-ID" header.',
           { data: { yourAgentId: requestInfo.agentId } },
         );
+      }
+
+      if (notify) {
+        const agent = await getAgentById(requestInfo.agentId);
+        const decision = can({
+          principal: { kind: "agent", agentId: requestInfo.agentId, isLead: !!agent?.isLead },
+          verb: "integration.slack.post",
+          resource: { kind: "none" },
+          source: "mcp",
+        });
+        if (!decision.allow) {
+          return toolErr("Choosing a Slack notice target requires lead privileges.");
+        }
       }
 
       // Resolve sourceTaskId: prefer header, fall back to agent's current in-progress task.
