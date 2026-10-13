@@ -13,10 +13,12 @@ import {
   closeDb,
   createAgent,
   createTaskExtended,
+  createUser,
   getApprovalRequestById,
   initDb,
   startTask,
 } from "../be/db";
+import { linkIdentity } from "../be/users";
 import { registerRequestHumanInputTool } from "../tools/request-human-input";
 
 type Tool = {
@@ -28,6 +30,7 @@ const original = keys.map((key) => process.env[key]);
 let tool: Tool;
 let agentId: string;
 let leadId: string;
+let ownerId: string;
 
 beforeAll(async () => {
   initDb(":memory:");
@@ -36,6 +39,8 @@ beforeAll(async () => {
   leadId = (
     await createAgent({ name: "Approval lead", status: "idle", capabilities: [], isLead: true })
   ).id;
+  ownerId = (await createUser({ name: "Local approval fixture", email: "owner@example.test" })).id;
+  await linkIdentity(ownerId, "slack", "UOWNER", { kind: "system", id: "test" });
   const server = new McpServer({ name: "request-human-input-test", version: "1" });
   registerRequestHumanInputTool(server);
   tool = (server as unknown as { _registeredTools: Record<string, Tool> })._registeredTools[
@@ -110,9 +115,29 @@ describe("request-human-input owner, notice and timeout", () => {
     expect(data.timeoutSeconds).toBe(86400);
     expect(data.notifiedTarget).toBe("C1");
   });
-  test("caller approvers restrict who may answer", async () => {
-    const { stored } = await request({ approvers: ["owner@capchase.com"] });
-    expect(stored.approvers).toEqual({ policy: "any", users: ["owner@capchase.com"] });
+  test.each([
+    "swarm id",
+    "email",
+    "Slack id",
+  ])("resolves approver by %s and stores its swarm user id", async (kind) => {
+    const entry =
+      kind === "swarm id" ? ownerId : kind === "email" ? "owner@example.test" : "UOWNER";
+    const { stored } = await request({ approvers: [entry] });
+    expect(stored.approvers).toEqual({ policy: "any", users: [ownerId] });
+  });
+  test("unknown approvers name every unresolved entry and create no request or notice", async () => {
+    const { data } = await request(
+      { approvers: [ownerId, "UMISSING", "unknown@example.test"] },
+      true,
+      true,
+      agentId,
+      false,
+    );
+    expect(data.message).toContain("UMISSING");
+    expect(data.message).toContain("unknown@example.test");
+    expect(data.message).not.toContain(ownerId);
+    expect(data.requestId).toBeUndefined();
+    expect(postMessage).not.toHaveBeenCalled();
   });
   test("scrubs secrets from the approval title and question label before Slack egress", async () => {
     const titleSecret = `ghp_${"aB3".repeat(12)}`;

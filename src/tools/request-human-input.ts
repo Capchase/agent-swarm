@@ -12,6 +12,7 @@ import {
   getTaskById,
   updateApprovalRequestNotifications,
 } from "@/be/db";
+import { findUserByEmail, findUserByExternalId, findUserById } from "@/be/users";
 import { can } from "@/rbac";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import { getAppUrl } from "@/utils/constants";
@@ -65,7 +66,7 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
           .array(z.string().min(1))
           .optional()
           .describe(
-            "Swarm user ids or emails of the people who may answer. When set, only they (or the operator key) can answer. Give this when you know the right owner.",
+            "Swarm user ids, emails, or Slack user ids of the people who may answer. When set, only they (or the operator key) can answer. Give this when you know the right owner.",
           ),
         notify: z
           .string()
@@ -112,6 +113,20 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
         }
       }
 
+      const resolvedApprovers: string[] = [];
+      const unresolvedApprovers: string[] = [];
+      for (const entry of approvers ?? []) {
+        const user =
+          (await findUserById(entry)) ??
+          (await findUserByEmail(entry)) ??
+          (await findUserByExternalId("slack", entry));
+        if (user) resolvedApprovers.push(user.id);
+        else unresolvedApprovers.push(entry);
+      }
+      if (unresolvedApprovers.length > 0) {
+        return toolErr(`Unknown approvers: ${unresolvedApprovers.join(", ")}`);
+      }
+
       // Resolve sourceTaskId: prefer header, fall back to agent's current in-progress task.
       // The X-Source-Task-Id header may be missing when the per-session MCP config wasn't
       // created (e.g. .mcp.json not found, session resumed, or lead agent on a non-task trigger).
@@ -145,7 +160,7 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
         id,
         title,
         questions,
-        approvers: approvers ? { policy: "any", users: approvers } : { policy: "any" },
+        approvers: approvers ? { policy: "any", users: resolvedApprovers } : { policy: "any" },
         sourceTaskId: sourceTaskId ?? undefined,
         timeoutSeconds: effectiveTimeout || undefined,
         notificationChannels: notification ? [notification] : undefined,
