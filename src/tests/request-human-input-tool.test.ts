@@ -100,6 +100,21 @@ describe("request-human-input owner, notice and timeout", () => {
     const { stored } = await request({ approvers: ["owner@capchase.com"] });
     expect(stored.approvers).toEqual({ policy: "any", users: ["owner@capchase.com"] });
   });
+  test("scrubs secrets from the approval title and question label before Slack egress", async () => {
+    const titleSecret = `ghp_${"aB3".repeat(12)}`;
+    const labelSecret = `ghp_${"cD4".repeat(12)}`;
+    await request({
+      title: `Deploy with ${titleSecret}`,
+      questions: [{ id: "q", type: "approval", label: `Approve using ${labelSecret}?` }],
+    });
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    const payload = postMessage.mock.calls[0]![0];
+    expect(JSON.stringify(payload)).not.toContain(titleSecret);
+    expect(JSON.stringify(payload)).not.toContain(labelSecret);
+    expect(payload.text).toContain("Deploy with [REDACTED:github_token]");
+    expect(JSON.stringify(payload.blocks)).toContain("Deploy with [REDACTED:github_token]");
+    expect(JSON.stringify(payload.blocks)).toContain("Approve using [REDACTED:github_token]?");
+  });
   test("caller notify wins over the thread", async () => {
     await request({ notify: "U9" });
     expect(postMessage.mock.calls[0]![0].channel).toBe("U9");

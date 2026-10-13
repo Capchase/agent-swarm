@@ -142,8 +142,8 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
         try {
           const result = await postApprovalNotice({
             requestId: request.id,
-            title,
-            questions,
+            title: request.title,
+            questions: questions.map(({ label }) => ({ label: scrubSecrets(label) })),
             timeoutSeconds: effectiveTimeout || undefined,
             target: notification.target,
             threadTs: notification.threadTs,
