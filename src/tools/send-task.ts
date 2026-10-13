@@ -232,6 +232,42 @@ const TRACKER_OWNERSHIP_TRANSFER_PARENT_STATUSES = new Set([
   "cancelled",
 ]);
 
+// The maximum number of `follow-up` tasks in one parent chain that may delegate.
+const MAX_FOLLOW_UP_DELEGATION_HOPS = 5;
+
+type FollowUpDelegation = "allowed" | "no-reason" | "hop-limit";
+
+/**
+ * Decide whether a follow-up may delegate past the re-delegation guard. It may
+ * when its parent's creator left an instruction for the parent's outcome, or
+ * when the parent failed, up to `MAX_FOLLOW_UP_DELEGATION_HOPS` follow-ups in
+ * one parent chain.
+ */
+async function evaluateFollowUpDelegation(sourceTask: AgentTask): Promise<FollowUpDelegation> {
+  if (!sourceTask.parentTaskId) return "no-reason";
+  const parent = await getTaskById(sourceTask.parentTaskId);
+  if (!parent) return "no-reason";
+
+  const instructed =
+    (parent.status === "completed" && !!parent.followUpConfig?.onCompleted) ||
+    (parent.status === "failed" && !!parent.followUpConfig?.onFailed);
+  const failedParent = parent.status === "failed";
+  if (!instructed && !failedParent) return "no-reason";
+
+  let followUpHops = 0;
+  let current: AgentTask | null = sourceTask;
+  for (let step = 0; current && step < 50; step++) {
+    if (current.taskType === "follow-up") followUpHops++;
+    if (!current.parentTaskId) break;
+    current = await getTaskById(current.parentTaskId);
+  }
+  return followUpHops > MAX_FOLLOW_UP_DELEGATION_HOPS ? "hop-limit" : "allowed";
+}
+
+export async function followUpDelegationAllowed(sourceTask: AgentTask): Promise<boolean> {
+  return (await evaluateFollowUpDelegation(sourceTask)) === "allowed";
+}
+
 /**
  * When `send-task` creates a `resume` task whose parent is in a terminal state,
  * move the parent's `tracker_sync` rows (Linear / Jira / GitHub outbound link)
@@ -572,6 +608,12 @@ export async function sendTaskHandler(
     // Without this bypass, a cancelled worker permanently jams the thread
     // against re-delegation when an earlier completed sibling exists.
     //
+    // The guard does not apply when the follow-up's parent carries an
+    // instruction for its outcome (`onCompleted` / `onFailed`), or when the
+    // parent failed, up to MAX_FOLLOW_UP_DELEGATION_HOPS follow-ups in one
+    // chain. The creator asked for a next step, or the failed template asks
+    // Lead to retry; the hop limit stops a slow follow-up loop.
+    //
     // NOTE: `taskType === "resume"` (created by createResumeFollowUp on
     // supersede) is intentionally NOT in this guard — a resume IS the legitimate
     // re-dispatch and bypassing the check is correct. Do not add "resume" here.
@@ -582,6 +624,8 @@ export async function sendTaskHandler(
         sourceTask.slackThreadTs &&
         sourceTask.slackChannelId
       ) {
+        const delegation = await evaluateFollowUpDelegation(sourceTask);
+        if (delegation === "allowed") return null;
         const recentCompleted = await findCompletedTaskInThread(
           sourceTask.slackChannelId,
           sourceTask.slackThreadTs,
@@ -598,9 +642,13 @@ export async function sendTaskHandler(
             new Date(recentCancelled.lastUpdatedAt).getTime() >
               new Date(recentCompleted.lastUpdatedAt).getTime();
           if (!cancelledMoreRecent) {
+            const hopNote =
+              delegation === "hop-limit"
+                ? ` The follow-up chain reached ${MAX_FOLLOW_UP_DELEGATION_HOPS} delegation hops.`
+                : "";
             return {
               ok: false,
-              message: `Blocked: re-delegation from follow-up task in a thread that already has completed work (task ${recentCompleted.id.slice(0, 8)}). The original request was already handled.`,
+              message: `Blocked: re-delegation from follow-up task in a thread that already has completed work (task ${recentCompleted.id.slice(0, 8)}). The original request was already handled.${hopNote}`,
             };
           }
           // else: fall through — the cancellation is more recent than the
