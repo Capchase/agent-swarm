@@ -44,6 +44,12 @@ import type { AgentMatch } from "./types";
 // Side-effect import: registers all Slack event templates in the in-memory registry
 import "./templates";
 import { isEnvFlagEnabled } from "../utils/env-flag";
+import {
+  invalidateChannelExternality,
+  isBlockExternalEnabled,
+  leaveExternalChannel,
+  shouldBlockChannel,
+} from "./external-channel";
 import { extractSlackMessageText } from "./message-text";
 import { ensureSlackThreadTree, isSlackRenderV2Enabled } from "./render-v2";
 import { formatSlackSteeringAck, requestSlackThreadSteering } from "./steering";
@@ -459,6 +465,18 @@ export function registerMessageHandler(app: App): void {
     const messageKey = `${msg.channel}:${msg.ts}`;
     if (!isAdmittedSlackDelivery() && isMessageProcessed(messageKey)) {
       return ignoreSlackInbound("duplicate_message");
+    }
+
+    // Block external (Slack Connect) channels when SLACK_BLOCK_EXTERNAL_CHANNELS is on.
+    if (
+      await shouldBlockChannel(
+        client,
+        msg.channel,
+        (body as { is_ext_shared_channel?: boolean }).is_ext_shared_channel,
+      )
+    ) {
+      console.log(`[Slack] Ignoring message in external channel ${msg.channel}`);
+      return ignoreSlackInbound("external_channel");
     }
 
     // Check user authorization
@@ -1017,5 +1035,46 @@ export function registerMessageHandler(app: App): void {
     // app_mention is already handled by the message event above
     // but we can add specific behavior here if needed
     console.log(`[Slack] App mentioned in channel ${event.channel}`);
+  });
+
+  // External (Slack Connect) channels: leave when the bot joins one, or when a
+  // channel the bot is in becomes shared. All no-ops unless
+  // SLACK_BLOCK_EXTERNAL_CHANNELS is on.
+  app.event("member_joined_channel", async ({ event, client }) => {
+    if (!isBlockExternalEnabled()) return ignoreSlackInbound("external_block_disabled");
+
+    if (!cachedBotUserId) {
+      try {
+        const authResult = await client.auth.test();
+        cachedBotUserId = authResult.user_id as string;
+        cachedBotId = (authResult.bot_id as string | undefined) ?? null;
+      } catch (error) {
+        console.error("[Slack] Failed to cache bot user ID:", error);
+      }
+    }
+    if (!cachedBotUserId || event.user !== cachedBotUserId) {
+      return ignoreSlackInbound("member_joined_not_bot");
+    }
+
+    invalidateChannelExternality(event.channel);
+    if (!(await shouldBlockChannel(client, event.channel))) {
+      return ignoreSlackInbound("member_joined_internal");
+    }
+    await leaveExternalChannel(client, event.channel, "joined");
+  });
+
+  app.event("channel_shared", async ({ event, client }) => {
+    if (!isBlockExternalEnabled()) return ignoreSlackInbound("external_block_disabled");
+
+    invalidateChannelExternality(event.channel);
+    if (!(await shouldBlockChannel(client, event.channel))) {
+      return ignoreSlackInbound("channel_shared_internal");
+    }
+    await leaveExternalChannel(client, event.channel, "shared");
+  });
+
+  app.event("channel_unshared", async ({ event }) => {
+    if (!isBlockExternalEnabled()) return ignoreSlackInbound("external_block_disabled");
+    invalidateChannelExternality(event.channel);
   });
 }

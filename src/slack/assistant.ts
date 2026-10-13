@@ -5,6 +5,7 @@ import { slackContextKey } from "../tasks/context-key";
 import { ackSlackMessage, reactionName } from "./ack";
 import { resolveSlackUserId, rewriteSlackMentions } from "./enrich";
 import { wasEventSeen } from "./event-dedup";
+import { shouldBlockChannel } from "./external-channel";
 import type { SlackFile } from "./files";
 import {
   ignoreSlackInbound,
@@ -69,6 +70,20 @@ export function createAssistant(): Assistant {
       if (!isAdmittedSlackDelivery() && wasEventSeen(eventId)) {
         console.log(`[Slack] dropping Slack retry: event_id=${eventId}`);
         return ignoreSlackInbound("duplicate_event");
+      }
+
+      // Block external (Slack Connect) channels when SLACK_BLOCK_EXTERNAL_CHANNELS is on.
+      const externalCheckChannel = (message as { channel?: string }).channel;
+      if (
+        externalCheckChannel &&
+        (await shouldBlockChannel(
+          client,
+          externalCheckChannel,
+          (body as { is_ext_shared_channel?: boolean }).is_ext_shared_channel,
+        ))
+      ) {
+        console.log(`[Slack] Ignoring message in external channel ${externalCheckChannel}`);
+        return ignoreSlackInbound("external_channel");
       }
 
       // Wrap setStatus/setTitle to swallow all errors gracefully.
