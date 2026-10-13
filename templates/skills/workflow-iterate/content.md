@@ -180,7 +180,7 @@ The same rules apply to a standalone `request-human-input` call.
 - **Dashboard card.** `title` is plain text. Each question's `label` is its heading and renders as markdown. `description` renders as full markdown and is the only field that shows images, so put drafts, diffs, and logs there.
 - **Code.** Fence code, logs, and JSON with a language (```` ```json ````): the block keeps its lines and scrolls. Fence a prose draft with no language: it wraps. A single newline outside a fence becomes a paragraph break.
 - **Images.** Put an `http(s)` URL ending in `.png`, `.jpg`, `.jpeg`, `.gif`, or `.webp` alone on its own line in `description`, or use `![alt](url)`. The link must outlive the request: an expired presigned URL shows an "image unavailable" note.
-- **Slack.** A node's `notifications` post the title, the question labels (each collapsed to one line, capped at 3000 characters in total), a Review button, and the timeout. Descriptions, options, code, and images are not shown, so the title and labels must make sense alone. `request-human-input` posts nothing to Slack: share the returned URL yourself.
+- **Slack.** A node's `notifications` post the title, the question labels (each collapsed to one line, capped at 3000 characters in total), a Review button, and the timeout. Descriptions, options, code, and images are not shown, so the title and labels must make sense alone. `request-human-input` posts the same card: to `notify` if given, else to your task's Slack thread with a mention of the requester, else to `APPROVAL_DEFAULT_SLACK_TARGET`. Its result says where the notice went; share the URL yourself only when it says no notice was sent.
 
 ### `swarm-script`
 
