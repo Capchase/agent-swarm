@@ -492,12 +492,12 @@ describe("Approval Requests", () => {
   });
 
   describe("DB: cancelPendingApprovalRequestsForRun", () => {
-    test("postApprovalNotice posts in a thread with a mention", async () => {
+    test("postApprovalNotice scrubs and escapes titles in blocks and fallback while preserving the requester mention", async () => {
       const postMessage = mock(async (_input: Record<string, unknown>) => ({ ts: "2.2" }));
       const result = await postApprovalNotice(
         {
           requestId: crypto.randomUUID(),
-          title: "Deploy",
+          title: `<!channel> ship <https://evil.example|click> ghp_${"aB3".repeat(12)}`,
           questions: [{ label: "Approve?" }],
           target: "C123",
           threadTs: "1.1",
@@ -511,6 +511,13 @@ describe("Approval Requests", () => {
       expect(postMessage.mock.calls[0]![0].thread_ts).toBe("1.1");
       const blocks = postMessage.mock.calls[0]![0].blocks as Array<{ text?: { text: string } }>;
       expect(blocks[0]!.text!.text).toStartWith("<@U123> ");
+      for (const text of [postMessage.mock.calls[0]![0].text, blocks[0]!.text!.text]) {
+        expect(text).toContain(
+          "&lt;!channel&gt; ship &lt;https://evil.example|click&gt; [REDACTED:github_token]",
+        );
+        expect(text).not.toContain("<!channel>");
+        expect(text).not.toContain(`ghp_${"aB3".repeat(12)}`);
+      }
     });
 
     test("cancellation update replies to threadTs when present", async () => {

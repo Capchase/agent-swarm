@@ -44,10 +44,11 @@ export async function postApprovalNotice(
   }
   const approvalUrl = `${getAppUrl()}/approval-requests/${input.requestId}`;
   const mention = input.mentionSlackUserId ? `<@${input.mentionSlackUserId}> ` : "";
+  const title = escapeSlackMrkdwn(scrubSecrets(input.title));
   const blocks: KnownBlock[] = [
     {
       type: "section",
-      text: { type: "mrkdwn", text: `${mention}🔔 *Approval Required: ${input.title}*` },
+      text: { type: "mrkdwn", text: `${mention}🔔 *Approval Required: ${title}*` },
     },
     {
       type: "section",
@@ -79,7 +80,7 @@ export async function postApprovalNotice(
   const result = await client.chat.postMessage({
     channel: input.target,
     ...(input.threadTs ? { thread_ts: input.threadTs } : {}),
-    text: `${mention}Approval Required: ${input.title} — ${approvalUrl}`,
+    text: `${mention}Approval Required: ${title} — ${approvalUrl}`,
     unfurl_links: false,
     unfurl_media: false,
     blocks,
