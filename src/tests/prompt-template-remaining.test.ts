@@ -411,9 +411,9 @@ Task: "Fix the login page CSS"
 Output:
 Fixed the CSS alignment issue on the login form
 
-IMPORTANT: Do NOT re-delegate or re-answer the original request. The worker has already handled it. Your job is ONLY to:
+IMPORTANT: Do NOT re-delegate or re-answer the original request. The worker has already handled it. If the instructions from the task creator above ask for a next step, dispatch that step and nothing else. Your job is ONLY to:
 1. Review the output above
-2. Do not relay the worker's raw output to Slack; the engine owns the thread tree and outcome card
+2. Do not relay the worker's raw output to Slack. The engine posts the worker's card, but it never posts this follow-up's output. If a person needs an answer from you, post it with \`slack-reply\`
 3. Complete this follow-up task
 
 Use \`get-task-details\` with taskId "task-abc-123" for full details.`;
