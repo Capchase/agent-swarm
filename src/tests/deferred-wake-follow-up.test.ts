@@ -196,4 +196,42 @@ describe("worker follow-up vs. deferred wake", () => {
     await reconcileDeferredTaskWaits(producer.id);
     expect(await wakeChildren(scheduleId)).toHaveLength(1);
   });
+
+  test("a deferral creates no follow-up and logs the suppression", async () => {
+    const task = await activeTask(workerId);
+    const followUp = await createWorkerTaskFollowUp({
+      task: { ...task, deferredAt: new Date().toISOString() },
+      status: "completed",
+      output: "Checking back at 09:36",
+    });
+
+    expect(followUp).toBeNull();
+    const logs = await suppressions(task.id);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.reason).toBe("deferred");
+  });
+
+  test("a deferral with onCompleted creates no follow-up", async () => {
+    const task = await activeTask(workerId, {
+      followUpConfig: { onCompleted: "Dispatch a review." },
+    });
+    const followUp = await createWorkerTaskFollowUp({
+      task: { ...task, deferredAt: new Date().toISOString() },
+      status: "completed",
+      output: "Checking back at 09:36",
+    });
+
+    expect(followUp).toBeNull();
+  });
+
+  test("a failed task with deferredAt still creates a follow-up", async () => {
+    const task = await activeTask(workerId);
+    const followUp = await createWorkerTaskFollowUp({
+      task: { ...task, deferredAt: new Date().toISOString() },
+      status: "failed",
+      failureReason: "boom",
+    });
+
+    expect(followUp?.taskType).toBe("follow-up");
+  });
 });
