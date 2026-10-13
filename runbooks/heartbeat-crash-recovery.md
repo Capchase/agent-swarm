@@ -698,6 +698,12 @@ escalateStarvedPoolTasks():
 
 `createWorkerTaskFollowUp` skips workflow tasks, Lead-owned tasks, disabled follow-ups, and tasks without a Lead. It renders the completion or failure summary before task creation.
 
+A deferral (`defer-task` completes the task with `deferredAt` set) creates no follow-up, also when the task has `followUpConfig.onCompleted`. The wake-up task inherits the `followUpConfig` and reports when the work ends. The skip writes a `task_follow_up_suppressed` log row with `reason: "deferred"`. A failed task with `deferredAt` still gets its follow-up.
+
+### Re-delegation guard on follow-ups
+
+`send-task` refuses a call from a `follow-up` source task in a Slack thread that has a `completed` task in the last 48 h, unless a more recent task in the thread was cancelled. The guard does not apply when the follow-up's parent has an instruction for its outcome (`onCompleted` for `completed`, `onFailed` for `failed`), or when the parent failed. That bypass holds up to `MAX_FOLLOW_UP_DELEGATION_HOPS` (5) `follow-up` tasks in the parent chain. Past the limit, the refusal message names the hop limit.
+
 The function dispatches `pre.task.followUp` before it creates the follow-up task. An extension can block creation or modify the description, assignee, priority, and `followUpConfig`.
 
 The resulting task also dispatches `pre.task.create` with origin `followUp`. Both extension events run before any database transaction begins.
