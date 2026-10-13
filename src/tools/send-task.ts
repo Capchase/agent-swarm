@@ -264,10 +264,6 @@ async function evaluateFollowUpDelegation(sourceTask: AgentTask): Promise<Follow
   return followUpHops > MAX_FOLLOW_UP_DELEGATION_HOPS ? "hop-limit" : "allowed";
 }
 
-export async function followUpDelegationAllowed(sourceTask: AgentTask): Promise<boolean> {
-  return (await evaluateFollowUpDelegation(sourceTask)) === "allowed";
-}
-
 /**
  * When `send-task` creates a `resume` task whose parent is in a terminal state,
  * move the parent's `tracker_sync` rows (Linear / Jira / GitHub outbound link)
@@ -612,7 +608,8 @@ export async function sendTaskHandler(
     // instruction for its outcome (`onCompleted` / `onFailed`), or when the
     // parent failed, up to MAX_FOLLOW_UP_DELEGATION_HOPS follow-ups in one
     // chain. The creator asked for a next step, or the failed template asks
-    // Lead to retry; the hop limit stops a slow follow-up loop.
+    // Lead to retry; the hop limit stops a slow follow-up loop. A follow-up at
+    // the hop limit is refused before the completion and cancellation checks.
     //
     // NOTE: `taskType === "resume"` (created by createResumeFollowUp on
     // supersede) is intentionally NOT in this guard — a resume IS the legitimate
@@ -625,7 +622,16 @@ export async function sendTaskHandler(
         sourceTask.slackChannelId
       ) {
         const delegation = await evaluateFollowUpDelegation(sourceTask);
-        if (delegation === "allowed") return null;
+        if (delegation === "hop-limit") {
+          return {
+            ok: false,
+            message: `Blocked: re-delegation from follow-up task. The follow-up chain reached ${MAX_FOLLOW_UP_DELEGATION_HOPS} delegation hops.`,
+          };
+        }
+        // The hop count walks parentTaskId, which the caller controls. Only a
+        // child parented on this follow-up keeps the count, so a parentTaskId
+        // override gets no bypass.
+        if (delegation === "allowed" && taskOptions.parentTaskId === sourceTaskId) return null;
         const recentCompleted = await findCompletedTaskInThread(
           sourceTask.slackChannelId,
           sourceTask.slackThreadTs,
@@ -642,13 +648,9 @@ export async function sendTaskHandler(
             new Date(recentCancelled.lastUpdatedAt).getTime() >
               new Date(recentCompleted.lastUpdatedAt).getTime();
           if (!cancelledMoreRecent) {
-            const hopNote =
-              delegation === "hop-limit"
-                ? ` The follow-up chain reached ${MAX_FOLLOW_UP_DELEGATION_HOPS} delegation hops.`
-                : "";
             return {
               ok: false,
-              message: `Blocked: re-delegation from follow-up task in a thread that already has completed work (task ${recentCompleted.id.slice(0, 8)}). The original request was already handled.${hopNote}`,
+              message: `Blocked: re-delegation from follow-up task in a thread that already has completed work (task ${recentCompleted.id.slice(0, 8)}). The original request was already handled.`,
             };
           }
           // else: fall through — the cancellation is more recent than the
