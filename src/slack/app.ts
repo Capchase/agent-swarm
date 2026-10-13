@@ -123,6 +123,14 @@ export async function initSlackApp(): Promise<App | null> {
   const { createAssistant } = await import("./assistant");
   app.assistant(createAssistant());
 
+  // Report-only scan for external (Slack Connect) channels the bot is already in.
+  const { isBlockExternalEnabled, scanExternalChannelsOnBoot } = await import("./external-channel");
+  if (isBlockExternalEnabled()) {
+    scanExternalChannelsOnBoot(app.client).catch((error) => {
+      console.error("[Slack] External channel boot scan failed:", error);
+    });
+  }
+
   return app;
 }
 

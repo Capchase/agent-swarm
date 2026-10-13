@@ -184,7 +184,7 @@ export async function scanExternalChannelsOnBoot(client: WebClient): Promise<voi
       types: "public_channel,private_channel",
       exclude_archived: true,
       limit: 200,
-      ...(cursor ? { cursor } : {}),
+      cursor,
     });
     for (const ch of (resp.channels ?? []) as Array<{
       id?: string;
