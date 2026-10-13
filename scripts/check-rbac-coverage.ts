@@ -110,7 +110,6 @@ const UNGATED_TOOL_FILES: Record<string, string> = {
   "src/tools/register-agentmail-inbox.ts": PIN_REASON,
   "src/tools/register-service.ts": PIN_REASON,
   "src/tools/repos/get-repos.ts": PIN_REASON,
-  "src/tools/request-human-input.ts": PIN_REASON,
   "src/tools/resolve-user.ts": PIN_REASON,
   "src/tools/schedules/create-schedule.ts": PIN_REASON,
   "src/tools/schedules/delete-schedule.ts": PIN_REASON,
