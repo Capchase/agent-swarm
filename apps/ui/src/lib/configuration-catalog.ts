@@ -351,6 +351,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         kind: "number",
         unit: "s",
         defaultValue: "86400",
+        docsUrl: `${DOCS}ui/configuration#approval-requests`,
       },
       {
         key: "APPROVAL_DEFAULT_SLACK_TARGET",
@@ -359,6 +360,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
           "Slack channel or user id for an approval notice when the source task has no Slack thread. Empty means no notice.",
         kind: "string",
         defaultValue: "",
+        docsUrl: `${DOCS}ui/configuration#approval-requests`,
       },
       {
         key: "APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS",

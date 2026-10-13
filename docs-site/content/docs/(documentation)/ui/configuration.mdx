@@ -76,6 +76,8 @@ Settings with deeper behavior link out to the relevant guide (for example the [t
   Leave `SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, and `CONTEXT_VERSIONS_KEEP_LATEST` unset to disable their individual sweeps. Each `*_RETENTION_DAYS` value must be between 1 and 1,000,000 whole days. `CONTEXT_VERSIONS_KEEP_LATEST` is a kept-version count per agent and field (1 to 1,000,000); the newest version is never deleted. We recommend at least seven days so recent task recovery and memory rating keep their context. Start with `DB_RETENTION_DRY_RUN=true`, verify the exact would-delete counts, then enable one table at a time. Retention deletes session transcripts, task history, telemetry, or older profile versions. Event aggregate totals become retention-window totals after an event sweep.
 </Callout>
 
+## Approval requests
+
 `APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS` (default 86400) sets the timeout in seconds that `request-human-input` applies when the agent gives none. On timeout the creator gets a `hitl-follow-up` task. `0` means no default timeout, so auto-cancellation applies instead.
 
 `APPROVAL_DEFAULT_SLACK_TARGET` (default empty) sets a Slack channel or user id for approval notices when the source task has no Slack thread. The caller's `notify` wins; otherwise the notice goes to the source task thread and mentions its requester. Empty means no fallback notice. The default mention does not restrict who may answer; agents can supply `approvers` to do that.
