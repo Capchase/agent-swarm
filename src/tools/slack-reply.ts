@@ -13,6 +13,7 @@ import { getTaskCitations } from "@/be/task-citations";
 import { getSlackApp } from "@/slack/app";
 import { buildCaptionBlock, getTaskLink, getTaskUrl } from "@/slack/blocks";
 import { withAutoJoin } from "@/slack/channel-join";
+import { externalChannelToolError, shouldBlockChannel } from "@/slack/external-channel";
 import { getAgentDisplayName, getAgentEmoji, markdownToSlack } from "@/slack/responses";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import {
@@ -108,6 +109,10 @@ export const registerSlackReplyTool = (server: McpServer) => {
       const app = getSlackApp();
       if (!app) {
         return toolErr("Slack not configured.");
+      }
+
+      if (await shouldBlockChannel(app.client, slackChannelId)) {
+        return toolErr(externalChannelToolError(slackChannelId));
       }
 
       try {
