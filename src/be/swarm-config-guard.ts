@@ -471,6 +471,11 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   ...integerValidators(["MODEL_LATEST_SOAK_DAYS"], 0),
   // 0 turns approval auto-cancellation off.
   ...integerValidators(["APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS"], 0),
+  ...integerValidators(["APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS"], 0),
+  APPROVAL_DEFAULT_SLACK_TARGET: (value) =>
+    typeof value === "string" && (value.trim() === "" || /^[CDGU][A-Z0-9]+$/.test(value.trim()))
+      ? null
+      : "APPROVAL_DEFAULT_SLACK_TARGET must be empty or a Slack channel or user id",
   // 0 turns the shutdown drain off; the shutdown path clamps to the same limit.
   ...boundedIntegerValidators(["API_DRAIN_MAX_MS"], 0, API_DRAIN_MAX_MS_LIMIT),
   // Below ~100 tokens the preamble can't fit a useful summary; above 20000

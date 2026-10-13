@@ -25,6 +25,22 @@ export function approvalRequestAutoCancellationDays(): number {
   return DEFAULT_APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS;
 }
 
+export const DEFAULT_APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS = 86400;
+
+// Read dynamically so dashboard overrides loaded into process.env take effect.
+export function approvalRequestDefaultTimeoutSeconds(): number {
+  const raw = process.env.APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS;
+  if (raw != null && /^\d+$/.test(raw.trim())) {
+    return Number.parseInt(raw.trim(), 10);
+  }
+  return DEFAULT_APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS;
+}
+
+export function approvalDefaultSlackTarget(): string | undefined {
+  const target = process.env.APPROVAL_DEFAULT_SLACK_TARGET?.trim();
+  return target && /^[CDGU][A-Z0-9]+$/.test(target) ? target : undefined;
+}
+
 /**
  * Cancel every pending request with no explicit expiresAt that is older than
  * APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS. A request that gates a live

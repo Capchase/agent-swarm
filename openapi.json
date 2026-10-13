@@ -12573,6 +12573,9 @@
                               },
                               "messageTs": {
                                 "type": "string"
+                              },
+                              "threadTs": {
+                                "type": "string"
                               }
                             },
                             "required": [
@@ -12969,6 +12972,9 @@
                                       "type": "string"
                                     },
                                     "messageTs": {
+                                      "type": "string"
+                                    },
+                                    "threadTs": {
                                       "type": "string"
                                     }
                                   },
@@ -13443,6 +13449,9 @@
                               },
                               "messageTs": {
                                 "type": "string"
+                              },
+                              "threadTs": {
+                                "type": "string"
                               }
                             },
                             "required": [
@@ -13829,6 +13838,9 @@
                                 "type": "string"
                               },
                               "messageTs": {
+                                "type": "string"
+                              },
+                              "threadTs": {
                                 "type": "string"
                               }
                             },
@@ -14238,6 +14250,9 @@
                                 "type": "string"
                               },
                               "messageTs": {
+                                "type": "string"
+                              },
+                              "threadTs": {
                                 "type": "string"
                               }
                             },

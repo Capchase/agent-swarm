@@ -768,9 +768,11 @@ Create an approval request and return at once with the request ID and URL. The a
 |-----------|------|----------|-------------|
 | `title` | string | Yes | Title of the approval request |
 | `questions` | array | Yes | Questions to ask the human |
+| `approvers` | string[] | No | Swarm user ids or emails allowed to answer. Omitted means anyone may answer. |
+| `notify` | string | No | Slack channel or user id for the notice. Overrides the source task thread. |
 | `timeoutSeconds` | integer | No | Seconds until the request expires. After that it becomes `timeout` and the requesting agent gets a `hitl-follow-up` task. |
 
-Approval requests are accessible via the dashboard at `/approval-requests/{id}`. Each question's `label` and `description` render there as markdown; a bare image URL on its own line in `description` shows as an image. The tool sends no Slack message, so share the URL yourself. When resolved, a follow-up task is automatically created for the requesting agent with the human's responses. A request with no `timeoutSeconds` is cancelled after `APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS` days (default 7) with no answer. An answer after the deadline is refused with 409.
+Approval requests are accessible via the dashboard at `/approval-requests/{id}`. Each question's `label` and `description` render there as markdown; a bare image URL on its own line in `description` shows as an image. The tool posts a Slack notice to `notify`, else the source task thread with a requester mention, else `APPROVAL_DEFAULT_SLACK_TARGET`. If no notice is sent, the result says so. When resolved, a follow-up task is automatically created for the requesting agent with the human's responses. Without `timeoutSeconds`, `APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS` defaults to 86400 (24 hours). Set that config to `0` for no default timeout; such a request is cancelled after `APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS` days (default 7) with no answer. An answer after the deadline is refused with 409.
 
 ### cancel-approval-request
 

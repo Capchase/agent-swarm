@@ -1,9 +1,20 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
+import {
+  approvalDefaultSlackTarget,
+  approvalRequestDefaultTimeoutSeconds,
+} from "@/be/approval-sweeps";
 import { resolveTaskAuditUserId } from "@/be/audit-user";
-import { createApprovalRequest, getAgentCurrentTask } from "@/be/db";
+import {
+  createApprovalRequest,
+  getAgentCurrentTask,
+  getTaskById,
+  updateApprovalRequestNotifications,
+} from "@/be/db";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 import { getAppUrl } from "@/utils/constants";
+import { scrubSecrets } from "@/utils/secret-scrubber";
+import { postApprovalNotice } from "@/workflows/approval-notifications";
 
 const QuestionSchema = z.object({
   id: z.string().describe("Unique ID for the question (used as key in responses)"),
@@ -44,26 +55,41 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
         "Supports multiple question types: approval (yes/no), text, single-select, " +
         "multi-select, and boolean. Returns the request ID and URL for the human to respond. " +
         "The dashboard renders each label and description as markdown: put long content in description, fence code with a language, and put an image URL alone on its own line to show it. " +
-        "No Slack message is sent; share the URL yourself.",
+        "The tool posts a Slack notice: to notify if given, else to your task's Slack thread with a mention of the requester, else to APPROVAL_DEFAULT_SLACK_TARGET. The result says where the notice went. Give approvers when you know who must decide.",
       inputSchema: z.object({
         title: z.string().min(1).describe("Title of the approval request"),
         questions: z.array(QuestionSchema).min(1).describe("Questions to ask the human"),
+        approvers: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "Swarm user ids or emails of the people who may answer. When set, only they (or the operator key) can answer. Give this when you know the right owner.",
+          ),
+        notify: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "A Slack channel id (C...) or user id (U...) for the notice. Default: a reply in your task's Slack thread that mentions the requester.",
+          ),
         timeoutSeconds: z
           .number()
           .int()
           .min(1)
           .optional()
           .describe(
-            "Seconds until the request expires. After that the request becomes 'timeout' and you get a hitl-follow-up task. A request with no timeout is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7).",
+            "Default: APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS (86400). After the timeout the request becomes 'timeout' and you get a hitl-follow-up task. 0 in the config means no default timeout; then the request is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7).",
           ),
       }),
       outputSchema: swarmToolOutputSchema({
         yourAgentId: z.string().optional(),
         requestId: z.string().optional(),
         url: z.string().optional(),
+        notifiedTarget: z.string().optional(),
+        timeoutSeconds: z.number().optional(),
       }),
     },
-    async ({ title, questions, timeoutSeconds }, requestInfo) => {
+    async ({ title, questions, timeoutSeconds, approvers, notify }, requestInfo) => {
       if (!requestInfo.agentId) {
         return toolErr(
           'Agent ID not found. The MCP client should define the "X-Agent-ID" header.',
@@ -82,22 +108,75 @@ export const registerRequestHumanInputTool = (server: McpServer) => {
         }
       }
 
+      const sourceTask = sourceTaskId ? await getTaskById(sourceTaskId) : null;
+      const effectiveTimeout = timeoutSeconds ?? approvalRequestDefaultTimeoutSeconds();
+      const fallbackTarget = approvalDefaultSlackTarget();
+      const notification = notify
+        ? { channel: "slack", target: notify }
+        : sourceTask?.slackChannelId && sourceTask.slackThreadTs
+          ? {
+              channel: "slack",
+              target: sourceTask.slackChannelId,
+              threadTs: sourceTask.slackThreadTs,
+            }
+          : fallbackTarget
+            ? { channel: "slack", target: fallbackTarget }
+            : undefined;
+      const mentionSlackUserId =
+        !notify && notification?.threadTs ? sourceTask?.slackUserId : undefined;
+
       const id = crypto.randomUUID();
       const request = await createApprovalRequest({
         id,
         title,
         questions,
-        approvers: { policy: "any" },
+        approvers: approvers ? { policy: "any", users: approvers } : { policy: "any" },
         sourceTaskId: sourceTaskId ?? undefined,
-        timeoutSeconds,
+        timeoutSeconds: effectiveTimeout || undefined,
+        notificationChannels: notification ? [notification] : undefined,
         createdBy: (await resolveTaskAuditUserId(sourceTaskId, requestInfo.agentId)) ?? undefined,
       });
+
+      let notifiedTarget: string | undefined;
+      if (notification) {
+        try {
+          const result = await postApprovalNotice({
+            requestId: request.id,
+            title,
+            questions,
+            timeoutSeconds: effectiveTimeout || undefined,
+            target: notification.target,
+            threadTs: notification.threadTs,
+            mentionSlackUserId: mentionSlackUserId ?? undefined,
+          });
+          if (result.messageTs) {
+            notifiedTarget = notification.target;
+            await updateApprovalRequestNotifications(request.id, [
+              { ...notification, messageTs: result.messageTs },
+            ]);
+          }
+        } catch (error) {
+          console.error(
+            "[HITL] Failed to send or store approval notice:",
+            scrubSecrets(error instanceof Error ? error.message : String(error)),
+          );
+        }
+      }
 
       const appUrl = getAppUrl();
       const url = `${appUrl}/approval-requests/${request.id}`;
 
-      return toolOk(`Created approval request "${id}". Human can respond at: ${url}`, {
-        data: { yourAgentId: requestInfo.agentId, requestId: request.id, url },
+      const notice = notifiedTarget
+        ? `Slack notice sent to ${notifiedTarget}${notification?.threadTs ? ` in thread ${notification.threadTs}` : ""}.`
+        : "No Slack notice was sent; share the URL yourself.";
+      return toolOk(`Created approval request "${id}". Human can respond at: ${url}. ${notice}`, {
+        data: {
+          yourAgentId: requestInfo.agentId,
+          requestId: request.id,
+          url,
+          notifiedTarget,
+          timeoutSeconds: effectiveTimeout || undefined,
+        },
       });
     },
   );

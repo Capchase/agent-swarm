@@ -105,6 +105,8 @@ Complete reference for all environment variables used by Agent Swarm.
 | `RUNTIME_PROVISION_CONCURRENCY` | `8` | Maximum runtimes the supervisor provisions at once |
 | `RUNTIME_WORKER_API_URL` | - | API origin that pool workers use to reach the swarm, when it differs from the public API URL |
 | `RUNTIME_DOCKER_HOST` | - | Docker socket seeded into the built-in controller, even when Docker is offline. Falls back to `DOCKER_HOST`, then `unix:///var/run/docker.sock` |
+| `APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS` | `86400` | Default request-human-input timeout in seconds. The creator gets a hitl-follow-up task on timeout. `0` means no default timeout |
+| `APPROVAL_DEFAULT_SLACK_TARGET` | (empty) | Slack channel or user id for approval notices when the source task has no Slack thread. Empty means no notice |
 | `APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS` | `7` | Days a pending approval request with no explicit timeout waits before the heartbeat cancels it. A request that gates a running or waiting workflow run cancels that run too. Set to `0` to disable |
 | `MODEL_LATEST_SOAK_DAYS` | `2` | Days a newly released model must age before a `latest:<provider>/<target>@stable` model-tier alias can resolve to it. `0` disables the soak. `@any` aliases ignore it |
 | `MODEL_AUTO_UPGRADE` | `true` | Set to `false` or `0` to freeze each `latest:` model-tier alias at its last recorded resolution (an alias never resolved before still resolves once). See [Model tiers](https://github.com/desplega-ai/agent-swarm/blob/main/runbooks/model-tiers.md) |

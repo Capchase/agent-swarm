@@ -74,6 +74,7 @@ const NotificationChannelSchema = z.object({
   // Added post-creation by workflows/executors/human-in-the-loop.ts once the
   // notification message is sent (see `updateApprovalRequestNotifications`).
   messageTs: z.string().optional(),
+  threadTs: z.string().optional(),
 });
 type NotificationChannelShape = z.infer<typeof NotificationChannelSchema>;
 

@@ -1,3 +1,4 @@
+import type { KnownBlock } from "@slack/types";
 import {
   type ApprovalRequest,
   claimApprovalCancellationNotification,
@@ -9,18 +10,81 @@ import {
 import { resolveTemplate } from "../prompts/resolver";
 import { getSlackApp } from "../slack/app";
 import { TERMINAL_TASK_STATUSES } from "../types";
+import { getAppUrl } from "../utils/constants";
 import { scrubSecrets } from "../utils/secret-scrubber";
 
 export interface ApprovalSlackClient {
   chat: {
     postMessage(input: {
       channel: string;
-      thread_ts: string;
+      thread_ts?: string;
+      blocks?: KnownBlock[];
       text: string;
       unfurl_links: false;
       unfurl_media: false;
-    }): Promise<unknown>;
+    }): Promise<{ ts?: string }>;
   };
+}
+
+export async function postApprovalNotice(
+  input: {
+    requestId: string;
+    title: string;
+    questions: ReadonlyArray<{ label: string }>;
+    timeoutSeconds?: number;
+    target: string;
+    threadTs?: string;
+    mentionSlackUserId?: string;
+  },
+  client: ApprovalSlackClient | undefined = getSlackApp()?.client,
+): Promise<{ messageTs?: string }> {
+  if (!client) {
+    console.warn("[HITL] Slack not initialized. Cannot send notification");
+    return {};
+  }
+  const approvalUrl = `${getAppUrl()}/approval-requests/${input.requestId}`;
+  const mention = input.mentionSlackUserId ? `<@${input.mentionSlackUserId}> ` : "";
+  const blocks: KnownBlock[] = [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `${mention}🔔 *Approval Required: ${input.title}*` },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: buildSlackQuestionsSummary(input.questions) },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Review & Respond" },
+          url: approvalUrl,
+          style: "primary",
+        },
+      ],
+    },
+  ];
+  if (input.timeoutSeconds) {
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `⏱ Timeout: ${formatTimeout(input.timeoutSeconds)} — times out if not responded`,
+        },
+      ],
+    });
+  }
+  const result = await client.chat.postMessage({
+    channel: input.target,
+    ...(input.threadTs ? { thread_ts: input.threadTs } : {}),
+    text: `${mention}Approval Required: ${input.title} — ${approvalUrl}`,
+    unfurl_links: false,
+    unfurl_media: false,
+    blocks,
+  });
+  return { messageTs: result.ts };
 }
 
 export async function postApprovalCancellationUpdates(
@@ -36,6 +100,7 @@ export async function postApprovalCancellationUpdates(
       channel: string;
       target: string;
       messageTs?: string;
+      threadTs?: string;
     }> | null;
     const slackThreads = (channels ?? []).filter(
       (notification) => notification.channel === "slack" && notification.messageTs,
@@ -50,7 +115,7 @@ export async function postApprovalCancellationUpdates(
       try {
         await client.chat.postMessage({
           channel: notification.target,
-          thread_ts: notification.messageTs,
+          thread_ts: notification.threadTs ?? notification.messageTs,
           text,
           unfurl_links: false,
           unfurl_media: false,
@@ -153,4 +218,46 @@ function formatResponses(
       return `- ${q.label}: ${answerText}`;
     })
     .join("\n");
+}
+
+const SLACK_SECTION_TEXT_LIMIT = 3000;
+
+function escapeSlackMrkdwn(text: string): string {
+  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+/**
+ * Render the Slack "Questions" section text within Block Kit's 3000-character
+ * section limit. Labels are escaped so upstream text cannot inject mentions or
+ * links. When the list does not fit, the tail is replaced by a count; every
+ * question stays answerable on the dashboard page the card's button opens.
+ */
+export function buildSlackQuestionsSummary(
+  questions: ReadonlyArray<{ label: string }>,
+  timeoutText = "",
+): string {
+  const header = "*Questions:*\n";
+  const lines = questions.map((q) => `• ${escapeSlackMrkdwn(q.label.replace(/\s+/g, " ").trim())}`);
+  const fits = (shown: string[], omitted: number) => {
+    const tail =
+      omitted > 0 ? `\n_…and ${omitted} more. Answer all of them on the dashboard._` : "";
+    const text = `${header}${shown.join("\n")}${tail}${timeoutText}`;
+    return text.length <= SLACK_SECTION_TEXT_LIMIT ? text : null;
+  };
+
+  const full = fits(lines, 0);
+  if (full) return full;
+  for (let count = lines.length - 1; count >= 0; count--) {
+    const text = fits(lines.slice(0, count), lines.length - count);
+    if (text) return text;
+  }
+  return `${header}_${questions.length} questions. Answer them on the dashboard._`;
+}
+
+function formatTimeout(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.round((seconds % 3600) / 60);
+  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
 }

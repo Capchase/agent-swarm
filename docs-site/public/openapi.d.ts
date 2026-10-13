@@ -3262,6 +3262,7 @@ export interface paths {
                                     channel: "slack" | "email";
                                     target: string;
                                     messageTs?: string;
+                                    threadTs?: string;
                                 }[] | null;
                                 createdBy?: string;
                                 createdAt: string;
@@ -3424,6 +3425,7 @@ export interface paths {
                                     channel: "slack" | "email";
                                     target: string;
                                     messageTs?: string;
+                                    threadTs?: string;
                                 }[] | null;
                                 createdBy?: string;
                                 createdAt: string;
@@ -3541,6 +3543,7 @@ export interface paths {
                                     channel: "slack" | "email";
                                     target: string;
                                     messageTs?: string;
+                                    threadTs?: string;
                                 }[] | null;
                                 createdBy?: string;
                                 createdAt: string;
@@ -3675,6 +3678,7 @@ export interface paths {
                                     channel: "slack" | "email";
                                     target: string;
                                     messageTs?: string;
+                                    threadTs?: string;
                                 }[] | null;
                                 createdBy?: string;
                                 createdAt: string;
@@ -3827,6 +3831,7 @@ export interface paths {
                                     channel: "slack" | "email";
                                     target: string;
                                     messageTs?: string;
+                                    threadTs?: string;
                                 }[] | null;
                                 createdBy?: string;
                                 createdAt: string;

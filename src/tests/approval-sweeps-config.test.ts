@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { approvalRequestAutoCancellationDays } from "../be/approval-sweeps";
+import {
+  approvalDefaultSlackTarget,
+  approvalRequestAutoCancellationDays,
+  approvalRequestDefaultTimeoutSeconds,
+} from "../be/approval-sweeps";
 import { validateConfigValue } from "../be/swarm-config-guard";
 
 const KEY = "APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS";
@@ -43,5 +47,56 @@ describe("APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS validator", () => {
   test("rejects negative and non-numeric values", () => {
     expect(typeof validateConfigValue(KEY, "-1")).toBe("string");
     expect(typeof validateConfigValue(KEY, "x")).toBe("string");
+  });
+});
+
+const TIMEOUT_KEY = "APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS";
+const TARGET_KEY = "APPROVAL_DEFAULT_SLACK_TARGET";
+const originalTimeout = process.env[TIMEOUT_KEY];
+const originalTarget = process.env[TARGET_KEY];
+afterEach(() => {
+  if (originalTimeout === undefined) delete process.env[TIMEOUT_KEY];
+  else process.env[TIMEOUT_KEY] = originalTimeout;
+  if (originalTarget === undefined) delete process.env[TARGET_KEY];
+  else process.env[TARGET_KEY] = originalTarget;
+});
+
+describe("standalone approval defaults", () => {
+  test("timeout defaults to 86400 when unset", () => {
+    delete process.env[TIMEOUT_KEY];
+    expect(approvalRequestDefaultTimeoutSeconds()).toBe(86400);
+  });
+  test("timeout reads overrides dynamically, including disabled", () => {
+    for (const seconds of [30, 0]) {
+      process.env[TIMEOUT_KEY] = String(seconds);
+      expect(approvalRequestDefaultTimeoutSeconds()).toBe(seconds);
+      expect(validateConfigValue(TIMEOUT_KEY, String(seconds))).toBeNull();
+    }
+  });
+  test("invalid timeout falls back and is rejected by config writes", () => {
+    for (const value of ["bad", "-1", "1.5"]) {
+      process.env[TIMEOUT_KEY] = value;
+      expect(approvalRequestDefaultTimeoutSeconds()).toBe(86400);
+      expect(validateConfigValue(TIMEOUT_KEY, value)).toBeString();
+    }
+  });
+  test("notice target defaults to none", () => {
+    delete process.env[TARGET_KEY];
+    expect(approvalDefaultSlackTarget()).toBeUndefined();
+    expect(validateConfigValue(TARGET_KEY, "")).toBeNull();
+  });
+  test("notice target reads valid Slack ids dynamically", () => {
+    for (const value of ["C123", "D123", "G123", "U123"]) {
+      process.env[TARGET_KEY] = value;
+      expect(approvalDefaultSlackTarget()).toBe(value);
+      expect(validateConfigValue(TARGET_KEY, value)).toBeNull();
+    }
+  });
+  test("invalid notice target falls back to none and is rejected", () => {
+    for (const value of ["#ops", "person@example.com", "C_bad"]) {
+      process.env[TARGET_KEY] = value;
+      expect(approvalDefaultSlackTarget()).toBeUndefined();
+      expect(validateConfigValue(TARGET_KEY, value)).toBeString();
+    }
   });
 });

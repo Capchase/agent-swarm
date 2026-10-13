@@ -38,7 +38,10 @@ import {
   missingRequiredResponseIds,
 } from "../http/approval-requests";
 import type { ExecutorMeta } from "../types";
-import { postApprovalCancellationUpdates } from "../workflows/approval-notifications";
+import {
+  postApprovalCancellationUpdates,
+  postApprovalNotice,
+} from "../workflows/approval-notifications";
 import { checkpointStepWaiting } from "../workflows/checkpoint";
 import type { ExecutorDependencies, ExecutorInput } from "../workflows/executors/base";
 import { HumanInTheLoopExecutor } from "../workflows/executors/human-in-the-loop";
@@ -489,6 +492,44 @@ describe("Approval Requests", () => {
   });
 
   describe("DB: cancelPendingApprovalRequestsForRun", () => {
+    test("postApprovalNotice posts in a thread with a mention", async () => {
+      const postMessage = mock(async (_input: Record<string, unknown>) => ({ ts: "2.2" }));
+      const result = await postApprovalNotice(
+        {
+          requestId: crypto.randomUUID(),
+          title: "Deploy",
+          questions: [{ label: "Approve?" }],
+          target: "C123",
+          threadTs: "1.1",
+          mentionSlackUserId: "U123",
+          timeoutSeconds: 86400,
+        },
+        { chat: { postMessage } },
+      );
+      expect(result.messageTs).toBe("2.2");
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(postMessage.mock.calls[0]![0].thread_ts).toBe("1.1");
+      const blocks = postMessage.mock.calls[0]![0].blocks as Array<{ text?: { text: string } }>;
+      expect(blocks[0]!.text!.text).toStartWith("<@U123> ");
+    });
+
+    test("cancellation update replies to threadTs when present", async () => {
+      const runId = crypto.randomUUID();
+      await createApprovalRequest(
+        makeApprovalData({
+          workflowRunId: runId,
+          notificationChannels: [
+            { channel: "slack", target: "C123", threadTs: "1.1", messageTs: "2.2" },
+          ],
+        }),
+      );
+      const cancelled = await cancelPendingApprovalRequestsForRun(runId, "Superseded");
+      const postMessage = mock(async (_input: Record<string, unknown>) => ({}));
+      await postApprovalCancellationUpdates(cancelled, "Superseded", { chat: { postMessage } });
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(postMessage.mock.calls[0]![0].thread_ts).toBe("1.1");
+    });
+
     test("records cancellation and posts one line to the stored Slack thread", async () => {
       const runId = crypto.randomUUID();
       const approval = await createApprovalRequest(

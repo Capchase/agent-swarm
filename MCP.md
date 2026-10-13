@@ -1523,13 +1523,15 @@ Cancel a running or waiting workflow run. Cancels all non-terminal steps and the
 
 **Request human input**
 
-Create an approval request and return at once with the request id and URL. The answer arrives later as a hitl-follow-up task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond. The dashboard renders each label and description as markdown: put long content in description, fence code with a language, and put an image URL alone on its own line to show it. No Slack message is sent; share the URL yourself.
+Create an approval request and return at once with the request id and URL. The answer arrives later as a hitl-follow-up task. Supports multiple question types: approval (yes/no), text, single-select, multi-select, and boolean. Returns the request ID and URL for the human to respond. The dashboard renders each label and description as markdown: put long content in description, fence code with a language, and put an image URL alone on its own line to show it. The tool posts a Slack notice: to notify if given, else to your task's Slack thread with a mention of the requester, else to APPROVAL_DEFAULT_SLACK_TARGET. The result says where the notice went. Give approvers when you know who must decide.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `title` | `string` | Yes | - | Title of the approval request |
 | `questions` | `array` | Yes | - | Questions to ask the human |
-| `timeoutSeconds` | `number` | No | - | Seconds until the request expires. After that the request becomes 'timeout' and you get a hitl-follow-up task. A request with no timeout is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7). |
+| `approvers` | `array` | No | - | Swarm user ids or emails of the people who may answer. When set, only they (or the operator key) can answer. Give this when you know the right owner. |
+| `notify` | `string` | No | - | A Slack channel id (C...) or user id (U...) for the notice. Default: a reply in your task's Slack thread that mentions the requester. |
+| `timeoutSeconds` | `number` | No | - | Default: APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS (86400). After the timeout the request becomes 'timeout' and you get a hitl-follow-up task. 0 in the config means no default timeout; then the request is cancelled after APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS days (default 7). |
 
 ### cancel-approval-request
 

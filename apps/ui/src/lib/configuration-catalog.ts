@@ -344,6 +344,23 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         placeholder: "5",
       },
       {
+        key: "APPROVAL_REQUEST_DEFAULT_TIMEOUT_SECONDS",
+        label: "Approval request default timeout (seconds)",
+        description:
+          "Timeout that request-human-input applies when the agent gives none. On timeout the creator agent gets a hitl-follow-up task. 0 means no default timeout.",
+        kind: "number",
+        unit: "s",
+        defaultValue: "86400",
+      },
+      {
+        key: "APPROVAL_DEFAULT_SLACK_TARGET",
+        label: "Approval notice fallback (Slack)",
+        description:
+          "Slack channel or user id for an approval notice when the source task has no Slack thread. Empty means no notice.",
+        kind: "string",
+        defaultValue: "",
+      },
+      {
         key: "APPROVAL_REQUEST_AUTO_CANCELLATION_DAYS",
         label: "Approval request auto-cancellation (days)",
         description:
