@@ -1493,6 +1493,8 @@ const TRANSIENT_SLACK_ERROR_CODES = new Set([
   "service_unavailable",
   "fatal_error",
   "request_timeout",
+  // The external-channel guard could not classify the channel; Slack may answer next time.
+  "external_channel_unverified",
 ]);
 
 export function slackErrorCode(error: unknown): string | undefined {
