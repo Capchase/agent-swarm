@@ -1,4 +1,5 @@
 import { Assistant } from "@slack/bolt";
+import type { WebClient } from "@slack/web-api";
 import { getAgentWorkingOnThread, getLeadAgent, getMostRecentTaskInThread } from "../be/db";
 import { resolveTemplate } from "../prompts/resolver";
 import { slackContextKey } from "../tasks/context-key";
@@ -33,9 +34,24 @@ const isAdditiveSlack = () => isEnvFlagEnabled("ADDITIVE_SLACK", false);
 // a different agent (e.g. Devin) rather than our bot.
 let cachedBotUserId: string | null = null;
 
+/** Startup and context callbacks write to the thread, so they get the inbound guard too. */
+async function isExternalAssistantThread(
+  client: WebClient,
+  channelId: string,
+  body: unknown,
+): Promise<boolean> {
+  const envelope = (body as { is_ext_shared_channel?: boolean }).is_ext_shared_channel;
+  if (!(await shouldBlockChannel(client, channelId, envelope))) return false;
+  console.log(`[Slack] Ignoring assistant thread event in external channel ${channelId}`);
+  return true;
+}
+
 export function createAssistant(): Assistant {
   return new Assistant({
-    threadStarted: async ({ say, setSuggestedPrompts, saveThreadContext }) => {
+    threadStarted: async ({ event, body, client, say, setSuggestedPrompts, saveThreadContext }) => {
+      if (await isExternalAssistantThread(client, event.assistant_thread.channel_id, body)) {
+        return ignoreSlackInbound("external_channel");
+      }
       try {
         await saveThreadContext();
 
@@ -58,7 +74,10 @@ export function createAssistant(): Assistant {
       }
     },
 
-    threadContextChanged: async ({ saveThreadContext }) => {
+    threadContextChanged: async ({ event, body, client, saveThreadContext }) => {
+      if (await isExternalAssistantThread(client, event.assistant_thread.channel_id, body)) {
+        return ignoreSlackInbound("external_channel");
+      }
       await saveThreadContext();
     },
 

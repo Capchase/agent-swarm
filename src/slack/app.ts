@@ -3,6 +3,7 @@ import { emitBuiltInIntegrationConnectedOnce, ensureSlackRenderV2Activation } fr
 import { getSlackConfiguration } from "./config";
 import { type SlackConnectionState, setSlackConnectionState } from "./connection-state";
 import { installSlackEgressScrub } from "./egress-scrub";
+import { installSlackExternalChannelGuard } from "./external-channel-egress";
 import { slackInboundOutcomeMiddleware } from "./inbound-dispatch";
 import { getSlackSocketModeBlockReason, SLACK_DEV_SOCKET_MODE_OPT_IN } from "./socket-mode-guard";
 import { startTaskWatcher, stopTaskWatcher } from "./watcher";
@@ -78,8 +79,10 @@ export async function initSlackApp(): Promise<App | null> {
     return null;
   }
 
-  // Every client Bolt builds from here on scrubs outbound text.
+  // Every client Bolt builds from here on scrubs outbound text and refuses
+  // writes to external channels when SLACK_BLOCK_EXTERNAL_CHANNELS is on.
   installSlackEgressScrub();
+  installSlackExternalChannelGuard();
 
   // SLACK_API_URL points Bolt (Web API and apps.connections.open) at a mock Slack server for e2e tests.
   const slackApiUrl = process.env.SLACK_API_URL;

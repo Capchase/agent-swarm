@@ -1,7 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import { closeDb, createAgent, getSlackTasksInThread, initDb } from "../be/db";
-import { resetExternalChannelStateForTesting, shouldBlockChannel } from "../slack/external-channel";
+import { registerCommandHandler } from "../slack/commands";
+import {
+  EXTERNAL_CHANNEL_BLOCKED_REPLY,
+  resetExternalChannelStateForTesting,
+  shouldBlockChannel,
+} from "../slack/external-channel";
 import { registerMessageHandler, resetSlackHandlerCachesForTesting } from "../slack/handlers";
 
 const TEST_DB_PATH = "./test-slack-external-channel-guard.sqlite";
@@ -235,5 +240,41 @@ describe("join and share events", () => {
       client: countingClient,
     });
     expect(authCalls + infoCalls + leaveCalls.length + alertPosts.length).toBe(0);
+  });
+});
+
+describe("/agent-swarm-status", () => {
+  async function runStatus(channelId: string): Promise<Array<Record<string, unknown>>> {
+    const commands = new Map<string, Handler>();
+    registerCommandHandler({
+      command: (name: string, handler: Handler) => {
+        commands.set(name, handler);
+      },
+    } as never);
+    const responses: Array<Record<string, unknown>> = [];
+    await commands.get("/agent-swarm-status")!({
+      ack: async () => {},
+      respond: async (response: Record<string, unknown>) => {
+        responses.push(response);
+      },
+      command: { channel_id: channelId },
+      client,
+    });
+    return responses;
+  }
+
+  test("flag true + external channel: refusal only, no task summaries", async () => {
+    process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
+    channelInfo = { is_ext_shared: true };
+    expect(await runStatus("C_EXT_CMD")).toEqual([
+      { response_type: "ephemeral", text: EXTERNAL_CHANNEL_BLOCKED_REPLY },
+    ]);
+  });
+
+  test("flag true + internal channel: status blocks", async () => {
+    process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
+    const responses = await runStatus("C_INT_CMD");
+    expect(responses).toHaveLength(1);
+    expect(responses[0]?.blocks).toBeDefined();
   });
 });
