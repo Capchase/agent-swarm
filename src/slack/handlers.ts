@@ -45,6 +45,7 @@ import type { AgentMatch } from "./types";
 import "./templates";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import {
+  getChannelBlockReason,
   invalidateChannelExternality,
   isBlockExternalEnabled,
   leaveExternalChannel,
@@ -1057,7 +1058,8 @@ export function registerMessageHandler(app: App): void {
     }
 
     invalidateChannelExternality(event.channel);
-    if (!(await shouldBlockChannel(client, event.channel))) {
+    // Leave only on positive evidence; an unverified channel stays blocked by the guards.
+    if ((await getChannelBlockReason(client, event.channel)) !== "external") {
       return ignoreSlackInbound("member_joined_internal");
     }
     await leaveExternalChannel(client, event.channel, "joined");
@@ -1067,7 +1069,7 @@ export function registerMessageHandler(app: App): void {
     if (!isBlockExternalEnabled()) return ignoreSlackInbound("external_block_disabled");
 
     invalidateChannelExternality(event.channel);
-    if (!(await shouldBlockChannel(client, event.channel))) {
+    if ((await getChannelBlockReason(client, event.channel)) !== "external") {
       return ignoreSlackInbound("channel_shared_internal");
     }
     await leaveExternalChannel(client, event.channel, "shared");

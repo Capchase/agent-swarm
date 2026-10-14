@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import { closeDb, createAgent, getSlackTasksInThread, initDb } from "../be/db";
-import { resetExternalChannelStateForTesting } from "../slack/external-channel";
+import { resetExternalChannelStateForTesting, shouldBlockChannel } from "../slack/external-channel";
 import { registerMessageHandler, resetSlackHandlerCachesForTesting } from "../slack/handlers";
 
 const TEST_DB_PATH = "./test-slack-external-channel-guard.sqlite";
@@ -19,6 +19,7 @@ const handlers = new Map<string, Handler>();
 
 let channelInfo: Record<string, unknown> = {};
 let infoCalls = 0;
+let infoFails = false;
 let leaveCalls: string[] = [];
 let alertPosts: string[] = [];
 
@@ -27,6 +28,7 @@ const client = {
   conversations: {
     info: async () => {
       infoCalls++;
+      if (infoFails) throw new Error("An API error occurred: ratelimited");
       return { ok: true, channel: channelInfo };
     },
     leave: async ({ channel }: { channel: string }) => {
@@ -91,6 +93,7 @@ beforeEach(() => {
   resetSlackHandlerCachesForTesting();
   channelInfo = { is_ext_shared: false, is_pending_ext_shared: false };
   infoCalls = 0;
+  infoFails = false;
   leaveCalls = [];
   alertPosts = [];
 });
@@ -117,6 +120,19 @@ describe("inbound guard (message handler)", () => {
     process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
     expect(await sendMention("C_INTERNAL", false)).toHaveLength(1);
   });
+
+  test("flag true + conversations.info failure + no envelope: 0 tasks (fail closed)", async () => {
+    process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
+    infoFails = true;
+    expect(await sendMention("C_UNVERIFIED", false)).toHaveLength(0);
+  });
+
+  test("an envelope-marked channel blocks later lookups with no envelope", async () => {
+    process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
+    expect(await shouldBlockChannel(client as never, "C_EXT_LATER")).toBe(false);
+    expect(await sendMention("C_EXT_LATER", true)).toHaveLength(0);
+    expect(await shouldBlockChannel(client as never, "C_EXT_LATER")).toBe(true);
+  });
 });
 
 describe("join and share events", () => {
@@ -130,6 +146,16 @@ describe("join and share events", () => {
     expect(leaveCalls).toEqual(["C_JOIN_EXT"]);
     expect(alertPosts).toHaveLength(1);
     expect(alertPosts[0]).toContain("Trigger: joined");
+  });
+
+  test("bot joins a channel Slack cannot classify: 0 leaves", async () => {
+    process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
+    infoFails = true;
+    await handlers.get("member_joined_channel")!({
+      event: { user: BOT_USER_ID, channel: "C_JOIN_UNVERIFIED" },
+      client,
+    });
+    expect(leaveCalls).toEqual([]);
   });
 
   test("a human joins an external channel: 0 Slack calls", async () => {

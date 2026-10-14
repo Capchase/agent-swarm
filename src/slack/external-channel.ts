@@ -17,18 +17,30 @@ import { slackCode, slackMissingScopeMessage } from "./channel-join";
 
 export type ChannelExternality = "external" | "internal" | "unknown";
 export type ExternalChannelTrigger = "joined" | "shared" | "boot-scan";
+/** Why a channel is blocked: Slack says it is external, or Slack could not confirm it is not. */
+export type ChannelBlockReason = "external" | "unverified";
 
 const EXTERNALITY_TTL_MS = 10 * 60 * 1000;
 const EXTERNALITY_CACHE_MAX = 500;
 const ALERT_DEDUPE_MS = 60 * 60 * 1000;
 
 const externalityCache = new Map<string, { value: "external" | "internal"; expiresAt: number }>();
+// Bumped on every invalidation or positive external evidence. A lookup that
+// started under an older generation must not overwrite the newer state.
+const channelGeneration = new Map<string, number>();
+let generationCounter = 0;
 const alertSentAt = new Map<string, number>();
 
 export const EXTERNAL_CHANNEL_BLOCKED_REPLY =
   "This channel is shared with another organization. The swarm does not work here.";
 
-export function externalChannelToolError(channelId: string): string {
+export function externalChannelToolError(
+  channelId: string,
+  reason: ChannelBlockReason = "external",
+): string {
+  if (reason === "unverified") {
+    return `Could not verify that channel ${channelId} is internal to this organization. SLACK_BLOCK_EXTERNAL_CHANNELS blocks swarm messages there until Slack confirms it. Try again later.`;
+  }
   return `Channel ${channelId} is shared with another organization. SLACK_BLOCK_EXTERNAL_CHANNELS blocks swarm messages there.`;
 }
 
@@ -36,19 +48,52 @@ export function isBlockExternalEnabled(): boolean {
   return isEnvFlagEnabled("SLACK_BLOCK_EXTERNAL_CHANNELS", false);
 }
 
-/** Reset caches between tests. */
+/** Reset in-memory caches between tests. Durable alert state lives in kv_entries. */
 export function resetExternalChannelStateForTesting(): void {
   externalityCache.clear();
+  channelGeneration.clear();
   alertSentAt.clear();
+}
+
+/** Insert into an insertion-ordered Map, evicting the oldest entry at the cap. */
+function setBounded<V>(map: Map<string, V>, key: string, value: V): void {
+  map.delete(key);
+  if (map.size >= EXTERNALITY_CACHE_MAX) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+function bumpGeneration(channelId: string): void {
+  generationCounter += 1;
+  setBounded(channelGeneration, channelId, generationCounter);
 }
 
 export function invalidateChannelExternality(channelId: string): void {
   externalityCache.delete(channelId);
+  bumpGeneration(channelId);
+}
+
+/**
+ * Records positive evidence that a channel is external (for example an event
+ * envelope with `is_ext_shared_channel: true`), so later outbound checks block
+ * without waiting for the cached internal value to expire.
+ */
+export function recordExternalChannel(channelId: string): void {
+  bumpGeneration(channelId);
+  setBounded(externalityCache, channelId, {
+    value: "external",
+    expiresAt: Date.now() + EXTERNALITY_TTL_MS,
+  });
 }
 
 /**
  * Looks up whether a channel is external. Known results are cached for 10
- * minutes; an API error returns "unknown" and is not cached.
+ * minutes; an API error returns "unknown" and is not cached. A result whose
+ * channel was invalidated or marked external while the lookup was in flight
+ * is not cached: the newer state wins, and an invalidated lookup returns
+ * "unknown".
  */
 export async function getChannelExternality(
   client: WebClient,
@@ -58,6 +103,7 @@ export async function getChannelExternality(
   if (cached && cached.expiresAt > Date.now()) return cached.value;
   if (cached) externalityCache.delete(channelId);
 
+  const generation = channelGeneration.get(channelId);
   let value: "external" | "internal";
   try {
     const resp = await client.conversations.info({ channel: channelId });
@@ -68,37 +114,56 @@ export async function getChannelExternality(
     value =
       ch.is_ext_shared === true || ch.is_pending_ext_shared === true ? "external" : "internal";
   } catch (error) {
-    console.warn(`[Slack] conversations.info failed for ${channelId}:`, error);
+    console.warn(
+      `[Slack] conversations.info failed for ${channelId}:`,
+      scrubSecrets(error instanceof Error ? error.message : String(error)),
+    );
     return "unknown";
   }
 
-  // Evict oldest entry (insertion-ordered Map) once the cap is reached.
-  if (externalityCache.size >= EXTERNALITY_CACHE_MAX) {
-    const oldest = externalityCache.keys().next().value;
-    if (oldest !== undefined) externalityCache.delete(oldest);
+  if (channelGeneration.get(channelId) !== generation) {
+    const fresher = externalityCache.get(channelId);
+    if (fresher && fresher.expiresAt > Date.now()) return fresher.value;
+    return value === "external" ? "external" : "unknown";
   }
-  externalityCache.set(channelId, { value, expiresAt: Date.now() + EXTERNALITY_TTL_MS });
+  setBounded(externalityCache, channelId, { value, expiresAt: Date.now() + EXTERNALITY_TTL_MS });
   return value;
 }
 
 /**
- * True when the flag is on and the channel is external. "unknown" does not
- * block (fail open, as `withAutoJoin` does).
+ * Returns why the swarm must not touch a channel, or null when it may. With the
+ * flag on, a channel Slack cannot classify is blocked as "unverified" (fail
+ * closed): disclosing swarm output across an unverified boundary is worse than
+ * a temporary refusal.
  */
+export async function getChannelBlockReason(
+  client: WebClient,
+  channelId: string,
+  envelopeFlag?: boolean,
+): Promise<ChannelBlockReason | null> {
+  if (!isBlockExternalEnabled()) return null;
+  if (envelopeFlag === true) {
+    recordExternalChannel(channelId);
+    return "external";
+  }
+  const externality = await getChannelExternality(client, channelId);
+  if (externality === "external") return "external";
+  if (externality === "unknown") {
+    console.warn(
+      `[Slack] Could not tell if channel ${channelId} is external; blocking (fail closed)`,
+    );
+    return "unverified";
+  }
+  return null;
+}
+
+/** True when the flag is on and the channel is external or cannot be verified. */
 export async function shouldBlockChannel(
   client: WebClient,
   channelId: string,
   envelopeFlag?: boolean,
 ): Promise<boolean> {
-  if (!isBlockExternalEnabled()) return false;
-  if (envelopeFlag === true) return true;
-  const externality = await getChannelExternality(client, channelId);
-  if (externality === "unknown") {
-    console.warn(
-      `[Slack] Could not tell if channel ${channelId} is external; not blocking (fail open)`,
-    );
-  }
-  return externality === "external";
+  return (await getChannelBlockReason(client, channelId, envelopeFlag)) !== null;
 }
 
 async function postExternalChannelAlert(

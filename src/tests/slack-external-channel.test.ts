@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { WebClient } from "@slack/web-api";
 import {
+  getChannelBlockReason,
   getChannelExternality,
   invalidateChannelExternality,
   leaveExternalChannel,
@@ -117,9 +118,59 @@ describe("shouldBlockChannel", () => {
     expect(info).not.toHaveBeenCalled();
   });
 
-  test("unknown does not block (fail open)", async () => {
+  test("unknown blocks as unverified (fail closed)", async () => {
     const { client } = makeClient({ info: () => Promise.reject(new Error("boom")) });
-    expect(await shouldBlockChannel(client, "C1")).toBe(false);
+    expect(await shouldBlockChannel(client, "C1")).toBe(true);
+    expect(await getChannelBlockReason(client, "C1")).toBe("unverified");
+  });
+
+  test("a verified internal channel is not blocked", async () => {
+    const { client } = makeClient({ channel: { is_ext_shared: false } });
+    expect(await getChannelBlockReason(client, "C1")).toBeNull();
+  });
+
+  test("envelope evidence replaces a cached internal value", async () => {
+    let channel: Record<string, unknown> = { is_ext_shared: false };
+    const { client, info } = makeClient({ info: () => Promise.resolve({ channel }) });
+    expect(await getChannelExternality(client, "C1")).toBe("internal");
+    channel = { is_ext_shared: true };
+    expect(await shouldBlockChannel(client, "C1", true)).toBe(true);
+    // Reviewer repro: the next outbound check without an envelope must block too.
+    expect(await shouldBlockChannel(client, "C1")).toBe(true);
+    expect(info).toHaveBeenCalledTimes(1);
+  });
+
+  test("an in-flight internal lookup does not overwrite envelope evidence", async () => {
+    let resolveInfo: (value: unknown) => void = () => {};
+    const { client } = makeClient({
+      info: () =>
+        new Promise((resolve) => {
+          resolveInfo = resolve;
+        }),
+    });
+    const inFlight = getChannelExternality(client, "C1");
+    expect(await shouldBlockChannel(client, "C1", true)).toBe(true);
+    resolveInfo({ channel: { is_ext_shared: false } });
+    expect(await inFlight).toBe("external");
+    expect(await shouldBlockChannel(client, "C1")).toBe(true);
+  });
+
+  test("an in-flight lookup after invalidation is not cached", async () => {
+    let resolveInfo: (value: unknown) => void = () => {};
+    const { client, info } = makeClient({
+      info: () =>
+        new Promise((resolve) => {
+          resolveInfo = resolve;
+        }),
+    });
+    const inFlight = getChannelExternality(client, "C1");
+    invalidateChannelExternality("C1");
+    resolveInfo({ channel: { is_ext_shared: false } });
+    expect(await inFlight).toBe("unknown");
+    const next = getChannelExternality(client, "C1");
+    resolveInfo({ channel: { is_ext_shared: false } });
+    expect(await next).toBe("internal");
+    expect(info).toHaveBeenCalledTimes(2);
   });
 });
 

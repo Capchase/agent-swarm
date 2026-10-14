@@ -10,7 +10,7 @@ import { can } from "@/rbac";
 import { getSlackApp } from "@/slack/app";
 import { getTaskLink } from "@/slack/blocks";
 import { withAutoJoin } from "@/slack/channel-join";
-import { externalChannelToolError, shouldBlockChannel } from "@/slack/external-channel";
+import { externalChannelToolError, getChannelBlockReason } from "@/slack/external-channel";
 import { getAgentDisplayName, getAgentEmoji, markdownToSlack } from "@/slack/responses";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
 
@@ -68,8 +68,9 @@ export const registerSlackPostTool = (server: McpServer) => {
         return toolErr("Slack not configured.");
       }
 
-      if (await shouldBlockChannel(app.client, channelId)) {
-        return toolErr(externalChannelToolError(channelId));
+      const blockReason = await getChannelBlockReason(app.client, channelId);
+      if (blockReason) {
+        return toolErr(externalChannelToolError(channelId, blockReason));
       }
 
       try {
