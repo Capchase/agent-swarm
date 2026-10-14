@@ -1,4 +1,5 @@
 import type { WebClient } from "@slack/web-api";
+import { claimKv, deleteKv, sweepExpiredKv, upsertKv } from "../be/db";
 import { isEnvFlagEnabled } from "../utils/env-flag";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { slackCode, slackMissingScopeMessage } from "./channel-join";
@@ -23,13 +24,16 @@ export type ChannelBlockReason = "external" | "unverified";
 const EXTERNALITY_TTL_MS = 10 * 60 * 1000;
 const EXTERNALITY_CACHE_MAX = 500;
 const ALERT_DEDUPE_MS = 60 * 60 * 1000;
+/** A reservation whose post never settles (crash mid-post) frees the key after this. */
+const ALERT_SENDING_TTL_MS = 2 * 60 * 1000;
+/** Durable alert dedupe in kv_entries, so a restart does not repeat alerts. */
+export const EXTERNAL_ALERT_KV_NAMESPACE = "slack-external-alert";
 
 const externalityCache = new Map<string, { value: "external" | "internal"; expiresAt: number }>();
 // Bumped on every invalidation or positive external evidence. A lookup that
 // started under an older generation must not overwrite the newer state.
 const channelGeneration = new Map<string, number>();
 let generationCounter = 0;
-const alertSentAt = new Map<string, number>();
 
 export const EXTERNAL_CHANNEL_BLOCKED_REPLY =
   "This channel is shared with another organization. The swarm does not work here.";
@@ -52,7 +56,6 @@ export function isBlockExternalEnabled(): boolean {
 export function resetExternalChannelStateForTesting(): void {
   externalityCache.clear();
   channelGeneration.clear();
-  alertSentAt.clear();
 }
 
 /** Insert into an insertion-ordered Map, evicting the oldest entry at the cap. */
@@ -179,10 +182,10 @@ async function postExternalChannelAlert(
     return;
   }
 
+  // Durable dedupe: reserve the key briefly, extend it to an hour only after
+  // Slack accepts the post, and release it when the post fails.
   const key = `${channelId}:${trigger}`;
-  const lastSent = alertSentAt.get(key);
-  if (lastSent !== undefined && Date.now() - lastSent < ALERT_DEDUPE_MS) return;
-  alertSentAt.set(key, Date.now());
+  if (!(await reserveAlert(key))) return;
 
   const lines = [
     `:no_entry: Swarm bot in external Slack channel <#${channelId}> (${channelId})`,
@@ -204,6 +207,43 @@ async function postExternalChannelAlert(
       "[Slack] Failed to send external channel alert:",
       scrubSecrets(error instanceof Error ? error.message : String(error)),
     );
+    await settleAlert(key, false);
+    return;
+  }
+  await settleAlert(key, true);
+}
+
+/** True when this caller may send the alert. A DB failure sends rather than suppresses. */
+async function reserveAlert(key: string): Promise<boolean> {
+  try {
+    return await claimKv({
+      namespace: EXTERNAL_ALERT_KV_NAMESPACE,
+      key,
+      value: "sending",
+      valueType: "string",
+      expiresAt: Date.now() + ALERT_SENDING_TTL_MS,
+    });
+  } catch (error) {
+    console.warn("[Slack] External channel alert dedupe unavailable:", error);
+    return true;
+  }
+}
+
+async function settleAlert(key: string, sent: boolean): Promise<void> {
+  try {
+    if (sent) {
+      await upsertKv({
+        namespace: EXTERNAL_ALERT_KV_NAMESPACE,
+        key,
+        value: "sent",
+        valueType: "string",
+        expiresAt: Date.now() + ALERT_DEDUPE_MS,
+      });
+    } else {
+      await deleteKv(EXTERNAL_ALERT_KV_NAMESPACE, key);
+    }
+  } catch (error) {
+    console.warn("[Slack] Failed to record external channel alert state:", error);
   }
 }
 
@@ -242,6 +282,11 @@ export async function leaveExternalChannel(
  */
 export async function scanExternalChannelsOnBoot(client: WebClient): Promise<void> {
   if (!isBlockExternalEnabled()) return;
+
+  // kv_entries has no background sweep; drop expired alert keys so the namespace stays bounded.
+  await sweepExpiredKv(EXTERNAL_ALERT_KV_NAMESPACE).catch((error) => {
+    console.warn("[Slack] Failed to sweep expired external channel alert keys:", error);
+  });
 
   let cursor: string | undefined;
   do {

@@ -1,6 +1,19 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import type { WebClient } from "@slack/web-api";
 import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
+import { unlinkSync } from "node:fs";
+import type { WebClient } from "@slack/web-api";
+import { closeDb, getDbClient, getKv, initDb, upsertKv } from "../be/db";
+import {
+  EXTERNAL_ALERT_KV_NAMESPACE,
   getChannelBlockReason,
   getChannelExternality,
   invalidateChannelExternality,
@@ -12,6 +25,27 @@ import {
 
 const originalFlag = process.env.SLACK_BLOCK_EXTERNAL_CHANNELS;
 const originalAlerts = process.env.SLACK_ALERTS_CHANNEL;
+const TEST_DB_PATH = "./test-slack-external-channel.sqlite";
+
+function removeDbFiles(): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      unlinkSync(`${TEST_DB_PATH}${suffix}`);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+beforeAll(() => {
+  removeDbFiles();
+  initDb(TEST_DB_PATH);
+});
+
+afterAll(() => {
+  closeDb();
+  removeDbFiles();
+});
 
 function makePlatformError(code: string, extra: Record<string, unknown> = {}): Error {
   const err = new Error(`An API error occurred: ${code}`);
@@ -43,8 +77,11 @@ function postedText(postMessage: ReturnType<typeof mock>): string {
   return (postMessage.mock.calls[0]?.[0] as { text: string }).text;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   resetExternalChannelStateForTesting();
+  await getDbClient().run("DELETE FROM kv_entries WHERE namespace = ?", [
+    EXTERNAL_ALERT_KV_NAMESPACE,
+  ]);
   process.env.SLACK_BLOCK_EXTERNAL_CHANNELS = "true";
   process.env.SLACK_ALERTS_CHANNEL = "C_ALERTS";
 });
@@ -223,6 +260,61 @@ describe("leaveExternalChannel", () => {
     expect(postMessage).toHaveBeenCalledTimes(1);
   });
 
+  test("alert dedupe survives a restart", async () => {
+    const first = makeClient({});
+    await leaveExternalChannel(first.client, "C1", "joined");
+    expect(first.postMessage).toHaveBeenCalledTimes(1);
+
+    // Restart: all process memory is gone; only kv_entries survives. (The test
+    // DB restores from an in-memory template, so it cannot be reopened here.)
+    resetExternalChannelStateForTesting();
+
+    const second = makeClient({});
+    await leaveExternalChannel(second.client, "C1", "joined");
+    expect(second.postMessage).not.toHaveBeenCalled();
+    const entry = await getKv(EXTERNAL_ALERT_KV_NAMESPACE, "C1:joined");
+    expect(entry?.value).toBe("sent");
+    expect(entry?.expiresAt).toBeGreaterThan(Date.now() + 59 * 60 * 1000);
+  });
+
+  test("a failed alert post releases the key so the next attempt sends", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { client, postMessage } = makeClient({});
+      postMessage.mockImplementationOnce(() => Promise.reject(new Error("slack down")));
+      await leaveExternalChannel(client, "C1", "joined");
+      expect(await getKv(EXTERNAL_ALERT_KV_NAMESPACE, "C1:joined")).toBeNull();
+      await leaveExternalChannel(client, "C1", "joined");
+      expect(postMessage).toHaveBeenCalledTimes(2);
+      await leaveExternalChannel(client, "C1", "joined");
+      expect(postMessage).toHaveBeenCalledTimes(2);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("a stale sending reservation (crash mid-post) does not suppress the alert", async () => {
+    await upsertKv({
+      namespace: EXTERNAL_ALERT_KV_NAMESPACE,
+      key: "C1:joined",
+      value: "sending",
+      valueType: "string",
+      expiresAt: Date.now() - 1,
+    });
+    const { client, postMessage } = makeClient({});
+    await leaveExternalChannel(client, "C1", "joined");
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("an in-flight sending reservation suppresses a concurrent duplicate", async () => {
+    const { client, postMessage } = makeClient({});
+    await Promise.all([
+      leaveExternalChannel(client, "C1", "joined"),
+      leaveExternalChannel(client, "C1", "joined"),
+    ]);
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("unset SLACK_ALERTS_CHANNEL: 0 posts and 1 warning", async () => {
     delete process.env.SLACK_ALERTS_CHANNEL;
     const warn = spyOn(console, "warn").mockImplementation(() => {});
@@ -238,6 +330,23 @@ describe("leaveExternalChannel", () => {
 });
 
 describe("scanExternalChannelsOnBoot", () => {
+  test("boot scan sweeps expired alert keys", async () => {
+    await upsertKv({
+      namespace: EXTERNAL_ALERT_KV_NAMESPACE,
+      key: "C_OLD:boot-scan",
+      value: "sent",
+      valueType: "string",
+      expiresAt: Date.now() - 1,
+    });
+    const { client } = makeClient({});
+    await scanExternalChannelsOnBoot(client);
+    const rows = await getDbClient().query<{ key: string }>(
+      "SELECT key FROM kv_entries WHERE namespace = ?",
+      [EXTERNAL_ALERT_KV_NAMESPACE],
+    );
+    expect(rows).toEqual([]);
+  });
+
   test("1 external + 1 internal: 1 report-only alert, 0 leaves", async () => {
     const { client, leave, postMessage } = makeClient({
       channels: [
