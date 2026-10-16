@@ -139,19 +139,25 @@ describe("request-human-input owner, notice and timeout", () => {
     expect(data.requestId).toBeUndefined();
     expect(postMessage).not.toHaveBeenCalled();
   });
-  test("scrubs secrets from the approval title and question label before Slack egress", async () => {
+  test("scrubs secrets and escapes title mrkdwn in both Slack payload fields", async () => {
     const titleSecret = `ghp_${"aB3".repeat(12)}`;
     const labelSecret = `ghp_${"cD4".repeat(12)}`;
     await request({
-      title: `Deploy with ${titleSecret}`,
+      title: `Deploy with ${titleSecret} & <!channel> <https://example.com|link>`,
       questions: [{ id: "q", type: "approval", label: `Approve using ${labelSecret}?` }],
     });
     expect(postMessage).toHaveBeenCalledTimes(1);
     const payload = postMessage.mock.calls[0]![0];
     expect(JSON.stringify(payload)).not.toContain(titleSecret);
     expect(JSON.stringify(payload)).not.toContain(labelSecret);
-    expect(payload.text).toContain("Deploy with [REDACTED:github_token]");
-    expect(JSON.stringify(payload.blocks)).toContain("Deploy with [REDACTED:github_token]");
+    const blocks = payload.blocks as Array<{ text: { text: string } }>;
+    for (const text of [payload.text, blocks[0]!.text.text]) {
+      expect(text).toContain(
+        "Deploy with [REDACTED:github_token] &amp; &lt;!channel&gt; &lt;https://example.com|link&gt;",
+      );
+      expect(text).not.toContain("<!channel>");
+      expect(text).not.toContain("<https://");
+    }
     expect(JSON.stringify(payload.blocks)).toContain("Approve using [REDACTED:github_token]?");
   });
   test("non-lead notify is denied before creating or posting an approval", async () => {
