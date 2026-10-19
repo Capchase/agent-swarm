@@ -95,6 +95,8 @@ const MAX_REPORTED_ISSUES = 5;
 
 const HITLConfigSchema = z.object({
   title: z.string(),
+  // Raw Slack mrkdwn. Not escaped. Slack only. The dashboard does not show it.
+  slackDetails: z.string().optional(),
   // Static array, or one exact `{{token}}` resolved at execute time to an
   // upstream array (see interpolateNodeConfig). `run` validates the resolved
   // value before this schema sees it.
@@ -227,6 +229,21 @@ export function buildSlackQuestionsSummary(
     if (text) return text;
   }
   return `${header}_${questions.length} questions. Answer them on the dashboard._`;
+}
+
+const SLACK_DETAILS_CUT_NOTE = "\n_…cut. See the dashboard._";
+
+/**
+ * Fit the author-written `slackDetails` mrkdwn into one section block. Over the
+ * limit Slack refuses the whole message, so the text is cut at the last line
+ * break that leaves room for the cut note.
+ */
+export function fitSlackDetails(text: string): string {
+  if (text.length <= SLACK_SECTION_TEXT_LIMIT) return text;
+  const room = SLACK_SECTION_TEXT_LIMIT - 60;
+  const lastBreak = text.lastIndexOf("\n", room);
+  const cut = lastBreak > 0 ? lastBreak : room;
+  return `${text.slice(0, cut)}${SLACK_DETAILS_CUT_NOTE}`;
 }
 
 // ─── Executor ───────────────────────────────────────────────
@@ -395,6 +412,14 @@ export class HumanInTheLoopExecutor extends BaseExecutor<
                 text: `🔔 *Approval Required: ${config.title}*`,
               },
             },
+            ...(config.slackDetails?.trim()
+              ? [
+                  {
+                    type: "section",
+                    text: { type: "mrkdwn", text: fitSlackDetails(config.slackDetails) },
+                  },
+                ]
+              : []),
             {
               type: "section",
               text: {
