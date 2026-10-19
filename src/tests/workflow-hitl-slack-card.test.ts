@@ -60,20 +60,15 @@ describe("HITL Slack card timeout caption", () => {
 });
 
 describe("HITL Slack card slackDetails", () => {
-  test("posts slackDetails unescaped between the title and the questions", async () => {
+  test("posts slackDetails unescaped in place of the questions summary", async () => {
     const details = "*Uses (1):*\n• <https://x.test/a#L1|a.ts:1>";
     const blocks = await postCard({ slackDetails: details });
 
-    expect(blocks.map((b) => b.type)).toEqual([
-      "section",
-      "section",
-      "section",
-      "actions",
-      "context",
-    ]);
+    expect(blocks.map((b) => b.type)).toEqual(["section", "section", "actions", "context"]);
     expect(blocks[0]!.text!.text).toContain("Approval Required: Deploy");
     expect(blocks[1]!.text).toEqual({ type: "mrkdwn", text: details });
-    expect(blocks[2]!.text!.text).toContain("Approve &lt;now&gt;?");
+    expect(JSON.stringify(blocks)).not.toContain("Questions:");
+    expect(JSON.stringify(blocks)).not.toContain("Approve &lt;now&gt;?");
   });
 
   for (const [name, slackDetails] of [

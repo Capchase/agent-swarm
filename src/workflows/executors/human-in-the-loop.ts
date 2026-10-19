@@ -96,6 +96,7 @@ const MAX_REPORTED_ISSUES = 5;
 const HITLConfigSchema = z.object({
   title: z.string(),
   // Raw Slack mrkdwn. Not escaped. Slack only. The dashboard does not show it.
+  // When set, it replaces the Questions summary on the Slack card.
   slackDetails: z.string().optional(),
   // Static array, or one exact `{{token}}` resolved at execute time to an
   // upstream array (see interpolateNodeConfig). `run` validates the resolved
@@ -412,19 +413,13 @@ export class HumanInTheLoopExecutor extends BaseExecutor<
                 text: `🔔 *Approval Required: ${config.title}*`,
               },
             },
-            ...(config.slackDetails?.trim()
-              ? [
-                  {
-                    type: "section",
-                    text: { type: "mrkdwn", text: fitSlackDetails(config.slackDetails) },
-                  },
-                ]
-              : []),
             {
               type: "section",
               text: {
                 type: "mrkdwn",
-                text: questionsText,
+                text: config.slackDetails?.trim()
+                  ? fitSlackDetails(config.slackDetails)
+                  : questionsText,
               },
             },
             {
