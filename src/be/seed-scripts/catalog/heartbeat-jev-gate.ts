@@ -189,11 +189,19 @@ async function buildState(ctx: any, leadId: string, nowMs: number, timeZone: str
   const mmdd = new Date(nowMs).toISOString().slice(5, 10);
   const mmddLocal = stamp.slice(5, 10);
   const due: string[] = [];
+  // An MM-DD counts only as a bare token: "release on 10-20" is due, while the
+  // stamp "2026-10-20T09:30Z" (a re-verification date) is not.
+  const mentionsMmdd = (s: string, tok: string) =>
+    new RegExp(`(?<![\\d-])${tok}(?![\\d-])`).test(s);
   for (const line of String(lead[0]?.heartbeatMd ?? "").split("\n")) {
     const l = line.trim();
     if (!l) continue;
     const del = /DELETE <?(\d\d-\d\d)>?/.exec(l);
-    if (l.includes(mmdd) || l.includes(mmddLocal) || (del?.[1] && del[1] <= mmddLocal)) {
+    if (
+      mentionsMmdd(l, mmdd) ||
+      mentionsMmdd(l, mmddLocal) ||
+      (del?.[1] && del[1] <= mmddLocal)
+    ) {
       due.push(oneLine(l).slice(0, 200));
     }
     if (due.length >= 6) break;
