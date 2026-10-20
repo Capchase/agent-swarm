@@ -189,10 +189,11 @@ async function buildState(ctx: any, leadId: string, nowMs: number, timeZone: str
   const mmdd = new Date(nowMs).toISOString().slice(5, 10);
   const mmddLocal = stamp.slice(5, 10);
   const due: string[] = [];
-  // An MM-DD counts only as a bare token: "release on 10-20" is due, while the
-  // stamp "2026-10-20T09:30Z" (a re-verification date) is not.
+  // An MM-DD counts only as a bare token: "release on 10-20" is due, while a
+  // re-verification stamp ("2026-10-20 ~10:45Z", a UUID piece) and a suffixed
+  // token ("10-20s") are not.
   const mentionsMmdd = (s: string, tok: string) =>
-    new RegExp(`(?<![\\d-])${tok}(?![\\d-])`).test(s);
+    new RegExp(`(?<![\\w-])${tok}(?![\\w-])`).test(s);
   for (const line of String(lead[0]?.heartbeatMd ?? "").split("\n")) {
     const l = line.trim();
     if (!l) continue;

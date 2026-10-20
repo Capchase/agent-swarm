@@ -261,14 +261,16 @@ describe("heartbeat-jev-gate with a provider", () => {
     });
   });
 
-  test("a re-verification stamp is not a due tracked item", async () => {
+  test("only a bare MM-DD counts as a due tracked item", async () => {
     const mocked = Date.now;
     Date.now = () => Date.parse("2026-10-20T09:30:00.000Z");
     try {
       const { ctx } = fakeCtx({
         configs: { TYPESAFE_API_KEY: "x" },
         heartbeatMd: [
-          "- Watch: re-verified 2026-10-20T09:30Z, nothing pending",
+          "- **2026-10-20 ~10:45Z (heartbeat 2026-10-20):** re-verified, nothing pending",
+          "- Watch: 10-20s retry window closed, nothing pending",
+          "- Watch: session 4a12-10-20-9e2f finished cleanly, nothing pending",
           "- Watch: release on 10-20 — lift after ship",
         ].join("\n"),
         jev: jevSays(0.9),
