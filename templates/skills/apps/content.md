@@ -511,17 +511,19 @@ Tones: Badge, Metric and Progress `tone` take `neutral`, `success`, `active`, `e
 | `Form` | `id`, `fields`, `onSubmit` | `title`, `submitLabel`; see below. |
 | `Drawer` | `param` | `title`, `description`, `side: "right" or "left"`, `size: "sm", "md" (default), "lg", or "xl"` (about 480/660/900/1010px at 1440px; grows with the viewport up to 640/960/1280/1600px; full width on phones), `actions` (sticky footer buttons; see below); has the `default` child slot. |
 | `DetailList` | `fields` | `data`, `emptyMessage`, `columns: 1 or 2`, `loading` (bind `/queries/<name>/loading` for skeleton fields while loading); renders one record without edit controls; see below for field kinds. |
+| `CardGrid` | `titleKey` | `data`, `loading`, `error`, `emptyMessage`, `imageKey`, `fields`, `columns`, `onClick`; one card per row for record browsers; see below. |
 | `Kanban` | `columnField`, `columns`, `titleField` | `data`, `loading`, `cardFields`, `idField` (default `id`), `onMove`, `onCardClick`; see below. |
 | `Calendar` | `startField`, `titleField` | `data`, `loading`, `endField`, `idField`, `onSelect`; read-only month grid; see below. |
 | `ContributionGraph` | none | `data`, `loading`, `dateField` (default `date`), `countField`, `days` (7-730, default 365); read-only activity heatmap. |
 
 Table details:
 
-- `columns[]`: `{ key, label?, kind?, tones?: {value: badgeTone}, width?: number, pinned?: "left" or "right", align?: "start" or "end", truncate?: "end" or "middle", icon?, tooltip?: "<row field>", max?: number, onChange?: chain }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, `badge`, `status`, `user`, `agent`, `relative`, `duration`, `progress`, `copy`, `switch`, `link`, or `json`; `string` and `enum` render as text, and `json` renders a truncated single-line `JSON.stringify` preview. Pin id/actions columns so they survive horizontal scroll on narrow viewports.
+- `columns[]`: `{ key, label?, kind?, tones?: {value: badgeTone}, width?: number, pinned?: "left" or "right", align?: "start" or "end", truncate?: "end" or "middle", icon?, tooltip?: "<row field>", max?: number, format?: "<template>", onChange?: chain }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, `badge`, `status`, `user`, `agent`, `relative`, `duration`, `progress`, `copy`, `switch`, `link`, or `json`; `string` and `enum` render as text, and `json` renders a truncated single-line `JSON.stringify` preview. Pin id/actions columns so they survive horizontal scroll on narrow viewports.
   - `status`: lifecycle values (`pending`, `in_progress`, `running`, `completed`, `failed`, `cancelled`, `paused`, `reviewing`, ...) render the dashboard status chip with its icon; other values use `tones` like `badge`.
   - `user` / `agent`: avatar plus name. `relative` (and `date`): smart time, exact time on hover. `duration`: milliseconds as `1m 23s`. `progress`: a bar against `max` (default 100). `copy`: the value plus a copy button. `link`: an http(s) URL opening in a new tab (other values render as text).
   - `switch`: a toggle. `onChange` runs with `$row` = the row with this column already set to the new value, e.g. `[{ "action": "app.mutate", "params": { "model": "m", "op": "update", "rowId": { "$row": "id" }, "values": { "enabled": { "$row": "enabled" } } } }]`. Without `onChange` the switch is read-only.
   - Numbers, durations and progress right-align by default. `truncate: "middle"` keeps both ends of ids and paths. `icon` shows in the header; `tooltip` names a row field shown on hover.
+  - `format`: a `{{field}}` template that combines several row fields into one cell, e.g. `"{{name}} ({{status}})"`. Placeholder names match `[\w.]+` (letters, digits, `_` and `.`; no hyphens or spaces). Each placeholder reads that row field as-is (a dotted name such as `{{owner.name}}` is a literal column name, not a nested path); a missing or null field becomes an empty string and an object or array becomes a JSON preview cut to 120 characters. The whole cell is capped at 500 characters. A templated column ignores `kind`, shows the same text in the phone list, and sorts by the composed text. `search` and `filters` still read the column's `key`.
 - `onRowClick`: action chain with `$row` / `$rowIndex`, run when a row is clicked (or Enter on a focused cell). Pair it with `app.navigate` that sets a Drawer param, and bind `selectedId` to `{ "$state": "/route/params/<param>" }` so the open row stays highlighted. `rowId` names the id field (default `id`).
 - Phones (below 768px): the table renders as a card list. `mobileFields: { title, subtitle?, meta?: string or string[], status? }` picks the columns; by default the first text column is the title and the first `status`/`badge` column the chip. `mobile: "scroll"` keeps the grid; it is the default when the table has `rowActions` but no `onRowClick`.
 - `emptyState: { icon?, title, body? }` replaces the plain empty message. A search or filter that hides every row shows its own "No rows match" state.
@@ -564,6 +566,16 @@ DetailList details:
 Motion details:
 
 - Every `Stack` fades its direct children in and lifts them 4px over 200ms on first paint, staggered 30ms (capped at the 10th child). It never replays on the 5s data poll. A Stack nested inside another one does not add its own entrance. `motion: "fade"` drops the lift; `motion: "none"` turns it off. Viewers with reduced motion get a 150ms fade.
+
+CardGrid details — the visual counterpart to Table for record browsers (projects, documents, media):
+
+- `titleKey` (required) picks the row field shown as the card title (an object value shows a JSON preview; titles are capped at 500 characters).
+- `imageKey` (optional) picks a row field holding an absolute http(s) image URL and adds an image tile to every card. When it is set, a non-URL value, a missing value, or a failed load shows a placeholder tile. Omit it for text-only cards with no tile.
+- `fields[]`: `{ key, kind?, tones? }`. `kind` is `text`, `string`, `enum`, `number`, `boolean`, `date`, `badge` (with `tones`), or `json` (no `label`, no `format`). A field with no `kind` whose value is an object renders like `json`. They render as an unlabeled `·`-joined meta line under the title, e.g. a `date` field for "created" and a `text` field for the author.
+- `columns`: same responsive shorthand as `Grid.columns` (default `{ "base": 1, "sm": 2, "md": 3 }`).
+- `onClick`: an action chain with `$row` / `$rowIndex`, run when a card is clicked or activated with Enter or Space. Commonly `app.navigate` into a detail page, the CardGrid equivalent of Table's `onRowClick`.
+- Bind `data` / `loading` / `error` to a named query like Table. Loading shows skeleton cards, an error shows a callout, and no rows shows `emptyMessage`.
+- It renders 200 cards at a time with a Show more button below the grid that reveals the next 200.
 
 Shortcut details:
 

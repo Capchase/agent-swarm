@@ -54,6 +54,7 @@ const PROP_ACTION_CHAINS: Record<string, readonly string[]> = {
   Form: ["onSubmit"],
   Kanban: ["onMove", "onCardClick"],
   Calendar: ["onSelect"],
+  CardGrid: ["onClick"],
 };
 
 /**
