@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Workflows: a `foreach` body can be any registered executor except `foreach`. A `sub-workflow` body runs one child workflow per item, an instant body (`script`, `swarm-script`, ...) runs once per item against its own timeout, and approval, wait and child-run items close the join through the same settle path. Each child step records the body's real node type, and the recovery sweep restarts queued or orphaned items (#2029).
+- Workflows: `foreach` takes `concurrency` (items in flight, held across restarts) and `failurePolicy` (`fail-fast` or `collect-outcomes`, defaulting from `onNodeFailure`). Fail-fast cancels queued items and lets in-flight ones finish. `retry-workflow-run` on a failed fan-out reruns only the failed and cancelled items as new attempts, so a `sub-workflow` item gets a new child run and completed items keep their output (#2029).
 
 ## [2.4.5] - 2026-10-21
 
