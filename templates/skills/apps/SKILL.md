@@ -520,6 +520,7 @@ Tones: Badge, Metric and Progress `tone` take `neutral`, `success`, `active`, `e
 | `Kanban` | `columnField`, `columns`, `titleField` | `data`, `loading`, `cardFields`, `idField` (default `id`), `onMove`, `onCardClick`; see below. |
 | `Calendar` | `startField`, `titleField` | `data`, `loading`, `endField`, `idField`, `onSelect`; read-only month grid; see below. |
 | `ContributionGraph` | none | `data`, `loading`, `dateField` (default `date`), `countField`, `days` (7-730, default 365); read-only activity heatmap. |
+| `Tree` | `id`, `nodes` | `label`, `maxHeight` (default `480px`), `fill`; collapsible outline of a doc-shaped value that writes the clicked node key to `/ui/<id>/value`; see below. |
 
 Table details:
 
@@ -552,6 +553,12 @@ Calendar details:
 ContributionGraph details:
 
 - Buckets `data` rows by the calendar day of `dateField` over the trailing `days`. Each row counts 1, or adds its numeric `countField` when set.
+
+Tree details:
+
+- `nodes` is a doc-shaped value: `{ root: string | string[], elements: { <key>: { type, children?: string[] } } }`, the json-render flat element map. Usually bind it to a json column: `{ "$state": "/queries/<name>/data/0/<column>" }`. A malformed or absent value renders an empty state; a `children` key missing from `elements` shows as `key — ?`. Outlines are cut at 2,000 rows with a notice; branches deeper than 32 levels keep a disabled chevron.
+- Each row shows `key — type`. Clicking a row writes its key to `/ui/<id>/value`, and the row bound to that path renders selected; read the selection with `{ "$state": "/ui/<id>/value" }`. The Tree never writes `null`: when the selected key leaves the doc (a refetch, an edit) the stored key stays and no row renders selected. Selection and collapse are keyed by node key, so a key reachable through two parents selects and collapses in both places.
+- Rows scroll inside `maxHeight` (default `480px`). Set `fill: true` inside a `fill` Stack or Split pane to grow to that height instead and scroll within it (ignores `maxHeight`).
 
 Form details:
 
@@ -594,7 +601,7 @@ Use `Stack` as the primary page and section layout; `Container` is the legacy tw
 
 `Split` and `Tabs` children are positional. For Split, `children[0]` is the first pane, `children[1]` is the second, and extra children append inside the second pane. Below `collapseBelow`, panes stack; `reverse` changes only that narrow-layout stacking order. For Tabs, `children[i]` is the body for `tabs[i]`; keep both arrays in the same order and with the same count. Inactive tab children stay mounted but hidden, so Tables keep polling. Use `Divider` to separate sections and `Markdown` for richer explanatory content.
 
-SearchInput, Select, NumberInput, and Chips are client-side controls: each needs a literal `id` and writes state under `/ui/<id>/value`; Tabs writes its active key to `/ui/<id>/tab`. Bind those values into a Table's `search` and `filters` props. This filters already-polled rows locally; it does not alter or re-run the named query.
+SearchInput, Select, NumberInput, Chips, and Tree are client-side controls: each needs a literal `id` and writes state under `/ui/<id>/value` (Tree writes the clicked node key); Tabs writes its active key to `/ui/<id>/tab`. Bind those values into a Table's `search` and `filters` props. This filters already-polled rows locally; it does not alter or re-run the named query.
 
 ```json
 {

@@ -14,6 +14,9 @@ interface JsonSchema {
   const?: unknown;
   items?: JsonSchema;
   anyOf?: JsonSchema[];
+  // A bare `z.unknown()` prop (e.g. Tree.nodes) serializes to a schema carrying
+  // only `description` and no `type` — a valid, type-less JSON Schema.
+  description?: string;
 }
 
 export interface AppCatalog {
@@ -42,7 +45,15 @@ export const ELEMENT_KEYS = new Set([
   "repeat",
   "watch",
 ]);
-const UI_STATE_COMPONENTS = new Set(["SearchInput", "Select", "NumberInput", "Tabs", "Chips"]);
+// Components whose `id` claims a `/ui/<id>/...` state slot.
+const UI_STATE_COMPONENTS = new Set([
+  "SearchInput",
+  "Select",
+  "NumberInput",
+  "Tabs",
+  "Chips",
+  "Tree",
+]);
 
 /**
  * Props that hold a plain action chain (an array of `{ action, params }`),

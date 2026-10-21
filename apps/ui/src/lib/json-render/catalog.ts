@@ -302,6 +302,24 @@ const selectProps = z.object({
   defaultValue: z.string().optional(),
 });
 
+const treeProps = z.object({
+  /** State id — the selected node key lands at `/ui/<id>/value`. */
+  id: z.string(),
+  nodes: z
+    .unknown()
+    .describe(
+      "json-render flat element map: { root: string | string[], elements: Record<key,{type,children?}> } — usually a {$state} binding to a query row's json column",
+    ),
+  label: z.string().optional(),
+  maxHeight: z
+    .string()
+    .optional()
+    .describe("CSS max-height for the scrollable row list, e.g. '480px' (default '480px')"),
+  /** Grow to fill a `fill`-aware parent instead of the fixed `maxHeight` box —
+   * the row list scrolls inside whatever height the parent gives it. */
+  fill: z.boolean().optional(),
+});
+
 const markdownProps = z.object({
   content: z.string(),
 });
@@ -1061,6 +1079,11 @@ export const swarmCatalogSpec = {
       props: contributionGraphProps,
       description:
         "GitHub-style activity heatmap over the trailing `days` (default 365). Buckets rows by the calendar day of `dateField` (default `date`); each row counts 1, or sums `countField` when set. Read-only.",
+    },
+    Tree: {
+      props: treeProps,
+      description:
+        'Collapsible tree view of a json-render flat element map. Bind `nodes` to a doc-shaped value (`{ root: string | string[], elements: Record<key,{type,children?}> }`) — usually `{ "$state": "/queries/<name>/data/0/<jsonColumn>" }`. Each row shows `key — type`; clicking one writes the node key to `/ui/<id>/value`, and the row bound to that path renders selected. A malformed or absent `nodes` value renders an empty state. Rows scroll inside a fixed-height viewport — `maxHeight` overrides the default `480px` — or set `fill: true` to grow inside a `fill`-aware parent and scroll within whatever height that gives it instead (ignores `maxHeight`). Outlines are cut at 2,000 rows with a notice; branches deeper than 32 levels keep a disabled chevron.',
     },
     ElementRef: {
       props: elementRefProps,
