@@ -102,6 +102,7 @@ type:UpsertAssetKeyMappingInput
 type:WorkflowFilters
 type:WorkflowRunListOptions
 type:WorkflowRunPage
+value:AssetKeyMovesBlockedError
 value:EXTENSION_AGENT_ROLE
 value:ExtensionAgentAssignmentError
 value:KvTypeCollisionError
@@ -116,6 +117,7 @@ value:UNATTRIBUTED_USER_ID
 value:__resetSqliteVecExtensionPathCacheForTests
 value:abandonSlackOutcomeDelivery
 value:acceptTask
+value:assertAssetKeyMovesAllowed
 value:assignUnassignedTaskPending
 value:autoEncryptLegacyPlaintextSecrets
 value:backfillSupersedeTaskResumeTaskId
@@ -336,6 +338,7 @@ value:getPageVersion
 value:getPageVersions
 value:getPausedTasksForAgent
 value:getPendingApprovalVoteState
+value:getPendingApprovalsForTasks
 value:getPendingChatRelayTasks
 value:getPendingEventWaitNames
 value:getPendingSlackRelayTasks
@@ -487,6 +490,7 @@ value:listUserFavorites
 value:listWorkflowRuns
 value:listWorkflowRunsPage
 value:listWorkflows
+value:literalPrefixPattern
 value:markChatRelayAttempted
 value:markChatRelayDelivered
 value:markChatRelayGivenUp
@@ -506,6 +510,7 @@ value:markTaskSlackReplySent
 value:markTasksNotified
 value:maskSecrets
 value:moveAssetKey
+value:moveTaskChainKeyInTx
 value:moveTaskFromBacklog
 value:moveTaskToBacklog
 value:normalizeSkillFilePath
