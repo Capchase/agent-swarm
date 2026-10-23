@@ -45,7 +45,7 @@ The worker image pins these harnesses via `ARG`. Each week, check upstream for n
    bun test
    bash scripts/check-db-boundary.sh
    ```
-   For Codex bumps: also run `bash scripts/check-codex-default-model.sh`.
+   For Codex bumps: also run `bash scripts/check-codex-default-model.sh` (CI runs it too). It fails when `ARG CODEX_VERSION` differs from the direct `@openai/codex` pin in `package.json`, or when the Dockerfile's baseline `model = "..."` differs from `CODEX_DEFAULT_MODEL` in `src/providers/codex-models.ts`.
    Note: do NOT run `docker build -f Dockerfile.worker .` locally — the runner lacks docker. CI's `docker-worker-build` job is the acceptance gate.
 9. If any local check fails, apply the **partial-bundle fallback** before giving up — one harness must never block the others:
    **BASELINE FIRST — do this before ANY isolation work.** A red gate does NOT mean the bumps broke anything. Re-run the EXACT failing command on a pristine `origin/main` worktree with zero bumps applied (`git worktree add /tmp/hb-baseline origin/main && cd /tmp/hb-baseline && bun install --frozen-lockfile`) and compare. If the SAME checks fail with the SAME assertions and the same pass/skip/fail totals, the failure is **PRE-EXISTING and unrelated to the bumps** ⇒ it does NOT block this PR, and you must NOT attempt isolation for it. Proceed to step 10, open the PR, and add a `## Pre-existing failures (also fail on origin/main)` section quoting the verbatim error plus both totals (baseline vs branch) so the reviewer can see they match. Only a failure that is RED on your branch and GREEN on baseline was caused by a bump — apply a–d below to that failure ONLY. A gate that is red on origin/main is never a reason to skip the weekly bump.
