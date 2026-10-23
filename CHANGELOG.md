@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Approvals: a `config` question type asks a person to set one swarm config key or secret on the dashboard. The card shows whether the key is already set, offers keep, replace or skip, and takes non-secret values from options. Secrets go straight into encrypted swarm config; the request, workflow output and follow-up task carry only `{ key, scope, isSecret, status, updatedAt }`. The `workflow-iterate` and `turso-interaction` skills now ask for missing keys with a `config` question instead of chat or the Secrets page.
 
 ### Fixed
+- Skills: `skill-search` finds the obvious skill for natural-language queries. English stopwords such as "a", "how" and "do" no longer match the whole catalog, and a second FTS5 index over name and description (migration 241, backfilled) adds its BM25 score three times over, so a long SKILL.md body no longer buries a name or description hit. A query of only stopwords uses the substring match.
 - Sessions: Done holds through agent activity. A Done session came back to the Inbox on the next agent progress update; now it comes back only for a pending approval or a person's message created after it was marked Done.
 - Sessions: a person's steering message (steer or queue) on any task in a Done session now returns it to the Inbox, like a new follow-up does. Agent and system steering, cancelled messages, and messages from before the Done mark keep it Done.
 
