@@ -24,6 +24,7 @@ import {
   upsertSwarmConfig,
 } from "../be/db";
 import { getScript, upsertScriptByName } from "../be/scripts/db";
+import * as savedScriptRunner from "../be/scripts/run-saved";
 import { runSavedScriptAsAgent } from "../be/scripts/run-saved";
 import {
   checkHeartbeatChecklist,
@@ -624,6 +625,66 @@ describe("Heartbeat Checklist", () => {
       });
     });
 
+    for (const quiet of [true, false]) {
+      test(`healthy probe preserves the saved gate quiet=${quiet} verdict`, async () => {
+        process.env.HEARTBEAT_CHECKLIST_GATE_MODE = "enforce";
+        await saveGlobalGateScript("quiet-gate", "export default () => ({ quiet: true });");
+        const saved = spyOn(savedScriptRunner, "runSavedScriptAsAgent").mockResolvedValue({
+          exitCode: 0,
+          result: { quiet, reason: "existing verdict" },
+          stdout: "",
+          stderr: "",
+          durationMs: 1,
+          truncated: { stdout: false, stderr: false },
+        });
+        try {
+          setChecklistGateRunnerForTests((name, agentId, signal) =>
+            defaultChecklistGateRunner(name, agentId, signal, { probe: async () => null }),
+          );
+          await seedLead();
+          await checkHeartbeatChecklist();
+          expect(saved).toHaveBeenCalledTimes(1);
+          const tasks = await checklistTasks();
+          expect(tasks).toHaveLength(quiet ? 0 : 1);
+          if (!quiet) expect(tasks[0]!.tags).toContain("heartbeat-gate:wake");
+        } finally {
+          saved.mockRestore();
+        }
+      });
+    }
+
+    for (const mode of ["shadow", "enforce"] as const) {
+      test(`${mode}: an unhealthy probe produces a wake checklist`, async () => {
+        process.env.HEARTBEAT_CHECKLIST_GATE_MODE = mode;
+        setChecklistGateRunnerForTests((name, agentId, signal) =>
+          defaultChecklistGateRunner(name, agentId, signal, {
+            probe: async () => ({ quiet: false, reason: "script-runner-unhealthy: timeout" }),
+          }),
+        );
+        await seedLead();
+        await checkHeartbeatChecklist();
+        const tasks = await checklistTasks();
+        expect(tasks).toHaveLength(1);
+        expect(tasks[0]!.tags).toContain("heartbeat-gate:wake");
+      });
+    }
+
+    test("a bug in the probe produces wake rather than error", async () => {
+      process.env.HEARTBEAT_CHECKLIST_GATE_MODE = "enforce";
+      setChecklistGateRunnerForTests((name, agentId, signal) =>
+        defaultChecklistGateRunner(name, agentId, signal, {
+          probe: async () => {
+            throw new Error("probe bug");
+          },
+        }),
+      );
+      await seedLead();
+      await checkHeartbeatChecklist();
+      const tasks = await checklistTasks();
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]!.tags).toContain("heartbeat-gate:wake");
+    });
+
     test("shadow mode (default): a quiet verdict still creates the task, tagged quiet", async () => {
       useGate({ quiet: true, reason: "no change", summary: "nothing moved" });
       const lead = await seedLead();
@@ -739,6 +800,7 @@ describe("Heartbeat Checklist", () => {
         let run: Promise<unknown> | undefined;
         setChecklistGateRunnerForTests((scriptName, leadAgentId, signal) => {
           run = defaultChecklistGateRunner(scriptName, leadAgentId, signal, {
+            probe: async () => null,
             buildCredentials: () => {
               setupStarted.resolve();
               return new Promise((resolve) => {
