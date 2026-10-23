@@ -134,7 +134,7 @@ RUN if ! gh extension install github/gh-stack; then \
     fi
 
 # Install Claude CLI (pinned version — bump ARG to update)
-ARG CLAUDE_CODE_VERSION=2.1.308
+ARG CLAUDE_CODE_VERSION=2.1.309
 USER root
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache \
     npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
@@ -160,7 +160,7 @@ ENV PI_PACKAGE_DIR=/usr/lib/node_modules/@earendil-works/pi-coding-agent
 # Install Codex CLI (alternative harness, selected via HARNESS_PROVIDER=codex)
 # Pinned version must match direct @openai/codex in package.json. Enforced by
 # scripts/check-codex-default-model.sh and the CI merge gate.
-ARG CODEX_VERSION=0.163.0
+ARG CODEX_VERSION=0.164.0
 USER root
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache \
     npm install -g @openai/codex@${CODEX_VERSION} \
@@ -570,9 +570,9 @@ RUN curl -fsSL "https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-${DSH_VERSION}
 # "disabled". Bump AMP_VERSION, both SHA-512 pins and AMP_PACKAGE in
 # src/providers/amp-adapter.ts together. The vendor licence is proprietary
 # (https://ampcode.com/terms): confirm it before publishing this image.
-ARG AMP_VERSION=0.0.1792670445-ge8d5b3
-ARG AMP_SHA512_AMD64=ebf26f2cc5f5a30228cf96289402bfa7542a007829c4b27c99efc8c12f990778c014c88db4763dbf5df748828d5f0fc3078d394c0ddd39c753081613c7751606
-ARG AMP_SHA512_ARM64=2b7d9ba33895bb94444daa29a8940fa0bc40d65a5b0af4d1a7402fec44b5656ecce164f43213e771afdc505319de42f5076c07b9e562ad3047f8b10dcf84f620
+ARG AMP_VERSION=0.0.1792728062-g40cf3f
+ARG AMP_SHA512_AMD64=04c7b3a8cba9bc48e3d5e7f3d81c1132c676b2fdf545100dd7d9e1e430b48519866d2924fcd82a81c9436858a6b57b6725e109ab0591d892a670adae9a1cde72
+ARG AMP_SHA512_ARM64=95c7ead7f638bc5f52f356c44eca1244c87f2fc5b50de63ecb19586d1f6c5c4688ce151b6fa108889028afc114a09e1e27f5f6324be0785a71e0675ae1069c07
 RUN case "$TARGETARCH" in \
       amd64) amp_platform=linux-x64; amp_sha512="$AMP_SHA512_AMD64" ;; \
       arm64) amp_platform=linux-arm64; amp_sha512="$AMP_SHA512_ARM64" ;; \
@@ -620,7 +620,7 @@ RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
 # than the CLI, with that licence included. npm keeps LICENSE.md in the
 # package dir; the copy under /usr/share/doc makes it easy to find. The adapter
 # sets COPILOT_AUTO_UPDATE=false, so the pinned binary is the one that runs.
-ARG COPILOT_CLI_VERSION=1.0.102
+ARG COPILOT_CLI_VERSION=1.0.103
 RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache npm install \
       --prefix /opt/copilot-cli --no-audit --no-fund "@github/copilot@${COPILOT_CLI_VERSION}" \
     && ln -sf /opt/copilot-cli/node_modules/.bin/copilot /usr/local/bin/copilot \
