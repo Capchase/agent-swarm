@@ -20,8 +20,12 @@ import { findUserById } from "../be/users";
 import { can, type RbacPrincipal } from "../rbac";
 import type { User } from "../types";
 import { getRequestAuth } from "../utils/request-auth-context";
+import { scrubSecrets } from "../utils/secret-scrubber";
 import { cancelApprovalRequest } from "../workflows/approval-cancel";
-import { createApprovalFollowUpTask } from "../workflows/approval-notifications";
+import {
+  createApprovalFollowUpTask,
+  dispatchApprovalNotifications,
+} from "../workflows/approval-notifications";
 import { workflowEventBus } from "../workflows/event-bus";
 import { bodyTask, route } from "./route-def";
 import { jsonError } from "./utils";
@@ -288,7 +292,10 @@ const createRoute = route({
           target: z.string(),
         }),
       )
-      .optional(),
+      .optional()
+      .describe(
+        "Where to announce the request. A Slack target (channel or user ID) gets a card with the title, the questions and a link to the dashboard page that answers it. Slack targets need a lead agent caller (403 otherwise). Email is not supported yet and is skipped.",
+      ),
   }),
   responses: {
     201: {
@@ -296,6 +303,7 @@ const createRoute = route({
       schema: z.object({ approvalRequest: ApprovalRequestSchema }),
     },
     400: { description: "Validation error" },
+    403: { description: "Slack notifications require a lead agent" },
   },
   auth: { apiKey: true },
 });
@@ -578,7 +586,7 @@ export async function handleApprovalRequests(
     const parsed = await cancelRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
-    const { principal, resolvedBy } = await approvalCancelPrincipal(req);
+    const { principal, resolvedBy } = await approvalCallerPrincipal(req);
     const result = await cancelApprovalRequest({
       id: parsed.params.id,
       reason: parsed.body.reason,
@@ -619,6 +627,17 @@ export async function handleApprovalRequests(
     const parsed = await createRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
 
+    // Posting to Slack is lead-only everywhere else (slack-post); a caller that
+    // may not post must not reach an arbitrary channel through this route.
+    if (parsed.body.notifications?.some((notification) => notification.channel === "slack")) {
+      const { principal } = await approvalCallerPrincipal(req);
+      const decision = can({ principal, verb: "integration.slack.post", source: "http" });
+      if (!decision.allow) {
+        jsonError(res, SLACK_NOTIFICATION_REFUSED, 403);
+        return true;
+      }
+    }
+
     const id = crypto.randomUUID();
     // Prefer a trusted authenticated user (never client-controlled); else fall
     // back to the ownership-validated sourceTaskId the request body carries.
@@ -641,6 +660,24 @@ export async function handleApprovalRequests(
       notificationChannels: parsed.body.notifications,
       createdBy,
     });
+
+    // Fire-and-forget: Slack must not delay or fail the 201. Workflow HITL
+    // requests are created by the executor directly, so they never post here.
+    const notifications = parsed.body.notifications;
+    if (notifications?.length && request.status === "pending") {
+      dispatchApprovalNotifications({
+        requestId: request.id,
+        title: request.title,
+        questions: parsed.body.questions,
+        timeoutSeconds: parsed.body.timeoutSeconds,
+        notifications,
+      }).catch((err) => {
+        console.error(
+          "[approval-requests] Unexpected error dispatching notifications:",
+          scrubSecrets(err instanceof Error ? err.message : String(err)),
+        );
+      });
+    }
 
     createRoute.respond(res, 201, {
       approvalRequest: await toApprovalRequestResponse(request),
@@ -676,11 +713,14 @@ export async function handleApprovalRequests(
   return false;
 }
 
+const SLACK_NOTIFICATION_REFUSED =
+  "Slack notifications require lead privileges (integration.slack.post). Create the request without them, or ask the lead to post the link.";
+
 /**
- * The caller of the cancel route. The shared API key with an `X-Agent-ID`
- * header identifies that agent, as on the create route.
+ * The caller of the create and cancel routes. The shared API key with an
+ * `X-Agent-ID` header identifies that agent.
  */
-async function approvalCancelPrincipal(
+async function approvalCallerPrincipal(
   req: IncomingMessage,
 ): Promise<{ principal: RbacPrincipal; resolvedBy: string | null }> {
   const auth = getRequestAuth(req);
