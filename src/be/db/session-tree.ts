@@ -6,7 +6,11 @@ import {
 } from "../../assets/key";
 import { isTerminalTaskStatus, TERMINAL_TASK_STATUSES } from "../../types";
 import { getDbClient, literalPrefixPattern } from "../db";
-import { type SessionViewer, sessionViewerCondition } from "./session-visibility";
+import {
+  type SessionViewer,
+  sessionMineCondition,
+  sessionViewerCondition,
+} from "./session-visibility";
 
 export type SessionReadState = "unread" | "read" | "later" | "done";
 export interface SessionFilters {
@@ -36,6 +40,8 @@ export interface SessionFilters {
   now?: string;
   /** Exclude ownerless roots for user viewers to match the tree's visibility. */
   tree?: boolean;
+  /** For user viewers: only human-started roots of the viewer and shares (the "Mine" view). */
+  mine?: boolean;
   /** Match exactly this root (one session's summary, e.g. its read state). */
   rootId?: string;
 }
@@ -106,6 +112,7 @@ export function sessionRootFilter(opts: SessionFilters = {}): SqlFragment {
   if (opts.viewer) {
     add(sessionViewerCondition(opts.viewer));
     if (opts.tree) conditions.push("r.requestedByUserId IS NOT NULL");
+    if (opts.mine) add(sessionMineCondition(opts.viewer.userId));
   }
   if (opts.keyPrefix) {
     const { lo, hi } = keyPrefixRange(opts.keyPrefix);
@@ -327,11 +334,13 @@ export interface SessionTree {
 export async function getSessionTree(
   actor: { kind: "bypass" } | { kind: "user"; userId: string | null },
   now?: string,
+  opts: { mine?: boolean } = {},
 ): Promise<SessionTree> {
   const query = sessionSummaryQuery({
     ...(actor.kind === "user" ? { viewer: { userId: actor.userId, scope: "all" } as const } : {}),
     now,
     tree: true,
+    mine: opts.mine,
   });
   const rows = await getDbClient().query<{
     key: string;

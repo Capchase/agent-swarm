@@ -41,6 +41,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import type { SessionsViewMode } from "@/hooks/use-sessions-view";
 import { useStableHandler } from "@/hooks/use-stable-handler";
+import { useSessionsShow } from "@/lib/sessions-show";
 import { SESSIONS_TOAST_POSITION, userName } from "@/lib/sessions-v2";
 import { MobileBulkBar } from "../mobile/mobile-bulk-bar";
 import { MobileTreeBody } from "../mobile/mobile-tree-body";
@@ -54,6 +55,7 @@ import { AddGroupRow, CreateGroupRow, EmptyRow, LoadingRow, PagingRow } from "./
 import type { RowMenuActions, RowMenuState } from "./row-menu";
 import { segmentsOf, TreeSection } from "./section-header";
 import { SessionDragPreview, SessionRow } from "./session-row";
+import { ShowToggle } from "./show-toggle";
 import { SidebarSearch } from "./sidebar-search";
 import { TreeDialogs, useTreeDialogs } from "./tree-dialogs";
 import {
@@ -147,6 +149,8 @@ export function SessionTree({
 }: SessionTreeProps) {
   const { userId } = useCurrentUser();
   const me = userId ?? null;
+  // The tree and list queries below read the Mine / All view: re-render on a change.
+  useSessionsShow();
   const now = useMinuteClock();
   const [expanded, setExpanded] = useState<ReadonlySet<ContainerId>>(() => new Set());
   const { isOpen, setOpen, prune } = useTreeFolds(me);
@@ -742,6 +746,7 @@ export function SessionTree({
           if (searching) cursor.moveTo(0);
         }}
       />
+      {me ? <ShowToggle phone={phone} /> : null}
       {body}
       <TreeDialogs
         dialogs={dialogs}

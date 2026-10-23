@@ -27,3 +27,34 @@ export function sessionViewerCondition(viewer: SessionViewer): {
     params: [viewer.userId, viewer.userId],
   };
 }
+
+/**
+ * Root sources that a machine starts: a workflow run, a schedule, or the
+ * swarm itself (heartbeat, follow-ups, budget and approval notices). A
+ * workflow root carries the user whose trigger fired it, so the requester
+ * alone does not tell a person's session from fan-out. `kapso-inbound` is the
+ * exception: a WhatsApp message a person sent, written with `system`.
+ */
+export const MACHINE_SESSION_SOURCES = ["workflow", "schedule", "system"] as const;
+const HUMAN_SYSTEM_TASK_TYPES = ["kapso-inbound"] as const;
+
+/**
+ * The sessions v2 "Mine" view (alias `r`): roots this user started from a
+ * human channel (every source outside {@link MACHINE_SESSION_SOURCES}), plus
+ * sessions shared with this user or everyone. A list filter only: it narrows
+ * what a list shows and never changes who can open a session.
+ */
+export function sessionMineCondition(userId: string | null): {
+  sql: string;
+  params: (string | null)[];
+} {
+  const machine = MACHINE_SESSION_SOURCES.map(() => "?").join(",");
+  const humanSystem = HUMAN_SYSTEM_TASK_TYPES.map(() => "?").join(",");
+  return {
+    sql: `((r.requestedByUserId = ? AND (r.source NOT IN (${machine})
+        OR (r.source = 'system' AND r.taskType IN (${humanSystem}))))
+      OR EXISTS (SELECT 1 FROM session_shares s
+        WHERE s.rootTaskId = r.id AND s.revokedAt IS NULL AND (s.userId IS NULL OR s.userId = ?)))`,
+    params: [userId, ...MACHINE_SESSION_SOURCES, ...HUMAN_SYSTEM_TASK_TYPES, userId],
+  };
+}

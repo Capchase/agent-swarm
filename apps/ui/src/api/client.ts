@@ -3340,6 +3340,8 @@ class ApiClient {
      * caller can open. Session sharing servers only (`SESSION_SHARING_MIN_VERSION`).
      */
     scope?: "mine" | "shared" | "tree";
+    /** With `scope=tree`: `all` adds machine-started runs to the Mine default (sessions v2). */
+    show?: "all";
     /** Asset key prefix, subgroups included (sessions v2). */
     keyPrefix?: string;
     /** Exactly this group, not its subgroups (sessions v2). */
@@ -3361,6 +3363,7 @@ class ApiClient {
     if (opts?.requestedByUserId) params.set("requestedByUserId", opts.requestedByUserId);
     if (opts?.contextKeyPrefix) params.set("contextKeyPrefix", opts.contextKeyPrefix);
     if (opts?.scope) params.set("scope", opts.scope);
+    if (opts?.show) params.set("show", opts.show);
     if (opts?.keyPrefix) params.set("keyPrefix", opts.keyPrefix);
     if (opts?.groupKey) params.set("groupKey", opts.groupKey);
     if (opts?.noGroup) params.set("noGroup", "true");
@@ -3375,8 +3378,8 @@ class ApiClient {
   }
 
   /** Every visible session group with its counts, plus the Inbox, Later, Done, and No group counts. */
-  async getSessionTree(): Promise<SessionTreeResponse> {
-    const url = `${this.getBaseUrl()}/api/session-tree`;
+  async getSessionTree(opts?: { show?: "all" }): Promise<SessionTreeResponse> {
+    const url = `${this.getBaseUrl()}/api/session-tree${opts?.show ? `?show=${opts.show}` : ""}`;
     const res = await fetch(url, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to load the session tree: ${res.status}`);
     return (await res.json()) as SessionTreeResponse;

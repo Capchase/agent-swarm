@@ -480,6 +480,13 @@ async function handleAgentTokens(
   return true;
 }
 
+const SessionShowSchema = z
+  .enum(["mine", "all"])
+  .optional()
+  .describe(
+    "Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged.",
+  );
+
 const listSessions = route({
   method: "get",
   path: "/api/sessions",
@@ -539,6 +546,8 @@ const listSessions = route({
       .describe(
         "mine: owned sessions. shared: sessions shared with me. tree: Sessions that GET /api/session-tree counts: mine plus shared with me, no ownerless roots. A bypass actor sees every root with tree scope.",
       ),
+    /** With `scope=tree`: `mine` (default) or `all`. Must match the tree's `show`. */
+    show: SessionShowSchema,
   }),
   responses: {
     200: {
@@ -561,6 +570,7 @@ const sessionTree = route({
   pattern: ["api", "session-tree"],
   summary: "Get session groups and triage counts",
   tags: ["Sessions"],
+  query: z.object({ show: SessionShowSchema }),
   responses: {
     200: { description: "Visible groups and section counts", schema: SessionTreeResponseSchema },
     401: { description: "Unauthorized" },
@@ -888,6 +898,7 @@ export async function handleSessions(
       withUserId: parsed.query.withUserId,
       now: new Date().toISOString(),
       tree: parsed.query.scope === "tree",
+      mine: parsed.query.scope === "tree" && parsed.query.show !== "all",
       ...(actor.kind === "user"
         ? {
             viewer: {
@@ -922,7 +933,12 @@ export async function handleSessions(
   if (sessionTree.match(req.method, pathSegments)) {
     const parsed = await sessionTree.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
-    sessionTree.respond(res, 200, await getSessionTree(await resolveSessionActor(req, myAgentId)));
+    const actor = await resolveSessionActor(req, myAgentId);
+    sessionTree.respond(
+      res,
+      200,
+      await getSessionTree(actor, undefined, { mine: parsed.query.show !== "all" }),
+    );
     return true;
   }
 

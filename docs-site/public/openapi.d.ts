@@ -18800,6 +18800,8 @@ export interface paths {
                     fields?: "full" | "slim";
                     /** @description mine: owned sessions. shared: sessions shared with me. tree: Sessions that GET /api/session-tree counts: mine plus shared with me, no ownerless roots. A bypass actor sees every root with tree scope. */
                     scope?: "mine" | "shared" | "tree";
+                    /** @description Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged. */
+                    show?: "mine" | "all";
                 };
                 header?: never;
                 path?: never;
@@ -18919,7 +18921,10 @@ export interface paths {
         /** Get session groups and triage counts */
         get: {
             parameters: {
-                query?: never;
+                query?: {
+                    /** @description Sessions v2 view, for a user viewer with tree scope. mine (default): roots the user started from a human channel (not workflow, schedule, or system) plus sessions shared with the user. all: every tree session. Lists only: access is unchanged. */
+                    show?: "mine" | "all";
+                };
                 header?: never;
                 path?: never;
                 cookie?: never;

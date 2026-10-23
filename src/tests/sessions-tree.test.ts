@@ -491,3 +491,48 @@ test("limit clamps to 200 and count without chain filters does not recurse", asy
   expect(body.sessions).toHaveLength(200);
   expect(body.total).toBe(205);
 });
+
+describe("Mine view hides machine-started roots", () => {
+  test("a workflow root attributed to the viewer is hidden by default and shown under All", async () => {
+    // Positive control: pr-review-demo fan-out carries the trigger user as requester.
+    const demo = await task("shared/", { source: "workflow", tags: ["pr-review-demo"] });
+    const scheduled = await task("shared/", { source: "schedule" });
+    const heartbeat = await task("shared/", { source: "system" });
+    // Negative controls: the viewer's own human sessions stay.
+    const slack = await task("shared/", { source: "slack" });
+    const ui = await task("shared/", { source: "ui" });
+    const whatsapp = await task("shared/", { source: "system", taskType: "kapso-inbound" });
+    // A workflow root someone else shared with the viewer stays too.
+    const sharedRun = await task("shared/", { source: "workflow", requestedByUserId: other.id });
+    await share(sharedRun);
+    // Ownerless roots stay out of both views, as before.
+    await task("shared/", { source: "workflow", requestedByUserId: undefined });
+
+    const headers = { "x-swarm-user-id": owner.id };
+    const list = async (query: string) => {
+      const res = await fetch(`${baseUrl}/api/sessions?scope=tree&limit=50&${query}`, { headers });
+      const body = (await res.json()) as { total: number; sessions: { root: { id: string } }[] };
+      expect(body.sessions).toHaveLength(body.total);
+      return body.sessions.map((s) => s.root.id).sort();
+    };
+    const tree = async (query: string) => {
+      const res = await fetch(`${baseUrl}/api/session-tree?${query}`, { headers });
+      return ((await res.json()) as Awaited<ReturnType<typeof getSessionTree>>).noGroup.total;
+    };
+
+    const mine = [slack.id, ui.id, whatsapp.id, sharedRun.id].sort();
+    const all = [...mine, demo.id, scheduled.id, heartbeat.id].sort();
+    expect(await list("")).toEqual(mine);
+    expect(await list("show=mine")).toEqual(mine);
+    expect(await list("show=all")).toEqual(all);
+    expect(await tree("")).toBe(mine.length);
+    expect(await tree("show=all")).toBe(all.length);
+
+    // No picked user: the bypass actor still sees every root, ownerless included.
+    const bypass = await fetch(`${baseUrl}/api/sessions?scope=tree&limit=50`);
+    expect(((await bypass.json()) as { total: number }).total).toBe(all.length + 1);
+    // Access is unchanged: the hidden session still opens by direct link.
+    const detail = await fetch(`${baseUrl}/api/sessions/${demo.id}`, { headers });
+    expect(detail.status).toBe(200);
+  });
+});

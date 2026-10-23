@@ -13,55 +13,28 @@
  * older API servers (which 404 these endpoints) don't render the surface.
  */
 
-import { type QueryKey, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useCurrentUser } from "@/contexts/current-user-context";
 import { sessionSharesMutationOptions } from "@/lib/session-shares-mutation";
 import { sharesInput } from "@/lib/session-sharing";
+import { useSessionsShow } from "@/lib/sessions-show";
 import { sessionRefetchInterval } from "@/lib/task-activity";
 import { api } from "../client";
-import type { SessionStatusFilter, SessionTriageFilter } from "../types";
+import {
+  sessionDetailKey,
+  sessionListKey,
+  sessionListParams,
+  type UseSessionsOptions,
+} from "./session-query-keys";
 
-export interface UseSessionsOptions {
-  limit?: number;
-  offset?: number;
-  /** Source filter (e.g. `["ui"]`). Empty / undefined → all sources. */
-  source?: string[];
-  /** Case-insensitive substring search against the root task's text. */
-  q?: string;
-  /** When set, restrict results to sessions owned by this user. */
-  requestedByUserId?: string;
-  /** Root tasks whose `contextKey` starts with this prefix (≥1.157.1). */
-  contextKeyPrefix?: string;
-  /**
-   * `mine` / `shared` (session sharing servers only, see `SESSION_SHARING_MIN_VERSION`).
-   * Every sessions v2 list sends `tree`, so its totals match `useSessionTree()`.
-   */
-  scope?: "mine" | "shared" | "tree";
-  /** Asset key prefix, subgroups included (sessions v2). */
-  keyPrefix?: string;
-  /** Exactly this group, not its subgroups (sessions v2). */
-  groupKey?: string;
-  /** Sessions in no group (sessions v2). */
-  noGroup?: boolean;
-  /** Read-state section: Inbox, Later, Done, or every unread session (sessions v2). */
-  triage?: SessionTriageFilter;
-  /** Running, failed, or "Needs you" (sessions v2). */
-  status?: SessionStatusFilter;
-  /** A person in the chain or a share user (sessions v2). */
-  withUserId?: string;
-  /** Disable the query entirely (e.g. when user identity is not yet resolved). */
-  enabled?: boolean;
-}
-
-/**
- * Query key prefix of every session list page. The triage hooks patch rows
- * under it. Invalidate with `["sessions"]`.
- */
-export const SESSION_LIST_KEY = ["sessions", "list"] as const;
-
-/** The list params in a session list query key: `[...SESSION_LIST_KEY, userId, params]`. */
-export type SessionListParams = Omit<UseSessionsOptions, "enabled"> & { limit: number };
+export {
+  SESSION_LIST_KEY,
+  type SessionListParams,
+  sessionDetailKey,
+  sessionListParamsOf,
+  type UseSessionsOptions,
+} from "./session-query-keys";
 
 /**
  * The query of one session list page. `useSessions` uses it, and so does a
@@ -69,25 +42,17 @@ export type SessionListParams = Omit<UseSessionsOptions, "enabled"> & { limit: n
  * cache entry per page.
  */
 export function sessionsQueryOptions(userId: string | null, options?: UseSessionsOptions) {
-  const { enabled = true, ...rest } = options ?? {};
-  const params: SessionListParams = { ...rest, limit: rest.limit ?? 50 };
+  const params = sessionListParams(options);
   return {
-    // Rows carry the viewer's read state, and `scope` and `triage` depend on
-    // the viewer, so a user switch must not show the last user's page.
-    queryKey: [...SESSION_LIST_KEY, userId, params] as const,
+    queryKey: sessionListKey(userId, params),
     queryFn: () => api.listSessions(params),
-    enabled,
+    enabled: options?.enabled ?? true,
   };
-}
-
-/** The list params of a session list query key (see `sessionsQueryOptions`). */
-export function sessionListParamsOf(key: QueryKey): SessionListParams | undefined {
-  const params = key[3];
-  return params && typeof params === "object" ? (params as SessionListParams) : undefined;
 }
 
 export function useSessions(options?: UseSessionsOptions) {
   const { userId } = useCurrentUser();
+  useSessionsShow();
   return useQuery(sessionsQueryOptions(userId ?? null, options));
 }
 
@@ -95,11 +60,6 @@ export function useSessions(options?: UseSessionsOptions) {
 export function sessionErrorStatus(error: unknown): number | undefined {
   const status = (error as { status?: unknown } | null)?.status;
   return typeof status === "number" ? status : undefined;
-}
-
-/** The session detail query: `["session", rootTaskId, userId]`. */
-export function sessionDetailKey(rootTaskId: string | undefined, userId: string | null): QueryKey {
-  return ["session", rootTaskId, userId];
 }
 
 /** A tab in the background polls its session this often (sessions v2 tab strip). */

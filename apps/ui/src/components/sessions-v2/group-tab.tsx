@@ -38,6 +38,7 @@ import { useIsPhone } from "@/hooks/use-mobile";
 import { useStableHandler } from "@/hooks/use-stable-handler";
 import { peerColor } from "@/lib/comb/presence";
 import { groupCrumb } from "@/lib/session-groups";
+import { useSessionsShow } from "@/lib/sessions-show";
 import { sidebarListParams, userName } from "@/lib/sessions-v2";
 import { cn, formatRelativeTime, sessionDisplayTitle } from "@/lib/utils";
 import { ActivityMark, activityOf, shortAgo } from "./sidebar/session-row";
@@ -100,6 +101,8 @@ function GroupList({
 }: GroupTabProps & { listKey: string }) {
   const { userId } = useCurrentUser();
   const me = userId ?? null;
+  // The list query reads the Mine / All view: re-render on a change.
+  useSessionsShow();
   const phone = useIsPhone();
   const { data: users } = useUsers();
   const nameOf = (id: string) => userName(users, id);
