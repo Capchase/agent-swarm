@@ -570,6 +570,9 @@ describe("script connections", () => {
       markMigrationApplied(database, "151_repair_scheduled_task_required_params.sql");
       // 152 indexes task routing context absent from this migration-112-only fixture.
       markMigrationApplied(database, "152_routing_decisions.sql");
+      // 153 drops a column, so SQLite revalidates 144's agent_tasks triggers
+      // against this fixture's id-only agent_tasks (Bun < 1.4.4 hid the error).
+      markMigrationApplied(database, "153_deferred_task_wait_members.sql");
       // 156 alters inbox_item_state, which this migration-112-only fixture does not create.
       markMigrationApplied(database, "156_inbox_item_state_read_at.sql");
       // 157 alters scheduled_tasks and slack_messages, neither of which this
