@@ -18,6 +18,7 @@ import {
 import { checkpointStep, checkpointStepFailure } from "./checkpoint";
 import { getSuccessors } from "./definition";
 import type { ExecutorRegistry } from "./executors/registry";
+import { resolveStepNode } from "./foreach-body";
 import { type ForeachSettleResult, resolveForeachParent, settleForeachChild } from "./foreach-join";
 
 export interface TaskStepRoutingResult {
@@ -182,8 +183,8 @@ export async function checkpointPortStepAndResolveSuccessors(
  *   or the failed task is no longer the one bound to the step (it was
  *   already retried and a fresh task now owns it); the caller stops.
  * - `not-eligible`: no retry applies (no `node.retry` and not a supersede
- *   cut, not an agent-task node, or retries exhausted); the caller applies
- *   `onNodeFailure` as before.
+ *   cut, not an agent-task node, retries exhausted, or a foreach child whose
+ *   run is no longer live); the caller applies `onNodeFailure` as before.
  */
 export type TaskStepRetryOutcome = "scheduled" | "not-claimed" | "not-eligible";
 
@@ -217,8 +218,13 @@ export const SUPERSEDE_RETRY_POLICY: RetryPolicy = {
  * only after ownership is confirmed: a stale caller's step snapshot may carry
  * the counter of a newer attempt.
  *
- * Foreach children (`<foreachId>#<key>`) are not matched here: the retry
- * poller resolves nodes by exact id and cannot re-dispatch a child yet.
+ * A foreach child (`<foreachId>#<key>`) with an `agent-task` body takes the
+ * parent foreach node's `retry`, else the same supersede default. While queued
+ * it does not settle, so the join stays open; the retry poller re-queues it and
+ * the foreach driver starts it under the fan-out's concurrency cap. A child is
+ * queued only while its run is live. Exhausted retries, a run that is no longer
+ * live and every other failure settle the item through `onNodeFailure` and the
+ * fan-out's failure policy as before.
  */
 export async function scheduleTaskStepRetry(
   def: WorkflowDefinition,
@@ -227,11 +233,14 @@ export async function scheduleTaskStepRetry(
   taskId: string,
   reason: string,
 ): Promise<TaskStepRetryOutcome> {
-  const node = def.nodes.find((n) => n.id === step.nodeId);
+  const foreachParent = resolveForeachParent(def, step.nodeId);
+  const node = resolveStepNode(def, step.nodeId);
   if (!node || node.type !== "agent-task") return "not-eligible";
+  // A synthesized child node carries only the body; its retry lives on the parent.
+  const declaredRetry = foreachParent ? foreachParent.retry : node.retry;
   let policy: RetryPolicy;
-  if (node.retry) {
-    const parsed = RetryPolicySchema.safeParse(node.retry);
+  if (declaredRetry) {
+    const parsed = RetryPolicySchema.safeParse(declaredRetry);
     if (!parsed.success) return "not-eligible";
     policy = parsed.data;
   } else {
@@ -243,6 +252,13 @@ export async function scheduleTaskStepRetry(
     const current = await getWorkflowRunStep(step.id);
     if (!current || current.status !== "waiting") return "not-claimed";
     if (!(await isTaskBoundToStep(taskId, step.id))) return "not-claimed";
+    // A sibling's fail-fast or another branch can fail the run while the
+    // caller awaited. A child queued then would revive the failed run, so the
+    // caller records the cut as the item's late outcome instead.
+    if (foreachParent) {
+      const run = await getWorkflowRun(runId);
+      if (run?.status !== "running" && run?.status !== "waiting") return "not-eligible";
+    }
     if (current.retryCount >= policy.maxRetries) return "not-eligible";
     await detachTaskFromWorkflowRunStep(taskId);
     await checkpointStepFailure(runId, step.id, reason, current.retryCount, policy);

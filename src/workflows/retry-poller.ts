@@ -17,7 +17,8 @@ import {
 } from "./engine";
 import type { AsyncExecutorResult } from "./executors/base";
 import type { ExecutorRegistry } from "./executors/registry";
-import { FOREACH_ITEMS_WAIT_FOR, parkAndDriveForeach } from "./foreach-driver";
+import { FOREACH_ITEMS_WAIT_FOR, parkAndDriveForeach, runForeachDrive } from "./foreach-driver";
+import { resolveForeachParent } from "./foreach-join";
 import { rebuildNodeExecutionInput } from "./step-input";
 import { runStepValidation } from "./validation";
 
@@ -44,6 +45,19 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
 
           const workflow = await getWorkflow(run.workflowId);
           if (!workflow) continue;
+
+          // A foreach child goes back to its fan-out's queue: the driver
+          // rebuilds the per-item config and starts it under the concurrency
+          // cap, and the item settles into the join like any other.
+          const foreachParent = resolveForeachParent(workflow.definition, step.nodeId);
+          if (foreachParent) {
+            if (!(await claimRetry(run.id, step.id, { requeueForeachChild: true }))) continue;
+            console.log(
+              `[workflows] Retrying foreach item ${step.nodeId} (attempt ${step.retryCount}) for run ${step.runId}`,
+            );
+            await runForeachDrive(run.id, foreachParent.id, registry);
+            continue;
+          }
 
           // Find the node definition for this step
           const node = workflow.definition.nodes.find((n) => n.id === step.nodeId);
@@ -264,14 +278,38 @@ export function startRetryPoller(registry: ExecutorRegistry, intervalMs = 5000):
 /**
  * Flip a retry-pending step to `running` only while it is still retry-pending
  * and its run is live, and revive a run failed by this step.
+ *
+ * `requeueForeachChild` flips a foreach child to `pending` instead, for the
+ * driver to claim, and clears the cut's error: the join reads `error` on a
+ * completed child as a failed item, so a stale one would count the retry's
+ * success as a failure.
+ *
+ * A queued child never revives a failed run: its retry does not settle, so
+ * something else failed the run. The queued retry is retired instead, leaving
+ * the item `failed` with the cut's error for a run retry to give a new attempt.
  */
-async function claimRetry(runId: string, stepId: string): Promise<boolean> {
+async function claimRetry(
+  runId: string,
+  stepId: string,
+  options: { requeueForeachChild?: boolean } = {},
+): Promise<boolean> {
   return getDbClient().transaction(async () => {
     const run = await getWorkflowRun(runId);
     if (!run || !RETRYABLE_RUN_STATUSES.has(run.status)) return false;
+    if (options.requeueForeachChild && run.status === "failed") {
+      await getDbClient().run(
+        `UPDATE workflow_run_steps SET nextRetryAt = NULL, finishedAt = ?
+          WHERE id = ? AND runId = ? AND status = 'failed' AND nextRetryAt IS NOT NULL`,
+        [new Date().toISOString(), stepId, runId],
+      );
+      return false;
+    }
+    const set = options.requeueForeachChild
+      ? "status = 'pending', nextRetryAt = NULL, error = NULL"
+      : "status = 'running', nextRetryAt = NULL";
     const claimed = await getDbClient().get<{ id: string }>(
       `UPDATE workflow_run_steps
-          SET status = 'running', nextRetryAt = NULL
+          SET ${set}
         WHERE id = ? AND runId = ? AND status = 'failed' AND nextRetryAt IS NOT NULL
         RETURNING id`,
       [stepId, runId],
