@@ -54,8 +54,10 @@ export async function resolveSqlDsn(
 // Bun >= 1.4.4 rejects an enumerable `raw`, so shape it like a real (frozen) template object.
 const asTemplate = (text: string): TemplateStringsArray =>
   Object.freeze(
-    Object.defineProperty([text], "raw", { value: Object.freeze([text]) }),
-  ) as unknown as TemplateStringsArray;
+    Object.defineProperty([text], "raw", { value: Object.freeze([text]) }) as string[] & {
+      raw: readonly string[];
+    },
+  );
 
 const defaultExecutor: SqlExecutor = async (dsn, query, params, take) => {
   // Bun.SQL global, not `import { SQL } from "bun"`: the node-target CLI bundle cannot import "bun".
