@@ -223,7 +223,13 @@ import {
 } from "./db/tasks/read";
 import { configureTaskWriteDependencies, failTask } from "./db/tasks/write";
 import { tombstoneWorkflowIdempotencyKeys } from "./db/workflow-idempotency";
-import { emitChildRunFinished, wakeParentsOfDeletedRuns } from "./db/workflow-runs";
+import {
+  emitChildRunFinished,
+  getRunLineageBlock,
+  getStepExecutionBlock,
+  WorkflowStepNotExecutableError,
+  wakeParentsOfDeletedRuns,
+} from "./db/workflow-runs";
 import { scrubJsonValue } from "./scrub-json";
 import { openSealedJson, sealedJsonForDisplay, sealJson } from "./sealed-json";
 import { configSecretName, registerStoredSecret } from "./secret-registry";
@@ -2856,6 +2862,14 @@ export async function createTaskExtended(
   const claim = await getDbClient().transaction<
     { existing: ExistingTrackerContextWork } | { row: AgentTaskRow }
   >(async () => {
+    // A workflow step's task commits only while the step may still start
+    // work. Checked in the INSERT's transaction: a cascade cancel of the
+    // step's run tree either commits first and is seen here, or sees and
+    // cancels this task.
+    if (options?.workflowRunStepId) {
+      const blocked = await getStepExecutionBlock(options.workflowRunStepId);
+      if (blocked) throw new WorkflowStepNotExecutableError(options.workflowRunStepId, blocked);
+    }
     const existingTrackerWork = options?.bypassTrackerContextDedup
       ? null
       : await findExistingLinearTrackerContextWork(options?.contextKey);
@@ -9806,15 +9820,29 @@ export async function createApprovalRequest(data: {
   const row = await getDbClient().transaction(async () => {
     let status: ApprovalRequest["status"] = "pending";
     let resolutionReason: string | null = null;
-    if (data.requireActionableWorkflow && data.workflowRunId && data.workflowRunStepId) {
-      const run = await getWorkflowRun(data.workflowRunId);
-      const step = await getWorkflowRunStep(data.workflowRunStepId);
+    // A request linked to an existing run, with or without a step, is born
+    // cancelled unless the run is live and its tree is not cancelled: a
+    // pending request in a cancelled tree would be open work no cancel may
+    // leave behind. A missing run is refused only on the workflow (HITL) path.
+    const actionable = data.requireActionableWorkflow && data.workflowRunStepId;
+    const run = data.workflowRunId ? await getWorkflowRun(data.workflowRunId, "display") : null;
+    if (data.workflowRunId && (run || actionable)) {
+      const step = actionable ? await getWorkflowRunStep(data.workflowRunStepId!) : undefined;
       if (!run || (run.status !== "running" && run.status !== "waiting")) {
         status = "cancelled";
         resolutionReason = run?.error ?? `Workflow run is ${run?.status ?? "missing"}`;
-      } else if (!step || step.runId !== run.id || step.status !== "running") {
+      } else if (
+        step !== undefined &&
+        (!step || step.runId !== run.id || step.status !== "running")
+      ) {
         status = "cancelled";
         resolutionReason = `Human-in-the-loop step is ${step?.status ?? "missing"}`;
+      } else {
+        const blocked = await getRunLineageBlock(run.id);
+        if (blocked) {
+          status = "cancelled";
+          resolutionReason = blocked;
+        }
       }
     }
 

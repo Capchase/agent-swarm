@@ -9,6 +9,7 @@ import {
   releaseApprovalCancellationNotificationClaim,
   updateApprovalRequestNotifications,
 } from "../be/db";
+import { approvalCancellationNotificationKey } from "../be/db/approvals";
 import { resolveTemplate } from "../prompts/resolver";
 import { getSlackApp } from "../slack/app";
 import { resolveSlackConversationId } from "../slack/dm";
@@ -263,7 +264,10 @@ export async function postApprovalCancellationUpdates(
 
     for (const notification of slackThreads) {
       if (notification.channel !== "slack" || !notification.messageTs) continue;
-      const notificationKey = `${notification.target}:${notification.messageTs}`;
+      const notificationKey = approvalCancellationNotificationKey(
+        notification.target,
+        notification.messageTs,
+      );
       const claim = await claimApprovalCancellationNotification(approval.id, notificationKey);
       if (!claim) continue;
       try {

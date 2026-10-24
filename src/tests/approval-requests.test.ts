@@ -418,7 +418,7 @@ describe("Approval Requests", () => {
       expect(result).toBeNull();
     });
 
-    test("does not resolve a workflow approval after its run and HITL step are cancelled", async () => {
+    test("does not resolve a workflow approval after its run is cancelled", async () => {
       const workflow = await createWorkflow({
         name: `approval-cancel-${crypto.randomUUID()}`,
         definition: { nodes: [] },
@@ -432,11 +432,12 @@ describe("Approval Requests", () => {
         nodeId: "approval",
         nodeType: "human-in-the-loop",
       });
-      await updateWorkflowRun(runId, { status: "cancelled" });
-      await updateWorkflowRunStep(stepId, { status: "cancelled" });
+      // Asked while the run was live; the run was cancelled after, leaving
+      // the request pending (a cancelled step's trigger would close it).
       const approval = await createApprovalRequest(
         makeApprovalData({ workflowRunId: runId, workflowRunStepId: stepId }),
       );
+      await updateWorkflowRun(runId, { status: "cancelled" });
 
       const result = await resolveApprovalRequest(
         approval.id,
@@ -1864,15 +1865,17 @@ describe("Approval Requests", () => {
 
     test("cancel on a waiting run cancels the run, its step, and its task", async () => {
       const { runId, stepId, approvalId } = await makeRun("waiting");
+      // Linked directly: the engine binds a step's task while the step is
+      // still running, and this step is already parked.
       const task = await createTaskExtended("step task", {
         agentId: owner.id,
         source: "mcp",
         workflowRunId: runId,
-        workflowRunStepId: stepId,
       });
-      await getDbClient().run("UPDATE agent_tasks SET status = 'in_progress' WHERE id = ?", [
-        task.id,
-      ]);
+      await getDbClient().run(
+        "UPDATE agent_tasks SET status = 'in_progress', workflowRunStepId = ? WHERE id = ?",
+        [stepId, task.id],
+      );
 
       const res = await post(
         `/api/approval-requests/${approvalId}/cancel`,

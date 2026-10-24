@@ -223,15 +223,17 @@ describe("approval sweeps", () => {
 
     test("cancels the waiting run, its step, and its linked task", async () => {
       const { runId, stepId } = await makeRun("waiting");
+      // Linked directly: the engine binds a step's task while the step is
+      // still running, and this step is already parked.
       const task = await createTaskExtended("step task", {
         agentId,
         source: "mcp",
         workflowRunId: runId,
-        workflowRunStepId: stepId,
       });
-      await getDbClient().run("UPDATE agent_tasks SET status = 'in_progress' WHERE id = ?", [
-        task.id,
-      ]);
+      await getDbClient().run(
+        "UPDATE agent_tasks SET status = 'in_progress', workflowRunStepId = ? WHERE id = ?",
+        [stepId, task.id],
+      );
       const id = await makeRequest({ ageDays: 8, workflowRunId: runId, workflowRunStepId: stepId });
 
       const result = await autoCancelStaleApprovalRequests();
@@ -300,8 +302,10 @@ describe("approval sweeps", () => {
     });
 
     test("leaves a failed run as it is", async () => {
-      const { runId, stepId } = await makeRun("failed");
+      // The request was asked while the run was live; the run failed after.
+      const { runId, stepId } = await makeRun("waiting");
       const id = await makeRequest({ ageDays: 8, workflowRunId: runId, workflowRunStepId: stepId });
+      await updateWorkflowRun(runId, { status: "failed" });
 
       const result = await autoCancelStaleApprovalRequests();
 
@@ -415,13 +419,15 @@ describe("approval sweeps", () => {
     });
 
     test("times out a request on a completed run", async () => {
-      const { runId, stepId } = await makeRun("completed");
+      // The request was asked while the run was live; the run completed after.
+      const { runId, stepId } = await makeRun("waiting");
       const id = await makeRequest({
         ageDays: 0,
         expiresInMs: -60_000,
         workflowRunId: runId,
         workflowRunStepId: stepId,
       });
+      await updateWorkflowRun(runId, { status: "completed" });
       await timeoutExpiredApprovalRequests();
       expect((await getApprovalRequestById(id))!.status).toBe("timeout");
     });
