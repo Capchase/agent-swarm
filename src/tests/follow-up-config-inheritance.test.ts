@@ -157,6 +157,30 @@ describe("kept: continuations of the same work inherit followUpConfig", () => {
     expect(wake.followUpConfig).toEqual(ON_COMPLETED);
   });
 
+  test("defer-task end to end: no Lead follow-up, wake-up carries the instruction", async () => {
+    const parent = await workerTaskWithOnCompleted("work that waits for a build");
+    const result = await callTool(
+      deferTask,
+      { taskId: parent.id, delayMs: 3_600_000, summary: "Waiting", note: "Check the build" },
+      workerId,
+    );
+    const { success, scheduleId } = result.structuredContent as {
+      success: boolean;
+      scheduleId?: string;
+    };
+    expect(success).toBe(true);
+
+    const followUps = await getDbClient().query<{ id: string }>(
+      "SELECT id FROM agent_tasks WHERE parentTaskId = ? AND taskType = 'follow-up'",
+      [parent.id],
+    );
+    expect(followUps).toHaveLength(0);
+
+    const schedule = await getScheduledTaskById(scheduleId!);
+    const wake = await createStandaloneScheduleTask(schedule!);
+    expect(wake.followUpConfig).toEqual(ON_COMPLETED);
+  });
+
   test("send-task resume re-delegation (reroute-decision template)", async () => {
     const parent = await workerTaskWithOnCompleted("crashed work");
     const childId = sentTaskId(
