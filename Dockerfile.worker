@@ -30,7 +30,7 @@ FROM ghcr.io/j178/prek:v${PREK_VERSION} AS prek
 FROM mwader/static-ffmpeg:7.0.2@sha256:d9b22f65c2049d73bf8ae556bb4c5c7d45e9fb85939d87951ed98f22b0f19105 AS ffmpeg
 
 # ─── Stage: builder ──────────────────────────────────────────────────────────
-FROM oven/bun:1.4.3 AS builder
+FROM oven/bun:1.4.4 AS builder
 WORKDIR /build
 # Root package.json declares Bun workspaces (apps/{ui,templates-ui,evals}); their manifests +
 # bunfig.toml (pins linker="hoisted"; the workspace default "isolated" would hide the
@@ -103,7 +103,7 @@ RUN apt-get update && apt-get install -y curl ca-certificates gnupg \
 # Install Bun once, system-wide at /usr/local/bin (shared by root and worker —
 # runbook rule 4: never install a toolchain twice). Runtime `bun i -g` for the
 # worker user still lands in ~/.bun via the BUN_INSTALL ENV set below.
-RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s "bun-v1.4.3"
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s "bun-v1.4.4"
 
 # Create non-root user for runtime execution.
 # NOTE: Container entrypoint runs as root (setup, chown, privileged mounts).
