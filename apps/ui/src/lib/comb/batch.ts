@@ -3,7 +3,8 @@
 
 import type { CombReviewBatchResult } from "../../api/types";
 import type { CommentListEntry } from "../agent-fs/types";
-import { hasSwarmMarker, isSentToSwarm } from "./markers";
+import { commentCombPath } from "./comments";
+import { isSentToSwarm } from "./markers";
 
 /**
  * Most comments one send carries (the server's `REVIEW_BATCH_MAX`,
@@ -12,20 +13,28 @@ import { hasSwarmMarker, isSentToSwarm } from "./markers";
 export const COMB_BATCH_MAX = 50;
 
 /**
- * A thread that "Send to swarm" offers: an open root comment that carries
- * `@swarm` and was not sent yet. The one-thread button and the "Send N"
- * count use the same rule.
+ * Longest note for the lead (the server's `REVIEW_NOTE_MAX`,
+ * `src/tests/comb-review-batch.test.ts` checks that they match).
+ */
+export const COMB_NOTE_MAX = 4000;
+
+/** The note to send: trimmed, and left out when empty. */
+export function batchNote(text: string): string | undefined {
+  const note = text.trim();
+  return note ? note : undefined;
+}
+
+/**
+ * A thread that "Send to swarm" offers: an open root comment that was not
+ * sent yet. `@swarm` is not needed (it only flags a comment). The one-thread
+ * button and the "N not sent" count use the same rule. The server applies
+ * the same skips (`src/comb/review-batch.ts`).
  */
 export function canSendThread(
   thread: CommentListEntry,
   serviceUserId: string | null = null,
 ): boolean {
-  return (
-    !thread.resolved &&
-    !thread.parentId &&
-    hasSwarmMarker(thread.body) &&
-    !isSentToSwarm(thread, serviceUserId)
-  );
+  return !thread.resolved && !thread.parentId && !isSentToSwarm(thread, serviceUserId);
 }
 
 /** The threads "Send N to swarm" (a file or a folder) offers (`canSendThread`). */
@@ -34,6 +43,38 @@ export function eligibleForBatch(
   serviceUserId: string | null = null,
 ): CommentListEntry[] {
   return threads.filter((thread) => canSendThread(thread, serviceUserId));
+}
+
+/**
+ * The send tray's comments: the open root comments of `me` (the connected
+ * agent-fs user) that were not sent yet, by file path, oldest first in a
+ * file. Null `me` (not connected): none.
+ */
+export function myUnsent(
+  threads: ReadonlyArray<CommentListEntry>,
+  me: string | null,
+  serviceUserId: string | null = null,
+): CommentListEntry[] {
+  if (!me) return [];
+  return eligibleForBatch(threads, serviceUserId)
+    .filter((thread) => thread.author === me)
+    .sort(
+      (a, b) =>
+        commentCombPath(a.path).localeCompare(commentCombPath(b.path)) ||
+        a.createdAt.localeCompare(b.createdAt),
+    );
+}
+
+/** Threads by file (`/docs/a.md`), in the order the files first appear. */
+export function groupByFile(
+  threads: ReadonlyArray<CommentListEntry>,
+): Array<{ path: string; threads: CommentListEntry[] }> {
+  const groups = new Map<string, CommentListEntry[]>();
+  for (const thread of threads) {
+    const path = commentCombPath(thread.path);
+    groups.set(path, [...(groups.get(path) ?? []), thread]);
+  }
+  return [...groups].map(([path, list]) => ({ path, threads: list }));
 }
 
 /** Who got the task of a send (`lead` in the result). */

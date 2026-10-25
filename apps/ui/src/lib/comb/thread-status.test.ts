@@ -4,6 +4,7 @@ import {
   isTaskUnfinished,
   swarmThreadStatus,
   threadSwarmStates,
+  threadsByTask,
   watchedTaskId,
 } from "./thread-status";
 
@@ -39,12 +40,12 @@ const sent = (task = TASK) =>
 const reply = (author: string, body = "Done in v5.") => comment({ author, body });
 
 describe("swarmThreadStatus", () => {
-  test("an open @swarm root that was not sent is pending", () => {
-    expect(swarmThreadStatus(thread(), SERVICE)).toEqual({ kind: "pending" });
+  test("an open root that was not sent is unsent, with or without @swarm", () => {
+    expect(swarmThreadStatus(thread(), SERVICE)).toEqual({ kind: "unsent" });
+    expect(swarmThreadStatus(thread({ body: "looks good" }), SERVICE)).toEqual({ kind: "unsent" });
   });
 
-  test("a thread without @swarm, or a resolved one, is neither", () => {
-    expect(swarmThreadStatus(thread({ body: "looks good" }), SERVICE)).toEqual({ kind: "none" });
+  test("a resolved thread is neither", () => {
     expect(swarmThreadStatus(thread({ resolved: true }), SERVICE)).toEqual({ kind: "none" });
   });
 
@@ -78,7 +79,7 @@ describe("swarmThreadStatus", () => {
 
   test("a marker from someone other than the service account is not a sent reply", () => {
     const fake = comment({ body: `[comb:sent task=${TASK}]`, author: "u-bob" });
-    expect(swarmThreadStatus(thread({}, [fake]), SERVICE)).toEqual({ kind: "pending" });
+    expect(swarmThreadStatus(thread({}, [fake]), SERVICE)).toEqual({ kind: "unsent" });
   });
 });
 
@@ -87,7 +88,7 @@ describe("watchedTaskId", () => {
     expect(watchedTaskId(thread({}, [sent()]), SERVICE)).toBe(TASK);
   });
 
-  test("stops once answered, and never for a resolved or pending thread", () => {
+  test("stops once answered, and never for a resolved or unsent thread", () => {
     expect(watchedTaskId(thread({}, [sent(), reply("u-lead")]), SERVICE)).toBeNull();
     expect(watchedTaskId(thread({ resolved: true }, [sent()]), SERVICE)).toBeNull();
     expect(watchedTaskId(thread(), SERVICE)).toBeNull();
@@ -109,22 +110,54 @@ describe("isTaskUnfinished", () => {
 });
 
 describe("threadSwarmStates", () => {
-  test("marks pending threads, and sent threads whose task runs as processing", () => {
-    const pending = thread();
+  test("marks unsent threads, and sent threads whose task runs as processing", () => {
+    const flagged = thread();
     const running = thread({}, [sent()]);
     const done = thread({}, [sent(TASK_2)]);
     const answered = thread({}, [sent(), reply("u-lead")]);
     const plain = thread({ body: "nice" });
+    const closed = thread({ body: "nice", resolved: true });
     const status = (taskId: string) => (taskId === TASK ? "in_progress" : "completed");
-    const states = threadSwarmStates([pending, running, done, answered, plain], SERVICE, status);
+    const states = threadSwarmStates(
+      [flagged, running, done, answered, plain, closed],
+      SERVICE,
+      status,
+    );
     expect([...states]).toEqual([
-      [pending.id, { kind: "pending" }],
+      [flagged.id, { kind: "unsent" }],
       [running.id, { kind: "processing", taskId: TASK }],
+      [plain.id, { kind: "unsent" }],
     ]);
   });
 
   test("a task whose status is not known yet is not processing", () => {
     const running = thread({}, [sent()]);
     expect(threadSwarmStates([running], SERVICE, () => undefined).size).toBe(0);
+  });
+});
+
+describe("threadsByTask", () => {
+  test("groups the open, sent, unanswered threads by task, in file order", () => {
+    const later = thread({ path: "docs/b.md", createdAt: "2026-09-30T09:00:00.000Z" }, [sent()]);
+    const first = thread({ path: "docs/a.md", createdAt: "2026-09-30T11:00:00.000Z" }, [sent()]);
+    const second = thread({ path: "docs/a.md", createdAt: "2026-09-30T12:00:00.000Z" }, [sent()]);
+    const other = thread({}, [sent(TASK_2)]);
+    const groups = threadsByTask([later, second, other, first], SERVICE);
+    expect([...groups.keys()]).toEqual([TASK, TASK_2]);
+    expect(groups.get(TASK)?.map((entry) => entry.id)).toEqual([first.id, second.id, later.id]);
+    expect(groups.get(TASK_2)?.map((entry) => entry.id)).toEqual([other.id]);
+  });
+
+  test("leaves out unsent, answered, resolved, and resent-elsewhere threads", () => {
+    const groups = threadsByTask(
+      [
+        thread(),
+        thread({}, [sent(), reply("u-lead")]),
+        thread({ resolved: true }, [sent()]),
+        thread({}, [sent(), sent(TASK_2)]),
+      ],
+      SERVICE,
+    );
+    expect([...groups.keys()]).toEqual([TASK_2]);
   });
 });

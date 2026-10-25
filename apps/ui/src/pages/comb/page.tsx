@@ -11,7 +11,8 @@ import { FileView } from "@/components/comb/file-view";
 import { FolderView } from "@/components/comb/folder-view";
 import { CombPresenceProvider } from "@/components/comb/presence-context";
 import { CombSearchButton } from "@/components/comb/search-dialog";
-import { LeftPanel, LeftPanelSheet } from "@/components/comb/side-panels";
+import { SendTrayButton } from "@/components/comb/send-tray";
+import { FullWidthButton, LeftPanel, LeftPanelSheet } from "@/components/comb/side-panels";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageSkeleton } from "@/components/shared/page-skeleton";
 import { Button } from "@/components/ui/button";
@@ -140,13 +141,19 @@ function CombWorkspace({ location }: { location: CombLocation }) {
   const inline = layout?.inline ?? true;
   const file = location.isFolder ? null : location;
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3">
+    <div className="flex min-h-0 flex-1 flex-col gap-2">
       <CombHeader
         lead={inline ? null : <LeftPanelSheet location={location} />}
         title={file ? <FileTitle file={file} /> : <CombBreadcrumbs location={location} />}
         subtitle={file ? <FileSubtitle file={file} /> : null}
         actions={file ? <FileActions file={file} /> : null}
-        search={<CombSearchButton drive={location} />}
+        search={
+          <>
+            <SendTrayButton drive={location} />
+            <FullWidthButton />
+            <CombSearchButton drive={location} />
+          </>
+        }
       />
       <div className="flex min-h-0 flex-1 gap-3">
         {inline ? <LeftPanel location={location} /> : null}

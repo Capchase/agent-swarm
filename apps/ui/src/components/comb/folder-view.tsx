@@ -3,6 +3,7 @@ import { AlertCircle, File, Folder, FolderOpen } from "lucide-react";
 import { useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAgentFsLs } from "@/api/hooks/use-agent-fs";
+import { CombHome } from "@/components/comb/comb-home";
 import { OpenInAgentFsButton } from "@/components/comb/file-actions";
 import { FolderComments } from "@/components/comb/folder-comments";
 import { PinButton } from "@/components/comb/pin-button";
@@ -128,6 +129,8 @@ export function FolderView({ folder }: { folder: DrivePath }) {
         }
       />
       <UploadList />
+      {/* The drive root is the Comb home: favorites, recently viewed, recently changed. */}
+      {folder.path === "/" ? <CombHome drive={folder} /> : null}
       {listing.data && rows.length === 0 ? (
         <EmptyState
           icon={FolderOpen}
@@ -136,7 +139,13 @@ export function FolderView({ folder }: { folder: DrivePath }) {
           fullPage
         />
       ) : isMobile ? (
-        <MobileList label="Folder contents" loading={listing.isPending} emptyMessage="Empty folder">
+        <MobileList
+          label="Folder contents"
+          loading={listing.isPending}
+          emptyMessage="Empty folder"
+          // Full height: the folder scrolls as one page on a phone.
+          className="flex-none overflow-visible"
+        >
           {rows.map((row) => (
             <MobileListRow
               key={row.id}
@@ -166,9 +175,11 @@ export function FolderView({ folder }: { folder: DrivePath }) {
           loading={listing.isPending}
           emptyMessage="Empty folder"
           pagination={false}
+          // The listing keeps room for about six rows. Below that the folder scrolls.
+          className="min-h-72"
         />
       )}
-      {/* Open comments below the folder, with "Send N to swarm" (step-9). */}
+      {/* Open comments below the folder: send to swarm, resolve in bulk. */}
       <FolderComments folder={folder} />
     </UploadDropZone>
   );

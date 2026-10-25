@@ -1,5 +1,5 @@
 import { Send } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { CombSendError } from "@/api/client";
@@ -9,6 +9,7 @@ import { SwarmMarkedText } from "@/components/comb/comment-thread";
 import { useAuthorLabel } from "@/components/comb/use-author-label";
 import { useCombServiceUserId } from "@/components/comb/use-comb-service-user";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogClose,
@@ -19,16 +20,21 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { CommentListEntry } from "@/lib/agent-fs/types";
 import {
+  batchNote,
   COMB_BATCH_MAX,
+  COMB_NOTE_MAX,
   canSendThread,
   eligibleForBatch,
+  groupByFile,
   leadNote,
   sendFailure,
 } from "@/lib/comb/batch";
-import { commentCombPath, lineRangeLabel } from "@/lib/comb/comments";
+import { selectionState } from "@/lib/comb/bulk";
+import { lineRangeLabel } from "@/lib/comb/comments";
 import type { DrivePath } from "@/lib/comb/paths";
 
 type Drive = { orgId: string; driveId: string };
@@ -99,7 +105,7 @@ function useSendToSwarm(drive: Drive) {
 
 /**
  * Thread action (the comment rail's `threadActions`): "Send to swarm" on an
- * open root comment with `@swarm` that was not sent yet, with a confirm popover.
+ * open root comment that was not sent yet, with a confirm popover.
  */
 export function SendThreadButton({ file, thread }: { file: DrivePath; thread: CommentListEntry }) {
   const serviceUserId = useCombServiceUserId();
@@ -154,25 +160,21 @@ export function SendThreadButton({ file, thread }: { file: DrivePath; thread: Co
 }
 
 /**
- * "Send N to swarm" for a file (the rail's `railHeaderActions`) or a folder
- * (`FolderComments`). N counts open root comments with `@swarm` that were not
- * sent yet. Hidden when N is 0. The dialog lets the human uncheck some.
+ * "Send to swarm" for a file: the primary button of the rail's send bar (the
+ * bar shows the count). It offers the open root comments not sent yet and is
+ * hidden when there are none. The dialog lets the human uncheck some and add
+ * a note for the lead. A folder sends its checked comments through
+ * `SendBatchDialog` (`FolderComments`).
  */
 export function SendBatchButton({
   drive,
   scopePath,
   threads,
-  showPaths = false,
-  compact = false,
 }: {
   drive: Drive;
-  /** The file or folder path the batch is sent from. */
+  /** The file path the batch is sent from. */
   scopePath: string;
   threads: ReadonlyArray<CommentListEntry>;
-  /** List each comment's file (a folder batch). */
-  showPaths?: boolean;
-  /** Show "Send N" (the narrow rail header). The full label moves to the tooltip. */
-  compact?: boolean;
 }) {
   const serviceUserId = useCombServiceUserId();
   const eligible = useMemo(
@@ -180,7 +182,6 @@ export function SendBatchButton({
     [threads, serviceUserId],
   );
   const [open, setOpen] = useState(false);
-  const label = `Send ${eligible.length} to swarm`;
 
   return (
     <>
@@ -189,16 +190,15 @@ export function SendBatchButton({
           <TooltipTrigger asChild>
             <Button
               size="sm"
-              variant="outline"
-              aria-label={label}
+              aria-label={`Send to swarm (${eligible.length})`}
               className="shrink-0"
               onClick={() => setOpen(true)}
             >
               <Send />
-              {compact ? `Send ${eligible.length}` : label}
+              Send to swarm
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Send the open @swarm comments to the lead as one task</TooltipContent>
+          <TooltipContent>Send the open comments to the lead as one task</TooltipContent>
         </Tooltip>
       ) : null}
       {/* Stays mounted while the list refreshes under it. */}
@@ -207,7 +207,7 @@ export function SendBatchButton({
           drive={drive}
           scopePath={scopePath}
           threads={eligible}
-          showPaths={showPaths}
+          showPaths={false}
           onClose={() => setOpen(false)}
         />
       ) : null}
@@ -215,17 +215,21 @@ export function SendBatchButton({
   );
 }
 
-function SendBatchDialog({
+export function SendBatchDialog({
   drive,
   scopePath,
   threads,
   showPaths,
+  onSent,
   onClose,
 }: {
   drive: Drive;
   scopePath: string;
   threads: CommentListEntry[];
+  /** List each comment's file (a folder batch). */
   showPaths: boolean;
+  /** After a send that landed, with the ids the swarm took, before `onClose`. */
+  onSent?: (sent: string[]) => void;
   onClose: () => void;
 }) {
   const send = useSendToSwarm(drive);
@@ -238,13 +242,48 @@ function SendBatchDialog({
   );
   const selected = listed.filter((thread) => checked.has(thread.id));
   const full = checked.size >= COMB_BATCH_MAX;
+  const [note, setNote] = useState("");
+  const noteId = useId();
 
-  const toggle = (id: string) =>
+  // Checks or unchecks `ids`. Checking stops at COMB_BATCH_MAX.
+  const toggleMany = (ids: readonly string[], on: boolean) =>
     setChecked((current) => {
       const next = new Set(current);
-      if (!next.delete(id)) next.add(id);
+      for (const id of ids) {
+        if (!on) next.delete(id);
+        else if (next.size < COMB_BATCH_MAX) next.add(id);
+      }
       return next;
     });
+
+  const row = (thread: CommentListEntry) => {
+    const on = checked.has(thread.id);
+    return (
+      <li key={thread.id}>
+        <label className="hover-linger flex items-start gap-2.5 px-3 py-2 transition-colors hover:bg-accent/50">
+          <Checkbox
+            checked={on}
+            disabled={full && !on}
+            onCheckedChange={(value) => toggleMany([thread.id], value === true)}
+            className="mt-0.5"
+          />
+          <span className="flex min-w-0 flex-col gap-0.5">
+            <span className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
+              <span className="truncate font-medium text-foreground">
+                {thread.authorDisplayName || authorLabel(thread.author)}
+              </span>
+              <span className="shrink-0 font-mono text-[11px]">
+                {lineRangeLabel(thread.lineStart, thread.lineEnd) ?? "File"}
+              </span>
+            </span>
+            <span className="line-clamp-2 break-words text-sm">
+              <SwarmMarkedText text={thread.body} />
+            </span>
+          </span>
+        </label>
+      </li>
+    );
+  };
 
   return (
     <Dialog open onOpenChange={(open) => (open ? undefined : onClose())}>
@@ -256,40 +295,64 @@ function SendBatchDialog({
             task link.
           </DialogDescription>
         </DialogHeader>
-        <ul className="max-h-80 divide-y divide-border-subtle overflow-y-auto rounded-lg border border-border">
-          {listed.map((thread) => (
-            <li key={thread.id}>
-              <label className="hover-linger flex items-start gap-2.5 px-3 py-2 transition-colors hover:bg-accent/50">
-                <input
-                  type="checkbox"
-                  checked={checked.has(thread.id)}
-                  disabled={full && !checked.has(thread.id)}
-                  onChange={() => toggle(thread.id)}
-                  className="mt-0.5 size-4 shrink-0 rounded border-input accent-primary outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-                />
-                <span className="flex min-w-0 flex-col gap-0.5">
-                  <span className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
-                    <span className="truncate font-medium text-foreground">
-                      {thread.authorDisplayName || authorLabel(thread.author)}
+        <div className="max-h-80 overflow-y-auto rounded-lg border border-border">
+          {showPaths ? (
+            // A batch from several files: one group per file, with a box for the whole file.
+            groupByFile(listed).map((group) => {
+              const ids = group.threads.map((thread) => thread.id);
+              return (
+                <section
+                  key={group.path}
+                  aria-label={group.path}
+                  className="border-b border-border-subtle last:border-b-0"
+                >
+                  <label className="flex items-center gap-2.5 bg-muted/40 px-3 py-1.5">
+                    <Checkbox
+                      aria-label={`Check the comments on ${group.path}`}
+                      checked={selectionState(checked, ids)}
+                      onCheckedChange={(on) => toggleMany(ids, on === true)}
+                    />
+                    <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                      {group.path}
                     </span>
-                    <span className="shrink-0 font-mono text-[11px]">
-                      {showPaths ? `${commentCombPath(thread.path)} ` : ""}
-                      {lineRangeLabel(thread.lineStart, thread.lineEnd) ?? "File"}
+                    <span className="ml-auto shrink-0 text-xs text-muted-foreground tabular-nums">
+                      {ids.length}
                     </span>
-                  </span>
-                  <span className="line-clamp-2 break-words text-sm">
-                    <SwarmMarkedText text={thread.body} />
-                  </span>
-                </span>
-              </label>
-            </li>
-          ))}
-        </ul>
+                  </label>
+                  <ul className="divide-y divide-border-subtle">
+                    {group.threads.map((thread) => row(thread))}
+                  </ul>
+                </section>
+              );
+            })
+          ) : (
+            <ul className="divide-y divide-border-subtle">{listed.map((thread) => row(thread))}</ul>
+          )}
+        </div>
         {listed.length > COMB_BATCH_MAX ? (
           <p className="text-xs text-muted-foreground">
             Only the first {COMB_BATCH_MAX} are sent in one batch. Send again for the rest.
           </p>
         ) : null}
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor={noteId} className="text-xs font-medium text-muted-foreground">
+            Note for the lead (optional)
+          </label>
+          <Textarea
+            id={noteId}
+            value={note}
+            onChange={(event) => setNote(event.target.value)}
+            maxLength={COMB_NOTE_MAX}
+            rows={2}
+            placeholder="Context for all the comments, if any"
+            className="max-h-40 min-h-14 text-sm"
+          />
+          {note.length > COMB_NOTE_MAX - 200 ? (
+            <p className="text-right text-xs text-muted-foreground tabular-nums">
+              {note.length} of {COMB_NOTE_MAX}
+            </p>
+          ) : null}
+        </div>
         <DialogFooter>
           <DialogClose asChild>
             <Button variant="ghost">Cancel</Button>
@@ -298,8 +361,17 @@ function SendBatchDialog({
             disabled={selected.length === 0 || send.isPending}
             onClick={() =>
               send.mutate(
-                { commentIds: selected.map((thread) => thread.id), scopePath },
-                { onSuccess: onClose },
+                {
+                  commentIds: selected.map((thread) => thread.id),
+                  scopePath,
+                  note: batchNote(note),
+                },
+                {
+                  onSuccess: (result) => {
+                    onSent?.(result.sent);
+                    onClose();
+                  },
+                },
               )
             }
           >

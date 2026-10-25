@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { CommentEntry, CommentListEntry } from "../agent-fs/types";
-import { canSendThread, eligibleForBatch, leadNote, sendFailure } from "./batch";
+import {
+  canSendThread,
+  eligibleForBatch,
+  groupByFile,
+  leadNote,
+  myUnsent,
+  sendFailure,
+} from "./batch";
 
 const TASK_ID = "0b8e1f5c-3d2a-4c6b-9e7f-1a2b3c4d5e6f";
 let seq = 0;
@@ -30,21 +37,15 @@ function thread(
 const sentBy = (author: string) => comment({ body: `[comb:sent task=${TASK_ID}] Sent`, author });
 
 describe("eligibleForBatch", () => {
-  test("keeps open, unsent root threads that carry @swarm", () => {
+  test("keeps open, unsent root threads, with or without @swarm", () => {
     const marked = thread();
-    const again = thread({ body: "please, @Swarm, add tests" });
-    expect(eligibleForBatch([marked, again])).toEqual([marked, again]);
+    const plain = thread({ body: "no marker" });
+    const mail = thread({ body: "mail me@swarm.local" });
+    expect(eligibleForBatch([marked, plain, mail])).toEqual([marked, plain, mail]);
   });
 
-  test("drops threads without @swarm, resolved threads, and replies", () => {
-    expect(
-      eligibleForBatch([
-        thread({ body: "no marker" }),
-        thread({ body: "mail me@swarm.local" }),
-        thread({ resolved: true }),
-        thread({ parentId: "c0" }),
-      ]),
-    ).toEqual([]);
+  test("drops resolved threads and replies", () => {
+    expect(eligibleForBatch([thread({ resolved: true }), thread({ parentId: "c0" })])).toEqual([]);
   });
 
   test("drops threads the swarm already answered with the sent marker", () => {
@@ -58,10 +59,38 @@ describe("eligibleForBatch", () => {
   });
 });
 
+describe("the send tray", () => {
+  test("myUnsent keeps my open, unsent roots, by file, oldest first", () => {
+    const late = thread({ path: "docs/b.md", createdAt: "2026-10-02T00:00:00.000Z" });
+    const early = thread({ path: "/docs/b.md", createdAt: "2026-10-01T00:00:00.000Z" });
+    const first = thread({ path: "docs/a.md" });
+    const theirs = thread({ author: "bob" });
+    const sent = thread({}, [sentBy("svc")]);
+    const closed = thread({ resolved: true });
+    expect(myUnsent([late, theirs, early, sent, closed, first], "human", "svc")).toEqual([
+      first,
+      early,
+      late,
+    ]);
+    expect(myUnsent([first], null)).toEqual([]);
+  });
+
+  test("groupByFile keeps the order and joins paths with and without the slash", () => {
+    const a1 = thread({ path: "docs/a.md" });
+    const b = thread({ path: "docs/b.md" });
+    const a2 = thread({ path: "/docs/a.md" });
+    expect(groupByFile([a1, b, a2])).toEqual([
+      { path: "/docs/a.md", threads: [a1, a2] },
+      { path: "/docs/b.md", threads: [b] },
+    ]);
+  });
+});
+
 describe("canSendThread", () => {
-  test("a one-thread send needs @swarm, like the batch", () => {
+  test("a one-thread send follows the batch rule: no @swarm needed", () => {
     expect(canSendThread(thread())).toBe(true);
-    expect(canSendThread(thread({ body: "no marker" }))).toBe(false);
+    expect(canSendThread(thread({ body: "no marker" }))).toBe(true);
+    expect(canSendThread(thread({ parentId: "c0" }))).toBe(false);
     expect(canSendThread(thread({ resolved: true }))).toBe(false);
     expect(canSendThread(thread({}, [sentBy("svc")]), "svc")).toBe(false);
   });

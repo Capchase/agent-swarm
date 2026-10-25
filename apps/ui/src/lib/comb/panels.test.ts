@@ -6,9 +6,11 @@ import {
   type LeftPanelState,
   leftPanelReducer,
   leftPanelView,
+  readFullWidth,
   readLeftPanel,
   readRightPanel,
   rightPanelOpen,
+  writeFullWidth,
   writeLeftPanel,
   writeRightPanel,
 } from "./panels";
@@ -71,6 +73,21 @@ describe("auto-switch on navigation", () => {
     expect(leftPanelView(back, "folder", true).open).toBe(true);
     // The auto collapse was never stored.
     expect(back.open).toBeNull();
+  });
+
+  test("the drive root collapses the panel for that page only, even on a list tab", () => {
+    const stored: LeftPanelState = { open: true, tab: "recent", autoCollapsed: false };
+    const home = run(stored, { type: "navigate", target: "home", first: true });
+    expect(leftPanelView(home, "home", true)).toEqual({
+      open: false,
+      tab: "recent",
+      outline: false,
+    });
+    expect(home.open).toBe(true);
+    const reopened = run(home, { type: "show", tab: "files", target: "home" });
+    expect(leftPanelView(reopened, "home", true).open).toBe(true);
+    const inFolder = run(home, { type: "navigate", target: "folder", first: false });
+    expect(leftPanelView(inFolder, "folder", true).open).toBe(true);
   });
 
   test("the person can reopen the panel on a file without an outline", () => {
@@ -142,6 +159,58 @@ describe("auto-switch on navigation", () => {
   });
 });
 
+describe("Recent and Favorites tabs", () => {
+  const open: LeftPanelState = { open: true, tab: "files", autoCollapsed: false };
+
+  test("picked on a folder, they stay while files with an outline open", () => {
+    for (const tab of ["recent", "favorites"] as const) {
+      const state = run(
+        open,
+        { type: "select", tab, target: "folder" },
+        { type: "navigate", target: "outline", first: false },
+      );
+      expect(leftPanelView(state, "outline", true).tab).toBe(tab);
+      expect(leftPanelView(state, "folder", true).tab).toBe(tab);
+    }
+  });
+
+  test("Files picked on a folder leaves a list tab", () => {
+    const state = run(
+      open,
+      { type: "select", tab: "recent", target: "folder" },
+      { type: "select", tab: "files", target: "folder" },
+    );
+    expect(leftPanelView(state, "folder", true).tab).toBe("files");
+  });
+
+  test("the strip opens the panel on a list tab anywhere", () => {
+    const collapsed: LeftPanelState = { open: false, tab: "outline", autoCollapsed: false };
+    const state = run(collapsed, { type: "show", tab: "favorites", target: "plain" });
+    expect(state).toEqual({ open: true, tab: "favorites", autoCollapsed: false });
+  });
+
+  test("a list tab keeps the panel open on a file without an outline", () => {
+    const state = run(
+      open,
+      { type: "select", tab: "recent", target: "folder" },
+      { type: "navigate", target: "plain", first: false },
+    );
+    expect(leftPanelView(state, "plain", true)).toEqual({
+      open: true,
+      tab: "recent",
+      outline: false,
+    });
+    // Files still collapses there, as before.
+    const files = run(open, { type: "navigate", target: "plain", first: false });
+    expect(leftPanelView(files, "plain", true).open).toBe(false);
+  });
+
+  test("Outline stored shows Files where there is no outline", () => {
+    const stored: LeftPanelState = { open: true, tab: "outline", autoCollapsed: false };
+    expect(leftPanelView(stored, "folder", true).tab).toBe("files");
+  });
+});
+
 describe("right panel", () => {
   test("the stored choice wins over the width", () => {
     expect(rightPanelOpen(null, true)).toBe(true);
@@ -169,6 +238,28 @@ describe("panel storage", () => {
     });
     expect(readRightPanel(storage, apiUrl)).toBe(true);
     expect(readRightPanel(storage, "http://other")).toBeNull();
+  });
+
+  test("every tab round-trips, and an unknown one reads as Outline", () => {
+    const storage = memoryStorage();
+    for (const tab of ["files", "recent", "favorites", "outline"] as const) {
+      writeLeftPanel(storage, apiUrl, { open: true, tab });
+      expect(readLeftPanel(storage, apiUrl).tab).toBe(tab);
+    }
+    storage.map.set(`swarm:v1:${apiUrl}:comb:panel:left`, '{"tab":"history"}');
+    expect(readLeftPanel(storage, apiUrl).tab).toBe("outline");
+  });
+
+  test("full width is off until turned on, and round-trips per API URL", () => {
+    const storage = memoryStorage();
+    expect(readFullWidth(storage, apiUrl)).toBe(false);
+    writeFullWidth(storage, apiUrl, true);
+    expect(readFullWidth(storage, apiUrl)).toBe(true);
+    expect(readFullWidth(storage, "http://other")).toBe(false);
+    writeFullWidth(storage, apiUrl, false);
+    expect(readFullWidth(storage, apiUrl)).toBe(false);
+    storage.map.set(`swarm:v1:${apiUrl}:comb:full-width`, '{"on":"yes"}');
+    expect(readFullWidth(storage, apiUrl)).toBe(false);
   });
 
   test("no choice yet stores only the tab", () => {

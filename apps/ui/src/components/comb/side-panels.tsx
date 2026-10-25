@@ -1,12 +1,16 @@
 import {
   CloudOff,
   FolderTree,
+  History,
   type LucideIcon,
+  Maximize2,
   MessageSquare,
+  Minimize2,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Star,
   TableOfContents,
 } from "lucide-react";
 import {
@@ -20,14 +24,17 @@ import {
 } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
+import { Kbd } from "@/components/ui/kbd";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { LeftTab } from "@/lib/comb/panels";
+import { LEFT_TABS, type LeftTab } from "@/lib/comb/panels";
 import type { CombLocation } from "@/lib/comb/paths";
+import { usePageShortcut } from "@/lib/json-render/use-page-shortcut";
 import { cn } from "@/lib/utils";
 import { useCombLayout } from "./comb-layout";
 import { OutlineList } from "./outline-list";
+import { FavoritesTab, RecentTab } from "./recent-lists";
 import { TreeRail } from "./tree-rail";
 
 // Drive-style side panels. Open, a panel is a card with a title row and a
@@ -110,19 +117,34 @@ function fromKeyboard(event: MouseEvent<HTMLElement>): boolean {
   return event.detail === 0;
 }
 
-const TAB_LABEL: Record<LeftTab, string> = { files: "Files", outline: "Outline" };
-const TAB_ICON: Record<LeftTab, LucideIcon> = { files: FolderTree, outline: TableOfContents };
+const TAB_LABEL: Record<LeftTab, string> = {
+  files: "Files",
+  recent: "Recent",
+  favorites: "Favorites",
+  outline: "Outline",
+};
+const TAB_ICON: Record<LeftTab, LucideIcon> = {
+  files: FolderTree,
+  recent: History,
+  favorites: Star,
+  outline: TableOfContents,
+};
+
+/** The tabs on `left`: Outline only for a file with headings. */
+function leftTabs(outline: boolean): LeftTab[] {
+  return LEFT_TABS.filter((tab) => outline || tab !== "outline");
+}
 
 /**
- * The left panel beside the content: Files (the pinned list and the drive
- * tree) and, for a file with headings, Outline.
+ * The left panel beside the content: Files (the drive tree), Recent (viewed
+ * and changed files), Favorites, and, for a file with headings, Outline.
  */
 export function LeftPanel({ location }: { location: CombLocation }) {
   const layout = useCombLayout();
   const { panelRef, stripRef, expandTarget } = usePanelFocus(layout?.left.open ?? true);
   if (!layout) return null;
   const { left, showLeft, collapseLeft } = layout;
-  const tabs: LeftTab[] = left.outline ? ["files", "outline"] : ["files"];
+  const tabs = leftTabs(left.outline);
   const show = (tab: LeftTab, event: MouseEvent<HTMLElement>) => {
     if (fromKeyboard(event)) {
       expandTarget.current =
@@ -133,7 +155,7 @@ export function LeftPanel({ location }: { location: CombLocation }) {
 
   return (
     <aside
-      aria-label="Files and outline"
+      aria-label="Files panel"
       className={cn("flex shrink-0 flex-col", left.open ? `w-64 ${PANEL_CARD}` : STRIP)}
     >
       {left.open ? null : (
@@ -204,15 +226,28 @@ function LeftPanelBody({
           titleRowClassName,
         )}
       >
+        {/* Icons, with the name of the open tab: four names do not fit the panel. */}
         <TabsList variant="line" className="p-0 group-data-[orientation=horizontal]/tabs:h-full">
-          <TabsTrigger value="files" data-panel-tab="files" className={LINE_TAB}>
-            Files
-          </TabsTrigger>
-          {left.outline ? (
-            <TabsTrigger value="outline" data-panel-tab="outline" className={LINE_TAB}>
-              Outline
-            </TabsTrigger>
-          ) : null}
+          {leftTabs(left.outline).map((tab) => {
+            const Icon = TAB_ICON[tab];
+            const active = tab === left.tab;
+            return (
+              <Tooltip key={tab}>
+                <TooltipTrigger asChild>
+                  <TabsTrigger
+                    value={tab}
+                    data-panel-tab={tab}
+                    aria-label={TAB_LABEL[tab]}
+                    className={LINE_TAB}
+                  >
+                    <Icon aria-hidden />
+                    {active ? TAB_LABEL[tab] : null}
+                  </TabsTrigger>
+                </TooltipTrigger>
+                {active ? null : <TooltipContent side="bottom">{TAB_LABEL[tab]}</TooltipContent>}
+              </Tooltip>
+            );
+          })}
         </TabsList>
         {action ? <div className="ml-auto">{action}</div> : null}
       </div>
@@ -227,6 +262,12 @@ function LeftPanelBody({
           location={location}
           onNavigate={onNavigate}
         />
+      </TabsContent>
+      <TabsContent value="recent" className="min-h-0 overflow-y-auto">
+        <RecentTab drive={location} current={location.path} onNavigate={onNavigate} />
+      </TabsContent>
+      <TabsContent value="favorites" className="min-h-0 overflow-y-auto">
+        <FavoritesTab drive={location} current={location.path} onNavigate={onNavigate} />
       </TabsContent>
       {left.outline ? (
         <TabsContent value="outline" className="min-h-0 overflow-y-auto">
@@ -243,12 +284,12 @@ const LINE_TAB =
 
 /** Below `md`: the left panel opens in a sheet from a header button. */
 export function LeftPanelSheet({ location }: { location: CombLocation }) {
-  const layout = useCombLayout();
   const [open, setOpen] = useState(false);
   const navigated = useRef(false);
-  const label = layout?.left.outline ? "Show files and outline" : "Show files";
-  // The icon of the tab the sheet opens on (the top bar's sidebar button is a panel icon).
-  const Icon = TAB_ICON[layout?.left.tab ?? "files"];
+  const label = "Show the files panel";
+  // The files icon: a panel icon is the top bar's sidebar button, and the
+  // Recent icon is the versions button next to it.
+  const Icon = FolderTree;
   return (
     <Sheet open={open} onOpenChange={setOpen}>
       <Tooltip>
@@ -273,7 +314,7 @@ export function LeftPanelSheet({ location }: { location: CombLocation }) {
           event.preventDefault();
         }}
       >
-        <SheetTitle className="sr-only">Files and outline</SheetTitle>
+        <SheetTitle className="sr-only">Files panel</SheetTitle>
         <div className="flex min-h-0 flex-1 flex-col pt-1">
           {/* The sheet's close button sits at the title row's right end. */}
           <LeftPanelBody
@@ -297,11 +338,11 @@ export function LeftPanelSheet({ location }: { location: CombLocation }) {
  */
 export function CommentPanel({
   openCount,
-  notSent,
+  notSaved,
   children,
 }: {
   openCount: number;
-  notSent: number;
+  notSaved: number;
   children: ReactNode;
 }) {
   const layout = useCombLayout();
@@ -320,8 +361,8 @@ export function CommentPanel({
     if (linkedId && !open) showRight?.();
   }, [linkedId, open, showRight]);
 
-  const total = openCount + notSent;
-  const label = `Comments (${openCount} open${notSent ? `, ${notSent} not sent` : ""})`;
+  const total = openCount + notSaved;
+  const label = `Comments (${openCount} open${notSaved ? `, ${notSaved} not saved` : ""})`;
   const expand = (event: MouseEvent<HTMLElement>) => {
     if (fromKeyboard(event)) expandTarget.current = collapseRef.current;
     layout?.showRight();
@@ -344,10 +385,10 @@ export function CommentPanel({
           <span aria-hidden className="my-0.5 h-px w-5 bg-border" />
           <PanelButton
             label={label}
-            icon={notSent ? CloudOff : MessageSquare}
+            icon={notSaved ? CloudOff : MessageSquare}
             side="left"
             onClick={expand}
-            className={notSent ? "[&_svg]:text-status-error-strong" : undefined}
+            className={notSaved ? "[&_svg]:text-status-error-strong" : undefined}
           >
             {total > 0 ? (
               <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-muted px-1 font-medium text-[10px] text-foreground tabular-nums ring-2 ring-background">
@@ -375,5 +416,41 @@ export function CommentPanel({
         {children}
       </div>
     </aside>
+  );
+}
+
+/**
+ * The header's full width toggle (`F`): a markdown file's text runs as wide
+ * as its pane. The side panels stay. Only on a markdown file, from `md` up
+ * (narrower panes are already under the reading measure).
+ */
+export function FullWidthButton() {
+  const layout = useCombLayout();
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const on = layout?.fullWidth ?? false;
+  const setFullWidth = layout?.setFullWidth;
+  const shown = layout?.inline && layout.canWiden;
+  usePageShortcut(shown ? "f" : undefined, buttonRef, () => setFullWidth?.(!on));
+  if (!shown) return null;
+  const label = on ? "Exit full width" : "Full width";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          ref={buttonRef}
+          variant="ghost"
+          size="icon-sm"
+          aria-label={label}
+          aria-pressed={on}
+          aria-keyshortcuts="F"
+          onClick={() => layout.setFullWidth(!on)}
+        >
+          {on ? <Minimize2 /> : <Maximize2 />}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" className="flex items-center gap-1.5">
+        {label} <Kbd aria-hidden>F</Kbd>
+      </TooltipContent>
+    </Tooltip>
   );
 }

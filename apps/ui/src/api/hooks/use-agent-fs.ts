@@ -15,7 +15,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 import { api } from "@/api/client";
 import type { CombReviewBatchInput, CombReviewBatchResult } from "@/api/types";
@@ -40,11 +40,13 @@ import type {
   FtsResult,
   LogResult,
   LsResult,
+  RecentResult,
   RevertParams,
   RevertResult,
   SearchResult,
   StatResult,
 } from "@/lib/agent-fs/types";
+import { BULK_CONCURRENCY, type BulkOutcome, runLimited } from "@/lib/comb/bulk";
 import {
   COMB_LOG_LIMIT,
   commentReadPaths,
@@ -69,6 +71,7 @@ import {
 } from "@/lib/comb/media";
 import { markMentionsRead } from "@/lib/comb/mentions";
 import type { DrivePath } from "@/lib/comb/paths";
+import { RECENT_CHANGES_LIMIT, recentChanges } from "@/lib/comb/recent";
 import {
   isSearchable,
   isUnknownOpError,
@@ -518,6 +521,60 @@ export function useResolveComment(file: DrivePath) {
 }
 
 /**
+ * Resolve or reopen many root threads of `drive` (the folder panel's bulk
+ * actions). agent-fs resolves one comment per call, so `run` sends
+ * `BULK_CONCURRENCY` at a time and never rejects: the outcome lists the ids
+ * that failed. `progress` counts the finished calls of the run in flight.
+ * Every comment query of the drive refreshes once, at the end.
+ */
+export function useBulkResolve(drive: { orgId: string; driveId: string }) {
+  const access = useAgentFsAccess();
+  const queryClient = useQueryClient();
+  const [progress, setProgress] = useState<{ finished: number; total: number } | null>(null);
+  // An Undo can start a run while another one is in flight: progress clears after the last.
+  const inFlight = useRef(0);
+  const run = useCallback(
+    async (ids: string[], resolved: boolean): Promise<BulkOutcome<string>> => {
+      const client = connectedClient(access);
+      const key = agentFsCommentsKey(access, drive);
+      inFlight.current++;
+      setProgress({ finished: 0, total: ids.length });
+      try {
+        // A poll that started before the writes must not bring the old state back.
+        await queryClient.cancelQueries({ queryKey: key });
+        return await runLimited(
+          ids,
+          BULK_CONCURRENCY,
+          (id) =>
+            client.callOp<CommentResolveResult>(
+              drive.orgId,
+              "comment-resolve",
+              { id, resolved },
+              drive.driveId,
+            ),
+          {
+            onProgress: (finished) => setProgress({ finished, total: ids.length }),
+            // Without the editor role every call fails the same way: stop at the first.
+            stopOn: isAccessDenied,
+          },
+        );
+      } finally {
+        inFlight.current--;
+        if (inFlight.current === 0) setProgress(null);
+        void queryClient.invalidateQueries({ queryKey: key });
+      }
+    },
+    [access, drive, queryClient],
+  );
+  return { run, progress };
+}
+
+/** agent-fs refused the key (401) or the role (403). */
+export function isAccessDenied(error: unknown): boolean {
+  return error instanceof AgentFsError && (error.status === 401 || error.status === 403);
+}
+
+/**
  * Edit a comment or a reply (author only). Success refreshes every comment
  * query of the drive, like `useResolveComment`.
  */
@@ -766,6 +823,31 @@ export function useCombSearch(
   });
 }
 
+/**
+ * The drive's recently changed files (the agent-fs `recent` op): the newest
+ * version of each, deletes left out, at most `max`. Undefined data while an
+ * older agent-fs without the op answers: the lists hide then. A
+ * `file.changed` event refreshes it while the drive's stream is live.
+ */
+export function useRecentChanges(drive: { orgId: string; driveId: string }, max: number) {
+  const access = useAgentFsAccess();
+  return useQuery({
+    queryKey: agentFsKey(access.endpoint, access.userId, drive.orgId, drive.driveId, "recent"),
+    queryFn: ({ signal }) =>
+      connectedClient(access).callOp<RecentResult>(
+        drive.orgId,
+        "recent",
+        { limit: RECENT_CHANGES_LIMIT },
+        drive.driveId,
+        { signal },
+      ),
+    select: (result) => recentChanges(result.entries, max),
+    enabled: access.client !== null,
+    retry: (count, error) => !isUnknownOpError(error, "recent") && agentFsRetry(count, error),
+    refetchInterval: drivePoll(access, drive, "recent"),
+  });
+}
+
 // --- Send to swarm (step-9) --------------------------------------------------
 
 /**
@@ -814,7 +896,7 @@ export function useSendCombReviewBatch(
   const access = useAgentFsAccess();
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: Pick<CombReviewBatchInput, "commentIds" | "scopePath">) =>
+    mutationFn: (input: Pick<CombReviewBatchInput, "commentIds" | "scopePath" | "note">) =>
       api.sendCombReviewBatch({ orgId: drive.orgId, driveId: drive.driveId, ...input }),
     onSuccess: callbacks.onSuccess,
     onError: callbacks.onError,

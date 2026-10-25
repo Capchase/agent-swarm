@@ -25,9 +25,11 @@ import {
   PANELS_INLINE_QUERY,
   type PanelTarget,
   RIGHT_OPEN_QUERY,
+  readFullWidth,
   readLeftPanel,
   readRightPanel,
   rightPanelOpen,
+  writeFullWidth,
   writeLeftPanel,
   writeRightPanel,
 } from "@/lib/comb/panels";
@@ -46,6 +48,14 @@ export interface CombLayoutValue {
   collapseLeft: () => void;
   showRight: () => void;
   collapseRight: () => void;
+  /**
+   * Full width: a markdown file's text runs as wide as its pane, without the
+   * reading measure. The side panels stay. Stored in this browser.
+   */
+  fullWidth: boolean;
+  setFullWidth: (on: boolean) => void;
+  /** The current file is markdown, so full width changes it. */
+  canWiden: boolean;
   /** The current file's headings (empty for a folder and for a file with no outline). */
   headings: readonly OutlineHeading[];
   /** The current file's viewer scroll pane (the outline scrolls it). */
@@ -67,10 +77,16 @@ interface OutlineResult {
   key: string;
   target: PanelTarget;
   headings: readonly OutlineHeading[];
+  markdown: boolean;
 }
 
 function locationKey({ orgId, driveId, path }: DrivePath): string {
   return `${orgId}/${driveId}:${path}`;
+}
+
+/** The target of a folder route: the drive root is the Comb home. */
+function folderTarget(location: CombLocation): PanelTarget {
+  return location.path === "/" ? "home" : "folder";
 }
 
 /**
@@ -91,6 +107,9 @@ export function CombLayoutProvider({
 
   const [left, setLeft] = useState(() => readLeftPanel(browserStorage(), apiUrl));
   const [rightStored, setRightStored] = useState(() => readRightPanel(browserStorage(), apiUrl));
+  const [fullWidthStored, setFullWidthStored] = useState(() =>
+    readFullWidth(browserStorage(), apiUrl),
+  );
   const [viewer, setViewer] = useState<HTMLElement | null>(null);
   const [outline, setOutline] = useState<OutlineResult | null>(null);
 
@@ -113,11 +132,13 @@ export function CombLayoutProvider({
   // meanwhile, so the tab does not flash while the next file loads.
   const key = locationKey(location);
   const resolved: PanelTarget | "pending" = location.isFolder
-    ? "folder"
+    ? folderTarget(location)
     : outline?.key === key
       ? outline.target
       : "pending";
-  const [target, setTarget] = useState<PanelTarget>(location.isFolder ? "folder" : "plain");
+  const [target, setTarget] = useState<PanelTarget>(
+    location.isFolder ? folderTarget(location) : "plain",
+  );
   const navigated = useRef<string | null>(null);
   useLayoutEffect(() => {
     if (resolved === "pending") return;
@@ -127,6 +148,14 @@ export function CombLayoutProvider({
     apply({ type: "navigate", target: resolved, first: navigated.current === null });
     navigated.current = key;
   }, [key, resolved, apply]);
+
+  const setFullWidth = useCallback(
+    (on: boolean) => {
+      setFullWidthStored(on);
+      writeFullWidth(browserStorage(), apiUrl, on);
+    },
+    [apiUrl],
+  );
 
   const value = useMemo<CombLayoutValue>(
     () => ({
@@ -144,12 +173,29 @@ export function CombLayoutProvider({
         setRightStored(false);
         writeRightPanel(browserStorage(), apiUrl, false);
       },
+      fullWidth: inline && fullWidthStored,
+      setFullWidth,
+      canWiden: outline?.key === key && outline.markdown,
       headings:
         outline?.key === key && outline.target === "outline" ? outline.headings : NO_HEADINGS,
       viewer,
       setViewer,
     }),
-    [inline, left, target, leftWide, rightStored, rightWide, apply, apiUrl, outline, key, viewer],
+    [
+      inline,
+      left,
+      target,
+      leftWide,
+      rightStored,
+      rightWide,
+      apply,
+      apiUrl,
+      fullWidthStored,
+      setFullWidth,
+      outline,
+      key,
+      viewer,
+    ],
   );
 
   return (
@@ -184,7 +230,7 @@ function OutlineProbe({
       : null;
   useEffect(() => {
     if (kind && kind !== "markdown") {
-      onResult({ key: probeKey, target: "plain", headings: NO_HEADINGS });
+      onResult({ key: probeKey, target: "plain", headings: NO_HEADINGS, markdown: false });
     }
   }, [kind, probeKey, onResult]);
   return kind === "markdown" ? (
@@ -207,7 +253,12 @@ function MarkdownOutlineProbe({
   const headings = useMemo(() => (text === null ? NO_HEADINGS : extractOutline(text)), [text]);
   useEffect(() => {
     if (!settled) return;
-    onResult({ key: probeKey, target: hasOutline(headings) ? "outline" : "plain", headings });
+    onResult({
+      key: probeKey,
+      target: hasOutline(headings) ? "outline" : "plain",
+      headings,
+      markdown: true,
+    });
   }, [settled, headings, probeKey, onResult]);
   return null;
 }
