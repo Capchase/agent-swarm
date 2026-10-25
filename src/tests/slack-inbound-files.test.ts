@@ -25,6 +25,7 @@ import {
   createAgent,
   createTaskExtended,
   getDbClient,
+  getKv,
   getLogsByTaskId,
   getSlackTasksInThread,
   getSteeringMessagesForTask,
@@ -34,7 +35,9 @@ import {
   promoteAbandonedDraftTasks,
   startTask,
 } from "../be/db";
+import { installExtension } from "../be/extensions/db";
 import { MAX_TASK_ATTACHMENT_BYTES } from "../be/task-attachment-store";
+import { disableExtension, enableExtension } from "../extensions/lifecycle";
 import { getFileStorageProvider, resetFileStorageProviderForTests } from "../fs/registry";
 import * as slackAppModule from "../slack/app";
 import { createAssistant } from "../slack/assistant";
@@ -49,6 +52,7 @@ import {
   setDraftLeaseRefreshMsForTests,
 } from "../slack/inbound-files";
 import { getBufferMessageCount, instantFlush } from "../slack/thread-buffer";
+import { loadBundleFixture } from "./fixtures/extensions/load";
 
 const TEST_DB_PATH = "./test-slack-inbound-files.sqlite";
 const BOT_TOKEN = "example-slack-inbound-files-token";
@@ -651,7 +655,7 @@ describe("Slack ingress with files", () => {
       "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
       [ts],
     );
-    return { client, task: row ? await getTaskById(row.id) : null };
+    return { client, task: row ? await getTaskById(row.id) : null, ts };
   }
 
   test("an image with no text creates a task that carries the image (case 1)", async () => {
@@ -953,31 +957,107 @@ describe("Slack ingress with files", () => {
     });
   });
 
-  test("a channel message that mentions the bot with a file attaches it", async () => {
+  for (const [route, withFiles] of [
+    ["lead", false],
+    ["lead", true],
+    ["no-lead", false],
+    ["no-lead", true],
+    ["follow-up", false],
+    ["follow-up", true],
+  ] as const) {
+    test(`Assistant DM metadata reaches hooks for ${route} with files=${withFiles}`, async () => {
+      const agent =
+        route === "no-lead"
+          ? undefined
+          : await createAgent({
+              name: route === "follow-up" ? "worker" : "lead",
+              isLead: route === "lead",
+              status: route === "follow-up" ? "busy" : "idle",
+            });
+      const channelId = "D0ASSISTMETADATA";
+      const threadTs = "1800000000.000001";
+      const earlier =
+        route === "follow-up"
+          ? await createTaskExtended("earlier work", {
+              agentId: agent!.id,
+              source: "slack",
+              slackChannelId: channelId,
+              slackThreadTs: threadTs,
+            })
+          : undefined;
+      if (earlier) await startTask(earlier.id);
+      const installed = await installExtension(await loadBundleFixture("record-task-create"));
+      const recorder = await enableExtension(installed.extension.id);
+      const text = "<@U_SWARM_BOT> inspect this\n  keep the spacing";
+      try {
+        const { task, ts } = await sendAssistantDm({
+          channel: channelId,
+          thread_ts: threadTs,
+          text,
+          files: withFiles ? [slackFile()] : [],
+        });
+
+        expect(task).not.toBeNull();
+        expect(task!.agentId ?? undefined).toBe(agent?.id);
+        if (earlier) expect(task!.parentTaskId).toBe(earlier.id);
+        expect(await readStoredBytes(task!.id)).toEqual(withFiles ? [PNG_BYTES] : []);
+        const event = (await getKv(`task:agent:${recorder.agentId}`, "ext:record-task-create:last"))
+          ?.value;
+        expect(event).toMatchObject({
+          origin: "slack",
+          slack: {
+            trigger: "mention",
+            messages: [{ ts, userId: "U_HUMAN", text }],
+          },
+        });
+      } finally {
+        await disableExtension(recorder.id);
+      }
+    });
+  }
+
+  test.each([
+    false,
+    true,
+  ])("Slack event metadata accompanies a channel mention with files=%s", async (withFiles) => {
     await createAgent({ name: "lead", isLead: true, status: "idle" });
+    const installed = await installExtension(await loadBundleFixture("record-task-create"));
+    const recorder = await enableExtension(installed.extension.id);
     seq += 1;
     const ts = `1900000000.${String(seq).padStart(6, "0")}`;
+    try {
+      await channelMessage({
+        event: {
+          type: "message",
+          subtype: "file_share",
+          channel: "C0CHANNEL1",
+          ts,
+          user: "U_HUMAN",
+          text: "<@U_SWARM_BOT> what is this?",
+          files: withFiles ? [slackFile()] : [],
+        },
+        body: { event_id: `evt_inbound_files_${seq}` },
+        client: slackClient(),
+        say: mock(async () => ({ ts: "1900000000.999999" })),
+      });
 
-    await channelMessage({
-      event: {
-        type: "message",
-        subtype: "file_share",
-        channel: "C0CHANNEL1",
-        ts,
-        user: "U_HUMAN",
-        text: "<@U_SWARM_BOT> what is this?",
-        files: [slackFile()],
-      },
-      body: { event_id: `evt_inbound_files_${seq}` },
-      client: slackClient(),
-      say: mock(async () => ({ ts: "1900000000.999999" })),
-    });
-
-    const row = await getDbClient().get<{ id: string }>(
-      "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
-      [ts],
-    );
-    expect(row).not.toBeNull();
-    expect(await readStoredBytes(row!.id)).toEqual([PNG_BYTES]);
+      const row = await getDbClient().get<{ id: string }>(
+        "SELECT id FROM agent_tasks WHERE slackTriggerMessageTs = ?",
+        [ts],
+      );
+      expect(row).not.toBeNull();
+      expect(await readStoredBytes(row!.id)).toEqual(withFiles ? [PNG_BYTES] : []);
+      const event = (await getKv(`task:agent:${recorder.agentId}`, "ext:record-task-create:last"))
+        ?.value;
+      expect(event).toMatchObject({
+        origin: "slack",
+        slack: {
+          trigger: "mention",
+          messages: [{ ts, userId: "U_HUMAN", text: "<@U_SWARM_BOT> what is this?" }],
+        },
+      });
+    } finally {
+      await disableExtension(recorder.id);
+    }
   });
 });
