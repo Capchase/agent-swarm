@@ -1,7 +1,8 @@
 /**
  * The company profile the dashboard asks for: the canonical answer lists
- * (values match the API validators and the telemetry catalog) and the email
- * domain helpers that pre-fill the swarm name and website.
+ * (values match the API validators; telemetry reports only the values its
+ * catalog lists, see `src/utils/company-profile.ts`) and the email domain
+ * helpers that pre-fill the swarm name and website.
  */
 import { z } from "zod";
 import { normalizeOrgWebsite, websiteSuggestion } from "../../../../src/utils/org-website";
@@ -24,13 +25,24 @@ export const TEAM_SIZES = [
 ] as const;
 export type TeamSize = (typeof TEAM_SIZES)[number]["value"];
 
+/** The two use case groups, in display order. */
+export const USE_CASE_GROUPS = [
+  { id: "build", label: "Build software" },
+  { id: "business", label: "Run the business" },
+] as const;
+
+/** Values never change: telemetry and the fleet benchmark compare them across versions. */
 export const USE_CASES = [
-  { value: "features", label: "Ship features" },
-  { value: "bugs", label: "Fix bugs" },
-  { value: "review", label: "Review PRs" },
-  { value: "ops", label: "Ops and incidents" },
-  { value: "docs", label: "Docs and support" },
-  { value: "data", label: "Data work" },
+  { value: "features", label: "Ship features", group: "build" },
+  { value: "bugs", label: "Fix bugs", group: "build" },
+  { value: "review", label: "Review PRs", group: "build" },
+  { value: "ops", label: "Ops and incidents", group: "build" },
+  { value: "data", label: "Data work", group: "build" },
+  { value: "content", label: "Write content", group: "business" },
+  { value: "research", label: "Research and reports", group: "business" },
+  { value: "seo", label: "Get found online", group: "business" },
+  { value: "docs", label: "Docs and support", group: "business" },
+  { value: "admin", label: "Inbox and admin", group: "business" },
 ] as const;
 export type UseCase = (typeof USE_CASES)[number]["value"];
 
@@ -54,6 +66,9 @@ export const USER_FUNCTIONS = [
   { value: "eng_lead", label: "Engineering lead" },
   { value: "founder", label: "Founder or exec" },
   { value: "product", label: "Product or design" },
+  { value: "marketing", label: "Marketing or content" },
+  { value: "sales", label: "Sales or success" },
+  { value: "research", label: "Research" },
   { value: "ops", label: "Ops or IT" },
   { value: "other", label: "Other" },
 ] as const;
@@ -120,9 +135,9 @@ export function orgNameFromDomain(domain: string): string {
   return base.split("-").filter(Boolean).map(capitalize).join(" ");
 }
 
-/** ada.lovelace@acme.com becomes Ada Lovelace. */
+/** ada.lovelace@acme.com becomes Ada Lovelace. A plus tag (ada+qa@) is not part of the name. */
 export function nameFromEmail(email: string): string {
-  const local = email.trim().split("@")[0] ?? "";
+  const local = (email.trim().split("@")[0] ?? "").split("+")[0];
   return local
     .split(/[._-]+/)
     .filter(Boolean)

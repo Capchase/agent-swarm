@@ -1,5 +1,6 @@
 import type { OnboardingIntegrationMethod, OnboardingSignals } from "@/api/types";
 import { KEY_RULES, type SecretRule } from "@/components/onboarding/autosave-secret-field";
+import { USE_CASES, type UseCase } from "@/lib/company-profile";
 import { INTEGRATIONS } from "@/lib/integrations-catalog";
 import { httpUrlError } from "../../components/http-url";
 
@@ -9,19 +10,13 @@ import { httpUrlError } from "../../components/http-url";
  *   plus the field specs each pane edits. Labels, placeholders, and secret
  *   flags come from the Settings catalog (`lib/integrations-catalog.ts`).
  * - "Business tools": Gmail and Microsoft 365 connect inline over the OAuth
- *   presets. The rest open Connections in a new tab until their presets
- *   ship. Connecting one does not complete the step.
+ *   presets. One "More coming" row lists the rest, which open Connections in
+ *   a new tab until their presets ship. Connecting one does not complete the
+ *   step.
  */
 
 export type CoreIntegrationId = keyof OnboardingSignals["integrations"];
-export type BusinessToolId =
-  | "gmail"
-  | "microsoft"
-  | "figma"
-  | "stripe"
-  | "salesforce"
-  | "shopify"
-  | "granola";
+export type BusinessToolId = "gmail" | "microsoft" | "more";
 export type SetupIntegrationId = CoreIntegrationId | BusinessToolId;
 
 export interface SetupFieldSpec {
@@ -46,12 +41,12 @@ export interface SetupFieldSpec {
 interface SetupItemBase {
   name: string;
   purpose: string;
-  logo: string;
   docsUrl: string;
 }
 
 export interface CoreIntegration extends SetupItemBase {
   group: "core";
+  logo: string;
   id: CoreIntegrationId;
   method: OnboardingIntegrationMethod;
   /** Keys whose presence means "saved but not connected yet". */
@@ -61,6 +56,8 @@ export interface CoreIntegration extends SetupItemBase {
 export interface BusinessTool extends SetupItemBase {
   group: "business";
   id: BusinessToolId;
+  /** Absent: a generic icon ("More coming"). */
+  logo?: string;
   /** OAuth preset that connects it inline. Absent: set up in Connections. */
   oauthPresetId?: "google" | "microsoft";
   /** Scopes for the app created from the preset, instead of the preset defaults. */
@@ -164,50 +161,54 @@ const BUSINESS_TOOLS: BusinessTool[] = [
   },
   {
     group: "business",
-    id: "figma",
-    name: "Figma",
-    purpose: "Design files and comments.",
-    logo: "/integration-logos/figma.svg",
-    docsUrl: CONNECTIONS_DOCS,
-  },
-  {
-    group: "business",
-    id: "stripe",
-    name: "Stripe",
-    purpose: "Payments, customers, and subscriptions.",
-    logo: "/integration-logos/stripe.svg",
-    docsUrl: CONNECTIONS_DOCS,
-  },
-  {
-    group: "business",
-    id: "salesforce",
-    name: "Salesforce",
-    purpose: "Accounts, leads, and opportunities.",
-    logo: "/integration-logos/salesforce.svg",
-    docsUrl: CONNECTIONS_DOCS,
-  },
-  {
-    group: "business",
-    id: "shopify",
-    name: "Shopify",
-    purpose: "Orders, products, and customers.",
-    logo: "/integration-logos/shopify.svg",
-    docsUrl: CONNECTIONS_DOCS,
-  },
-  {
-    group: "business",
-    id: "granola",
-    name: "Granola",
-    purpose: "Meeting notes and transcripts.",
-    logo: "/integration-logos/granola.svg",
+    id: "more",
+    name: "More coming",
+    purpose: "Guided setup for these tools ships later.",
     docsUrl: CONNECTIONS_DOCS,
   },
 ];
 
-export const SETUP_GROUPS: ReadonlyArray<{ label: string; items: SetupIntegration[] }> = [
-  { label: "Chat and code", items: CORE_INTEGRATIONS },
-  { label: "Business tools", items: BUSINESS_TOOLS },
+/** A business tool with no guided setup yet. It connects from Connections. */
+export interface ComingSoonTool {
+  name: string;
+  purpose: string;
+  logo: string;
+}
+
+export const COMING_SOON_TOOLS: ComingSoonTool[] = [
+  { name: "Figma", purpose: "Design files and comments.", logo: "/integration-logos/figma.svg" },
+  {
+    name: "Stripe",
+    purpose: "Payments, customers, and subscriptions.",
+    logo: "/integration-logos/stripe.svg",
+  },
+  {
+    name: "Salesforce",
+    purpose: "Accounts, leads, and opportunities.",
+    logo: "/integration-logos/salesforce.svg",
+  },
+  {
+    name: "Shopify",
+    purpose: "Orders, products, and customers.",
+    logo: "/integration-logos/shopify.svg",
+  },
+  {
+    name: "Granola",
+    purpose: "Meeting notes and transcripts.",
+    logo: "/integration-logos/granola.svg",
+  },
 ];
+
+export type SetupGroup = { label: string; items: SetupIntegration[] };
+
+const CHAT_AND_CODE: SetupGroup = { label: "Chat and code", items: CORE_INTEGRATIONS };
+const BUSINESS: SetupGroup = { label: "Business tools", items: BUSINESS_TOOLS };
+
+/** The step 6 groups. A "Run the business" use case lists the business tools first. */
+export function setupGroups(useCase: UseCase | null): SetupGroup[] {
+  const business = USE_CASES.find((option) => option.value === useCase)?.group === "business";
+  return business ? [BUSINESS, CHAT_AND_CODE] : [CHAT_AND_CODE, BUSINESS];
+}
 
 export const SETUP_INTEGRATIONS: SetupIntegration[] = [...CORE_INTEGRATIONS, ...BUSINESS_TOOLS];
 
@@ -326,6 +327,18 @@ export const JIRA_FIELDS: SetupFieldSpec[] = [
   spec("jira", "JIRA_CLIENT_SECRET", { required: true }),
   spec("jira", "JIRA_WEBHOOK_TOKEN", { hint: "Shared token on the Jira webhook URL." }),
 ];
+
+const requiredKeys = (specs: SetupFieldSpec[]) => specs.filter((f) => f.required).map((f) => f.key);
+
+/** Keys an integration needs before it can connect ("1 of 2" until all are saved). */
+export const REQUIRED_KEYS: Record<CoreIntegrationId, string[]> = {
+  slack: requiredKeys(SLACK_TOKEN_FIELDS),
+  github: requiredKeys(GITHUB_FIELDS),
+  gitlab: requiredKeys(GITLAB_FIELDS),
+  bitbucket: requiredKeys(BITBUCKET_FIELDS),
+  linear: requiredKeys(LINEAR_FIELDS),
+  jira: requiredKeys(JIRA_FIELDS),
+};
 
 /** Every key the step reads presence for, in one `env-presence` query. */
 export const ALL_SETUP_KEYS: string[] = [

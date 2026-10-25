@@ -29,9 +29,10 @@ interface SetupFooterProps {
   };
   /**
    * `blockedBy` disables the action and becomes its tooltip. `enterKey` binds
-   * the Enter shortcut (Continue only, never "Go to dashboard").
+   * the Enter shortcut (Continue only, never "Go to dashboard"). Omit it when
+   * the step has its own primary action (step 7 sends from its composer).
    */
-  primary: { label: string; onClick: () => void; blockedBy: string | null; enterKey?: boolean };
+  primary?: { label: string; onClick: () => void; blockedBy: string | null; enterKey?: boolean };
   busy?: boolean;
   /** Skip or the primary action shows a spinner on its own button while it runs. */
   busyAction?: SetupBusyAction | null;
@@ -52,7 +53,7 @@ export function SetupFooter({
 }: SetupFooterProps) {
   const back = onBack && !busy ? onBack : undefined;
   const skipNow = skip && !skip.blockedBy && !busy ? skip.onSkip : undefined;
-  const next = primary.enterKey && !primary.blockedBy && !busy ? primary.onClick : undefined;
+  const next = primary?.enterKey && !primary.blockedBy && !busy ? primary.onClick : undefined;
   useSetupShortcuts({ back, skip: skipNow, next });
 
   return (
@@ -105,22 +106,26 @@ export function SetupFooter({
             </Button>
           </Hint>
         ) : null}
-        <Hint
-          content={primary.blockedBy ?? (primary.enterKey ? `${primary.label} (Enter)` : undefined)}
-        >
-          <Button
-            onClick={primary.blockedBy ? undefined : primary.onClick}
-            aria-disabled={primary.blockedBy ? true : undefined}
-            disabled={busy && busyAction !== "primary"}
-            status={busyAction === "primary" ? "loading" : "idle"}
-            aria-keyshortcuts={primary.enterKey ? "Enter" : undefined}
-            className={cn(ARIA_DISABLED, "aria-disabled:hover:bg-primary")}
+        {primary ? (
+          <Hint
+            content={
+              primary.blockedBy ?? (primary.enterKey ? `${primary.label} (Enter)` : undefined)
+            }
           >
-            {primary.label}
-            {primary.enterKey ? <Keycap tone="inverted">↵</Keycap> : null}
-            <ArrowRight />
-          </Button>
-        </Hint>
+            <Button
+              onClick={primary.blockedBy ? undefined : primary.onClick}
+              aria-disabled={primary.blockedBy ? true : undefined}
+              disabled={busy && busyAction !== "primary"}
+              status={busyAction === "primary" ? "loading" : "idle"}
+              aria-keyshortcuts={primary.enterKey ? "Enter" : undefined}
+              className={cn(ARIA_DISABLED, "aria-disabled:hover:bg-primary")}
+            >
+              {primary.label}
+              {primary.enterKey ? <Keycap tone="inverted">↵</Keycap> : null}
+              <ArrowRight />
+            </Button>
+          </Hint>
+        ) : null}
       </div>
     </footer>
   );
@@ -149,6 +154,8 @@ const OPEN_OVERLAY = '[role="dialog"], [role="alertdialog"], [role="menu"], [rol
 /** Enter already activates a focused control. */
 const CONTROL_TARGET =
   'button, a[href], summary, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"]';
+/** A step form whose text fields submit with Continue (step 1's "Who are you?"). */
+const ENTER_CONTINUES = "[data-enter-continues] input";
 
 function shortcutBlocked(event: KeyboardEvent): boolean {
   if (event.defaultPrevented || event.isComposing || event.repeat) return true;
@@ -157,6 +164,7 @@ function shortcutBlocked(event: KeyboardEvent): boolean {
   // Escape closes an open tooltip first.
   if (event.key === "Escape" && document.querySelector('[role="tooltip"]')) return true;
   const target = event.target instanceof Element ? event.target : null;
+  if (event.key === "Enter" && target?.matches(ENTER_CONTINUES)) return false;
   if (target?.closest(TYPING_TARGET)) return true;
   return event.key === "Enter" && Boolean(target?.closest(CONTROL_TARGET));
 }

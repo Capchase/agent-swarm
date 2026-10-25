@@ -1,6 +1,8 @@
 import type { LiveModelsCatalog } from "@/lib/agent-runtime-models";
-import { getConfig } from "@/lib/config";
+import { getActiveConnection, getConfig } from "@/lib/config";
+import { reportedUseCase, reportedUserFunction } from "../../../../src/utils/company-profile";
 import { DASHBOARD_USER_HEADER, dashboardUserIdFor } from "../lib/dashboard-user";
+import { withAddressSpace } from "../lib/local-network";
 import type {
   AcpRuntimeConfig,
   Agent,
@@ -188,6 +190,19 @@ import type {
   WorkflowsResponse,
   WorkflowVersion,
 } from "./types";
+
+/**
+ * Every request in this file goes through this `fetch`, not the global one.
+ * With no stored connection it fails without a request: a request to the
+ * default address would open the browser's local network prompt before the
+ * `/setup` connect step explains it. A request to a local API gets the Local
+ * Network Access hint (`lib/local-network.ts`).
+ */
+const fetch = (input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> => {
+  if (!getActiveConnection()) return Promise.reject(new Error("Not connected to an API yet"));
+  const url = input instanceof Request ? input.url : String(input);
+  return globalThis.fetch(input, withAddressSpace(url, init));
+};
 
 /**
  * Thrown by `api.triggerWorkflow` when the server returns the frozen
@@ -918,7 +933,12 @@ class ApiClient {
       throw new Error("Invalid feedback endpoint");
     }
 
-    const body = JSON.stringify(data);
+    // The proxy rejects a profile value its catalog does not list yet: leave it out.
+    const body = JSON.stringify({
+      ...data,
+      use_case: reportedUseCase(data.use_case),
+      user_function: reportedUserFunction(data.user_function),
+    });
     let response: Response;
 
     try {
