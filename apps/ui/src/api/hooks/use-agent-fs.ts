@@ -36,10 +36,13 @@ import type {
   CommentUpdateResult,
   DiffResult,
   DriveMembersResult,
+  FindResult,
+  FtsResult,
   LogResult,
   LsResult,
   RevertParams,
   RevertResult,
+  SearchResult,
   StatResult,
 } from "@/lib/agent-fs/types";
 import {
@@ -48,6 +51,13 @@ import {
   type FileThreads,
   listFileThreads,
 } from "@/lib/comb/comments";
+import {
+  HTML_SITE_TTL_SECONDS,
+  siteBaseUrl,
+  siteFileUrl,
+  siteFolderOf,
+  siteShareFreshFor,
+} from "@/lib/comb/html-view";
 import {
   blobUrlPlan,
   COMB_MEDIA_MAX_BYTES,
@@ -59,6 +69,15 @@ import {
 } from "@/lib/comb/media";
 import { markMentionsRead } from "@/lib/comb/mentions";
 import type { DrivePath } from "@/lib/comb/paths";
+import {
+  isSearchable,
+  isUnknownOpError,
+  SEARCH_OPS,
+  type SearchMode,
+  type SearchOutcome,
+  searchOutcome,
+  searchParams,
+} from "@/lib/comb/search";
 import { type AgentFsText, COMB_TEXT_MAX_BYTES, readDriveText } from "@/lib/comb/text-content";
 
 export { agentFsKey, agentFsRetry };
@@ -162,7 +181,7 @@ export function useAgentFsText(target: DrivePath) {
     // One entry per revision: drop each as soon as no viewer reads it, so a
     // file that changes on every poll does not pile up copies of its bytes.
     gcTime: 0,
-    placeholderData: keepSameFile(fileKey),
+    placeholderData: keepUnderPrefix(fileKey),
   });
 }
 
@@ -176,15 +195,16 @@ function fileRevision(stat: StatResult | undefined) {
 }
 
 /**
- * `placeholderData` that keeps the previous data of the same file (keys under
- * `fileKey`) on screen while a new revision loads.
+ * `placeholderData` that keeps the previous data of a query under `prefix` on
+ * screen while the next one loads: the same file at a new revision, or the
+ * same search mode with a new query.
  */
-function keepSameFile(fileKey: readonly unknown[]) {
+function keepUnderPrefix(prefix: readonly unknown[]) {
   return <T>(previous: T | undefined, previousQuery?: { queryKey: QueryKey }) =>
-    previousQuery && sameKeyPrefix(previousQuery.queryKey, fileKey) ? previous : undefined;
+    previousQuery && sameKeyPrefix(previousQuery.queryKey, prefix) ? previous : undefined;
 }
 
-// --- Media URLs (step-6: image, video, and PDF viewers) ---
+// --- Media URLs (step-6: image, video, and PDF viewers, then audio) ---
 
 /** Presigned media URLs live one hour. */
 const MEDIA_URL_EXPIRES_IN_SECONDS = 3600;
@@ -250,7 +270,7 @@ export function useAgentFsMediaUrl(target: DrivePath, kind: MediaKind): AgentFsM
     // PDF at page 1 and restarts a video.
     refetchInterval: false,
     refetchOnWindowFocus: false,
-    placeholderData: keepSameFile(mediaKey),
+    placeholderData: keepUnderPrefix(mediaKey),
   });
   const presignedUrl = freshPresignedUrl(signed.data, mountedAt);
   const blobMode = signed.data?.kind === "blob";
@@ -268,7 +288,7 @@ export function useAgentFsMediaUrl(target: DrivePath, kind: MediaKind): AgentFsM
     refetchInterval: false,
     // Never keep media bytes (or their object URLs) for a file that is not on screen.
     gcTime: 0,
-    placeholderData: keepSameFile(mediaKey),
+    placeholderData: keepUnderPrefix(mediaKey),
   });
   const plan = blobUrlPlan(kind, target.path, stat?.contentType);
   const blob = blobMode && !tooLarge ? raw.data : undefined;
@@ -647,6 +667,102 @@ export function useRevertFile(file: DrivePath) {
       ),
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: drivePathKey(access, file, "stat") }),
+  });
+}
+
+// --- Rendered HTML -------------------------------------------------------------
+
+/**
+ * The preview frame URL of an HTML file: the file inside a 15-minute site
+ * share of its folder (`share-create` on the folder, feature `html-sites`).
+ * One share per folder, kept in memory until 3 minutes before it expires, so
+ * two pages of one folder and a quick reopen reuse it. Nothing persists the
+ * token. `enabled: false` mints nothing. Key: `(..., "html-site", folder)`.
+ */
+export function useHtmlSiteUrl(file: DrivePath, enabled: boolean) {
+  const access = useAgentFsAccess();
+  const folder = siteFolderOf(file.path);
+  // A cached share near its expiry never shows on mount: it is stale, so the
+  // mount mints a new one and the frame loads once.
+  const [mountedAt] = useState(Date.now);
+  const site = useQuery({
+    queryKey: agentFsKey(
+      access.endpoint,
+      access.userId,
+      file.orgId,
+      file.driveId,
+      "html-site",
+      folder,
+    ),
+    queryFn: async () => {
+      const client = connectedClient(access);
+      const result = await client.createShare(file.orgId, file.driveId, folder, {
+        expiresIn: HTML_SITE_TTL_SECONDS,
+      });
+      const expiresAt = Date.parse(result.expiresAt);
+      return {
+        base: siteBaseUrl(access.endpoint || client.endpoint, result.sharePath),
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + result.expiresIn * 1000,
+      };
+    },
+    enabled: enabled && access.client !== null,
+    retry: agentFsRetry,
+    staleTime: ({ state }) =>
+      state.data ? siteShareFreshFor(state.data.expiresAt, state.dataUpdatedAt) : 0,
+    gcTime: HTML_SITE_TTL_SECONDS * 1000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+  });
+  const fresh = site.data && siteShareFreshFor(site.data.expiresAt, mountedAt) > 0;
+  return {
+    url: site.data && fresh ? siteFileUrl(site.data.base, file.path) : null,
+    error: site.error,
+  };
+}
+
+// --- Search ------------------------------------------------------------------
+
+/**
+ * Search the drive by name (`find`), full text (`fts`), or meaning (`search`).
+ * Key: `(..., "search", mode, query)`. A query too short for its mode does not
+ * run. Results do not poll: a new query or mode is a new search.
+ */
+export function useCombSearch(
+  drive: { orgId: string; driveId: string },
+  mode: SearchMode,
+  query: string,
+) {
+  const access = useAgentFsAccess();
+  const trimmed = query.trim();
+  const modeKey = agentFsKey(
+    access.endpoint,
+    access.userId,
+    drive.orgId,
+    drive.driveId,
+    "search",
+    mode,
+  );
+  return useQuery({
+    queryKey: [...modeKey, trimmed] as const,
+    queryFn: async ({ signal }): Promise<SearchOutcome> => {
+      const result = await connectedClient(access).callOp<FindResult | FtsResult | SearchResult>(
+        drive.orgId,
+        SEARCH_OPS[mode],
+        searchParams(mode, trimmed),
+        drive.driveId,
+        { signal },
+      );
+      return searchOutcome(mode, result);
+    },
+    enabled: access.client !== null && isSearchable(mode, trimmed),
+    // An older agent-fs without the op answers 500: retrying cannot help.
+    retry: (count, error) =>
+      !isUnknownOpError(error, SEARCH_OPS[mode]) && agentFsRetry(count, error),
+    staleTime: 30_000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    // The previous answer of the same mode stays on screen while the next query runs.
+    placeholderData: keepUnderPrefix(modeKey),
   });
 }
 

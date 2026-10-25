@@ -233,6 +233,63 @@ export interface CommentNotificationReadResult {
   markedRead: number;
 }
 
+/** Result of the core `find` op (fuzzy file names, agent-fs 0.18.5+). Best first. */
+export interface FindResult {
+  matches: Array<{ path: string; size: number; modifiedAt?: string; score: number }>;
+  /** Matching files before the `limit` cap. */
+  total: number;
+}
+
+/** Result of the core `fts` op. `snippet` marks matches with `<b>` and `</b>`. */
+export interface FtsResult {
+  matches: Array<{ path: string; snippet: string; rank: number }>;
+  hint?: string;
+  tookMs?: number;
+}
+
+/** Result of the core `search` op (vector and keyword results merged by rank). */
+export interface SearchResult {
+  results: Array<{
+    path: string;
+    score: number;
+    snippet: string;
+    /** PDF chunks only. */
+    page?: number;
+    kind?: string;
+    author?: string;
+    modifiedAt?: string;
+  }>;
+  hint?: string;
+  tookMs?: number;
+}
+
+/** Result of a write (`PUT .../raw`). */
+export interface WriteResult {
+  version: number;
+  path: string;
+  size: number;
+  contentHash?: string;
+  /** True when the bytes matched the head version, so no version was added. */
+  deduped?: boolean;
+}
+
+/** Result of the core `share-create` op (feature `share-links`). */
+export interface ShareCreateResult {
+  id: string;
+  /** `file` for a file. `site` for a folder (`/site/<token>/`). Absent on older servers. */
+  kind?: "file" | "site";
+  /** Absolute when the server knows its public address, else the same as `sharePath`. */
+  url: string;
+  /** Host-relative link: `/share/<token>` for a file, `/site/<token>/` for a folder. */
+  sharePath: string;
+  path: string;
+  expiresIn: number;
+  /** ISO time. */
+  expiresAt: string;
+  /** `null` = unlimited views. */
+  maxViews: number | null;
+}
+
 /** Mirrors the `disposition` param of the core `signed-url` op. */
 export type SignedUrlDisposition = "inline" | "attachment";
 
