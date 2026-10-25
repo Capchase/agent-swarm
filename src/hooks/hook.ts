@@ -24,6 +24,7 @@ import { getMcpBaseUrl, MAX_PROFILE_FILE_LENGTH } from "../utils/constants";
 import { isSessionSummarySkipped } from "../utils/env-flag";
 import { summarizeSession as runSummarize } from "../utils/internal-ai";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { contextBoundNoteThreshold, injectClaimedContextBoundNote } from "./context-bound-note";
 import { guardGhPrBody } from "./pr-body-guard";
 import { guardGhPrRoom } from "./pr-room-guard";
 import { checkToolLoop, clearToolHistory } from "./tool-loop-detection";
@@ -78,6 +79,8 @@ interface HookMessage {
   tool_input?: Record<string, unknown>;
   tool_response?: Record<string, unknown>;
   tool_use_id?: string;
+  /** Set only when the hook fires inside a subagent. */
+  agent_id?: string;
   prompt?: string;
   stop_hook_active?: boolean;
 }
@@ -1339,6 +1342,15 @@ export async function handleHook(): Promise<void> {
               `Task sent successfully.${maybeTaskId ? ` Task ID: ${maybeTaskId}.` : ""} Monitor progress using the get-task-details tool periodically.`,
             );
           }
+        } else if (!msg.agent_id) {
+          // One-time nudge once the session's context crosses the threshold.
+          // Main thread only: a subagent call must not consume the marker.
+          // Any failure means no note; it never blocks the tool call.
+          await injectClaimedContextBoundNote(
+            process.env.TASK_FILE,
+            contextBoundNoteThreshold(),
+            (note) => outputToolContext("PostToolUse", note),
+          );
         }
       }
       break;

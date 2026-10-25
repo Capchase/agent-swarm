@@ -830,6 +830,16 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}ui/configuration`,
       },
       {
+        key: "CONTEXT_BOUND_NOTE_TOKENS",
+        label: "Context-bound note threshold (tokens)",
+        description:
+          "When a worker session's latest main-thread request reaches this many tokens (input + cache read + cache write), the session gets one note per task telling it to finish the current step, store progress, and complete or defer instead of starting new exploration. Claude, Codex, pi, OpenCode, Amp and Claude Managed sessions get it. The note never blocks a tool call. Off by default: unset, empty, 0 or an invalid value means no note. Applies to new sessions. To try it on one agent first, set an agent-scoped row instead of this global one.",
+        kind: "number",
+        defaultValue: "off",
+        placeholder: "200000",
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
         key: "MODEL_WINDOW_EXHAUSTED_POLICY",
         label: "Model window exhausted policy",
         description:

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "nod
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { contextBoundNoteThreshold, createContextBoundNote } from "../hooks/context-bound-note";
 import {
   type AmpMode,
   type AmpModelSelection,
@@ -442,6 +443,8 @@ interface QueuedSteer {
    * answer from the model that received it settles the steer.
    */
   receiver?: string | null;
+  /** The swarm's own note: rides a tool result or is dropped, never replayed as a new turn. */
+  internal?: boolean;
   resolve: (result: SteerDeliveryResult) => void;
 }
 
@@ -486,6 +489,8 @@ class AmpSession implements ProviderSession {
   private steeringSeq = 0;
   /** Accepted steering not yet consumed, by inbox file name. Each settles exactly once. */
   private steers = new Map<string, QueuedSteer>();
+  /** Fed each top-level request's prompt size; queues the one-time context-bound note. */
+  private readonly observeContextBound: (contextTokens: number | undefined) => Promise<void>;
 
   constructor(
     private proc: Bun.Subprocess<"pipe", "pipe", "pipe">,
@@ -523,6 +528,15 @@ class AmpSession implements ProviderSession {
         });
       }
     };
+    // The plugin's `tool.result` hook carries queued steering mid-turn; a note
+    // no tool result took is dropped at turn end (`onTurnEnd`).
+    this.observeContextBound = createContextBoundNote({
+      threshold: contextBoundNoteThreshold(run.env),
+      // A mode names no model in advance, so only a pinned model gets a window share.
+      model: () => run.selection.pin,
+      canDeliver: () => !this.inputClosed && !this.aborted,
+      inject: (note) => this.queueSteering(note, true),
+    });
     this.completion = this.runSession(prompt);
   }
 
@@ -553,13 +567,13 @@ class AmpSession implements ProviderSession {
    * check and the rename, no turn end can drain the inbox and close input, so
    * a message is either visible to the next drain or refused.
    */
-  private queueSteering(text: string): Promise<SteerDeliveryResult> {
+  private queueSteering(text: string, internal = false): Promise<SteerDeliveryResult> {
     const name = `${String(++this.steeringSeq).padStart(6, "0")}.json`;
     const temp = join(this.run.steeringInbox, `.${name}.tmp`);
     writeFileSync(temp, JSON.stringify(text), { mode: 0o600 });
     renameSync(temp, join(this.run.steeringInbox, name));
     return new Promise((resolve) => {
-      this.steers.set(name, { text, via: "inbox", resolve });
+      this.steers.set(name, { text, via: "inbox", internal, resolve });
     });
   }
 
@@ -631,8 +645,8 @@ class AmpSession implements ProviderSession {
    * Claim the messages no tool result carried, with the plugin's rename
    * protocol (`.json -> .stdin`). They stay open until Amp echoes them.
    */
-  private takeSteering(): { name: string; text: string }[] {
-    const taken: { name: string; text: string }[] = [];
+  private takeSteering(): { name: string; text: string; internal?: boolean }[] {
+    const taken: { name: string; text: string; internal?: boolean }[] = [];
     for (const [name, steer] of [...this.steers].sort(([a], [b]) => a.localeCompare(b))) {
       if (steer.via !== "inbox") continue;
       try {
@@ -641,7 +655,7 @@ class AmpSession implements ProviderSession {
         continue; // The plugin took it.
       }
       steer.via = "stdin";
-      taken.push({ name, text: steer.text });
+      taken.push({ name, text: steer.text, internal: steer.internal });
     }
     return taken;
   }
@@ -704,11 +718,16 @@ class AmpSession implements ProviderSession {
   /**
    * A top-level assistant message with no tool call ends the turn. Steering
    * that arrived after the last tool result reached no hook, so it goes in as
-   * the next user message and starts another turn.
+   * the next user message and starts another turn. The swarm's own note is
+   * withdrawn instead: it must not start a turn.
    */
   private onTurnEnd(): void {
     if (this.inputClosed) return;
-    for (const { name, text } of this.takeSteering()) {
+    for (const { name, text, internal } of this.takeSteering()) {
+      if (internal) {
+        this.settleSteer(name, { delivered: false, reason: "no tool result carried the note" });
+        continue;
+      }
       this.writeInput(text).catch((error) => {
         this.settleSteer(name, {
           delivered: false,
@@ -817,6 +836,9 @@ class AmpSession implements ProviderSession {
       });
       // The window is not in the stream; the final snapshot after the export carries it.
       if (used > 0) this.emitContext(used, output, null);
+      // Only when a tool result follows to carry the note; the turn end drops
+      // a note no tool result carried.
+      if (topLevel && calledTool) void this.observeContextBound(input + cacheRead + cacheCreation);
     }
     if (topLevel && !calledTool && message.stop_reason !== "tool_use") this.onTurnEnd();
   }

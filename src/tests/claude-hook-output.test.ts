@@ -82,7 +82,11 @@ afterAll(async () => {
   await rm(projectDir, { recursive: true, force: true });
 });
 
-async function runHook(event: Record<string, unknown>, taskId: string) {
+async function runHook(
+  event: Record<string, unknown>,
+  taskId: string,
+  extraEnv: Record<string, string> = {},
+) {
   const taskFile = join(projectDir, `task-${taskId}.json`);
   await Bun.write(
     taskFile,
@@ -92,6 +96,8 @@ async function runHook(event: Record<string, unknown>, taskId: string) {
     ...process.env,
     CLAUDE_PROJECT_DIR: projectDir,
     TASK_FILE: taskFile,
+    CONTEXT_BOUND_NOTE_TOKENS: undefined,
+    ...extraEnv,
   };
   return runChild(["bun", HOOK_PATH], {
     cwd: projectDir,
@@ -106,6 +112,9 @@ function parseSoleJson(stdout: string): Record<string, unknown> {
   expect(trimmed.split("\n")).toHaveLength(1);
   return JSON.parse(trimmed) as Record<string, unknown>;
 }
+
+/** The note is off unless CONTEXT_BOUND_NOTE_TOKENS is set. */
+const noteOn = { CONTEXT_BOUND_NOTE_TOKENS: "200000" };
 
 const bashTouch = {
   tool_name: "Bash",
@@ -227,6 +236,75 @@ describe("claude hook stdout", () => {
       };
       expect(out.hookSpecificOutput.hookEventName).toBe("PostToolUse");
       expect(out.hookSpecificOutput.additionalContext).toContain("Task ID: task-123.");
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS,
+  );
+
+  test(
+    "worker context-bound note fires once as PostToolUse additionalContext",
+    async () => {
+      Object.assign(state, { isLead: false, cancelledTaskId: null, shouldBlockPolling: false });
+      const taskId = crypto.randomUUID();
+      await Bun.write(
+        join(projectDir, `task-${taskId}.json.context.json`),
+        JSON.stringify({ contextTokens: 250_000, model: "claude-opus-5-5" }),
+      );
+      const event = { hook_event_name: "PostToolUse", ...bashTouch, tool_response: {} };
+
+      const first = await runHook(event, taskId, noteOn);
+      const out = parseSoleJson(first.stdout) as { hookSpecificOutput: Record<string, string> };
+      expect(out.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+      expect(out.hookSpecificOutput.additionalContext).toStartWith(
+        "Context is 250,000 tokens (25% of the 1,000,000-token window). Keep this task bounded",
+      );
+
+      const second = await runHook(event, taskId, noteOn);
+      expect(second.exitCode).toBe(0);
+      expect(second.stdout.trim()).toBe("");
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS * 2,
+  );
+
+  test(
+    "a subagent tool call does not consume the context-bound note",
+    async () => {
+      Object.assign(state, { isLead: false, cancelledTaskId: null, shouldBlockPolling: false });
+      const taskId = crypto.randomUUID();
+      await Bun.write(
+        join(projectDir, `task-${taskId}.json.context.json`),
+        JSON.stringify({ contextTokens: 250_000, model: "made-up-model" }),
+      );
+      const event = { hook_event_name: "PostToolUse", ...bashTouch, tool_response: {} };
+
+      const child = await runHook({ ...event, agent_id: "child" }, taskId, noteOn);
+      expect(child.exitCode).toBe(0);
+      expect(child.stdout.trim()).toBe("");
+
+      // Unknown model: no window share rather than a percent of the 200k fallback.
+      const main = await runHook(event, taskId, noteOn);
+      const out = parseSoleJson(main.stdout) as { hookSpecificOutput: Record<string, string> };
+      expect(out.hookSpecificOutput.additionalContext).toStartWith(
+        "Context is 250,000 tokens. Keep this task bounded",
+      );
+    },
+    CHILD_PROCESS_TEST_BUDGET_MS * 2,
+  );
+
+  test(
+    "the context-bound note is off when CONTEXT_BOUND_NOTE_TOKENS is unset",
+    async () => {
+      Object.assign(state, { isLead: false, cancelledTaskId: null, shouldBlockPolling: false });
+      const taskId = crypto.randomUUID();
+      await Bun.write(
+        join(projectDir, `task-${taskId}.json.context.json`),
+        JSON.stringify({ contextTokens: 900_000, model: "claude-opus-5-5" }),
+      );
+      const result = await runHook(
+        { hook_event_name: "PostToolUse", ...bashTouch, tool_response: {} },
+        taskId,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("");
     },
     CHILD_PROCESS_TEST_BUDGET_MS,
   );

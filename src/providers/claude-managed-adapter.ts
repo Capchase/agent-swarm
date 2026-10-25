@@ -56,6 +56,7 @@ import type {
   BetaManagedAgentsSessionEvent as SessionEvent,
 } from "@anthropic-ai/sdk/resources/beta/sessions";
 
+import { contextBoundNoteThreshold, createContextBoundNote } from "../hooks/context-bound-note";
 import { checkToolLoop } from "../hooks/tool-loop-detection";
 import {
   CONTEXT_FORMULA,
@@ -268,6 +269,12 @@ class ClaudeManagedSession implements ProviderSession {
   private readonly taskId: string | null;
   private aborted = false;
   private settled = false;
+  /** Prompt size of the latest model request: input + cache read + cache write. */
+  private lastRequestContextTokens: number | undefined;
+  /** Fed the latest request's prompt size on each tool call; steers the one-time context-bound note. */
+  private readonly observeContextBound: (contextTokens: number | undefined) => Promise<void>;
+  /** Tool calls the stream started and has not returned a result for. */
+  private readonly openToolCalls = new Set<string>();
 
   constructor(
     client: ManagedAgentsClient,
@@ -285,6 +292,14 @@ class ClaudeManagedSession implements ProviderSession {
     this.logFileHandle = Bun.file(config.logFile).writer();
     this.completionPromise = new Promise<ProviderResult>((resolve) => {
       this.resolveCompletion = resolve;
+    });
+    this.observeContextBound = createContextBoundNote({
+      threshold: contextBoundNoteThreshold(config.env ?? process.env),
+      model: () => this.cost.model,
+      // A message with no tool call left to return, or after idle or abort,
+      // would start another turn.
+      canDeliver: () => !this.settled && !this.aborted && this.openToolCalls.size > 0,
+      inject: (note) => this.deliverSteering({ mode: "steer", text: note }),
     });
 
     // Phase 5: adapter-side swarm hooks. Lower-latency cancellation poll,
@@ -497,6 +512,11 @@ class ClaudeManagedSession implements ProviderSession {
       case "agent.tool_use": {
         const tu = event as BetaManagedAgentsAgentToolUseEvent;
         this.runToolLoopCheck(tu.name, tu.input);
+        // Only on tool calls: a message after the final reply would start another
+        // turn. The stream can send the call before its request ends, so this may
+        // read the previous request: at most one request late.
+        this.openToolCalls.add(tu.id);
+        void this.observeContextBound(this.lastRequestContextTokens);
         this.emit({
           type: "tool_start",
           toolCallId: tu.id,
@@ -509,6 +529,8 @@ class ClaudeManagedSession implements ProviderSession {
         const tu = event as BetaManagedAgentsAgentMCPToolUseEvent;
         const fqToolName = `${tu.mcp_server_name}:${tu.name}`;
         this.runToolLoopCheck(fqToolName, tu.input);
+        this.openToolCalls.add(tu.id);
+        void this.observeContextBound(this.lastRequestContextTokens);
         this.emit({
           type: "tool_start",
           toolCallId: tu.id,
@@ -519,6 +541,7 @@ class ClaudeManagedSession implements ProviderSession {
       }
       case "agent.tool_result": {
         const tr = event as BetaManagedAgentsAgentToolResultEvent;
+        this.openToolCalls.delete(tr.tool_use_id);
         this.emit({
           type: "tool_end",
           toolCallId: tr.tool_use_id,
@@ -533,6 +556,7 @@ class ClaudeManagedSession implements ProviderSession {
       }
       case "agent.mcp_tool_result": {
         const tr = event as BetaManagedAgentsAgentMCPToolResultEvent;
+        this.openToolCalls.delete(tr.mcp_tool_use_id);
         this.emit({
           type: "tool_end",
           toolCallId: tr.mcp_tool_use_id,
@@ -571,6 +595,8 @@ class ClaudeManagedSession implements ProviderSession {
       case "span.model_request_end": {
         const sp = event as BetaManagedAgentsSpanModelRequestEndEvent;
         const usage = sp.model_usage;
+        this.lastRequestContextTokens =
+          usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         this.cost.inputTokens = (this.cost.inputTokens ?? 0) + usage.input_tokens;
         this.cost.outputTokens = (this.cost.outputTokens ?? 0) + usage.output_tokens;
         this.cost.cacheReadTokens =

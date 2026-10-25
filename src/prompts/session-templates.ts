@@ -354,6 +354,30 @@ Task: {{task}}{{progressLine}}
 });
 
 /**
+ * One-time note injected into a worker session once its latest main-thread
+ * request crosses CONTEXT_BOUND_NOTE_TOKENS (`renderContextBoundNote`, via
+ * `src/hooks/context-bound-note.ts`).
+ */
+registerTemplate({
+  eventType: "system.agent.context.bound_note",
+  header: "",
+  defaultBody:
+    "Context is {{contextTokens}} tokens{{contextShare}}. Keep this task bounded: finish the current step, store-progress, and complete or defer instead of starting new exploration.",
+  variables: [
+    {
+      name: "contextTokens",
+      description: "Prompt size of the latest request (input + cache read + cache write tokens)",
+    },
+    {
+      name: "contextShare",
+      description:
+        'How full the model\'s context window is, e.g. " (21% of the 1,000,000-token window)". Empty when the window is unknown',
+    },
+  ],
+  category: "system",
+});
+
+/**
  * First message of a cursor session on the first-message path. Cursor keeps
  * its own system prompt there, so the swarm's rides on top of the task prompt.
  */

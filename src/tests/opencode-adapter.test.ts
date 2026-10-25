@@ -10,6 +10,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { OpenCodeEvent } from "@opencode/sdk";
 import { normalizeSessionLogs, type SessionLogRecord } from "../../apps/ui/src/logs-parser";
+import { renderContextBoundNote } from "../prompts/context-bound-note";
 import {
   _setOpencodeSdkLoaderForTests,
   _setOpencodeSessionHooksForTests,
@@ -22,6 +23,7 @@ import {
 import { createSkillInvokeTracker, type SkillInvoke } from "../providers/skill-invoke";
 import type { ProviderEvent, ProviderSessionConfig } from "../providers/types";
 import { clearVolatileSecretsForTesting } from "../utils/secret-scrubber";
+import { HELD_NOTE_TEXT, holdTemplateRender } from "./fixtures/held-template-render";
 
 const SESSION_ID = "ses_test";
 
@@ -68,6 +70,7 @@ type FakeHostOptions = {
   tools?: string[];
   /** Model responses handed to the plugin's `http.response` hook at startup. */
   responses?: Response[];
+  syntheticError?: Error;
 };
 
 /**
@@ -85,6 +88,7 @@ function makeFakeHost(events: OpenCodeEvent[], opts: FakeHostOptions = {}) {
     createOptions: undefined as unknown as Record<string, unknown>,
     created: [] as unknown[],
     prompts: [] as Array<Record<string, unknown>>,
+    synthetics: [] as Array<Record<string, unknown>>,
     interrupts: [] as unknown[],
     closeCalls: 0,
     mcpListCalls: 0,
@@ -114,6 +118,11 @@ function makeFakeHost(events: OpenCodeEvent[], opts: FakeHostOptions = {}) {
       },
       interrupt: async (input: unknown) => {
         host.interrupts.push(input);
+        return {};
+      },
+      synthetic: async (input: Record<string, unknown>) => {
+        host.synthetics.push(input);
+        if (opts.syntheticError) throw opts.syntheticError;
         return {};
       },
     },
@@ -812,6 +821,131 @@ describe("OpencodeSession — abort and steering", () => {
       delivered: false,
       reason: "opencode session already completed",
     });
+  });
+});
+
+describe("OpencodeSession — context-bound note", () => {
+  const boundConfig = (threshold: string) =>
+    testConfig({ env: { CONTEXT_BOUND_NOTE_TOKENS: threshold } });
+  const step = (sessionID: string, input: number, read = 0, write = 0) =>
+    ev("session.step.ended", { sessionID, tokens: tokens(input, 10, read, write) });
+
+  test("steers the note once at the threshold, not again on a larger step", async () => {
+    const { session, host } = await startSession([], boundConfig("1000"));
+    // 600 input + 300 cache read + 100 cache write = 1,000 (output does not count).
+    session.handleOpencodeEvent(step(SESSION_ID, 500, 300, 100));
+    session.handleOpencodeEvent(step(SESSION_ID, 600, 300, 100));
+    session.handleOpencodeEvent(step(SESSION_ID, 5_000));
+    await waitFor(() => host.synthetics.length > 0);
+    await Bun.sleep(20);
+    expect(host.synthetics).toEqual([
+      {
+        sessionID: SESSION_ID,
+        text: await renderContextBoundNote(1_000, "openrouter/google/gemini-3-flash-preview"),
+        delivery: "steer",
+        resume: false,
+      },
+    ]);
+    expect(host.synthetics[0]?.text).toContain("1,000");
+    session.handleOpencodeEvent(succeeded);
+    expect((await session.waitForCompletion()).isError).toBe(false);
+  });
+
+  test("the note shows the window share for a known model and omits it for an unknown one", async () => {
+    const noteFor = async (model: string) => {
+      const { session, host } = await startSession(
+        [],
+        testConfig({ model, env: { CONTEXT_BOUND_NOTE_TOKENS: "1000" } }),
+      );
+      session.handleOpencodeEvent(step(SESSION_ID, 524_288));
+      await waitFor(() => host.synthetics.length > 0);
+      session.handleOpencodeEvent(succeeded);
+      await session.waitForCompletion();
+      return host.synthetics[0]?.text;
+    };
+    const rest =
+      "Keep this task bounded: finish the current step, store-progress, and complete or defer instead of starting new exploration.";
+    expect(await noteFor("openrouter/google/gemini-3-flash-preview")).toBe(
+      `Context is 524,288 tokens (50% of the 1,048,576-token window). ${rest}`,
+    );
+    expect(await noteFor("openrouter/made-up/model")).toBe(`Context is 524,288 tokens. ${rest}`);
+  });
+
+  test("off when CONTEXT_BOUND_NOTE_TOKENS is unset", async () => {
+    const { session, host } = await startSession([]);
+    session.handleOpencodeEvent(step(SESSION_ID, 900_000));
+    await Bun.sleep(20);
+    expect(host.synthetics).toEqual([]);
+    session.handleOpencodeEvent(succeeded);
+    await session.waitForCompletion();
+  });
+
+  test("no-op below the threshold and for a child session's steps", async () => {
+    const { session, host } = await startSession([], boundConfig("1000"));
+    session.handleOpencodeEvent(step(SESSION_ID, 999));
+    session.handleOpencodeEvent(step("ses_child", 50_000));
+    await Bun.sleep(20);
+    expect(host.synthetics).toEqual([]);
+    session.handleOpencodeEvent(succeeded);
+    await session.waitForCompletion();
+  });
+
+  test("off at 0", async () => {
+    const { session, host } = await startSession([], boundConfig("0"));
+    session.handleOpencodeEvent(step(SESSION_ID, 250_000));
+    await Bun.sleep(20);
+    expect(host.synthetics).toEqual([]);
+    session.handleOpencodeEvent(succeeded);
+    await session.waitForCompletion();
+  });
+
+  test("fails open on corrupt step tokens", async () => {
+    const { session, host } = await startSession([], boundConfig("1000"));
+    session.handleOpencodeEvent(
+      ev("session.step.ended", {
+        sessionID: SESSION_ID,
+        tokens: { input: "lots", output: 1, reasoning: 0, cache: { read: null, write: {} } },
+      }),
+    );
+    await Bun.sleep(20);
+    expect(host.synthetics).toEqual([]);
+    session.handleOpencodeEvent(succeeded);
+    expect((await session.waitForCompletion()).isError).toBe(false);
+  });
+
+  test("a rejected steer still lets the session complete", async () => {
+    const { session, host } = await startSession([], boundConfig("1000"), {
+      syntheticError: new Error("synthetic refused"),
+    });
+    session.handleOpencodeEvent(step(SESSION_ID, 5_000));
+    await waitFor(() => host.synthetics.length > 0);
+    session.handleOpencodeEvent(succeeded);
+    expect((await session.waitForCompletion()).isError).toBe(false);
+  });
+
+  test("a note rendered after the session completed is dropped", async () => {
+    const lateSynthetics = async (releaseInSession: boolean) => {
+      const held = holdTemplateRender();
+      try {
+        const { session, host } = await startSession([], boundConfig("1000"));
+        session.handleOpencodeEvent(step(SESSION_ID, 5_000));
+        await held.requested;
+        if (releaseInSession) {
+          held.release();
+          await waitFor(() => host.synthetics.length > 0);
+        }
+        session.handleOpencodeEvent(succeeded);
+        expect((await session.waitForCompletion()).isError).toBe(false);
+        held.release();
+        await Bun.sleep(50);
+        return host.synthetics.map((s) => s.text);
+      } finally {
+        held.stop();
+      }
+    };
+    expect(await lateSynthetics(false)).toEqual([]);
+    // Control: ready while the session runs.
+    expect(await lateSynthetics(true)).toEqual([HELD_NOTE_TEXT]);
   });
 });
 

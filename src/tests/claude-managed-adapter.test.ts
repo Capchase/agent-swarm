@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { renderContextBoundNote } from "../prompts/context-bound-note";
 import { createProviderAdapter } from "../providers";
 import {
   ClaudeManagedAdapter,
@@ -13,6 +14,7 @@ import {
   getClaudeManagedModelPricing,
 } from "../providers/claude-managed-models";
 import type { ProviderEvent, ProviderSessionConfig } from "../providers/types";
+import { HELD_NOTE_TEXT, holdTemplateRender } from "./fixtures/held-template-render";
 
 // Stash + restore env vars so this file plays nicely with the rest of the
 // suite (other tests don't expect MANAGED_AGENT_ID / MANAGED_ENVIRONMENT_ID
@@ -1501,5 +1503,278 @@ describe("ClaudeManagedAdapter (Phase 6) — full happy-path integration", () =>
     expect(result.sessionId).toBe("sesn_test_123");
     expect(result.cost?.totalCostUsd).toBeGreaterThan(0);
     expect(result.output).toBe("Read the file and here's what I found.");
+  });
+});
+
+describe("ClaudeManagedAdapter — one-time context-bound note", () => {
+  const tmpLogDir = `/tmp/claude-managed-adapter-bound-note-${Date.now()}`;
+  let seq = 0;
+
+  beforeAll(() => {
+    mkdirSync(tmpLogDir, { recursive: true });
+    process.env.ANTHROPIC_API_KEY = "sk-test";
+    process.env.MANAGED_AGENT_ID = "agent_x";
+    process.env.MANAGED_ENVIRONMENT_ID = "env_x";
+  });
+
+  afterAll(() => {
+    rmSync(tmpLogDir, { recursive: true, force: true });
+  });
+
+  /** A main-thread model request whose prompt is `input + cacheRead + cacheWrite`. */
+  function requestEnd(input: unknown, cacheRead: unknown = 0, cacheWrite: unknown = 0) {
+    seq += 1;
+    return {
+      type: "span.model_request_end",
+      id: `req-${seq}`,
+      processed_at: "2026-01-01T00:00:00Z",
+      is_error: false,
+      model_request_start_id: `start-${seq}`,
+      model_usage: {
+        input_tokens: input,
+        output_tokens: 10,
+        cache_read_input_tokens: cacheRead,
+        cache_creation_input_tokens: cacheWrite,
+      },
+    };
+  }
+
+  function toolUse(kind: "agent.tool_use" | "agent.mcp_tool_use" = "agent.tool_use") {
+    seq += 1;
+    return {
+      type: kind,
+      id: `tu-${seq}`,
+      processed_at: "2026-01-01T00:00:00Z",
+      name: "read_file",
+      ...(kind === "agent.mcp_tool_use" ? { mcp_server_name: "agent-swarm" } : {}),
+      input: { path: `/tmp/${seq}` },
+    };
+  }
+
+  const idle = () => ({
+    type: "session.status_idle",
+    id: `idle-${++seq}`,
+    processed_at: "2026-01-01T00:00:00Z",
+    stop_reason: { type: "end_turn" },
+  });
+
+  /** Run a session over `events` and return the texts of every message sent after the prompt. */
+  async function runNotes(
+    events: Array<Record<string, unknown>>,
+    threshold: string,
+    onSend?: Parameters<typeof makeFakeClient>[0]["onSend"],
+    model?: string,
+  ) {
+    const spy = makeFakeClient({
+      streamEvents: async function* () {
+        for (const e of events) yield e;
+      },
+      onSend,
+    });
+    const adapter = new ClaudeManagedAdapter({ client: spy.client });
+    const session = await adapter.createSession(
+      tConfig({
+        logFile: join(tmpLogDir, `note-${++seq}.log`),
+        env: { CONTEXT_BOUND_NOTE_TOKENS: threshold },
+        ...(model ? { model } : {}),
+      }),
+    );
+    const result = await session.waitForCompletion();
+    // The note is rendered and sent off the event loop; let it land.
+    await Bun.sleep(150);
+    const notes = spy.sent.slice(1).map((sent) => {
+      const content = sent.events[0]?.content as Array<{ text?: string }> | undefined;
+      return { type: sent.events[0]?.type, text: content?.[0]?.text };
+    });
+    return { result, notes };
+  }
+
+  test("fires once when a tool call follows a request at the threshold, not again", async () => {
+    const { result, notes } = await runNotes(
+      [
+        requestEnd(150_000, 40_000, 10_000),
+        toolUse(),
+        requestEnd(240_000, 10_000, 0),
+        toolUse("agent.mcp_tool_use"),
+        requestEnd(260_000),
+        toolUse(),
+        idle(),
+      ],
+      "200000",
+    );
+    expect(result.isError).toBe(false);
+    expect(notes).toEqual([
+      { type: "user.message", text: await renderContextBoundNote(200_000, "claude-sonnet-4-6") },
+    ]);
+  });
+
+  test("the note shows the window share for a known model and omits it for an unknown one", async () => {
+    const noteFor = async (model: string) =>
+      (await runNotes([requestEnd(250_000), toolUse(), idle()], "200000", undefined, model)).notes;
+    const rest =
+      "Keep this task bounded: finish the current step, store-progress, and complete or defer instead of starting new exploration.";
+    expect(await noteFor("claude-sonnet-4-6")).toEqual([
+      {
+        type: "user.message",
+        text: `Context is 250,000 tokens (25% of the 1,000,000-token window). ${rest}`,
+      },
+    ]);
+    expect(await noteFor("made-up-model")).toEqual([
+      { type: "user.message", text: `Context is 250,000 tokens. ${rest}` },
+    ]);
+  });
+
+  test("no-op below the threshold, then fires once it is crossed", async () => {
+    const { notes } = await runNotes(
+      [requestEnd(199_999), toolUse(), requestEnd(205_000), toolUse(), idle()],
+      "200000",
+    );
+    expect(notes).toEqual([
+      { type: "user.message", text: await renderContextBoundNote(205_000, "claude-sonnet-4-6") },
+    ]);
+  });
+
+  test("off at 0 and when unset", async () => {
+    const events = () => [requestEnd(500_000), toolUse(), idle()];
+    expect((await runNotes(events(), "0")).notes).toEqual([]);
+    expect((await runNotes(events(), "")).notes).toEqual([]);
+    // Control: the same session with a threshold gets the note.
+    expect((await runNotes(events(), "200000")).notes).toHaveLength(1);
+  });
+
+  test("no note when the request ends the turn without a tool call", async () => {
+    expect((await runNotes([requestEnd(300_000), idle()], "200000")).notes).toEqual([]);
+    // Control: a tool call after the same request carries the note.
+    expect((await runNotes([requestEnd(300_000), toolUse(), idle()], "200000")).notes).toHaveLength(
+      1,
+    );
+  });
+
+  test("fails open on missing or corrupt usage", async () => {
+    const { result, notes } = await runNotes(
+      [
+        // Missing: a tool call before any request reported usage.
+        toolUse(),
+        // Corrupt: non-numeric usage fields.
+        requestEnd("lots", null, {}),
+        toolUse(),
+        requestEnd(Number.NaN),
+        toolUse(),
+        // Control: a valid request afterwards still gets the note.
+        requestEnd(210_000),
+        toolUse(),
+        idle(),
+      ],
+      "200000",
+    );
+    expect(result.isError).toBe(false);
+    expect(notes).toEqual([
+      { type: "user.message", text: await renderContextBoundNote(210_000, "claude-sonnet-4-6") },
+    ]);
+  });
+
+  test("fails open when sending the note rejects", async () => {
+    let sends = 0;
+    const { result, notes } = await runNotes(
+      [requestEnd(300_000), toolUse(), requestEnd(310_000), toolUse(), idle()],
+      "200000",
+      () => {
+        sends += 1;
+        if (sends > 1) throw new Error("send failed");
+      },
+    );
+    expect(result.isError).toBe(false);
+    // One attempt only: a failed send does not re-arm the note.
+    expect(notes).toHaveLength(1);
+  });
+
+  describe("note rendered late", () => {
+    const toolResult = (toolUseId: string) => ({
+      type: "agent.tool_result",
+      id: `tr-${++seq}`,
+      processed_at: "2026-01-01T00:00:00Z",
+      tool_use_id: toolUseId,
+      content: [],
+    });
+
+    /**
+     * Holds the render until the stream reaches `releaseAt`. Returns the
+     * `user.message` events sent after the prompt, read once the late render
+     * had time to land.
+     */
+    async function lateNotes(
+      releaseAt: "tool-open" | "tool-returned" | "idle" | "abort",
+    ): Promise<{ notes: unknown[]; isError: boolean }> {
+      const held = holdTemplateRender();
+      const tool = toolUse();
+      let unblock!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        unblock = resolve;
+      });
+      const spy = makeFakeClient({
+        streamEvents: async function* () {
+          yield requestEnd(300_000);
+          yield tool;
+          await held.requested;
+          if (releaseAt === "tool-open") {
+            held.release();
+            await Bun.sleep(50);
+          }
+          yield toolResult(tool.id);
+          if (releaseAt === "tool-returned") {
+            held.release();
+            await Bun.sleep(50);
+          }
+          if (releaseAt === "abort") await blocked;
+          yield idle();
+        },
+      });
+      try {
+        const session = await new ClaudeManagedAdapter({ client: spy.client }).createSession(
+          tConfig({
+            logFile: join(tmpLogDir, `late-${++seq}.log`),
+            env: { CONTEXT_BOUND_NOTE_TOKENS: "200000" },
+          }),
+        );
+        if (releaseAt === "abort") {
+          await held.requested;
+          await session.abort();
+          unblock();
+        }
+        const result = await session.waitForCompletion();
+        held.release();
+        await Bun.sleep(100);
+        const notes = spy.sent
+          .slice(1)
+          .filter((sent) => sent.events[0]?.type === "user.message")
+          .map((sent) => sent.events[0]);
+        return { notes, isError: result.isError };
+      } finally {
+        unblock();
+        held.stop();
+      }
+    }
+
+    test("control: a note ready while its tool call is open is sent", async () => {
+      const { notes, isError } = await lateNotes("tool-open");
+      expect(isError).toBe(false);
+      expect(notes).toEqual([
+        { type: "user.message", content: [{ type: "text", text: HELD_NOTE_TEXT }] },
+      ]);
+    });
+
+    test("dropped once the tool result is back and the final reply is pending", async () => {
+      expect((await lateNotes("tool-returned")).notes).toEqual([]);
+    });
+
+    test("dropped after the session went idle", async () => {
+      const { notes, isError } = await lateNotes("idle");
+      expect(isError).toBe(false);
+      expect(notes).toEqual([]);
+    });
+
+    test("dropped after abort", async () => {
+      expect((await lateNotes("abort")).notes).toEqual([]);
+    });
   });
 });

@@ -8,6 +8,7 @@ import {
   validateProviderCredentials,
 } from "../commands/provider-credentials";
 import { recomputeSessionCost } from "../http/session-cost-recompute";
+import { renderContextBoundNote } from "../prompts/context-bound-note";
 import { createProviderAdapter } from "../providers";
 import {
   AMP_PACKAGE,
@@ -31,6 +32,7 @@ import { getModelAwareCredentialVars } from "../utils/credentials";
 import { resolveHarnessProvider } from "../utils/harness-provider";
 import { clearVolatileSecretsForTesting } from "../utils/secret-scrubber";
 import { ampPricingLookup } from "./amp-pricing-helpers";
+import { holdTemplateRender } from "./fixtures/held-template-render";
 
 const KEY = "sgamp_test_credential_value";
 
@@ -767,6 +769,101 @@ describe("amp session", () => {
     expect(childPid).toBeGreaterThan(0);
     expect(isRunning(childPid)).toBe(false);
   }, 20_000);
+});
+
+describe("amp context-bound note", () => {
+  // Each fake request is 4 input + 200 cache read + 1000 cache write = 1204 tokens.
+  async function toolResults(
+    mode: string,
+    env: Record<string, string>,
+    overrides: Partial<ProviderSessionConfig> = {},
+  ) {
+    const { config } = await fixture(mode, overrides, env);
+    const { events, result } = await runToCompletion(config);
+    const results = events.flatMap((e) => (e.type === "tool_end" ? [e.result] : []));
+    return { results, result };
+  }
+
+  test("queues the note into the first tool result at the threshold, then never again", async () => {
+    const { results, result } = await toolResults("steer-twice", {
+      CONTEXT_BOUND_NOTE_TOKENS: "1204",
+    });
+    expect(results).toEqual([`2\n\n${await renderContextBoundNote(1204)}`, "2"]);
+    // Carried inside the turn: no extra turn replays it.
+    expect(result).toMatchObject({ isError: false, output: "DONE1" });
+    expect(result.cost?.numTurns).toBe(1);
+  });
+
+  test("a pinned model gets the window share; a mode names no model and gets none", async () => {
+    const pin = "anthropic/claude-sonnet-4-6";
+    const pinned = await toolResults(
+      "steer-twice",
+      { CONTEXT_BOUND_NOTE_TOKENS: "1204" },
+      { model: pin },
+    );
+    const note = await renderContextBoundNote(1204, pin);
+    expect(note).toContain("of the 1,000,000-token window)");
+    expect(pinned.results).toEqual([`2\n\n${note}`, "2"]);
+    const mode = await toolResults("steer-twice", { CONTEXT_BOUND_NOTE_TOKENS: "1204" });
+    expect(mode.results[0]).not.toContain("token window");
+  });
+
+  test("no-op below the threshold and when disabled at 0", async () => {
+    for (const threshold of ["1205", "0"]) {
+      const { results } = await toolResults("steer-twice", {
+        CONTEXT_BOUND_NOTE_TOKENS: threshold,
+      });
+      expect(results).toEqual(["2", "2"]);
+    }
+  });
+
+  test("fails open on missing or corrupt request usage", async () => {
+    for (const usage of ["missing", "corrupt"]) {
+      const { results, result } = await toolResults("steer", {
+        CONTEXT_BOUND_NOTE_TOKENS: "1",
+        AMP_TEST_REQUEST_USAGE: usage,
+      });
+      expect(results).toEqual(["2"]);
+      expect(result).toMatchObject({ isError: false, output: "DONE1" });
+    }
+  });
+
+  test("a final reply with no tool call never queues it, so no new turn starts", async () => {
+    const { results, result } = await toolResults("steer-no-tool", {
+      CONTEXT_BOUND_NOTE_TOKENS: "1",
+    });
+    expect(results).toEqual([]);
+    expect(result).toMatchObject({ isError: false, output: "DONE1" });
+    expect(result.cost?.numTurns).toBe(1);
+  });
+
+  test("a note rendered after the last tool result is dropped, not replayed as a new turn", async () => {
+    const held = holdTemplateRender();
+    try {
+      const { config } = await fixture(
+        "steer",
+        {},
+        {
+          CONTEXT_BOUND_NOTE_TOKENS: "1204",
+          AMP_TEST_POST_RESULT_DELAY_MS: "150",
+        },
+      );
+      const session = await new AmpAdapter().createSession(config);
+      const results: unknown[] = [];
+      session.onEvent((event) => {
+        if (event.type !== "tool_end") return;
+        results.push(event.result);
+        // Ready while the final reply is pending.
+        held.release();
+      });
+      const result = await session.waitForCompletion();
+      expect(results).toEqual(["2"]);
+      expect(result).toMatchObject({ isError: false, output: "DONE1" });
+      expect(result.cost?.numTurns).toBe(1);
+    } finally {
+      held.stop();
+    }
+  });
 });
 
 describe("amp live test", () => {
