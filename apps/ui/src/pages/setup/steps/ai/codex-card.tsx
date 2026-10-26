@@ -2,9 +2,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "@/api/client";
+import { CODEX_ACCOUNTS_QUERY_KEY } from "@/api/hooks/use-codex-accounts";
 import { ONBOARDING_QUERY_KEY } from "@/api/hooks/use-onboarding";
+import { usePoolKeysSupport } from "@/api/hooks/use-pool-keys-support";
 import type { CodexDeviceStartResponse } from "@/api/types";
 import { Spinner } from "@/components/kibo-ui/spinner";
+import { CodexAccountsList } from "@/components/onboarding/codex-accounts-list";
 import { BrandLogo } from "@/components/shared/brand-logo";
 import { CollapsibleSection } from "@/components/shared/collapsible-section";
 import { StatusLine } from "@/components/shared/status-icon";
@@ -41,6 +44,7 @@ export function CodexCard({
   const queryClient = useQueryClient();
   const { config } = useConfig();
   const [flow, setFlow] = useState<CodexFlow>({ phase: "idle" });
+  const accountsSupport = usePoolKeysSupport();
   // Remounts the CLI fallback open after a failed start, and keeps it open.
   const [cliKey, setCliKey] = useState(0);
 
@@ -88,6 +92,7 @@ export function CodexCard({
           onDeviceComplete();
           void queryClient.invalidateQueries({ queryKey: ONBOARDING_QUERY_KEY });
           void queryClient.invalidateQueries({ queryKey: ["configs"] });
+          void queryClient.invalidateQueries({ queryKey: CODEX_ACCOUNTS_QUERY_KEY });
           return;
         }
         if (res.status === "failed" || res.status === "expired") {
@@ -131,6 +136,16 @@ export function CodexCard({
       subtitle="Device code login. No terminal needed."
       saved={saved}
     >
+      {/* An older API has no account list route. */}
+      {accountsSupport === "supported" ? (
+        <CodexAccountsList
+          onRemoved={(accounts) => {
+            // The last account is gone: the card offers the first sign-in again.
+            if (accounts.length === 0 && flow.phase === "complete") setFlow({ phase: "idle" });
+          }}
+        />
+      ) : null}
+
       {flow.phase === "idle" ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           {startButton(saved ? "Add another ChatGPT account" : "Sign in with ChatGPT")}
@@ -160,9 +175,13 @@ export function CodexCard({
       {flow.phase === "polling" ? <DeviceCodePanel flow={flow.flow} /> : null}
 
       {flow.phase === "complete" ? (
-        <StatusLine tone="done">
-          {flow.slot === undefined ? "Signed in" : `Signed in (Codex slot ${flow.slot})`}
-        </StatusLine>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <StatusLine tone="done">
+            {flow.slot === undefined ? "Signed in" : `Signed in (Codex slot ${flow.slot})`}
+          </StatusLine>
+          {/* Starts a new device flow, which takes the next free slot. */}
+          {startButton("Add another ChatGPT account")}
+        </div>
       ) : null}
 
       {flow.phase === "failed" ? (

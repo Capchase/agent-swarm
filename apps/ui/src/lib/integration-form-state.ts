@@ -19,7 +19,7 @@ export type DirtyState = Record<string, DirtyField>;
 
 // Build the initial form state:
 //  - Non-secret fields: pre-fill with the existing plaintext value (these are
-//    harmless — channel names, emails, flags, etc.).
+//    harmless: channel names, emails, flags, etc.).
 //  - Secret fields with an existing row: store the "********" sentinel so the
 //    renderer shows masked read-only + Replace.
 export function buildInitialState(def: IntegrationDef, configs: SwarmConfig[]): DirtyState {
@@ -63,13 +63,18 @@ export function reconcileWithStored(
 //   - Secret + existing row + Replace clicked + non-mask value typed → send.
 //   - Secret + no existing row + non-empty value typed → send.
 //   - Non-secret + value differs from the stored value → send.
+// A credential pool field is never dirty: its list adds and removes one key
+// at a time through `/api/config/pool-keys`, outside the page Save. With
+// `poolLists: false` (an API without that route) a pool is a plain secret.
 export function computeDirtyEntries(
   fields: IntegrationField[],
   state: DirtyState,
   configs: SwarmConfig[],
+  { poolLists = true }: { poolLists?: boolean } = {},
 ): UpsertConfigEntry[] {
   const entries: UpsertConfigEntry[] = [];
   for (const f of fields) {
+    if (f.credentialPool && poolLists) continue;
     const current = state[f.key];
     if (!current) continue;
     const existing = findConfigForKey(configs, f.key);

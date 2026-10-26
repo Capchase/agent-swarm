@@ -88,3 +88,24 @@ describe("integration form state after another editor saves the same keys", () =
     ]);
   });
 });
+
+describe("credential pool fields", () => {
+  const anthropic = INTEGRATIONS.find((integration) => integration.id === "anthropic")!;
+  const anthropicFields = getIntegrationFields(anthropic);
+
+  test("a typed pool value never reaches the page Save", () => {
+    expect(anthropicFields.every((field) => field.credentialPool)).toBe(true);
+    const state = {
+      CLAUDE_CODE_OAUTH_TOKEN: { value: "sk-ant-oat01-typed", markedForReplace: true },
+      ANTHROPIC_API_KEY: { value: "sk-ant-api03-typed" },
+    };
+    expect(computeDirtyEntries(anthropicFields, state, [])).toEqual([]);
+  });
+
+  test("an API without the pool-keys route saves a typed pool with the page", () => {
+    const state = { ANTHROPIC_API_KEY: { value: "sk-ant-api03-first,sk-ant-api03-secnd" } };
+    expect(computeDirtyEntries(anthropicFields, state, [], { poolLists: false })).toMatchObject([
+      { key: "ANTHROPIC_API_KEY", value: "sk-ant-api03-first,sk-ant-api03-secnd", isSecret: true },
+    ]);
+  });
+});

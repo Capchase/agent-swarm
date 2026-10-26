@@ -1,7 +1,9 @@
 import { AlertCircle, Check, Copy, Terminal, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useConfigs, useDeleteConfigsBatch } from "@/api/hooks/use-config-api";
-import { OAuthSection, OAuthStatusRow } from "@/components/shared/oauth-section";
+import { usePoolKeysSupport } from "@/api/hooks/use-pool-keys-support";
+import { CodexAccountsList } from "@/components/onboarding/codex-accounts-list";
+import { OAuthSection, OAuthSectionRow, OAuthStatusRow } from "@/components/shared/oauth-section";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -18,15 +20,20 @@ import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { getConfig } from "@/lib/config";
 
 // ---------------------------------------------------------------------------
-// Codex ChatGPT OAuth section — the entire flow happens on the user's laptop,
-// not the browser. We surface:
+// Codex ChatGPT OAuth section. The sign-in runs on the user's laptop, not in
+// the browser. We surface:
 //   1. An explainer
 //   2. A copyable `codex-login` snippet auto-filled with the current API URL
-//   3. Status derived from presence of the `codex_oauth` global config row
-//   4. A "Clear stored OAuth" button (confirm dialog) that deletes that row
+//   3. Status derived from the global `codex_oauth` / `codex_oauth_<n>` rows
+//   4. The stored ChatGPT accounts, each with Remove (`CodexAccountsList`).
+//      An API older than `POOL_KEYS_MIN_VERSION` has no account routes: it
+//      keeps the old "Clear stored OAuth" button for the `codex_oauth` row.
 // ---------------------------------------------------------------------------
 
-const CODEX_OAUTH_KEY = "codex_oauth";
+const LEGACY_CODEX_OAUTH_KEY = "codex_oauth";
+
+/** Global rows the CLI and the device flow write (`codex_oauth` is the legacy slot 0). */
+const CODEX_SLOT_KEY = /^codex_oauth(_\d+)?$/i;
 
 function resolveApiUrl(): string {
   // Prefer the configured API URL so the snippet works in multi-connection setups.
@@ -42,21 +49,24 @@ export function CodexOAuthSection() {
   const snippet = `npx @desplega.ai/agent-swarm codex-login --api-url ${apiUrl}`;
 
   const { data: configs, isLoading } = useConfigs({ scope: "global" });
+  const accountsSupport = usePoolKeysSupport();
   const deleteBatch = useDeleteConfigsBatch();
 
   const { copied, copy } = useCopyToClipboard();
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
 
-  const codexRow = configs?.find((c) => c.key === CODEX_OAUTH_KEY && c.scope === "global");
-  const isConfigured = !!codexRow;
-
-  const handleCopy = () => copy(snippet);
+  const isConfigured = !!configs?.some((c) => c.scope === "global" && CODEX_SLOT_KEY.test(c.key));
+  const legacyRow =
+    accountsSupport === "legacy" &&
+    configs?.some((c) => c.key === LEGACY_CODEX_OAUTH_KEY && c.scope === "global");
 
   function handleClear() {
     if (!configs) return;
-    deleteBatch.mutate({ configs, keys: [CODEX_OAUTH_KEY] });
+    deleteBatch.mutate({ configs, keys: [LEGACY_CODEX_OAUTH_KEY] });
     setConfirmClearOpen(false);
   }
+
+  const handleCopy = () => copy(snippet);
 
   return (
     <div className="space-y-6">
@@ -64,10 +74,9 @@ export function CodexOAuthSection() {
       <Alert>
         <Terminal className="h-4 w-4" />
         <AlertDescription>
-          Codex ChatGPT OAuth must be completed from your local terminal — it cannot be done from
-          this UI. Run the command below on your laptop; the CLI walks you through the browser
-          consent flow and then uploads the resulting credentials to this swarm's encrypted config
-          store.
+          Run the command below on your laptop. The CLI walks you through the browser consent flow,
+          then uploads the credentials to this swarm's encrypted config store. Each sign-in adds one
+          ChatGPT account.
         </AlertDescription>
       </Alert>
 
@@ -119,7 +128,7 @@ export function CodexOAuthSection() {
               )
             }
             actions={
-              isConfigured ? (
+              legacyRow ? (
                 <Button
                   type="button"
                   size="sm"
@@ -134,6 +143,11 @@ export function CodexOAuthSection() {
             }
           />
         )}
+        {accountsSupport === "supported" ? (
+          <OAuthSectionRow>
+            <CodexAccountsList />
+          </OAuthSectionRow>
+        ) : null}
       </OAuthSection>
 
       {/* Non-ideal edge: if we can't list configs at all, warn. */}
@@ -146,7 +160,6 @@ export function CodexOAuthSection() {
         </Alert>
       )}
 
-      {/* Confirm clear dialog */}
       <AlertDialog open={confirmClearOpen} onOpenChange={setConfirmClearOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
