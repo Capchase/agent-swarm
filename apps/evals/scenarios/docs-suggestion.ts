@@ -93,11 +93,100 @@ function brief(request: Request): string {
   ].join("\n");
 }
 
-/** True when a tool call names the `swarm-docs` skill (Skill tool, skill-get, or a read of its file). */
+const SWARM_DOCS_SKILL_FILE = /(^|[\\/])swarm-docs[\\/]SKILL\.md$/i;
+
+const SHELL_READERS = new Set(["cat", "bat", "sed", "head", "tail", "nl", "less", "more", "awk"]);
+const SHELL_WRAPPERS = new Set(["bash", "sh", "zsh", "dash"]);
+
+/**
+ * Splits a shell command into simple commands, each a list of unquoted words. Newlines and
+ * unquoted `; & | ( )` end a command; quotes group a word and never end one.
+ */
+export function shellSegments(command: string): string[][] {
+  const segments: string[][] = [];
+  let words: string[] = [];
+  let word: string | null = null;
+  let quote: "'" | '"' | null = null;
+  const endWord = () => {
+    if (word !== null) words.push(word);
+    word = null;
+  };
+  const endSegment = () => {
+    endWord();
+    if (words.length) segments.push(words);
+    words = [];
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] as string;
+    if (quote) {
+      if (ch === quote) quote = null;
+      else if (ch === "\\" && quote === '"' && i + 1 < command.length)
+        word = (word ?? "") + command[++i];
+      else word = (word ?? "") + ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      word ??= "";
+    } else if (ch === "\\" && i + 1 < command.length) {
+      const next = command[++i] as string;
+      if (next !== "\n") word = (word ?? "") + next;
+    } else if (/[\n;&|()]/.test(ch)) endSegment();
+    else if (/\s/.test(ch)) endWord();
+    else word = (word ?? "") + ch;
+  }
+  endSegment();
+  return segments;
+}
+
+/**
+ * True when a shell command prints the skill file: a simple command led by a file reader (cat,
+ * sed, head, ...) with an argument ending in `swarm-docs/SKILL.md`. A `bash -lc '...'` or
+ * `sh -c` wrapper is unwrapped first; a reader named inside another command's argument is not.
+ */
+export function shellReadsSwarmDocs(command: string, depth = 0): boolean {
+  return shellSegments(command).some((segment) => {
+    const words = segment.filter((w, i) => i > 0 || !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    const program = (words[0] ?? "").split("/").pop() ?? "";
+    if (SHELL_WRAPPERS.has(program)) {
+      const flag = words.findIndex((w, i) => i > 0 && /^-[a-z]*c[a-z]*$/i.test(w));
+      const script = flag > 0 ? words[flag + 1] : undefined;
+      return script !== undefined && depth < 3 && shellReadsSwarmDocs(script, depth + 1);
+    }
+    return SHELL_READERS.has(program) && words.slice(1).some((w) => SWARM_DOCS_SKILL_FILE.test(w));
+  });
+}
+
+function field(input: unknown, key: string): string {
+  const value = (input as Record<string, unknown> | null | undefined)?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+/** Tool arguments: Codex MCP calls nest them under `arguments`; other harnesses pass them flat. */
+function toolArgs(input: unknown): unknown {
+  const nested = (input as Record<string, unknown> | null | undefined)?.arguments;
+  return typeof nested === "object" && nested !== null ? nested : input;
+}
+
+/**
+ * True when a tool call loads the `swarm-docs` skill: the Skill tool, skill-get, a read of its
+ * file, or a shell command that prints that file. A search or grep that only mentions the name
+ * does not count.
+ */
 export function loadedSwarmDocs(uses: { toolName: string; input: unknown }[]): boolean {
-  return uses.some((use) =>
-    /swarm-docs/i.test(`${use.toolName} ${JSON.stringify(use.input ?? {})}`),
-  );
+  return uses.some(({ toolName, input }) => {
+    const tool = toolName.toLowerCase();
+    const args = toolArgs(input);
+    if (tool === "skill") return field(args, "skill") === "swarm-docs";
+    if (/(^|[_-])skill-get$/.test(tool)) return field(args, "name") === "swarm-docs";
+    if (tool === "read") {
+      return SWARM_DOCS_SKILL_FILE.test(
+        field(args, "file_path") || field(args, "filePath") || field(args, "path"),
+      );
+    }
+    if (/(^|[_-])(bash|shell|exec_command)$/.test(tool)) {
+      return shellReadsSwarmDocs(field(args, "command") || field(args, "cmd"));
+    }
+    return false;
+  });
 }
 
 function replyFor(ctx: JudgeContext, request: Request): string {
@@ -171,7 +260,7 @@ const docsOfferCheck: DeterministicCheck = {
 
 export const docsSuggestion: Scenario = {
   id: "docs-suggestion",
-  version: 1,
+  version: 2,
   name: "Docs suggestion",
   description: [
     "A person sends the lead five requests: three setup asks that each match one docs playbook",
