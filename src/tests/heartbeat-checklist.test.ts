@@ -764,6 +764,9 @@ describe("Heartbeat Checklist", () => {
     test("enforce mode: a missing global script fails open through the real runner", async () => {
       process.env.HEARTBEAT_CHECKLIST_GATE_MODE = "enforce";
       process.env.HEARTBEAT_CHECKLIST_GATE_SCRIPT = "no-such-gate-script";
+      setChecklistGateRunnerForTests((name, agentId, signal) =>
+        defaultChecklistGateRunner(name, agentId, signal, { probe: async () => null }),
+      );
       await seedLead();
 
       await checkHeartbeatChecklist();
@@ -860,6 +863,9 @@ describe("Heartbeat Checklist", () => {
         "export default async function run() { await new Promise((r) => setTimeout(r, 30_000)); return { quiet: true }; }",
       );
       setChecklistGateTimeoutMsForTests(1_500);
+      setChecklistGateRunnerForTests((name, agentId, signal) =>
+        defaultChecklistGateRunner(name, agentId, signal, { probe: async () => null }),
+      );
       await seedLead();
 
       const started = Date.now();
