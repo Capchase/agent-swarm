@@ -876,6 +876,27 @@ describe("Heartbeat Checklist", () => {
       expect(tasks).toHaveLength(1);
       expect(tasks[0]!.tags).toContain("heartbeat-gate:error");
     });
+
+    test("enforce mode: the real probe passes with no swarm API key, using the Lead's run token", async () => {
+      process.env.HEARTBEAT_CHECKLIST_GATE_MODE = "enforce";
+      await saveGlobalGateScript("quiet-gate", "export default () => ({ quiet: true });");
+      const savedKeys = { swarm: process.env.AGENT_SWARM_API_KEY, legacy: process.env.API_KEY };
+      process.env.AGENT_SWARM_API_KEY = "";
+      process.env.API_KEY = "";
+      try {
+        await seedLead();
+        await checkHeartbeatChecklist();
+        expect(await checklistTasks()).toHaveLength(0);
+      } finally {
+        for (const [name, value] of [
+          ["AGENT_SWARM_API_KEY", savedKeys.swarm],
+          ["API_KEY", savedKeys.legacy],
+        ] as const) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    });
   });
 
   // ==========================================================================

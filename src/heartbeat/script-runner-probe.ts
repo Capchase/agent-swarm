@@ -1,12 +1,12 @@
-import { runScript } from "../scripts-runtime/loader";
+import { runScriptWithRunCredential } from "../be/scripts/run-credential";
 import { scrubSecrets } from "../utils/secret-scrubber";
 
 const PROBE_TIMEOUT_MS = 10_000;
 
-/** Exercise the same executor as script-run, with a deadline even if the runner stalls. */
+/** Exercise the same executor and per-run credential as the gate, with a deadline even if the runner stalls. */
 export async function probeScriptRunner(
   agentId: string,
-  runner: typeof runScript = runScript,
+  runner: typeof runScriptWithRunCredential = runScriptWithRunCredential,
 ): Promise<{ quiet: false; reason: string } | null> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
