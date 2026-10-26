@@ -6,12 +6,13 @@ import { createValueScrubber, scrubObject, scrubSecrets } from "../utils/secret-
 import type { ScriptApiConnectionDescriptor, ScriptMcpConnectionDescriptor } from "./api-types";
 import type { FailedCredentialBinding } from "./credential-broker";
 import { buildEgressSecrets } from "./egress-secrets";
-import { getScriptExecutor } from "./executors/registry";
+import { isExecutorAllowedByDeployment, resolveScriptExecutor } from "./executors/registry";
 import {
   DEFAULT_SCRIPT_RESOURCES,
   type EgressSecretEntry,
   type ExecutorOutput,
   type ScriptAgentFsDescriptor,
+  type ScriptExecutorName,
   type ScriptFsMode,
   type ScriptResourcePolicy,
   type SwarmConfigPayload,
@@ -39,6 +40,11 @@ export type RunScriptInput = {
   source: string;
   args?: unknown;
   fsMode?: ScriptFsMode;
+  /**
+   * Optional per-script executor override ("native" | "quickjs"). When null or
+   * undefined, `getScriptExecutor` falls back to `SCRIPT_EXECUTOR ?? "native"`.
+   */
+  executor?: ScriptExecutorName | null;
   agentId: string;
   /**
    * Bearer for the run's `ctx.swarm` SDK calls. Api-side callers pass a
@@ -118,6 +124,18 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     };
   }
 
+  if (!isExecutorAllowedByDeployment(input.executor)) {
+    return {
+      result: undefined,
+      stdout: "",
+      stderr: 'Executor "native" is not permitted when deployment SCRIPT_EXECUTOR="quickjs"',
+      truncated: { stdout: false, stderr: false },
+      durationMs: 0,
+      exitCode: 1,
+      error: "executor_error",
+    };
+  }
+
   // The global scrubber skips values under its length floor, so this run's own
   // secret config is redacted here at any length before the global pass. Built
   // before the import check: its diagnostic quotes source, which can hold a value.
@@ -157,11 +175,11 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     signal: input.signal,
   };
 
-  let output = await getScriptExecutor().run(executorInput);
+  let output = await resolveScriptExecutor(input.executor).run(executorInput);
   for (const delayMs of CAPACITY_EXCEEDED_RETRY_DELAYS_MS) {
     if (output.error !== "capacity_exceeded" || input.signal?.aborted) break;
     await Bun.sleep(delayMs);
-    output = await getScriptExecutor().run(executorInput);
+    output = await resolveScriptExecutor(input.executor).run(executorInput);
   }
 
   return {

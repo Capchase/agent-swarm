@@ -3210,6 +3210,9 @@ export type ScriptScope = z.infer<typeof ScriptScopeSchema>;
 export const ScriptFsModeSchema = z.enum(["none", "workspace-rw"]);
 export type ScriptFsMode = z.infer<typeof ScriptFsModeSchema>;
 
+export const ScriptExecutorNameSchema = z.enum(["native", "quickjs"]);
+export type ScriptExecutorName = z.infer<typeof ScriptExecutorNameSchema>;
+
 export const ScriptRecordSchema = z
   .object({
     id: z.string(),
@@ -3226,6 +3229,7 @@ export const ScriptRecordSchema = z
     isScratch: z.boolean(),
     typeChecked: z.boolean(),
     fsMode: ScriptFsModeSchema,
+    executor: ScriptExecutorNameSchema.nullable().default(null),
     createdByAgentId: z.string().nullable(),
     createdAt: z.string(),
     updatedAt: z.string(),
