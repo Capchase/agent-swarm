@@ -50,6 +50,12 @@ export type ScriptResourcePolicy = {
 export type ExecutorInput = {
   source: string;
   args: unknown;
+  /**
+   * Trusted host-only flag indicating `args` already passed host JSON Schema
+   * validation for this run. Executors may skip `argsSchema.parse(args)` only
+   * when this flag is true AND the runtime `argsSchema` is purely structural.
+   */
+  hostValidatedArgs?: boolean;
   configPayload: SwarmConfigPayload;
   resources: ScriptResourcePolicy;
   fsMode: ScriptFsMode;

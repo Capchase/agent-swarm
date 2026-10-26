@@ -17,6 +17,7 @@ import {
   type ScriptResourcePolicy,
   type SwarmConfigPayload,
 } from "./executors/types";
+import { HOST_VALIDATED_ARGS } from "./host-validated-args";
 import { validateScriptImports } from "./import-allowlist";
 
 /**
@@ -39,6 +40,13 @@ const CAPACITY_EXCEEDED_RETRY_DELAYS_MS = [200, 750];
 export type RunScriptInput = {
   source: string;
   args?: unknown;
+  /**
+   * Unforgeable host-only capability symbol set only when the host has already
+   * validated `args` against the script's `argsJsonSchema` (e.g. `POST /api/x/script/{endpointId}`).
+   * Keyed by a `Symbol` so request-shaped JSON inputs forwarded into `RunScriptInput`
+   * can never opt out of `argsSchema` validation.
+   */
+  [HOST_VALIDATED_ARGS]?: boolean;
   fsMode?: ScriptFsMode;
   /**
    * Optional per-script executor override ("native" | "quickjs"). When null or
@@ -168,6 +176,7 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
   const executorInput = {
     source: input.source,
     args: input.args ?? null,
+    ...(input[HOST_VALIDATED_ARGS] === true ? { hostValidatedArgs: true } : {}),
     configPayload,
     resources,
     fsMode: input.fsMode ?? "none",
