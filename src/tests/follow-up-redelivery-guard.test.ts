@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   cancelTask,
   closeDb,
@@ -13,6 +15,8 @@ import {
   getTaskById,
   initDb,
 } from "../be/db";
+import { registerSendTaskTool } from "../tools/send-task";
+import type { AgentTask, CreateTaskOptions } from "../types";
 
 const TEST_DB_PATH = "./test-follow-up-redelivery-guard.sqlite";
 
@@ -428,5 +432,274 @@ describe("follow-up re-delegation guard logic", () => {
     expect(recentCompleted).toBeNull();
 
     // → Guard does NOT block: completed work is too old
+  });
+});
+
+describe("send-task re-delegation guard, end to end", () => {
+  type Tool = { handler: (args: unknown, extra: unknown) => Promise<CallToolResult> };
+  let sendTask: Tool;
+  let leadId: string;
+  let workerId: string;
+
+  beforeAll(async () => {
+    const server = new McpServer({ name: "follow-up-redelivery-guard", version: "1.0.0" });
+    registerSendTaskTool(server);
+    sendTask = (server as unknown as { _registeredTools: Record<string, Tool> })._registeredTools[
+      "send-task"
+    ]!;
+    leadId = (
+      await createAgent({ name: "e2e-guard-lead", isLead: true, status: "idle", capabilities: [] })
+    ).id;
+    workerId = (
+      await createAgent({
+        name: "e2e-guard-worker",
+        isLead: false,
+        status: "idle",
+        capabilities: [],
+        maxTasks: 50,
+      })
+    ).id;
+  });
+
+  function callSendTask(task: string, followUpId: string, parentTaskId?: string) {
+    return sendTask.handler(
+      {
+        task,
+        agentId: workerId,
+        routingReason: "skill",
+        routingNote: "worker owns this area of the codebase",
+        ...(parentTaskId ? { parentTaskId } : {}),
+      },
+      {
+        sessionId: crypto.randomUUID(),
+        requestInfo: { headers: { "x-agent-id": leadId, "x-source-task-id": followUpId } },
+      },
+    );
+  }
+
+  function resultOf(result: CallToolResult) {
+    return result.structuredContent as { success: boolean; message: string; task?: AgentTask };
+  }
+
+  async function workerTask(
+    description: string,
+    thread: string,
+    outcome: "completed" | "failed",
+    options: Partial<CreateTaskOptions> = {},
+    failureReason = "boom",
+  ) {
+    const task = await createTaskExtended(description, {
+      agentId: workerId,
+      slackChannelId: "C_E2E",
+      slackThreadTs: thread,
+      ...options,
+    });
+    if (outcome === "completed") await completeTask(task.id, "done");
+    else await failTask(task.id, failureReason);
+    return task;
+  }
+
+  async function followUpOf(parentId: string, thread: string) {
+    return createTaskExtended("Worker task ended — review needed.", {
+      agentId: leadId,
+      source: "system",
+      taskType: "follow-up",
+      parentTaskId: parentId,
+      slackChannelId: "C_E2E",
+      slackThreadTs: thread,
+    });
+  }
+
+  type ChainOptions = {
+    /** Outcome of every worker except the last. */
+    stepOutcome?: "completed" | "failed";
+    /** Outcome of the last worker. */
+    lastOutcome?: "completed" | "failed";
+    lastFailureReason?: string;
+    followUpConfig?: CreateTaskOptions["followUpConfig"];
+  };
+
+  /** worker -> follow-up, `hops` times. Returns the last follow-up and the first worker. */
+  async function followUpChain(hops: number, thread: string, chain: ChainOptions = {}) {
+    const {
+      stepOutcome = "completed",
+      lastOutcome = "failed",
+      lastFailureReason,
+      followUpConfig,
+    } = chain;
+    let parentId: string | undefined;
+    let followUp: AgentTask | undefined;
+    let first: AgentTask | undefined;
+    for (let hop = 1; hop <= hops; hop++) {
+      const last = hop === hops;
+      // Keep the last outcome strictly newer than earlier ones in the thread.
+      if (last) await Bun.sleep(5);
+      const worker = await workerTask(
+        `chain step ${hop} in ${thread}`,
+        thread,
+        last ? lastOutcome : stepOutcome,
+        { parentTaskId: parentId, followUpConfig },
+        last ? lastFailureReason : undefined,
+      );
+      first ??= worker;
+      followUp = await followUpOf(worker.id, thread);
+      parentId = followUp.id;
+    }
+    return { followUp: followUp!, first: first! };
+  }
+
+  test("blocks a follow-up with no instruction (PR #345 replay)", async () => {
+    const parent = await workerTask("implement feature Y", "9000.0001", "completed");
+    const followUp = await followUpOf(parent.id, "9000.0001");
+
+    const result = resultOf(await callSendTask("implement feature Y", followUp.id));
+    expect(result.success).toBe(false);
+    expect(result.message.startsWith("Blocked: re-delegation from follow-up task")).toBe(true);
+  });
+
+  test("allows a follow-up whose parent has onCompleted", async () => {
+    const parent = await workerTask("ship PR #1", "9000.0002", "completed", {
+      followUpConfig: { onCompleted: "Dispatch a code review of the PR." },
+    });
+    const followUp = await followUpOf(parent.id, "9000.0002");
+
+    const result = resultOf(await callSendTask("Review PR #1", followUp.id));
+    expect(result.success).toBe(true);
+    expect(result.task?.parentTaskId).toBe(followUp.id);
+  });
+
+  test("allows a follow-up whose parent failed", async () => {
+    await workerTask("an earlier request in the thread", "9000.0003", "completed");
+    const parent = await workerTask("deploy the fix", "9000.0003", "failed");
+    const followUp = await followUpOf(parent.id, "9000.0003");
+
+    const result = resultOf(await callSendTask("Retry the deploy", followUp.id));
+    expect(result.success).toBe(true);
+  });
+
+  test("blocks a failed parent's follow-up once the hop limit is reached", async () => {
+    const { followUp } = await followUpChain(6, "9000.0004");
+
+    const result = resultOf(await callSendTask("Retry the chain step", followUp.id));
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("delegation hops");
+  });
+
+  test("onFailed instruction does not unlock a completed parent", async () => {
+    const parent = await workerTask("migrate the table", "9000.0005", "completed", {
+      followUpConfig: { onFailed: "Retry." },
+    });
+    const followUp = await followUpOf(parent.id, "9000.0005");
+
+    const result = resultOf(await callSendTask("Migrate the table again", followUp.id));
+    expect(result.success).toBe(false);
+  });
+
+  test("allows a failed parent's follow-up at five hops", async () => {
+    const { followUp } = await followUpChain(5, "9000.0006");
+
+    const result = resultOf(await callSendTask("Rerun the flaky billing deploy", followUp.id));
+    expect(result.success).toBe(true);
+  });
+
+  test("hop limit counts the whole chain past 50 deferred wakes", async () => {
+    const thread = "9000.0012";
+    const { followUp: fifth } = await followUpChain(5, thread, { stepOutcome: "failed" });
+    // Each deferred wake is a new task whose parent is the previous attempt.
+    let parentId = fifth.id;
+    for (let wake = 1; wake <= 50; wake++) {
+      const task = await createTaskExtended(`deferred wake ${wake} in ${thread}`, {
+        agentId: workerId,
+        parentTaskId: parentId,
+        slackChannelId: "C_E2E",
+        slackThreadTs: thread,
+      });
+      parentId = task.id;
+    }
+    await Bun.sleep(5);
+    const last = await workerTask(`final wake in ${thread}`, thread, "failed", {
+      parentTaskId: parentId,
+    });
+    const sixth = await followUpOf(last.id, thread);
+
+    const result = resultOf(await callSendTask("Retry after the deferred wakes", sixth.id));
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("delegation hops");
+  });
+
+  test("hop limit holds when the thread has no completed work", async () => {
+    const { followUp } = await followUpChain(6, "9000.0007", { stepOutcome: "failed" });
+
+    const result = resultOf(await callSendTask("Rebuild the search index shards", followUp.id));
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("delegation hops");
+  });
+
+  test("hop limit holds when a cancellation is newer than the completed work", async () => {
+    const { followUp } = await followUpChain(6, "9000.0008", {
+      lastFailureReason: "cancelled by user",
+    });
+
+    const result = resultOf(await callSendTask("Regenerate quarterly invoice PDFs", followUp.id));
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("delegation hops");
+  });
+
+  test("a parentTaskId override gets no instructed bypass", async () => {
+    const { followUp, first } = await followUpChain(5, "9000.0009", {
+      lastOutcome: "completed",
+      followUpConfig: { onCompleted: "Dispatch the next step." },
+    });
+
+    const kept = resultOf(
+      await callSendTask("Open the release notes draft", followUp.id, followUp.id),
+    );
+    expect(kept.success).toBe(true);
+
+    const reset = resultOf(
+      await callSendTask("Rotate the staging TLS certificates", followUp.id, first.id),
+    );
+    expect(reset.success).toBe(false);
+    expect(reset.message.startsWith("Blocked: re-delegation from follow-up task")).toBe(true);
+  });
+
+  /**
+   * At five hops, an override to the first worker is refused. The child without
+   * an override keeps the count: when it fails, its follow-up is at the limit.
+   */
+  async function expectOverrideKeepsHopCount(
+    followUp: AgentTask,
+    first: AgentTask,
+    thread: string,
+  ) {
+    const override = resultOf(
+      await callSendTask(`Retry from the first worker in ${thread}`, followUp.id, first.id),
+    );
+    expect(override.success).toBe(false);
+    expect(override.message).toContain("reset the follow-up hop count");
+
+    const kept = resultOf(await callSendTask(`Retry on the chain in ${thread}`, followUp.id));
+    expect(kept.success).toBe(true);
+    expect(kept.task?.parentTaskId).toBe(followUp.id);
+
+    await failTask(kept.task!.id, "boom");
+    const nextFollowUp = await followUpOf(kept.task!.id, thread);
+    const next = resultOf(
+      await callSendTask(`Retry after the sixth hop in ${thread}`, nextFollowUp.id),
+    );
+    expect(next.success).toBe(false);
+    expect(next.message).toContain("delegation hops");
+  }
+
+  test("a parentTaskId override cannot reset the hop count with no completed work", async () => {
+    const { followUp, first } = await followUpChain(5, "9000.0010", { stepOutcome: "failed" });
+    await expectOverrideKeepsHopCount(followUp, first, "9000.0010");
+  });
+
+  test("a parentTaskId override cannot reset the hop count after a newer cancellation", async () => {
+    const { followUp, first } = await followUpChain(5, "9000.0011", {
+      lastFailureReason: "cancelled by user",
+    });
+    await expectOverrideKeepsHopCount(followUp, first, "9000.0011");
   });
 });

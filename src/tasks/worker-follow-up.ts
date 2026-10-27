@@ -258,6 +258,9 @@ async function findDeferredWakeFor(taskId: string, agentId: string): Promise<Def
  * `all` wait with siblings still pending wakes nobody, so the follow-up stays.
  * A `followUpConfig.onCompleted` / `onFailed` instruction for this status also
  * keeps the follow-up, because the wake-up task does not carry that text.
+ *
+ * A deferral (`deferredAt` set) creates no follow-up, because the wake-up task
+ * continues the work and carries the creator's `followUpConfig`.
  */
 export async function createWorkerTaskFollowUp(args: {
   task: AgentTask;
@@ -269,6 +272,19 @@ export async function createWorkerTaskFollowUp(args: {
 
   if (task.workflowRunId) return null;
   if (task.followUpConfig?.disabled === true) return null;
+  if (status === "completed" && task.deferredAt) {
+    try {
+      await createLogEntry({
+        eventType: "task_follow_up_suppressed",
+        taskId: task.id,
+        metadata: { reason: "deferred", status, deferredAt: task.deferredAt },
+      });
+    } catch {}
+    console.log(
+      `[worker-follow-up] Skipped follow-up for deferred task ${task.id.slice(0, 8)}: the wake-up task reports when the work ends`,
+    );
+    return null;
+  }
 
   const taskAgent = await getAgentById(task.agentId ?? "");
   if (!taskAgent || taskAgent.isLead) return null;

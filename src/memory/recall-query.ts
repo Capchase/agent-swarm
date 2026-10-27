@@ -1,7 +1,7 @@
 import { stripSiblingBlock } from "../tasks/sibling-block";
 
 const COMPLETED_INSTRUCTIONS =
-  "\n\nIMPORTANT: Do NOT re-delegate or re-answer the original request. The worker has already handled it. Your job is ONLY to:\n1. Review the output above\n2. Do not relay the worker's raw output to Slack; the engine owns the thread tree and outcome card\n3. Complete this follow-up task\n\nUse";
+  "\n\nIMPORTANT: Do NOT re-delegate or re-answer the original request. The worker has already handled it. If the instructions from the task creator above ask for a next step, dispatch that step and nothing else. Your job is ONLY to:\n1. Review the output above\n2. Do not relay the worker's raw output to Slack. The engine posts the worker's card, but it never posts this follow-up's output. If a person needs an answer from you, post it with `slack-reply`\n3. Complete this follow-up task\n\nUse";
 const FAILED_INSTRUCTIONS = "\n\nDecide whether to reassign, retry, or handle the failure. Use";
 const DETAILS_PREFIX = ' `get-task-details` with taskId "';
 const DETAILS_SUFFIX = '" for full details.';
