@@ -319,6 +319,43 @@ describe("session routes", () => {
     const operatorScoped = await call("sessions", "GET", "/api/sessions?scope=shared");
     expect(operatorScoped.body.sessions).toEqual([]);
   });
+
+  test("list, count and tree: a non-creator sees schedule runs like their creator", async () => {
+    // The scheduler names the schedule's creator as the requester.
+    const run = await createTaskExtended("SCHEDULED LIST RUN", {
+      requestedByUserId: owner.id,
+      scheduleId: crypto.randomUUID(),
+      source: "schedule",
+    });
+
+    const view = async (userId: string) => {
+      const list = await call(
+        "sessions",
+        "GET",
+        "/api/sessions?limit=100&scope=tree&show=all&showSource=schedule",
+        { dashboardUserId: userId },
+      );
+      const tree = await call("sessions", "GET", "/api/session-tree?show=all", {
+        dashboardUserId: userId,
+      });
+      expect(list.status).toBe(200);
+      expect(tree.status).toBe(200);
+      return {
+        ids: list.body.sessions.map((s: { root: { id: string } }) => s.root.id) as string[],
+        total: list.body.total as number,
+        treeTotal: (tree.body.sources as { source: string; total: number }[]).find(
+          (s) => s.source === "schedule",
+        )?.total,
+      };
+    };
+    const creator = await view(owner.id);
+    const other = await view(eze.id);
+    expect(creator.ids).toContain(run.id);
+    expect(other.ids).toContain(run.id);
+    expect(other.total).toBe(creator.total);
+    expect(other.treeTotal).toBe(creator.treeTotal);
+    expect(other.treeTotal).toBeGreaterThan(0);
+  });
 });
 
 describe("task routes", () => {
