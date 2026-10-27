@@ -406,6 +406,52 @@ describe("task routes", () => {
       expect(body.total).toBe(2);
     }
   });
+
+  test("a schedule session is readable by every user, but writable only by its creator", async () => {
+    // The scheduler names the schedule's creator as the requester.
+    const scheduleId = crypto.randomUUID();
+    const root = await createTaskExtended("SCHEDULED RUN", {
+      requestedByUserId: owner.id,
+      scheduleId,
+      source: "schedule",
+    });
+    const child = await createTaskExtended("SCHEDULED FOLLOW-UP", {
+      requestedByUserId: owner.id,
+      parentTaskId: root.id,
+      source: "ui",
+    });
+
+    expect(await sessionAccess(eze.id, child.id)).toBe("read");
+    expect(await sessionAccess(null, root.id)).toBe("read");
+    expect(await sessionAccess(owner.id, child.id)).toBe("owner");
+
+    const list = await call(
+      "tasks",
+      "GET",
+      `/api/tasks?scheduleId=${scheduleId}&includeTotal=true`,
+      {
+        auth: ezeAuth,
+      },
+    );
+    expect(list.status).toBe(200);
+    expect(list.body.tasks.map((task: { id: string }) => task.id)).toEqual([root.id]);
+    expect(list.body.total).toBe(1);
+    expect((await call("tasks", "GET", `/api/tasks/${child.id}`, { auth: ezeAuth })).status).toBe(
+      200,
+    );
+    expect(
+      (await call("sessions", "GET", `/api/sessions/${root.id}`, { dashboardUserId: eze.id }))
+        .status,
+    ).toBe(200);
+
+    const followUp = (dashboardUserId: string) =>
+      call("tasks", "POST", "/api/tasks", {
+        dashboardUserId,
+        body: { task: "rerun it", parentTaskId: child.id, source: "ui" },
+      });
+    expect((await followUp(eze.id)).status).toBe(403);
+    expect((await followUp(owner.id)).status).toBe(201);
+  });
 });
 
 describe("write gate", () => {
