@@ -1016,6 +1016,64 @@
           "reportedAt"
         ]
       },
+      "AgentSlackIcon": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "emoji"
+                ]
+              },
+              "emoji": {
+                "type": "string",
+                "maxLength": 102,
+                "pattern": "^:[a-z0-9_+'-]+:$"
+              }
+            },
+            "required": [
+              "type",
+              "emoji"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "url"
+                ]
+              },
+              "url": {
+                "type": "string",
+                "maxLength": 2048,
+                "format": "uri"
+              }
+            },
+            "required": [
+              "type",
+              "url"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "app"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        ]
+      },
       "Agent": {
         "type": "object",
         "properties": {
@@ -1186,6 +1244,16 @@
                   "type",
                   "icon"
                 ]
+              }
+            ]
+          },
+          "slackIcon": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentSlackIcon"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -11798,6 +11866,16 @@
                           "type",
                           "icon"
                         ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "slackIcon": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/AgentSlackIcon"
                       },
                       {
                         "type": "null"
@@ -23612,6 +23690,42 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/integrations/slack/app-icon": {
+      "get": {
+        "summary": "The Slack app's own avatar, shown on posts with no icon override",
+        "tags": [
+          "Integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`imageUrl` is null when Slack is off or the lookup fails.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "imageUrl": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "imageUrl"
+                  ]
                 }
               }
             }

@@ -135,6 +135,12 @@ export interface AgentAvatarLucide {
 }
 export type AgentAvatar = AgentAvatarLucide;
 
+/** Mirrors `AgentSlackIconSchema` (backend `src/types.ts`): the agent's Slack persona icon. */
+export type AgentSlackIcon =
+  | { type: "emoji"; emoji: string }
+  | { type: "url"; url: string }
+  | { type: "app" };
+
 export interface Agent {
   id: string;
   name: string;
@@ -145,6 +151,8 @@ export interface Agent {
   capabilities?: string[];
   /** Custom avatar. Null/missing = fall back to the deterministic hash-derived icon/color. */
   avatar?: AgentAvatar | null;
+  /** Slack persona icon. Null/missing = :crown: for the lead, a hashed emoji for workers. */
+  slackIcon?: AgentSlackIcon | null;
   claudeMd?: string;
   soulMd?: string;
   identityMd?: string;

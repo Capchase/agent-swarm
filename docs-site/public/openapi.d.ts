@@ -2870,6 +2870,7 @@ export interface paths {
                             icon: string;
                             color?: string;
                         } | null;
+                        slackIcon?: components["schemas"]["AgentSlackIcon"] | null;
                         changeSource?: string;
                         changedByAgentId?: string;
                         changeReason?: string;
@@ -8697,6 +8698,44 @@ export interface paths {
                     content: {
                         "application/json": {
                             [key: string]: unknown;
+                        };
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/integrations/slack/app-icon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Slack app's own avatar, shown on posts with no icon override */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description `imageUrl` is null when Slack is off or the lookup fails. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            imageUrl: string | null;
                         };
                     };
                 };
@@ -27996,6 +28035,19 @@ export interface components {
             })[];
             reportedAt: number;
         } | null;
+        AgentSlackIcon: {
+            /** @enum {string} */
+            type: "emoji";
+            emoji: string;
+        } | {
+            /** @enum {string} */
+            type: "url";
+            /** Format: uri */
+            url: string;
+        } | {
+            /** @enum {string} */
+            type: "app";
+        };
         Agent: {
             id: string;
             name: string;
@@ -28032,6 +28084,7 @@ export interface components {
                 icon: string;
                 color?: string;
             };
+            slackIcon?: components["schemas"]["AgentSlackIcon"] | null;
             /** Format: date-time */
             createdAt: string;
             /** Format: date-time */
