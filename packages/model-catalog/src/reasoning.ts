@@ -9,6 +9,7 @@
  *
  * Pure module: no IO, no Bun APIs.
  */
+import { CHATGPT_SUBSCRIPTION_PROVIDER } from "./chatgpt-subscription.ts";
 import {
   buildClaudeShortnameMap,
   fxModelRoute,
@@ -282,6 +283,8 @@ export function reasoningLevelsForModel(
     if (slash <= 0) return [];
     providerId = model.slice(0, slash);
     catalogId = model.slice(slash + 1);
+    // A ChatGPT subscription id names an OpenAI catalog model.
+    if (providerId.toLowerCase() === CHATGPT_SUBSCRIPTION_PROVIDER) providerId = "openai";
   }
   return reasoningLevelsFor(harness, catalogId, catalog?.[providerId]?.models?.[catalogId]);
 }

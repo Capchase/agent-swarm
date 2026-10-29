@@ -12,6 +12,10 @@
  * Pure module: no IO, no Bun APIs.
  */
 
+import {
+  CHATGPT_SUBSCRIPTION_HARNESSES,
+  chatgptSubscriptionModelId,
+} from "./chatgpt-subscription.ts";
 import { isAlias, parseAlias } from "./resolve-alias.ts";
 
 /** Minimal per-model facts the filters read. */
@@ -254,6 +258,10 @@ export function harnessModelMismatch(
   sections: HarnessCatalogSections,
   context: { agentName?: string | null; agentId?: string | null } = {},
 ): string | null {
+  const subscriptionId = chatgptSubscriptionModelId(model);
+  if (harness && subscriptionId && !CHATGPT_SUBSCRIPTION_HARNESSES.includes(harness)) {
+    return subscriptionMismatchMessage(model.trim(), subscriptionId, harness, context);
+  }
   if (harness === "grok") return grokModelMismatch(model, sections, context);
   if (harness === "fx") return fxModelMismatch(model, sections, context);
   const section = harness ? harnessCatalogSection(harness) : null;
@@ -401,6 +409,20 @@ function grokMismatchMessage(
     ? ` (for example: ${ids.slice(0, MAX_EXAMPLE_IDS).join(", ")}${extra > 0 ? ` and ${extra} more` : ""})`
     : "";
   return `Model "${model}" does not run on the grok harness${agent}. The grok harness accepts xai catalog models${examples} and openrouter/<vendor>/<id>. Use modelTier (smol, regular, smart, ultra) for portable intent, or omit model and let the assignee resolve it.`;
+}
+
+function subscriptionMismatchMessage(
+  model: string,
+  bareId: string,
+  harness: string,
+  context: { agentName?: string | null; agentId?: string | null },
+): string {
+  const agent = context.agentId
+    ? ` of agent "${context.agentName ?? context.agentId}" (${context.agentId})`
+    : "";
+  const codexHint =
+    harness === "codex" ? ` On codex, use "${bareId}": codex runs it on the pool directly.` : "";
+  return `Model "${model}" does not run on the ${harness} harness${agent}. The ChatGPT subscription prefix (openai-codex/) is for the ${CHATGPT_SUBSCRIPTION_HARNESSES.join(" and ")} harness.${codexHint}`;
 }
 
 function harnessMismatchMessage(
