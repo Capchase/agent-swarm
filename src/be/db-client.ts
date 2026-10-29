@@ -468,9 +468,12 @@ class BunSqliteClient implements DbClient {
         if (!willRetry) warnIfSlowStatement(sql, ms);
       }
     };
+    // The first call opens the database and applies migrations; resolve it
+    // before the timer, so boot work is not logged as this statement's cost.
+    const db = this.getDatabase();
     const ctx = txContext.getStore();
     if (ctx && !ctx.closed) {
-      return timed(() => op(this.getDatabase()));
+      return timed(() => op(db));
     }
     let sleptMs = 0;
     for (let attemptIndex = 0; ; attemptIndex++) {
@@ -482,10 +485,7 @@ class BunSqliteClient implements DbClient {
         // A top-level single statement is atomic, so a repeat on BUSY is
         // exact. The final attempt spins `finalAttemptSpinMs` (see
         // transaction()).
-        return timed(
-          () => this.shortSpin(this.getDatabase(), () => op(this.getDatabase()), !canRetryAfter),
-          canRetryAfter,
-        );
+        return timed(() => this.shortSpin(db, () => op(db), !canRetryAfter), canRetryAfter);
       } catch (err) {
         if (!isSqliteBusy(err) || !canRetryAfter || next === undefined) throw err;
         backoff = next;
