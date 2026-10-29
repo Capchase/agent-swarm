@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { closeDb, getDb, getDbClient, initDb } from "../be/db";
-import { purgeStaleSearchRetrievals } from "../http/memory";
+import { purgeStaleSearchRetrievals, startMemoryGc, stopMemoryGc } from "../http/memory";
 
 const TEST_DB_PATH = "./test-memory-retrieval-purge.sqlite";
 const DAY = 24 * 60 * 60 * 1000;
@@ -63,5 +63,18 @@ describe("purgeStaleSearchRetrievals", () => {
       .join("\n");
     expect(plan).toContain("USING INDEX idx_memret_retrieved_at (retrievedAt<?)");
     expect(plan).not.toContain("idx_memret_event_type");
+  });
+});
+
+describe("startMemoryGc", () => {
+  test("defers the first purge off the boot path", async () => {
+    const timeout = spyOn(globalThis, "setTimeout");
+    try {
+      await startMemoryGc(60 * 60 * 1000, 120_000);
+      expect(timeout.mock.calls.some(([, ms]) => ms === 120_000)).toBe(true);
+    } finally {
+      stopMemoryGc();
+      timeout.mockRestore();
+    }
   });
 });
