@@ -1090,6 +1090,7 @@ describe("Workflow Engine v2 (Phase 3)", () => {
       expect(run?.error).toContain('node "unsafe-script"');
       expect(run?.error).toContain("{{trigger.payload}}");
       expect(run?.error).toContain("config.args");
+      expect(run?.error).toContain("config.env");
       expect(step?.status).toBe("failed");
       expect(step?.error).toContain("{{trigger.payload}}");
       expect(step?.retryCount).toBe(0);

@@ -1434,8 +1434,8 @@ export function interpolateNodeConfig(
     // a declared alias (`inputs: { payload: "trigger.payload" }` used as
     // `{{payload}}`) carry webhook data into the body, and upstream node outputs
     // (`{{someNode.stdout}}`) are LLM- or script-generated text with the same
-    // problem. Dynamic per-run values must flow through `args` instead, which
-    // are passed as separate argv elements (data), not spliced into source text.
+    // problem. Dynamic per-run values must flow through args or env as data,
+    // not be spliced into source text.
     // Preserve the original source when a body token cannot be resolved. The
     // caller fails the node before execution and reports the token explicitly;
     // returning partially blanked source here would recreate the silent-green
@@ -1474,6 +1474,7 @@ export function scriptBodyInterpolationError(nodeId: string, tokens: string[]): 
   return (
     `Script body interpolation failed for node "${nodeId}": unresolved or disallowed token(s): ${renderedTokens}. ` +
     "Executable source may interpolate only input, workflow, swarm, or run values. " +
-    "Pass dynamic trigger or upstream values through config.args and read them from argv."
+    "Pass dynamic trigger or upstream values through config.args and read them from argv. " +
+    "Inline script nodes also support config.env for environment variables."
   );
 }
