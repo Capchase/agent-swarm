@@ -1568,17 +1568,31 @@ const MEMORY_GC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 let memoryGcTimer: ReturnType<typeof setInterval> | null = null;
 
 const SEARCH_RETRIEVAL_TTL_DAYS = 90;
+/** Rows per purge statement. The purge yields the event loop between batches. */
+const SEARCH_RETRIEVAL_PURGE_BATCH = 2000;
 
-async function purgeStaleSearchRetrievals(): Promise<number> {
+export async function purgeStaleSearchRetrievals(
+  batchSize = SEARCH_RETRIEVAL_PURGE_BATCH,
+): Promise<number> {
   try {
     const cutoff = new Date(
       Date.now() - SEARCH_RETRIEVAL_TTL_DAYS * 24 * 60 * 60 * 1000,
     ).toISOString();
-    const result = await getDbClient().run(
-      "DELETE FROM memory_retrieval WHERE eventType = 'search' AND retrievedAt < ?",
-      [cutoff],
-    );
-    return result.changes;
+    let purged = 0;
+    for (;;) {
+      // `+eventType` keeps the planner on the retrievedAt range. Without
+      // sqlite_stat1 it prefers the eventType equality, which reads every
+      // search row to test its date, even when nothing is stale.
+      const result = await getDbClient().run(
+        `DELETE FROM memory_retrieval WHERE rowid IN (
+          SELECT rowid FROM memory_retrieval
+          WHERE +eventType = 'search' AND retrievedAt < ? LIMIT ?)`,
+        [cutoff, batchSize],
+      );
+      purged += result.changes;
+      if (result.changes < batchSize) return purged;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
   } catch (err) {
     console.error("[memory-gc] Search retrieval purge failed:", (err as Error).message);
     return 0;
