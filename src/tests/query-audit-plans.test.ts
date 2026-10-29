@@ -157,6 +157,22 @@ const CASES: Array<{
     revert: { dropIndex: "idx_session_summaries_source" },
   },
   {
+    // A user's task list hides other users' sessions. Both steps of that
+    // walk stay in an index (migration 261) instead of reading task rows.
+    name: "getAllTasks readableBy, root step",
+    match: /WITH page AS/,
+    run: () => getAllTasks({ status: "in_progress", readableBy: { userId: "viewer-1" } }),
+    uses: ["SEARCH r USING COVERING INDEX idx_agent_tasks_session_owner (scheduleId=?)"],
+    revert: { dropIndex: "idx_agent_tasks_session_owner" },
+  },
+  {
+    name: "getAllTasks readableBy, recursive step",
+    match: /WITH page AS/,
+    run: () => getAllTasks({ status: "in_progress", readableBy: { userId: "viewer-1" } }),
+    uses: ["SEARCH c USING COVERING INDEX idx_agent_tasks_parentTaskId_id (parentTaskId=?)"],
+    revert: { dropIndex: "idx_agent_tasks_parentTaskId_id" },
+  },
+  {
     // Few hits: the page reads the agent_tasks_fts candidates by rowid. The
     // control is the old `task LIKE '%q%'`, which scans every task body.
     name: "getAllTasks search",

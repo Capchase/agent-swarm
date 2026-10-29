@@ -670,6 +670,8 @@ describe("script connections", () => {
       // 260 alters runtime_pools and creates runtime_cache_releases. This
       // migration-112-only fixture has neither runtime_pools nor runtime_controllers.
       markMigrationApplied(database, "260_runtime_pool_cache.sql");
+      // 261 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
+      markMigrationApplied(database, "261_session_visibility_indexes.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();

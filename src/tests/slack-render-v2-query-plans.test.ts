@@ -96,9 +96,9 @@ describe("slack render-v2 watcher queries", () => {
   test("deferral resolution drives from the chain, not from every task", async () => {
     const sql = await capturedSql(() => getResolvableDeferralOutcomes());
     const detail = plan(sql, [50]);
-    // Either parentTaskId-led index is a seek on the chain's children.
+    // Any parentTaskId-led index is a seek on the chain's children.
     expect(detail).toMatch(
-      /SEARCH wake USING INDEX idx_agent_tasks_parentTaskId(_source)? \(parentTaskId=\?\)/,
+      /SEARCH wake USING INDEX idx_agent_tasks_parentTaskId(_source|_id)? \(parentTaskId=\?\)/,
     );
     expect(detail).not.toContain("idx_agent_tasks_taskType");
     expect(detail).not.toContain("idx_agent_tasks_status_last_updated");
