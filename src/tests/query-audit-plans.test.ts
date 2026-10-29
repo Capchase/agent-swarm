@@ -237,6 +237,17 @@ describe("query audit plans without sqlite_stat1", () => {
     });
   }
 
+  test("the default task count scans the filter index, not the task rows", async () => {
+    // The heartbeat filter is a NOT IN and a NOT LIKE, so the count scans.
+    // Migration 262 lets it scan the narrow index instead of every task body.
+    const count = await capturedSql(/COUNT/, () =>
+      getTasksCount({ readableBy: { userId: "viewer-1" } }),
+    );
+    const uses = ["SCAN agent_tasks USING COVERING INDEX idx_agent_tasks_list_filter"];
+    expect(missing(plan(count), uses)).toEqual([]);
+    expect(missing(planWithoutIndex(count, "idx_agent_tasks_list_filter"), uses)).not.toEqual([]);
+  });
+
   test("task search with many hits pages by lastUpdatedAt and counts from the index", async () => {
     await getDbClient().transaction(async (tx) => {
       for (let i = 0; i < 501; i++) {
