@@ -869,6 +869,52 @@ export function readableSessionCondition(
   };
 }
 
+/** Parent hops the row-at-a-time walk takes before it falls back to the set form. */
+const READABLE_WALK_MAX_DEPTH = 64;
+
+/**
+ * The row-at-a-time form of {@link readableSessionCondition}, for a query that
+ * stops at a LIMIT. It walks up from each row it tests to the root, so a page
+ * costs a few key lookups per row instead of the set of every hidden task,
+ * which on a large DB took hundreds of milliseconds per request. The rule is
+ * the same: the root is the first task whose parent is null or missing. A row
+ * whose walk finds no root within {@link READABLE_WALK_MAX_DEPTH} hops (a very
+ * deep chain, or a parent cycle written before migration 253) falls back to
+ * the set form, which SQLite then builds once for the statement. A count reads
+ * every row, so it keeps the set form.
+ */
+function readableSessionRowCondition(
+  userId: string | null,
+  taskIdColumn = "agent_tasks.id",
+): { sql: string; params: string[] } {
+  const otherOwner = userId
+    ? "up.requestedByUserId IS NOT NULL AND up.requestedByUserId != ?"
+    : "up.requestedByUserId IS NOT NULL";
+  const shareMatch = userId ? "(s.userId IS NULL OR s.userId = ?)" : "s.userId IS NULL";
+  const set = readableSessionCondition(userId, taskIdColumn);
+  return {
+    sql: `(CASE (
+      WITH RECURSIVE up(id, parentTaskId, requestedByUserId, scheduleId, depth) AS (
+        SELECT u.id, u.parentTaskId, u.requestedByUserId, u.scheduleId, 0
+        FROM agent_tasks u WHERE u.id = ${taskIdColumn}
+        UNION ALL
+        SELECT p.id, p.parentTaskId, p.requestedByUserId, p.scheduleId, up.depth + 1
+        FROM up JOIN agent_tasks p ON p.id = up.parentTaskId
+        WHERE up.depth < ${READABLE_WALK_MAX_DEPTH}
+      )
+      SELECT CASE WHEN ${otherOwner} AND up.scheduleId IS NULL
+          AND NOT EXISTS (SELECT 1 FROM session_shares s
+            WHERE s.rootTaskId = up.id AND s.revokedAt IS NULL AND ${shareMatch})
+        THEN 1 ELSE 0 END
+      FROM up
+      WHERE up.parentTaskId IS NULL
+        OR NOT EXISTS (SELECT 1 FROM agent_tasks p WHERE p.id = up.parentTaskId)
+      LIMIT 1
+    ) WHEN 0 THEN 1 WHEN 1 THEN 0 ELSE ${set.sql} END)`,
+    params: [...(userId ? [userId, userId] : []), ...set.params],
+  };
+}
+
 export function getAllTasks(filters?: TaskFilters): Promise<AgentTask[]>;
 export function getAllTasks(
   filters: TaskFilters | undefined,
@@ -988,7 +1034,8 @@ export async function getAllTasks(
   }
 
   if (filters?.readableBy) {
-    const readable = readableSessionCondition(filters.readableBy.userId);
+    // The page stops at LIMIT, so test only the rows it reads.
+    const readable = readableSessionRowCondition(filters.readableBy.userId);
     conditions.push(readable.sql);
     params.push(...readable.params);
   }
