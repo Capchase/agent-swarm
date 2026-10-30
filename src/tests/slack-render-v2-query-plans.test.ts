@@ -100,7 +100,7 @@ describe("slack render-v2 watcher queries", () => {
     const detail = plan(sql);
     const uses = "SEARCH task USING COVERING INDEX idx_agent_tasks_slack_thread_cover";
     expect(detail.split(uses).length - 1).toBe(3);
-    // Control: without migration 263 the same tests read the task rows.
+    // Control: without migration 264 the same tests read the task rows.
     const copy = Database.deserialize(getDb().serialize());
     try {
       copy.run("DROP INDEX idx_agent_tasks_slack_thread_cover");
