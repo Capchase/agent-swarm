@@ -158,7 +158,7 @@ const CASES: Array<{
   },
   {
     // A user's task count hides other users' sessions. Both steps of that
-    // walk stay in an index (migration 261) instead of reading task rows.
+    // walk stay in an index (migration 262) instead of reading task rows.
     name: "getTasksCount readableBy, root step",
     match: /COUNT/,
     run: () => getTasksCount({ status: "in_progress", readableBy: { userId: "viewer-1" } }),
@@ -239,7 +239,7 @@ describe("query audit plans without sqlite_stat1", () => {
 
   test("the default task count scans the filter index, not the task rows", async () => {
     // The heartbeat filter is a NOT IN and a NOT LIKE, so the count scans.
-    // Migration 262 lets it scan the narrow index instead of every task body.
+    // Migration 263 lets it scan the narrow index instead of every task body.
     const count = await capturedSql(/COUNT/, () =>
       getTasksCount({ readableBy: { userId: "viewer-1" } }),
     );

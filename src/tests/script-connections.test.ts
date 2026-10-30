@@ -670,12 +670,12 @@ describe("script connections", () => {
       // 260 alters runtime_pools and creates runtime_cache_releases. This
       // migration-112-only fixture has neither runtime_pools nor runtime_controllers.
       markMigrationApplied(database, "260_runtime_pool_cache.sql");
-      // 261 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
-      markMigrationApplied(database, "261_session_visibility_indexes.sql");
       // 262 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
-      markMigrationApplied(database, "262_task_list_filter_index.sql");
+      markMigrationApplied(database, "262_session_visibility_indexes.sql");
       // 263 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
-      markMigrationApplied(database, "263_slack_thread_cover_index.sql");
+      markMigrationApplied(database, "263_task_list_filter_index.sql");
+      // 264 indexes agent_tasks columns that this fixture's id-only agent_tasks lacks.
+      markMigrationApplied(database, "264_slack_thread_cover_index.sql");
 
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
