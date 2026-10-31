@@ -26,6 +26,7 @@ import {
 } from "../be/db";
 import { explicitModelErrorForAgent } from "../be/model-validation";
 import { refuseSourceWithSecrets } from "../be/scripts/source-secrets";
+import { can } from "../rbac";
 import { lintWorkflowLabels } from "../script-workflows/label-lint";
 import { scriptRunMaxAgentTasks, scriptRunMaxSteps } from "../script-workflows/limits";
 import {
@@ -308,12 +309,43 @@ const agentTaskRoute = route({
       description: "Agent task created or still running",
       schema: z.object({ taskId: z.string(), status: AgentTaskStatusSchema }),
     },
-    403: { description: "Script run belongs to another agent" },
+    403: {
+      description:
+        "Script run belongs to another agent, or the run's agent may not create a child task under parentTaskId",
+    },
     404: { description: "Script run not found" },
     409: { description: "Agent task failed, was cancelled, or was superseded" },
     422: { description: "Blocked by the follow-up re-delegation guard" },
   },
 });
+
+/**
+ * Send-task's task.parent.attach decision for a `ctx.step.agentTask` step: a
+ * step inherits its parent's contextKey (its Slack or chat thread) and
+ * requester, so the run's agent needs the right to hold a child under it.
+ * Returns the 403 message, or null when allowed. A parent id with no task row
+ * passes: a step under it inherits nothing, as on send-task.
+ */
+async function stepParentRefusal(runAgentId: string, parentTaskId: string): Promise<string | null> {
+  const parentTask = await getTaskById(parentTaskId);
+  if (!parentTask) return null;
+  const runAgent = await getAgentById(runAgentId);
+  const decision = can({
+    principal: { kind: "agent", agentId: runAgentId, isLead: runAgent?.isLead ?? false },
+    verb: "task.parent.attach",
+    resource: {
+      kind: "task",
+      taskId: parentTask.id,
+      requestedByUserId: parentTask.requestedByUserId,
+      creatorAgentId: parentTask.creatorAgentId,
+      agentId: parentTask.agentId,
+    },
+    source: "http",
+  });
+  return decision.allow
+    ? null
+    : `You don't have context for parent task ${parentTaskId}. Only its assignee, its creator, or a lead can create a child task under it.`;
+}
 
 /**
  * The launching session's task (X-Source-Task-Id), kept only when it belongs
@@ -332,7 +364,13 @@ async function resolveRunSourceTaskId(
 
 /** One `ctx.step.agentTask` dispatch: the step task, or the guard rule that blocked it. */
 type StepDispatch =
-  | { task: AgentTask; blocked?: undefined; override?: FollowUpRedelegationBlock["rule"] }
+  | {
+      task: AgentTask;
+      /** True when this call inserted the step, false on a replay. */
+      created?: boolean;
+      blocked?: undefined;
+      override?: FollowUpRedelegationBlock["rule"];
+    }
   | { task?: undefined; blocked: FollowUpRedelegationBlock; override?: undefined };
 
 async function requireAgent(res: ServerResponse, agentId: string | undefined) {
@@ -672,8 +710,19 @@ export async function handleScriptRuns(
       return true;
     }
 
+    // The requested parent, checked before any lookup or insert so a refused
+    // call creates nothing.
+    if (parsed.body.parentTaskId) {
+      const refusal = await stepParentRefusal(run.agentId, parsed.body.parentTaskId);
+      if (refusal) {
+        jsonError(res, refusal, 403);
+        return true;
+      }
+    }
+
     const contextKey = `script-run:${run.id}:${parsed.body.stepKey}`;
     let task = await getLatestScriptRunStepTaskByContextKey(contextKey);
+    let dispatchedHere = false;
     if (!task) {
       const taskDescription = parsed.body.template ?? parsed.body.task ?? parsed.body.stepKey;
       const modelError = await explicitModelErrorForAgent({
@@ -763,7 +812,7 @@ export async function handleScriptRuns(
             outputSchema: parsed.body.outputSchema,
             contextKey,
           });
-          return { task: created, override };
+          return { task: created, created: true, override };
         });
       } catch (error) {
         if (error instanceof ExtensionAgentAssignmentError) {
@@ -782,6 +831,20 @@ export async function handleScriptRuns(
         return true;
       }
       task = dispatched.task;
+      dispatchedHere = dispatched.created === true;
+    }
+
+    // A replay answers from the selected step, whatever parent this call sent
+    // (or omitted), so authorize the parent the step actually holds. Every
+    // replay lookup above lands here before any output is returned. A step this
+    // call just dispatched was authorized above; refusing it now would leave
+    // the work running behind a 403.
+    if (!dispatchedHere && task.parentTaskId) {
+      const refusal = await stepParentRefusal(run.agentId, task.parentTaskId);
+      if (refusal) {
+        jsonError(res, refusal, 403);
+        return true;
+      }
     }
 
     const deadline = Date.now() + 30_000;

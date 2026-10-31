@@ -32286,7 +32286,7 @@ export interface operations {
                     };
                 };
             };
-            /** @description Script run belongs to another agent */
+            /** @description Script run belongs to another agent, or the run's agent may not create a child task under parentTaskId */
             403: {
                 headers: {
                     [name: string]: unknown;
