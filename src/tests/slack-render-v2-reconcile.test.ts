@@ -6,9 +6,13 @@ import {
   getDb,
   getDbClient,
   getSlackTreeMessageByThread,
+  getSlackTreeMessages,
   initDb,
+  markSlackTreeRendered,
+  recordSlackMessage,
 } from "../be/db";
-import { startTask } from "../be/db/tasks/write";
+import { closeSlackTreeIfSettled } from "../be/db/slack-trees";
+import { completeTask, startTask } from "../be/db/tasks/write";
 import { workflowEventBus } from "../workflows/event-bus";
 
 let messageCounter = 0;
@@ -178,7 +182,64 @@ describe("slack render-v2 reconcile scheduling", () => {
     }
     expect(turns).toBeGreaterThanOrEqual(labels.length);
   });
+
+  test("a reopened tree rendered by the throttle timer is closed by the full reconcile", async () => {
+    const channelId = "C_THROTTLED";
+    const threadTs = "THROTTLED.0";
+    const ask = await createTaskExtended("ask THROTTLED", {
+      agentId: leadId,
+      source: "slack",
+      slackChannelId: channelId,
+      slackThreadTs: threadTs,
+    });
+    await startTask(ask.id);
+    await completeTask(ask.id, "done");
+    await recordSlackMessage({
+      contextKey: `slack:${channelId}:${threadTs}`,
+      channelId,
+      threadTs,
+      ts: "THROTTLED.2",
+      kind: "outcome",
+      taskId: ask.id,
+      finalized: true,
+    });
+    await Bun.sleep(2);
+    const tree = await recordSlackMessage({
+      contextKey: `slack:${channelId}:${threadTs}`,
+      channelId,
+      threadTs,
+      ts: "THROTTLED.1",
+      kind: "tree",
+    });
+    expect(await closeSlackTreeIfSettled(tree.id)).toBe(true);
+
+    // A task write reopens the tree. The sweep's render is inside the 3 s
+    // throttle window, so the update goes to a timer, which later marks the
+    // tree rendered. The thread is settled again, so the sweep skips it.
+    await Bun.sleep(2);
+    getDb().run("UPDATE agent_tasks SET lastUpdatedAt = ? WHERE id = ?", [
+      new Date().toISOString(),
+      ask.id,
+    ]);
+    expect(treeClosedAt(tree.id)).toBeNull();
+    await Bun.sleep(2);
+    await markSlackTreeRendered(tree.id, new Date().toISOString());
+    expect(await getSlackTreeMessages()).toEqual([]);
+
+    await processSlackRenderV2();
+    expect(treeClosedAt(tree.id)).not.toBeNull();
+  });
 });
+
+function treeClosedAt(id: string): string | null {
+  return (
+    getDb()
+      .query<{ closed_at: string | null }, [string]>(
+        "SELECT closed_at FROM slack_messages WHERE id = ?",
+      )
+      .get(id)?.closed_at ?? null
+  );
+}
 
 describe("slack task watcher interval", () => {
   const previous = process.env.SLACK_TASK_WATCHER_INTERVAL_MS;

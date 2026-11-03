@@ -28,6 +28,7 @@ import {
   updateSlackMessageRecord,
 } from "../be/db";
 import {
+  closeSettledSlackTrees,
   closeSlackTreeIfSettled,
   getSlackThreadsOfTasks,
   slackThreadHasOutcomeWork,
@@ -2056,6 +2057,14 @@ async function reconcileAllThreads(): Promise<void> {
     if ((await renderStoredTree(storedTree, context)) === "stop") return;
     await yieldToEventLoop();
   }
+  // A throttled tree is marked rendered by its timer, after the sweep's
+  // needs-render filter has stopped returning it. Close those trees here.
+  try {
+    await closeSettledSlackTrees();
+  } catch (error) {
+    console.error("[Slack] Failed to close settled v2 trees:", error);
+  }
+  await yieldToEventLoop();
 
   await refreshResolvedDeferralCards();
   await yieldToEventLoop();

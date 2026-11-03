@@ -75,6 +75,28 @@ export async function closeSlackTreeIfSettled(id: string): Promise<boolean> {
   return result.changes > 0;
 }
 
+/**
+ * Close every open tree the sweep has nothing left to do for, in one
+ * statement. Catches trees the per-tree close missed: a reopened tree whose
+ * render the update throttle deferred to a timer is settled by the time the
+ * timer marks it rendered, but the sweep's needs-render filter then skips it,
+ * so it would stay open. Returns the number of trees closed.
+ */
+export async function closeSettledSlackTrees(): Promise<number> {
+  const result = await getDbClient().run(
+    `UPDATE slack_messages AS tree SET closed_at = ?
+       WHERE tree.kind = 'tree'
+       AND tree.closed_at IS NULL
+       AND tree.ts NOT LIKE 'pending:%'
+       AND EXISTS (
+         SELECT 1 FROM slack_render_v2_state state
+         WHERE state.id = 1 AND NOT ${SLACK_TREE_NEEDS_RENDER_SQL}
+       )`,
+    [new Date().toISOString()],
+  );
+  return result.changes;
+}
+
 const THREAD_LOOKUP_CHUNK = 500;
 
 /**
