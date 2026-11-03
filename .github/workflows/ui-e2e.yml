@@ -113,7 +113,7 @@ jobs:
 
   report:
     needs: test
-    if: always()
+    if: always() && github.repository == 'desplega-ai/agent-swarm'
     runs-on: ubuntu-latest
     permissions:
       contents: read
