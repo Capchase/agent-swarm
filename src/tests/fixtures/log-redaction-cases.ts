@@ -61,7 +61,7 @@ export const CREDENTIAL_CASES = [
   },
   ...["API_KEY", "password", "client_secret", "access_token"].map((key) => ({
     name: `assignment ${key}`,
-    secret: "abc",
+    secret: "v!3",
     wrap: (s: string) => `[worker] ${key}=${s}`,
   })),
 ];
