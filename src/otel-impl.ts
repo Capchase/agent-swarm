@@ -30,6 +30,7 @@ import { NodeSDK } from "@opentelemetry/sdk-node";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import pkg from "../package.json";
 import type { DbRetentionSweepMetric, SpanOptions, SwarmSpan, SwarmSpanKind } from "./otel";
+import { createLogScrubber } from "./utils/log-redaction";
 import { getNodeEnv } from "./utils/node-env";
 import { scrubSecrets } from "./utils/secret-scrubber";
 
@@ -328,6 +329,7 @@ let restoreConsole: (() => void) | undefined;
 export function installConsoleLogBridge(): void {
   if (restoreConsole) return;
   const logger = logs.getLogger(METER_NAME);
+  const scrubbers = { stdout: createLogScrubber(), stderr: createLogScrubber() };
   const originals = new Map<ConsoleMethod, (...args: unknown[]) => void>();
   let emitting = false;
   for (const method of Object.keys(CONSOLE_SEVERITY) as ConsoleMethod[]) {
@@ -341,7 +343,8 @@ export function installConsoleLogBridge(): void {
       try {
         // Scrub before truncating so a cut can never split a secret into an
         // unrecognizable fragment.
-        const text = scrubSecrets(format(...args));
+        const scrub = method === "warn" || method === "error" ? scrubbers.stderr : scrubbers.stdout;
+        const text = scrub(format(...args));
         const body =
           text.length > CONSOLE_LOG_BODY_MAX_CHARS
             ? `${text.slice(0, CONSOLE_LOG_BODY_MAX_CHARS)}…`

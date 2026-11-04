@@ -5,7 +5,7 @@ import { installConsoleScrub, uninstallConsoleScrub } from "../utils/console-scr
 
 // Built at runtime so no secret-shaped literal sits in the repo.
 const SECRET = `ghp_${"Q".repeat(36)}`;
-const REDACTED = "[REDACTED:";
+const REDACTED = "[REDACTED]";
 
 const METHODS = ["log", "info", "warn", "error", "debug"] as const;
 type Method = (typeof METHODS)[number];

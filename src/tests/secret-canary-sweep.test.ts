@@ -574,7 +574,7 @@ describe("positive controls", () => {
     streamCapture.length = 0;
     console.log("post-scrub line", CANARY.volatile);
     expect(streamCapture.flatMap((e) => needlesIn(e.text))).toEqual([]);
-    expect(streamCapture.at(-1)?.text).toContain(MARKERS.volatile);
+    expect(streamCapture.at(-1)?.text).toContain("[REDACTED]");
 
     process.stderr.write(`raw write ${CANARY.env}\n`);
     expect(streamCapture.at(-1)?.stream).toBe("stderr");
@@ -953,6 +953,6 @@ describe("sweep", () => {
       expect(atRest).toContain(marker);
       expect(slackText).toContain(marker);
     }
-    expect(streamCapture.some((e) => e.text.includes(MARKERS.config))).toBe(true);
+    expect(streamCapture.some((e) => e.text.includes("[REDACTED]"))).toBe(true);
   });
 });

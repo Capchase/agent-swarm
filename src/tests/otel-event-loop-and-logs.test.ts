@@ -96,4 +96,26 @@ describe("console log bridge", () => {
       console.warn = originalWarn;
     }
   });
+
+  test("PEM tails cannot reach exported log records across console calls", () => {
+    logs.setGlobalLoggerProvider({ getLogger: () => ({ emit }) });
+    const original = console.warn;
+    console.warn = () => {};
+    const tail = "QUJDREVGR0hJSktMTU5PUA==";
+    try {
+      installConsoleLogBridge();
+      console.warn("-----BEGIN PRIVATE KEY-----");
+      console.warn(tail);
+      console.warn("-----END PRIVATE KEY-----");
+      console.warn("normal diagnostic survives");
+      const output = emitted.map((record) => record.body).join("\n");
+      expect(output).not.toContain(tail);
+      expect(output).not.toContain("-----");
+      expect(output).toContain("[REDACTED]");
+      expect(output).toContain("normal diagnostic survives");
+    } finally {
+      uninstallConsoleLogBridge();
+      console.warn = original;
+    }
+  });
 });

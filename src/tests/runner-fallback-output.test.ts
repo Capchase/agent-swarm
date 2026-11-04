@@ -15,6 +15,7 @@ import {
   refreshSecretScrubberCache,
   registerVolatileSecret,
 } from "../utils/secret-scrubber";
+import { PROMPT_CASES } from "./fixtures/log-redaction-cases";
 
 // Configurable mock responses per test
 let mockGetTask: Record<string, unknown> | null = null;
@@ -828,7 +829,7 @@ describe("ensureTaskFinished", () => {
     mockFinishStatus = 409;
     mockFinishResponse = {
       success: false,
-      error: "Discarded write; retry with force: true",
+      error: PROMPT_CASES[2],
     };
     const warn = spyOn(console, "warn").mockImplementation(() => {});
 
@@ -837,6 +838,8 @@ describe("ensureTaskFinished", () => {
       expect(lastFinishBody).toBeTruthy();
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("was discarded"));
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("continuing"));
+      expect(warn.mock.calls.flat().join("\n")).not.toContain("OUTPUT_SECRET");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("id=task-13b chars="));
     } finally {
       warn.mockRestore();
     }

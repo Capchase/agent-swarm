@@ -608,7 +608,7 @@ export function registerMessageHandler(app: App): void {
         const threadKey = `${msg.channel}:${msg.thread_ts}`;
 
         console.log(
-          `[Slack] !now command detected in thread ${threadKey}${nowMessage ? ` with message: "${nowMessage}"` : ""}`,
+          `[Slack] !now command detected in thread ${threadKey} message chars=${nowMessage.length}`,
         );
 
         noteSlackInboundSideEffect("thread_flush");

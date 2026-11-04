@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import "./utils/worker-log-scrub-install.ts";
 import "./utils/internal-ai/register-bedrock.ts";
 
 import { Spinner } from "@inkjs/ui";
@@ -566,7 +567,7 @@ function WorkerRunner({ prompt, systemPrompt, systemPromptFile, additionalArgs }
   useEffect(() => {
     // Inside the effect, not before render(): Ink's console patch would
     // replace a wrap installed earlier.
-    installConsoleScrub();
+    installConsoleScrub({ streams: true });
     import("./commands/worker.ts")
       .then(({ runWorker }) =>
         runWorker({
@@ -593,7 +594,7 @@ function LeadRunner({ prompt, systemPrompt, systemPromptFile, additionalArgs }: 
   useEffect(() => {
     // Inside the effect, not before render(): Ink's console patch would
     // replace a wrap installed earlier.
-    installConsoleScrub();
+    installConsoleScrub({ streams: true });
     import("./commands/lead.ts")
       .then(({ runLead }) =>
         runLead({

@@ -91,6 +91,7 @@ import {
 import { resolveCodexCreditsExhaustedCooldownMs } from "../utils/error-tracker.ts";
 import { probeHarnessCliVersion, reportHarnessModelOutcome } from "../utils/harness-cli-version.ts";
 import { resolveHarnessProvider } from "../utils/harness-provider.ts";
+import { describeLogContent } from "../utils/log-redaction";
 import { isEffectiveOutputSchema } from "../utils/output-schema.ts";
 import { prettyPrintLine, prettyPrintStderr } from "../utils/pretty-print.ts";
 import { terminateRegisteredProcessGroups } from "../utils/process-group.ts";
@@ -2006,7 +2007,7 @@ export async function ensureTaskFinished(
       // surface the discarded wrapper result, and let session teardown finish.
       console.warn(
         scrubSecrets(
-          `[${role}] Runner result for task ${taskId.slice(0, 8)} was discarded because the task is already terminal; continuing: ${error}`,
+          `[${role}] Runner result for task ${taskId.slice(0, 8)} was discarded because the task is already terminal; continuing: ${describeLogContent(error, taskId)}`,
         ),
       );
     } else if (response.status === 404) {
@@ -2015,7 +2016,7 @@ export async function ensureTaskFinished(
       const error = await response.text();
       console.warn(
         scrubSecrets(
-          `[${role}] Failed to finish task ${taskId.slice(0, 8)}: ${response.status} ${error}`,
+          `[${role}] Failed to finish task ${taskId.slice(0, 8)}: ${response.status} ${describeLogContent(error, taskId)}`,
         ),
       );
     }
@@ -6108,7 +6109,7 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
   console.log(`[${role}] Agent ID: ${agentId}`);
   console.log(`[${role}] Session ID: ${sessionId}`);
   console.log(`[${role}] Log directory: ${logDir}`);
-  console.log(`[${role}] Prompt: ${prompt}`);
+  console.log(`[${role}] Prompt: ${describeLogContent(prompt, sessionId)}`);
   console.log(`[${role}] API URL: ${apiUrl}`);
   console.log(`[${role}] Swarm URL: ${apiUrl}`);
   console.log(`[${role}] Base prompt: included (${basePrompt.length} chars)`);
@@ -6966,14 +6967,15 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
         console.log(`\n[${role}] === Resuming paused task (iteration ${iteration}) ===`);
         console.log(`[${role}] Logging to: ${logFile}`);
-        console.log(`[${role}] Prompt: ${resumePrompt.slice(0, 100)}...`);
+        console.log(`[${role}] Prompt: ${describeLogContent(resumePrompt, task.id)}`);
 
         const metadata = {
           type: metadataType,
           sessionId,
           iteration,
           timestamp: new Date().toISOString(),
-          prompt: resumePrompt,
+          promptLength: resumePrompt.length,
+          promptId: task.id,
           trigger: "task_resumed",
           resumedTaskId: task.id,
         };
@@ -7635,7 +7637,9 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
 
         console.log(`\n[${role}] === Iteration ${iteration} ===`);
         console.log(`[${role}] Logging to: ${logFile}`);
-        console.log(`[${role}] Prompt: ${triggerPrompt.slice(0, 100)}...`);
+        console.log(
+          `[${role}] Prompt: ${describeLogContent(triggerPrompt, trigger.taskId ?? sessionId)}`,
+        );
         if (effectiveCwd) {
           console.log(`[${role}] Working directory: ${effectiveCwd}`);
         }
@@ -7645,7 +7649,8 @@ export async function runAgent(config: RunnerConfig, opts: RunnerOptions) {
           sessionId,
           iteration,
           timestamp: new Date().toISOString(),
-          prompt: triggerPrompt,
+          promptLength: triggerPrompt.length,
+          promptId: trigger.taskId ?? sessionId,
           trigger: trigger.type,
         };
         await Bun.write(logFile, `${JSON.stringify(metadata)}\n`);

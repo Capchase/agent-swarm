@@ -1,3 +1,5 @@
+import { describeLogContent } from "./log-redaction";
+
 /**
  * Pretty print utilities for Claude CLI output
  */
@@ -38,10 +40,9 @@ const colors = {
 
 const c = colors;
 
-/** Truncate string with ellipsis */
-function truncate(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str;
-  return `${str.slice(0, maxLen - 3)}...`;
+/** Content can echo prompts or contain partial credentials. Log metadata only. */
+function summarize(str: string): string {
+  return describeLogContent(str);
 }
 
 /** Format a tool name nicely */
@@ -56,17 +57,7 @@ function formatToolName(name: string): string {
 
 /** Format input parameters for tool calls */
 function formatToolInput(input: Record<string, unknown>): string {
-  const entries = Object.entries(input);
-  if (entries.length === 0) return "";
-
-  const formatted = entries
-    .map(([k, v]) => {
-      const value = typeof v === "string" ? truncate(v, 50) : JSON.stringify(v);
-      return `${c.dim}${k}=${c.reset}${truncate(String(value), 60)}`;
-    })
-    .join(", ");
-
-  return ` (${formatted})`;
+  return ` (${describeLogContent(JSON.stringify(input))})`;
 }
 
 /** Pretty print a single JSON line from Claude output */
@@ -79,7 +70,7 @@ export function prettyPrintLine(line: string, role: string): void {
       json = JSON.parse(line.trim());
     } catch {
       // Raw output - just print it
-      console.log(`${c.dim}[${role}]${c.reset} ${line.trim()}`);
+      console.log(`${c.dim}[${role}]${c.reset} ${summarize(line.trim())}`);
       return;
     }
 
@@ -113,7 +104,7 @@ export function prettyPrintLine(line: string, role: string): void {
           if (stdout) {
             const lines = stdout.split("\n").filter((l) => l.trim());
             for (const l of lines.slice(0, 3)) {
-              console.log(`${prefix}    ${c.dim}${truncate(l, 80)}${c.reset}`);
+              console.log(`${prefix}    ${c.dim}${summarize(l)}${c.reset}`);
             }
             if (lines.length > 3) {
               console.log(`${prefix}    ${c.dim}... (${lines.length - 3} more lines)${c.reset}`);
@@ -122,7 +113,7 @@ export function prettyPrintLine(line: string, role: string): void {
         } else {
           const msg = (json.message as string) || (json.content as string) || "";
           console.log(
-            `${prefix} ${c.cyan}ℹ${c.reset} System${subtype ? ` (${subtype})` : ""}: ${truncate(msg, 100)}`,
+            `${prefix} ${c.cyan}ℹ${c.reset} System${subtype ? ` (${subtype})` : ""}: ${summarize(msg)}`,
           );
         }
         break;
@@ -142,7 +133,7 @@ export function prettyPrintLine(line: string, role: string): void {
             // Print text with nice indentation, truncate long lines
             const lines = text.split("\n");
             for (const l of lines.slice(0, 5)) {
-              console.log(`${prefix}    ${truncate(l, 100)}`);
+              console.log(`${prefix}    ${summarize(l)}`);
             }
             if (lines.length > 5) {
               console.log(`${prefix}    ${c.dim}... (${lines.length - 5} more lines)${c.reset}`);
@@ -157,7 +148,7 @@ export function prettyPrintLine(line: string, role: string): void {
             const thinking = block.thinking as string;
             console.log(`${prefix} ${c.blue}💭${c.reset} ${c.dim}Thinking...${c.reset}`);
             if (thinking) {
-              console.log(`${prefix}    ${c.dim}${truncate(thinking, 80)}${c.reset}`);
+              console.log(`${prefix}    ${c.dim}${summarize(thinking)}${c.reset}`);
             }
           }
         }
@@ -177,7 +168,7 @@ export function prettyPrintLine(line: string, role: string): void {
         if (toolResult) {
           const isError = toolResult.includes("Error") || toolResult.includes("error");
           const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
-          console.log(`${prefix} ${icon} Result: ${truncate(toolResult, 100)}`);
+          console.log(`${prefix} ${icon} Result: ${summarize(toolResult)}`);
         } else if (message) {
           const content = message.content as Array<Record<string, unknown>>;
           if (content) {
@@ -192,7 +183,7 @@ export function prettyPrintLine(line: string, role: string): void {
                       : "";
                 const isError = block.is_error as boolean;
                 const icon = isError ? `${c.red}✗${c.reset}` : `${c.green}✓${c.reset}`;
-                console.log(`${prefix} ${icon} Result: ${truncate(result, 100)}`);
+                console.log(`${prefix} ${icon} Result: ${summarize(result)}`);
               }
             }
           }
@@ -223,7 +214,7 @@ export function prettyPrintLine(line: string, role: string): void {
         if (result) {
           const lines = result.split("\n").filter((l) => l.trim());
           for (const l of lines.slice(0, 3)) {
-            console.log(`${prefix}    ${truncate(l, 100)}`);
+            console.log(`${prefix}    ${summarize(l)}`);
           }
           if (lines.length > 3) {
             console.log(`${prefix}    ${c.dim}... (${lines.length - 3} more lines)${c.reset}`);
@@ -234,23 +225,23 @@ export function prettyPrintLine(line: string, role: string): void {
 
       case "error": {
         const error = (json.error as string) || (json.message as string) || JSON.stringify(json);
-        console.log(`${prefix} ${c.red}✗ Error:${c.reset} ${truncate(error, 100)}`);
+        console.log(`${prefix} ${c.red}✗ Error:${c.reset} ${summarize(error)}`);
         break;
       }
 
       default: {
         // Unknown type - print a summary
-        console.log(`${prefix} ${c.dim}[${type}]${c.reset} ${truncate(JSON.stringify(json), 100)}`);
+        console.log(`${prefix} ${c.dim}[${type}]${c.reset} ${summarize(JSON.stringify(json))}`);
       }
     }
   } catch (_err) {
     // Never let pretty-print crash the runner - just log raw line
-    console.log(`${c.dim}[${role}]${c.reset} ${line}`);
+    console.log(`${c.dim}[${role}]${c.reset} ${summarize(line)}`);
   }
 }
 
 /** Pretty print stderr output */
 export function prettyPrintStderr(text: string, role: string): void {
   const prefix = `${c.dim}[${role}]${c.reset}`;
-  console.error(`${prefix} ${c.red}stderr:${c.reset} ${truncate(text.trim(), 100)}`);
+  console.error(`${prefix} ${c.red}stderr:${c.reset} ${summarize(text.trim())}`);
 }

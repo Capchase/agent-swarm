@@ -80,3 +80,18 @@ A new rule protects only rows written after it ships. `src/be/boot-scrub-sweep.t
 - A row whose scrub would turn valid JSON into invalid JSON is skipped and counted as `skipped_invalid_json`.
 - Log line per table (counts only): `boot-scrub-v<N>: <table> scanned=… changed=… skipped_invalid_json=…`.
 - To re-run a version by hand, delete its done row from `seed_state` and restart the API.
+
+## Daemon stdout and stderr
+
+HTTP API, worker and lead processes install the console scrub before dependency logs.
+The same log policy protects console methods, Bun `console.write`, and raw process stream writes.
+It replaces credentials with `[REDACTED]` and tracks PEM blocks and quoted secret assignments across writes.
+A raw partial line stays buffered until its newline arrives. On exit, an incomplete line becomes `[REDACTED]`.
+Lines above 64 KiB are replaced while the parser continues tracking PEM armor.
+Missing PEM end markers or secret closing quotes keep subsequent content private.
+
+Prompt logs and provider content previews contain only lengths and unrelated identifiers.
+JSONL prompt metadata uses `promptLength` and `promptId`.
+The optional OTel console bridge uses the same log policy.
+Stored text keeps the existing scrubber and its named markers.
+Protocol stdout, interactive commands, and inherited subprocess descriptors are separate from daemon log streams.

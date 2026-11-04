@@ -2,4 +2,4 @@
 // module-load log line goes through the scrub.
 import { installConsoleScrub } from "./console-scrub";
 
-installConsoleScrub();
+installConsoleScrub({ streams: true });
