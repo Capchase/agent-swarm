@@ -128,7 +128,7 @@ function ConnectPrompt({ invalidKey }: { invalidKey: boolean }) {
         title={title}
         description="Files load with your own agent-fs account."
         action={
-          <Button size="sm" onClick={() => setOpen(true)}>
+          <Button type="button" size="sm" onClick={() => setOpen(true)}>
             Connect agent-fs
           </Button>
         }
