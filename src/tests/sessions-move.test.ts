@@ -18,6 +18,7 @@ import {
   upsertInboxState,
 } from "../be/db";
 import * as sessionMoves from "../be/db/session-moves";
+import { getSessionTree } from "../be/db/session-tree";
 import { attachRole, detachRole, ensureRbacSeedsSynced } from "../be/rbac-roles";
 import { setSessionShares } from "../be/session-shares";
 import * as assets from "../http/assets";
@@ -156,7 +157,7 @@ test("bulk source moves allow exits and exact Undo keys, but refuse source group
 test("prefix refuses source prefixes before audit and root scans, including bypass requests", async () => {
   const auditSpy = spyOn(audit, "auditAssetKeys");
   const prefixScan = spyOn(sessionMoves, "listPrefixRoots");
-  const sharedScan = spyOn(sessionMoves, "listSharedPrefixRoots");
+  const sharedScan = spyOn(sessionMoves, "listUnownedPrefixRoots");
   try {
     for (const userId of [owner, null]) {
       for (const body of [
@@ -224,12 +225,8 @@ test("PATCH checks the actual root source for root and child moves", async () =>
 test("prefix refuses a source destination produced by suffix replacement", async () => {
   const { root } = await session("shared/indirect/slack/c1/");
   expect(await call("session-moves/prefix", { from: "shared/indirect/", to: "shared/" })).toEqual({
-    status: 200,
-    body: {
-      moved: [],
-      remaining: 0,
-      skipped: [{ rootTaskId: root.id, reason: "Source groups are read-only." }],
-    },
+    status: 409,
+    body: { error: "No sessions moved. Source groups are read-only." },
   });
   expect((await getTaskById(root.id))?.key).toBe(root.key);
 });
@@ -375,10 +372,8 @@ test("a denied descendant prevents the entire chain move and does not count as r
     null,
     agentId,
   );
-  expect(prefix.status).toBe(200);
-  expect(prefix.body.moved).toEqual([]);
-  expect(prefix.body.remaining).toBe(0);
-  expect(prefix.body.skipped).toHaveLength(1);
+  expect(prefix.status).toBe(409);
+  expect(prefix.body.error).toContain("Not authorized to move this task namespace");
   expect((await getTaskById(denied.root.id))?.key).toBe(denied.root.key);
 });
 
@@ -398,9 +393,8 @@ test("prefix rename preserves subgroups and skips shared sessions without exposi
   expect((await getTaskById(own.grandchild.id))?.key).toBe("shared/renamed/b/");
   expect((await getTaskById(hidden.root.id))?.key).toBe(hidden.root.key);
   expect(
-    (await call("session-moves/prefix", { from: "shared/rename/", to: "shared/renamed/" })).body
-      .moved,
-  ).toEqual([]);
+    (await call("session-moves/prefix", { from: "shared/rename/", to: "shared/renamed/" })).status,
+  ).toBe(409);
   expect(
     (await call("session-moves/prefix", { from: "shared/renamed/", to: null })).body.moved,
   ).toEqual([own.root.id]);
@@ -504,8 +498,8 @@ test("user prefix moves exclude ownerless roots and report only visible roots ow
       expect((await getTaskById(ownerless.id))?.key).toBe(ownerless.key);
       expect((await getTaskById(privateRoot.root.id))?.key).toBe(privateRoot.root.key);
       const deleted = await call("session-moves/prefix", { from, to: null });
-      expect(deleted.body.moved).toEqual([]);
-      expect(deleted.body.skipped).toHaveLength(1);
+      expect(deleted.status).toBe(409);
+      expect(deleted.body.error).toContain("Only the session owner");
       expect((await getTaskById(ownerless.id))?.key).toBe(ownerless.key);
     } finally {
       checks.mockRestore();
@@ -519,6 +513,73 @@ test("user prefix moves exclude ownerless roots and report only visible roots ow
   }
 });
 
+test("schedule-only groups reject deletion instead of returning empty success", async () => {
+  for (const requestedByUserId of [other, undefined]) {
+    const key = `shared/schedule-only-${crypto.randomUUID()}/`;
+    const root = await createTaskExtended("scheduled session", {
+      key,
+      source: "schedule",
+      scheduleId: crypto.randomUUID(),
+      requestedByUserId,
+    });
+    expect(await sessionMoves.listUnownedPrefixRoots({ from: key, userId: null })).toEqual([
+      { id: root.id },
+    ]);
+    const tree = () => getSessionTree({ kind: "user", userId: owner }, undefined, { mine: true });
+    expect((await tree()).groups.some((group) => group.key === key)).toBe(true);
+    const result = await call("session-moves/prefix", { from: key, to: null });
+    expect(result.status).toBe(409);
+    expect(result.body.error).toContain("Only the session owner");
+    expect((await getTaskById(root.id))?.key).toBe(key);
+    expect((await tree()).groups.some((group) => group.key === key)).toBe(true);
+  }
+});
+
+test("mixed groups report visible scheduled sessions and move only owned sessions", async () => {
+  const key = "shared/mixed-scheduled/";
+  const own = await session(key);
+  const scheduled = await createTaskExtended("scheduled", {
+    key,
+    source: "schedule",
+    scheduleId: crypto.randomUUID(),
+  });
+  const hidden = await session(key, other);
+  const result = await call("session-moves/prefix", { from: key, to: null });
+  expect(result.status).toBe(200);
+  expect(result.body).toEqual({
+    moved: [own.root.id],
+    remaining: 0,
+    skipped: [{ rootTaskId: scheduled.id, reason: "Only the session owner can move this group" }],
+  });
+  expect((await getTaskById(own.root.id))?.key).toBe(`shared/task:${own.root.id}/`);
+  expect((await getTaskById(scheduled.id))?.key).toBe(key);
+  expect((await getTaskById(hidden.root.id))?.key).toBe(key);
+});
+
+test("all-users read scope reports blocked roots without granting write access", async () => {
+  await ensureRbacSeedsSynced();
+  await attachRole(owner, "auditor");
+  const { root } = await session("shared/audited-group/", other);
+  try {
+    const hidden = await call("session-moves/prefix", { from: root.key, to: null });
+    expect(hidden).toEqual({ status: 200, body: { moved: [], skipped: [], remaining: 0 } });
+    const response = await fetch(`${baseUrl}/api/session-moves/prefix`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Test-User": owner,
+        "X-Swarm-Session-Scope": "all",
+      },
+      body: JSON.stringify({ from: root.key, to: null }),
+    });
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toContain("Only the session owner");
+    expect((await getTaskById(root.id))?.key).toBe(root.key);
+  } finally {
+    await detachRole(owner, "auditor");
+  }
+});
+
 test("owned roots denied task mutation are skipped without remaining work", async () => {
   const { root } = await session("shared/owned-denied/");
   const checks = spyOn(assets, "canMutateTaskNamespace").mockResolvedValue(false);
@@ -528,12 +589,8 @@ test("owned roots denied task mutation are skipped without remaining work", asyn
       to: "shared/owned-allowed/",
     });
     expect(result).toEqual({
-      status: 200,
-      body: {
-        moved: [],
-        remaining: 0,
-        skipped: [{ rootTaskId: root.id, reason: "Not authorized to move this task namespace" }],
-      },
+      status: 409,
+      body: { error: "No sessions moved. Not authorized to move this task namespace" },
     });
   } finally {
     checks.mockRestore();
@@ -545,12 +602,8 @@ test("prefix skips replacement keys that remain in the source group", async () =
   const move = { from: "shared/p/q/", to: "shared/p/" };
   for (let i = 0; i < 2; i++) {
     expect(await call("session-moves/prefix", move)).toEqual({
-      status: 200,
-      body: {
-        moved: [],
-        remaining: 0,
-        skipped: [{ rootTaskId: root.id, reason: "The new key stays inside the source group" }],
-      },
+      status: 409,
+      body: { error: "No sessions moved. The new key stays inside the source group" },
     });
     expect((await getTaskById(root.id))?.key).toBe(root.key);
   }
@@ -650,13 +703,10 @@ test("prefix skips overlong results and excludes them from remaining", async () 
     to: `shared/${"y".repeat(140)}/`,
   });
   expect(result).toEqual({
-    status: 200,
-    body: {
-      moved: [],
-      skipped: [{ rootTaskId: root.id, reason: "Asset key cannot exceed 255 characters" }],
-      remaining: 0,
-    },
+    status: 409,
+    body: { error: "No sessions moved. Asset key cannot exceed 255 characters" },
   });
+  expect((await getTaskById(root.id))?.key).toBe(root.key);
 });
 
 test("prefix pages past skipped roots and reaches zero with skipped roots remaining", async () => {
@@ -688,9 +738,8 @@ test("prefix pages past skipped roots and reaches zero with skipped roots remain
     from: "shared/paging/",
     to: "shared/paged/",
   });
-  expect(repeated.body.moved).toEqual([]);
-  expect(repeated.body.remaining).toBe(0);
-  expect(repeated.body.skipped).toHaveLength(skipped.length);
+  expect(repeated.status).toBe(409);
+  expect(repeated.body.error).toContain("Only the session owner");
 });
 
 test("audit warnings block all moves with the existing message and one audit per request", async () => {
@@ -703,7 +752,7 @@ test("audit warnings block all moves with the existing message and one audit per
     warningCount: 1,
   }));
   const prefixScan = spyOn(sessionMoves, "listPrefixRoots");
-  const sharedScan = spyOn(sessionMoves, "listSharedPrefixRoots");
+  const sharedScan = spyOn(sessionMoves, "listUnownedPrefixRoots");
   try {
     for (const body of [
       { rootTaskIds: [first.root.id, second.root.id], groupKey: "shared/blocked/" },

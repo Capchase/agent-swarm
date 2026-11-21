@@ -417,6 +417,38 @@ async function moves(ctx: ScenarioContext, owner: string, rootId: string, childI
   expect(hasRoot(list, rootId), "noGroup=true omits a reset session");
 }
 
+/** Visible scheduled sessions must not produce an empty deletion success. */
+async function blockedScheduleGroup(ctx: ScenarioContext, owner: string, viewer: string) {
+  const key = `shared/blocked-schedule-${ctx.nonce}/`;
+  const created = await ctx.api("POST", "/api/tasks", {
+    body: {
+      task: `Scheduled session ${mark(ctx)}`,
+      source: "schedule",
+      scheduleId: crypto.randomUUID(),
+      requestedByUserId: owner,
+      key,
+    },
+  });
+  expectStatus(created, [201], "create another user's scheduled session");
+  const rootId = String(asRecord(created.json).id);
+  const tree = asRecord((await ctx.api("GET", "/api/session-tree", as(viewer))).json);
+  expect(
+    asRecords(tree, "groups").some((group) => group.key === key),
+    "Schedule group is not visible",
+  );
+  const response = await ctx.api("POST", "/api/session-moves/prefix", {
+    ...as(viewer),
+    body: { from: key, to: null },
+  });
+  expectStatus(response, [409], "reject deletion of an entirely blocked group");
+  expect(
+    String(asRecord(response.json).error).includes("Only the session owner"),
+    "Missing ownership explanation",
+  );
+  expect(taskKey(ctx, rootId) === key, "Blocked deletion changed the session key");
+  await cancelQuietly(ctx, rootId);
+}
+
 export const coreSessions: Scenario = {
   name: "core-sessions",
   order: 240,
@@ -428,6 +460,7 @@ export const coreSessions: Scenario = {
     const { rootId, childId } = await ownershipAndSharing(ctx, workerId, owner, reader, stranger);
     await triage(ctx, owner, rootId);
     await moves(ctx, owner, rootId, childId);
+    await blockedScheduleGroup(ctx, owner, stranger);
     for (const id of [childId, rootId]) await cancelQuietly(ctx, id);
     const writerSteers = ctx.db.query<{ id: string }>(
       "SELECT id FROM agent_tasks WHERE parentTaskId = ? AND taskType = 'follow-up'",

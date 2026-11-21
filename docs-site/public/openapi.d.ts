@@ -22818,7 +22818,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description Moves blocked until audit warnings are repaired */
+                /** @description Moves blocked by audit warnings or no visible session can be moved */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -22897,7 +22897,7 @@ export interface paths {
                         "application/json": components["schemas"]["ErrorResponse"];
                     };
                 };
-                /** @description Moves blocked until audit warnings are repaired */
+                /** @description Moves blocked by audit warnings or no visible session can be moved */
                 409: {
                     headers: {
                         [name: string]: unknown;

@@ -58068,7 +58068,7 @@
             }
           },
           "409": {
-            "description": "Moves blocked until audit warnings are repaired",
+            "description": "Moves blocked by audit warnings or no visible session can be moved",
             "content": {
               "application/json": {
                 "schema": {
@@ -58188,7 +58188,7 @@
             }
           },
           "409": {
-            "description": "Moves blocked until audit warnings are repaired",
+            "description": "Moves blocked by audit warnings or no visible session can be moved",
             "content": {
               "application/json": {
                 "schema": {

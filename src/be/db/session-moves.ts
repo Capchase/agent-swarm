@@ -171,16 +171,24 @@ export async function listPrefixRoots(input: {
   );
 }
 
-export async function listSharedPrefixRoots(input: {
+/** Visible roots that a user cannot move through the owner-only group action. */
+export async function listUnownedPrefixRoots(input: {
   from: string;
   userId: string | null;
+  readAll?: boolean;
 }): Promise<{ id: string }[]> {
   const { lo, hi } = keyPrefixRange(input.from);
-  const visibility = sessionViewerCondition({ userId: input.userId, scope: "shared" });
+  const visibility = sessionViewerCondition({
+    userId: input.userId,
+    scope: "all",
+    readAll: input.readAll,
+  });
   return getDbClient().query<{ id: string }>(
     `SELECT r.id FROM agent_tasks r
      WHERE r.parentTaskId IS NULL AND r."key" >= ? AND r."key" < ?
+       AND (r.requestedByUserId IS NULL OR r.requestedByUserId IS NOT ?)
+       AND (r.requestedByUserId IS NOT NULL OR r.scheduleId IS NOT NULL)
        AND ${visibility.sql} ORDER BY r.id`,
-    [lo, hi, ...visibility.params],
+    [lo, hi, input.userId, ...visibility.params],
   );
 }

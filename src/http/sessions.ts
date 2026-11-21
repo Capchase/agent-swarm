@@ -27,7 +27,7 @@ import {
 import { getResourceSessionLabels, getSessionLabels } from "../be/db/session-labels";
 import {
   listPrefixRoots,
-  listSharedPrefixRoots,
+  listUnownedPrefixRoots,
   moveKeyFavorites,
   moveSessionChains,
   type SessionKeyMove,
@@ -702,7 +702,7 @@ const sessionMoveRbac = { permission: "task.fs.mutate" } as const;
 const sessionMoveResponses = {
   400: { description: "Invalid namespace or request" },
   403: { description: "Personal destination not authorized" },
-  409: { description: "Moves blocked until audit warnings are repaired" },
+  409: { description: "Moves blocked by audit warnings or no visible session can be moved" },
 };
 
 const moveSessions = route({
@@ -1199,7 +1199,9 @@ export async function handleSessions(
         }
         const skipped =
           actor.kind === "user"
-            ? (await listSharedPrefixRoots({ from, userId: actor.userId })).map((root) => ({
+            ? (
+                await listUnownedPrefixRoots({ from, userId: actor.userId, readAll: actor.readAll })
+              ).map((root) => ({
                 rootTaskId: root.id,
                 reason: SESSION_MOVE_OWNER_ONLY,
               }))
@@ -1246,6 +1248,11 @@ export async function handleSessions(
           if (roots.length < SESSION_MOVE_LIMIT) break;
         }
         const moved = await moveSessionChains({ moves, changedBy });
+        const blocked = skipped[0];
+        if (moved.length === 0 && blocked) {
+          jsonError(res, `No sessions moved. ${blocked.reason}`, 409);
+          return;
+        }
         // Stars on the group follow a rename only when no session of any owner is
         // left under the old key: nothing skipped, nothing remaining. Every user's
         // stars move only when this request moved sessions, which proves the caller
